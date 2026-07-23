@@ -1,0 +1,38 @@
+{
+  "jsonrpc": "2.0",
+  "id": "agent:100",
+  "method": "agent.run.complete",
+  "params": {
+    "runId": "run-238",
+    "status": "succeeded",
+    "message": {
+      "messageId": "msg-900",
+      "type": "critique",
+      "replyTo": "msg-877",
+      "threadId": "thread-auth-security",
+      "content": "The proposal lacks token-family revocation.",
+      "claims": [
+        {
+          "claimId": "claim-44",
+          "text": "Current code has no token-family invalidation path.",
+          "evidenceRefs": [
+            {
+              "sourceType": "repository",
+              "sourceId": "src/auth/token_service.rs",
+              "revision": "worktree:task-1:abc123",
+              "contentDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "startLine": 88,
+              "endLine": 140
+            }
+          ],
+          "confidence": 0.88
+        }
+      ]
+    },
+    "usage": {
+      "inputTokens": 12000,
+      "outputTokens": 1800,
+      "providerReportedCost": 0.08
+    }
+  }
+}

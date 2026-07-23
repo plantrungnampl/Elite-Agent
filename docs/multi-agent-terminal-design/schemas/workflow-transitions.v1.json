@@ -1,0 +1,337 @@
+{
+  "schemaVersion": 1,
+  "stateShape": {
+    "phase": "Phase",
+    "condition": "Condition",
+    "operation": "OperationState",
+    "streamVersion": "u64",
+    "workspaceVersion": "u64",
+    "fencingEpoch": "u64"
+  },
+  "phases": [
+    "Intake",
+    "ContextBuild",
+    "ParallelAnalysis",
+    "CrossReview",
+    "PrePlanVerification",
+    "Synthesis",
+    "FinalObjection",
+    "AwaitingPlanApproval",
+    "Implementation",
+    "Verification",
+    "Repair",
+    "FinalReview",
+    "AwaitingCommitApproval",
+    "LocalCommit",
+    "WorkspaceDirty",
+    "Completed",
+    "Cancelled",
+    "Failed"
+  ],
+  "terminalPhases": [
+    "Completed",
+    "Cancelled",
+    "Failed"
+  ],
+  "conditions": [
+    "Active",
+    "Paused",
+    "Blocked",
+    "BudgetExhausted"
+  ],
+  "operationStates": [
+    "None",
+    "AwaitingApproval",
+    "Running",
+    "Cancelling",
+    "Indeterminate"
+  ],
+  "phaseTransitions": [
+    {
+      "from": "Intake",
+      "event": "task.validated",
+      "to": "ContextBuild",
+      "guard": "repository_policy_budgets_valid",
+      "effects": ["persist_risk", "persist_base_identity"]
+    },
+    {
+      "from": "ContextBuild",
+      "event": "context.initial.ready",
+      "to": "ParallelAnalysis",
+      "guard": "required_context_packages_valid",
+      "effects": ["freeze_independent_inputs"]
+    },
+    {
+      "from": "ParallelAnalysis",
+      "event": "analysis.quorum.reached",
+      "to": "CrossReview",
+      "guard": "minimum_independent_results",
+      "effects": ["publish_selected_proposals", "assign_review_edges"]
+    },
+    {
+      "from": "CrossReview",
+      "event": "review.complete",
+      "to": "PrePlanVerification",
+      "guard": "review_outputs_or_bounded_stop",
+      "effects": ["freeze_material_claims"]
+    },
+    {
+      "from": "PrePlanVerification",
+      "event": "claims.checked",
+      "to": "Synthesis",
+      "guard": "all_material_claims_classified",
+      "effects": ["persist_claim_verification_set"]
+    },
+    {
+      "from": "Synthesis",
+      "event": "decision.draft.created",
+      "to": "FinalObjection",
+      "guard": "decision_schema_and_evidence_valid",
+      "effects": ["publish_immutable_decision_draft"]
+    },
+    {
+      "from": "FinalObjection",
+      "event": "objection.severe.accepted",
+      "to": "CrossReview",
+      "guard": "reopen_criteria_satisfied",
+      "effects": ["increment_review_round"]
+    },
+    {
+      "from": "FinalObjection",
+      "event": "objection.round.closed",
+      "to": "AwaitingPlanApproval",
+      "guard": "no_accepted_severe_objection",
+      "effects": ["create_plan_approval_request"]
+    },
+    {
+      "from": "AwaitingPlanApproval",
+      "event": "plan.revision.requested",
+      "to": "Synthesis",
+      "guard": "user_feedback_present",
+      "effects": ["supersede_decision_draft"]
+    },
+    {
+      "from": "AwaitingPlanApproval",
+      "event": "plan.approved",
+      "to": "Implementation",
+      "guard": "plan_approval_digest_valid",
+      "effects": ["persist_approved_plan_version", "allocate_executor_lease"]
+    },
+    {
+      "from": "Implementation",
+      "event": "implementation.submitted",
+      "to": "Verification",
+      "guard": "no_in_flight_writes",
+      "effects": [
+        "revoke_executor_lease",
+        "reconcile_workspace",
+        "create_candidate_tree"
+      ]
+    },
+    {
+      "from": "Verification",
+      "event": "verification.failed",
+      "to": "Repair",
+      "guard": "repair_budget_available",
+      "effects": [
+        "discard_candidate_tree",
+        "persist_failure_evidence",
+        "allocate_new_executor_token"
+      ]
+    },
+    {
+      "from": "Verification",
+      "event": "verification.passed",
+      "to": "FinalReview",
+      "guard": "required_suite_complete",
+      "effects": ["freeze_verified_candidate_evidence"]
+    },
+    {
+      "from": "Repair",
+      "event": "repair.submitted",
+      "to": "Verification",
+      "guard": "current_fenced_executor_and_scoped_writes",
+      "effects": [
+        "increment_workspace_version",
+        "revoke_executor_lease",
+        "create_candidate_tree"
+      ]
+    },
+    {
+      "from": "FinalReview",
+      "event": "review.changes.required",
+      "to": "Repair",
+      "guard": "review_finding_accepted",
+      "effects": ["discard_candidate_tree", "allocate_new_executor_token"]
+    },
+    {
+      "from": "FinalReview",
+      "event": "review.accepted",
+      "to": "AwaitingCommitApproval",
+      "guard": "review_cites_current_candidate_tree",
+      "effects": ["create_final_approval_request"]
+    },
+    {
+      "from": "AwaitingCommitApproval",
+      "event": "commit.repair.requested",
+      "to": "Repair",
+      "guard": "user_feedback_present",
+      "effects": ["invalidate_candidate_and_approval", "allocate_new_executor_token"]
+    },
+    {
+      "from": "AwaitingCommitApproval",
+      "event": "commit.approved",
+      "to": "LocalCommit",
+      "guard": "canonical_commit_inputs_unchanged",
+      "effects": ["persist_final_approval"]
+    },
+    {
+      "from": "LocalCommit",
+      "event": "commit.verified",
+      "to": "Completed",
+      "guard": "commit_tree_equals_candidate_tree",
+      "effects": ["persist_commit", "create_completion_package"]
+    },
+    {
+      "from": "WorkspaceDirty",
+      "event": "workspace.repair.authorized",
+      "to": "Repair",
+      "guard": "mutation_evidence_preserved",
+      "effects": ["allocate_new_executor_token"]
+    },
+    {
+      "from": "WorkspaceDirty",
+      "event": "workspace.reconciled",
+      "to": "FinalReview",
+      "guard": "candidate_rebuilt_and_verified",
+      "effects": ["create_new_candidate_tree"]
+    }
+  ],
+  "workspaceDirtySources": [
+    "Implementation",
+    "Verification",
+    "Repair",
+    "FinalReview",
+    "AwaitingCommitApproval"
+  ],
+  "workspaceDirtyTransition": {
+    "event": "workspace.mutated",
+    "to": "WorkspaceDirty",
+    "effects": [
+      "revoke_executor_lease",
+      "increment_fencing_epoch",
+      "invalidate_affected_approvals",
+      "stop_write_capable_tools",
+      "capture_workspace_evidence"
+    ]
+  },
+  "conditionTransitions": [
+    {
+      "from": "Active",
+      "event": "task.paused",
+      "to": "Paused",
+      "guard": "phase_nonterminal"
+    },
+    {
+      "from": "Paused",
+      "event": "task.resumed",
+      "to": "Active",
+      "guard": "policy_budget_workspace_and_lease_valid"
+    },
+    {
+      "from": "Active",
+      "event": "budget.exhausted",
+      "to": "BudgetExhausted",
+      "guard": "phase_nonterminal"
+    },
+    {
+      "from": "BudgetExhausted",
+      "event": "budget.extended",
+      "to": "Active",
+      "guard": "new_budget_reserved"
+    },
+    {
+      "from": "Active",
+      "event": "workflow.blocked",
+      "to": "Blocked",
+      "guard": "typed_block_reason_present"
+    },
+    {
+      "from": "Blocked",
+      "event": "workflow.unblocked",
+      "to": "Active",
+      "guard": "block_guard_revalidated"
+    }
+  ],
+  "operationTransitions": [
+    {
+      "from": "None",
+      "event": "operation.approval.required",
+      "to": "AwaitingApproval"
+    },
+    {
+      "from": "AwaitingApproval",
+      "event": "approval.granted",
+      "to": "Running",
+      "guard": "approval_digest_recomputed"
+    },
+    {
+      "from": "AwaitingApproval",
+      "event": "approval.denied",
+      "to": "None"
+    },
+    {
+      "from": "Running",
+      "event": "operation.succeeded",
+      "to": "None",
+      "guard": "result_evidence_persisted"
+    },
+    {
+      "from": "Running",
+      "event": "operation.failed",
+      "to": "None",
+      "guard": "failure_evidence_persisted"
+    },
+    {
+      "from": "Running",
+      "event": "operation.cancel.requested",
+      "to": "Cancelling"
+    },
+    {
+      "from": "Cancelling",
+      "event": "operation.terminated",
+      "to": "None"
+    },
+    {
+      "from": "Running",
+      "event": "operation.outcome.unknown",
+      "to": "Indeterminate"
+    },
+    {
+      "from": "Cancelling",
+      "event": "operation.outcome.unknown",
+      "to": "Indeterminate"
+    },
+    {
+      "from": "Indeterminate",
+      "event": "operation.outcome.verified",
+      "to": "None",
+      "guard": "trusted_reconciler_evidence"
+    }
+  ],
+  "globalEvents": {
+    "task.cancel.requested": {
+      "allowedFrom": "any_nonterminal_phase",
+      "effect": "stop_new_dispatch_and_resolve_in_flight_operation"
+    },
+    "task.cancelled": {
+      "allowedFrom": "any_nonterminal_phase_after_resolution",
+      "to": "Cancelled"
+    },
+    "task.failed": {
+      "allowedFrom": "any_nonterminal_phase",
+      "guard": "no_running_or_indeterminate_operation_and_failure_evidence_persisted",
+      "to": "Failed"
+    }
+  }
+}

@@ -1,0 +1,30 @@
+# Isolated development worktrees
+.worktrees/
+
+# Rust and frontend build output
+target/
+**/target/
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+
+# Local runtime state
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.log
+
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Durable local workflow scratch and raw verification output
+.superpowers/sdd/
+artifacts/verification/**/raw/

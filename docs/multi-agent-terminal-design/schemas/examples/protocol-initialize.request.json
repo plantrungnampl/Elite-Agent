@@ -1,0 +1,28 @@
+{
+  "jsonrpc": "2.0",
+  "id": "core:1",
+  "method": "initialize",
+  "params": {
+    "protocolVersions": ["1.0"],
+    "client": {
+      "name": "local-agent-terminal",
+      "version": "0.2.0"
+    },
+    "transport": {
+      "type": "stdio-ndjson",
+      "maxFrameBytes": 8388608
+    },
+    "features": [
+      "streaming",
+      "context-query",
+      "tool-request",
+      "specialist-request"
+    ],
+    "launchBinding": {
+      "connectionId": "conn-71",
+      "manifestDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "executableDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "trustTier": "brokered_process"
+    }
+  }
+}
