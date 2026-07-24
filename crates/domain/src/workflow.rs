@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
-use serde::Deserialize;
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use crate::{
     Effect, FencingToken, GuardEvaluations, GuardName, Sequence, WorkflowEvent, WorkspaceVersion,
@@ -419,6 +420,7 @@ struct WorkflowSpecification {
     workspace_dirty_transition: WorkspaceDirtyRule,
     condition_transitions: Vec<ConditionTransitionRule>,
     operation_transitions: Vec<OperationTransitionRule>,
+    #[serde(deserialize_with = "deserialize_unique_global_events")]
     global_events: BTreeMap<String, GlobalRule>,
 }
 
@@ -481,50 +483,111 @@ impl WorkflowSpecification {
     }
 
     fn validate_unique_transition_selectors(&self) -> Result<(), String> {
-        let mut phase_selectors = BTreeSet::new();
+        let mut owners = BTreeMap::new();
+
         for rule in &self.phase_transitions {
-            if !phase_selectors.insert((rule.from, rule.event.as_str())) {
-                return Err(format!(
-                    "duplicate phase transition selector ({}, {})",
-                    rule.from, rule.event
-                ));
+            for condition in Condition::ALL {
+                for operation in OperationState::ALL {
+                    claim_selector(
+                        &mut owners,
+                        "phase",
+                        &rule.event,
+                        rule.from,
+                        *condition,
+                        *operation,
+                    )?;
+                }
             }
         }
 
-        let mut condition_selectors = BTreeSet::new();
-        for rule in &self.condition_transitions {
-            if !condition_selectors.insert((rule.from, rule.event.as_str())) {
-                return Err(format!(
-                    "duplicate condition transition selector ({}, {})",
-                    rule.from, rule.event
-                ));
-            }
-        }
-
-        let mut operation_selectors = BTreeSet::new();
-        for rule in &self.operation_transitions {
-            if !operation_selectors.insert((rule.from, rule.event.as_str())) {
-                return Err(format!(
-                    "duplicate operation transition selector ({}, {})",
-                    rule.from, rule.event
-                ));
-            }
-        }
-
-        let mut workspace_dirty_selectors = BTreeSet::new();
         for source in &self.workspace_dirty_sources {
-            if !workspace_dirty_selectors
-                .insert((*source, self.workspace_dirty_transition.event.as_str()))
+            for condition in Condition::ALL {
+                for operation in OperationState::ALL {
+                    claim_selector(
+                        &mut owners,
+                        "workspace",
+                        &self.workspace_dirty_transition.event,
+                        *source,
+                        *condition,
+                        *operation,
+                    )?;
+                }
+            }
+        }
+
+        for rule in &self.condition_transitions {
+            for phase in Phase::ALL {
+                for operation in OperationState::ALL {
+                    claim_selector(
+                        &mut owners,
+                        "condition",
+                        &rule.event,
+                        *phase,
+                        rule.from,
+                        *operation,
+                    )?;
+                }
+            }
+        }
+
+        for rule in &self.operation_transitions {
+            for phase in Phase::ALL {
+                for condition in Condition::ALL {
+                    claim_selector(
+                        &mut owners,
+                        "operation",
+                        &rule.event,
+                        *phase,
+                        *condition,
+                        rule.from,
+                    )?;
+                }
+            }
+        }
+
+        for event in self.global_events.keys() {
+            for phase in Phase::ALL
+                .iter()
+                .copied()
+                .filter(|phase| !phase.is_terminal())
             {
-                return Err(format!(
-                    "duplicate workspace transition selector ({}, {})",
-                    source, self.workspace_dirty_transition.event
-                ));
+                for condition in Condition::ALL {
+                    for operation in OperationState::ALL {
+                        claim_selector(
+                            &mut owners,
+                            "global",
+                            event,
+                            phase,
+                            *condition,
+                            *operation,
+                        )?;
+                    }
+                }
             }
         }
 
         Ok(())
     }
+}
+
+type ExpandedSelector = (String, Phase, Condition, OperationState);
+
+fn claim_selector(
+    owners: &mut BTreeMap<ExpandedSelector, &'static str>,
+    axis: &'static str,
+    event: &str,
+    phase: Phase,
+    condition: Condition,
+    operation: OperationState,
+) -> Result<(), String> {
+    let selector = (event.to_owned(), phase, condition, operation);
+    if let Some(previous_axis) = owners.insert(selector, axis) {
+        return Err(format!(
+            "ambiguous {event} selector for {phase}/{condition}/{operation}: \
+             {previous_axis} and {axis}"
+        ));
+    }
+    Ok(())
 }
 
 static SPECIFICATION: OnceLock<Result<WorkflowSpecification, String>> = OnceLock::new();
@@ -592,6 +655,40 @@ struct GlobalRule {
     effect: Option<String>,
     guard: Option<String>,
     to: Option<Phase>,
+}
+
+fn deserialize_unique_global_events<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, GlobalRule>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct UniqueGlobalEvents;
+
+    impl<'de> Visitor<'de> for UniqueGlobalEvents {
+        type Value = BTreeMap<String, GlobalRule>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("global events with unique names")
+        }
+
+        fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut events = BTreeMap::new();
+            while let Some((name, rule)) = entries.next_entry::<String, GlobalRule>()? {
+                if events.insert(name.clone(), rule).is_some() {
+                    return Err(de::Error::custom(format!(
+                        "duplicate global event key {name}"
+                    )));
+                }
+            }
+            Ok(events)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueGlobalEvents)
 }
 
 enum SelectedTransition<'a> {
@@ -737,11 +834,15 @@ mod specification_tests {
         serde_json::from_str(WORKFLOW_JSON).expect("normative workflow JSON")
     }
 
-    fn parse_for_test(value: Value) -> Result<WorkflowSpecification, String> {
+    fn parse_json_for_test(json: &str) -> Result<WorkflowSpecification, String> {
         let specification: WorkflowSpecification =
-            serde_json::from_value(value).map_err(|error| error.to_string())?;
+            serde_json::from_str(json).map_err(|error| error.to_string())?;
         specification.validate()?;
         Ok(specification)
+    }
+
+    fn parse_for_test(value: Value) -> Result<WorkflowSpecification, String> {
+        parse_json_for_test(&serde_json::to_string(&value).unwrap())
     }
 
     #[test]
@@ -817,5 +918,77 @@ mod specification_tests {
         for invalid in [wrong_event, wrong_target] {
             assert!(parse_for_test(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn specification_rejects_phase_condition_selector_overlap() {
+        let mut invalid = normative_value();
+        invalid["conditionTransitions"][0]["event"] =
+            invalid["phaseTransitions"][0]["event"].clone();
+
+        assert!(parse_for_test(invalid).is_err());
+    }
+
+    #[test]
+    fn specification_rejects_workspace_selector_overlap() {
+        let mut phase_overlap = normative_value();
+        let phase_rule = phase_overlap["phaseTransitions"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|rule| rule["from"].as_str() == Some("Implementation"))
+            .unwrap();
+        phase_rule["event"] = json!(OBSERVED_WORKSPACE_MUTATION_EVENT);
+        assert!(parse_for_test(phase_overlap).is_err());
+
+        let mut global_overlap = normative_value();
+        let global_rule = global_overlap["globalEvents"]["task.cancel.requested"].clone();
+        global_overlap["globalEvents"]
+            .as_object_mut()
+            .unwrap()
+            .insert(OBSERVED_WORKSPACE_MUTATION_EVENT.to_owned(), global_rule);
+        assert!(parse_for_test(global_overlap).is_err());
+    }
+
+    #[test]
+    fn specification_rejects_condition_operation_selector_overlap() {
+        let mut invalid = normative_value();
+        invalid["operationTransitions"][0]["event"] =
+            invalid["conditionTransitions"][0]["event"].clone();
+
+        assert!(parse_for_test(invalid).is_err());
+    }
+
+    #[test]
+    fn specification_allows_same_axis_event_from_mutually_exclusive_states() {
+        let specification = parse_for_test(normative_value()).unwrap();
+        let outcome_unknown_rules = specification
+            .operation_transitions
+            .iter()
+            .filter(|rule| rule.event == "operation.outcome.unknown")
+            .count();
+
+        assert_eq!(outcome_unknown_rules, 2);
+    }
+
+    #[test]
+    fn specification_allows_disjoint_phase_workspace_event_reuse() {
+        let mut valid = normative_value();
+        assert_eq!(valid["phaseTransitions"][0]["from"], json!("Intake"));
+        valid["phaseTransitions"][0]["event"] = json!(OBSERVED_WORKSPACE_MUTATION_EVENT);
+
+        assert!(parse_for_test(valid).is_ok());
+    }
+
+    #[test]
+    fn specification_rejects_duplicate_raw_global_event_keys() {
+        let value = normative_value();
+        let rule = serde_json::to_string(&value["globalEvents"]["task.failed"]).unwrap();
+        let selector = format!("\"task.failed\":{rule}");
+        let json = serde_json::to_string(&value).unwrap();
+        assert_eq!(json.matches(&selector).count(), 1);
+        let duplicate = json.replacen(&selector, &format!("{selector},{selector}"), 1);
+
+        assert!(parse_json_for_test(&duplicate).is_err());
     }
 }
