@@ -1,3 +1,7 @@
 [workspace]
-members = ["apps/desktop/src-tauri", "crates/domain"]
+members = [
+    "apps/desktop/src-tauri",
+    "crates/application",
+    "crates/domain",
+]
 resolver = "2"
