@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -11,6 +11,7 @@ use crate::{
 
 const WORKFLOW_JSON: &str =
     include_str!("../../../docs/multi-agent-terminal-design/schemas/workflow-transitions.v1.json");
+const OBSERVED_WORKSPACE_MUTATION_EVENT: &str = "workspace.mutated";
 
 macro_rules! workflow_enum {
     ($name:ident { $($variant:ident),+ $(,)? }) => {
@@ -215,6 +216,9 @@ pub enum WorkflowError {
         condition: Condition,
         operation: OperationState,
     },
+    OperationNotDispatchable {
+        condition: Condition,
+    },
     OperationNotResolved {
         operation: OperationState,
     },
@@ -260,6 +264,12 @@ impl fmt::Display for WorkflowError {
                 formatter,
                 "phase cannot advance with condition {condition} and operation {operation}"
             ),
+            Self::OperationNotDispatchable { condition } => {
+                write!(
+                    formatter,
+                    "operation cannot start with condition {condition}"
+                )
+            }
             Self::OperationNotResolved { operation } => {
                 write!(formatter, "operation {operation} is not resolved")
             }
@@ -297,12 +307,17 @@ pub fn reduce(
             operation: state.operation,
         });
     }
+    if selected.enters_running_operation() && state.condition != Condition::Active {
+        return Err(WorkflowError::OperationNotDispatchable {
+            condition: state.condition,
+        });
+    }
 
     selected.validate_preconditions(state)?;
     validate_guard(selected.guard(), guards)?;
 
     let effects = selected.effects()?;
-    let observed_workspace_mutation = selected.is_workspace_dirty();
+    let observed_workspace_mutation = selected.is_observed_workspace_mutation();
     let mut next = *state;
     selected.apply_axis(&mut next);
     apply_effect_semantics(&effects, observed_workspace_mutation, &mut next)?;
@@ -339,6 +354,9 @@ fn apply_effect_semantics(
     observed_workspace_mutation: bool,
     state: &mut WorkflowState,
 ) -> Result<(), WorkflowError> {
+    // Cross-document invariant: docs/multi-agent-terminal-design/
+    // 13-trust-sandbox-model.md §10 requires every observed workspace mutation to
+    // increment the version; this is not a JSON-declared effect.
     let increment_workspace = observed_workspace_mutation
         || effects
             .iter()
@@ -388,9 +406,10 @@ fn normalize_terminal(state: &mut WorkflowState) {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkflowSpecification {
     schema_version: u64,
+    state_shape: StateShape,
     phases: Vec<Phase>,
     terminal_phases: Vec<Phase>,
     conditions: Vec<Condition>,
@@ -401,6 +420,17 @@ struct WorkflowSpecification {
     condition_transitions: Vec<ConditionTransitionRule>,
     operation_transitions: Vec<OperationTransitionRule>,
     global_events: BTreeMap<String, GlobalRule>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StateShape {
+    phase: String,
+    condition: String,
+    operation: String,
+    stream_version: String,
+    workspace_version: String,
+    fencing_epoch: String,
 }
 
 impl WorkflowSpecification {
@@ -418,6 +448,17 @@ impl WorkflowSpecification {
                 self.schema_version
             ));
         }
+        let expected_shape = StateShape {
+            phase: "Phase".to_owned(),
+            condition: "Condition".to_owned(),
+            operation: "OperationState".to_owned(),
+            stream_version: "u64".to_owned(),
+            workspace_version: "u64".to_owned(),
+            fencing_epoch: "u64".to_owned(),
+        };
+        if self.state_shape != expected_shape {
+            return Err("state shape does not match the domain model".to_owned());
+        }
         if self.phases.as_slice() != Phase::ALL {
             return Err("phase enum does not match the normative table".to_owned());
         }
@@ -430,6 +471,58 @@ impl WorkflowSpecification {
         if self.operation_states.as_slice() != OperationState::ALL {
             return Err("operation enum does not match the normative table".to_owned());
         }
+        if self.workspace_dirty_transition.event != OBSERVED_WORKSPACE_MUTATION_EVENT
+            || self.workspace_dirty_transition.to != Phase::WorkspaceDirty
+        {
+            return Err("observed workspace mutation rule must target WorkspaceDirty".to_owned());
+        }
+        self.validate_unique_transition_selectors()?;
+        Ok(())
+    }
+
+    fn validate_unique_transition_selectors(&self) -> Result<(), String> {
+        let mut phase_selectors = BTreeSet::new();
+        for rule in &self.phase_transitions {
+            if !phase_selectors.insert((rule.from, rule.event.as_str())) {
+                return Err(format!(
+                    "duplicate phase transition selector ({}, {})",
+                    rule.from, rule.event
+                ));
+            }
+        }
+
+        let mut condition_selectors = BTreeSet::new();
+        for rule in &self.condition_transitions {
+            if !condition_selectors.insert((rule.from, rule.event.as_str())) {
+                return Err(format!(
+                    "duplicate condition transition selector ({}, {})",
+                    rule.from, rule.event
+                ));
+            }
+        }
+
+        let mut operation_selectors = BTreeSet::new();
+        for rule in &self.operation_transitions {
+            if !operation_selectors.insert((rule.from, rule.event.as_str())) {
+                return Err(format!(
+                    "duplicate operation transition selector ({}, {})",
+                    rule.from, rule.event
+                ));
+            }
+        }
+
+        let mut workspace_dirty_selectors = BTreeSet::new();
+        for source in &self.workspace_dirty_sources {
+            if !workspace_dirty_selectors
+                .insert((*source, self.workspace_dirty_transition.event.as_str()))
+            {
+                return Err(format!(
+                    "duplicate workspace transition selector ({}, {})",
+                    source, self.workspace_dirty_transition.event
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -444,6 +537,7 @@ fn workflow_specification() -> Result<&'static WorkflowSpecification, WorkflowEr
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PhaseTransitionRule {
     from: Phase,
     event: String,
@@ -454,6 +548,7 @@ struct PhaseTransitionRule {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkspaceDirtyRule {
     event: String,
     to: Phase,
@@ -462,6 +557,7 @@ struct WorkspaceDirtyRule {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConditionTransitionRule {
     from: Condition,
     event: String,
@@ -472,6 +568,7 @@ struct ConditionTransitionRule {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OperationTransitionRule {
     from: OperationState,
     event: String,
@@ -489,7 +586,7 @@ enum AllowedFrom {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GlobalRule {
     allowed_from: AllowedFrom,
     effect: Option<String>,
@@ -510,7 +607,11 @@ impl SelectedTransition<'_> {
         matches!(self, Self::Phase(_))
     }
 
-    fn is_workspace_dirty(&self) -> bool {
+    fn enters_running_operation(&self) -> bool {
+        matches!(self, Self::Operation(rule) if rule.to == OperationState::Running)
+    }
+
+    fn is_observed_workspace_mutation(&self) -> bool {
         matches!(self, Self::WorkspaceDirty(_))
     }
 
@@ -569,7 +670,12 @@ impl SelectedTransition<'_> {
                 operation: state.operation,
             });
         }
-        if rule.to.is_some_and(Phase::is_terminal) && state.operation != OperationState::None {
+        if rule.to == Some(Phase::Failed)
+            && matches!(
+                state.operation,
+                OperationState::Running | OperationState::Indeterminate
+            )
+        {
             return Err(WorkflowError::OperationNotResolved {
                 operation: state.operation,
             });
@@ -619,4 +725,97 @@ fn select_transition<'a>(
         .global_events
         .get(event.as_str())
         .map(SelectedTransition::Global)
+}
+
+#[cfg(test)]
+mod specification_tests {
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    fn normative_value() -> Value {
+        serde_json::from_str(WORKFLOW_JSON).expect("normative workflow JSON")
+    }
+
+    fn parse_for_test(value: Value) -> Result<WorkflowSpecification, String> {
+        let specification: WorkflowSpecification =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        specification.validate()?;
+        Ok(specification)
+    }
+
+    #[test]
+    fn specification_rejects_wrong_missing_and_unknown_state_shape_fields() {
+        let mut wrong = normative_value();
+        wrong["stateShape"]["phase"] = json!("WrongPhaseType");
+
+        let mut missing = normative_value();
+        missing["stateShape"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fencingEpoch");
+
+        let mut unknown = normative_value();
+        unknown["stateShape"]["invented"] = json!("u64");
+
+        for invalid in [wrong, missing, unknown] {
+            assert!(parse_for_test(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn specification_rejects_unknown_fields_in_nested_rules() {
+        for group in [
+            "phaseTransitions",
+            "conditionTransitions",
+            "operationTransitions",
+        ] {
+            let mut invalid = normative_value();
+            invalid[group][0]["invented"] = json!(true);
+            assert!(parse_for_test(invalid).is_err(), "{group}");
+        }
+
+        let mut workspace_dirty = normative_value();
+        workspace_dirty["workspaceDirtyTransition"]["invented"] = json!(true);
+        assert!(parse_for_test(workspace_dirty).is_err());
+
+        let mut global = normative_value();
+        global["globalEvents"]["task.failed"]["invented"] = json!(true);
+        assert!(parse_for_test(global).is_err());
+    }
+
+    #[test]
+    fn specification_rejects_duplicate_transition_selectors() {
+        for group in [
+            "phaseTransitions",
+            "conditionTransitions",
+            "operationTransitions",
+        ] {
+            let mut invalid = normative_value();
+            let duplicate = invalid[group][0].clone();
+            invalid[group].as_array_mut().unwrap().push(duplicate);
+            assert!(parse_for_test(invalid).is_err(), "{group}");
+        }
+
+        let mut workspace_dirty = normative_value();
+        let duplicate_source = workspace_dirty["workspaceDirtySources"][0].clone();
+        workspace_dirty["workspaceDirtySources"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate_source);
+        assert!(parse_for_test(workspace_dirty).is_err());
+    }
+
+    #[test]
+    fn specification_pins_the_observed_workspace_mutation_rule() {
+        let mut wrong_event = normative_value();
+        wrong_event["workspaceDirtyTransition"]["event"] = json!("workspace.changed");
+
+        let mut wrong_target = normative_value();
+        wrong_target["workspaceDirtyTransition"]["to"] = json!("Repair");
+
+        for invalid in [wrong_event, wrong_target] {
+            assert!(parse_for_test(invalid).is_err());
+        }
+    }
 }

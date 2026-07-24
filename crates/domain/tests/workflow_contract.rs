@@ -442,8 +442,13 @@ fn rejects_undeclared_transitions_and_paused_phase_advancement() {
 }
 
 #[test]
-fn preserves_workspace_dirty_recovery_and_fencing_semantics() {
+fn observed_workspace_mutation_increments_version_outside_json_effects() {
     let source = state(Phase::FinalReview, Condition::Active, OperationState::None);
+    let dirty_rule = &specification()["workspaceDirtyTransition"];
+    assert!(
+        !expected_effects(dirty_rule).contains(&"increment_workspace_version"),
+        "workspace version is a cross-document trust invariant, not a declared JSON effect"
+    );
     let dirty = reduce(
         &source,
         &event("workspace.mutated"),
@@ -456,6 +461,19 @@ fn preserves_workspace_dirty_recovery_and_fencing_semantics() {
         dirty.state().workspace_version().get(),
         source.workspace_version().get() + 1
     );
+}
+
+#[test]
+fn preserves_workspace_dirty_recovery_and_fencing_semantics() {
+    let source = state(Phase::FinalReview, Condition::Active, OperationState::None);
+    let dirty = reduce(
+        &source,
+        &event("workspace.mutated"),
+        &GuardEvaluations::new(),
+    )
+    .unwrap();
+
+    assert_eq!(dirty.state().phase(), Phase::WorkspaceDirty);
     assert_eq!(
         dirty.state().fencing_token().get(),
         source.fencing_token().get() + 1
@@ -578,6 +596,32 @@ fn preserves_approval_and_verification_repair_semantics() {
 }
 
 #[test]
+fn approval_granted_requires_an_active_condition() {
+    let guards = guard_evaluations([("approval_digest_recomputed".to_owned(), true)]);
+
+    for condition in [
+        Condition::Paused,
+        Condition::Blocked,
+        Condition::BudgetExhausted,
+    ] {
+        let source = state(
+            Phase::Implementation,
+            condition,
+            OperationState::AwaitingApproval,
+        );
+        let before = source;
+
+        let result = reduce(&source, &event("approval.granted"), &guards);
+
+        assert!(
+            result.is_err(),
+            "approval entered Running while condition was {condition}"
+        );
+        assert_eq!(source, before);
+    }
+}
+
+#[test]
 fn terminal_states_are_normalized_and_cannot_transition() {
     assert!(WorkflowState::new(
         Phase::Completed,
@@ -660,6 +704,59 @@ fn cancellation_and_failure_require_resolved_external_operations() {
     assert_eq!(cancelled.state().phase(), Phase::Cancelled);
     assert_eq!(cancelled.state().condition(), Condition::Active);
     assert_eq!(cancelled.state().operation(), OperationState::None);
+}
+
+#[test]
+fn task_failed_excludes_exactly_running_and_indeterminate_operations() {
+    let guards = guard_evaluations([(
+        "no_running_or_indeterminate_operation_and_failure_evidence_persisted".to_owned(),
+        true,
+    )]);
+
+    for operation in [
+        OperationState::None,
+        OperationState::AwaitingApproval,
+        OperationState::Cancelling,
+    ] {
+        let source = state(Phase::Implementation, Condition::Paused, operation);
+        let failed = reduce(&source, &event("task.failed"), &guards)
+            .unwrap_or_else(|error| panic!("{operation} should be accepted: {error}"));
+
+        assert_eq!(failed.state().phase(), Phase::Failed);
+        assert_eq!(failed.state().condition(), Condition::Active);
+        assert_eq!(failed.state().operation(), OperationState::None);
+    }
+
+    for operation in [OperationState::Running, OperationState::Indeterminate] {
+        let source = state(Phase::Implementation, Condition::Active, operation);
+        assert!(matches!(
+            reduce(&source, &event("task.failed"), &guards),
+            Err(WorkflowError::OperationNotResolved {
+                operation: rejected
+            }) if rejected == operation
+        ));
+    }
+}
+
+#[test]
+fn task_cancelled_still_requires_a_fully_resolved_operation() {
+    for operation in OperationState::ALL
+        .iter()
+        .copied()
+        .filter(|operation| *operation != OperationState::None)
+    {
+        let source = state(Phase::Implementation, Condition::Active, operation);
+        assert!(matches!(
+            reduce(
+                &source,
+                &event("task.cancelled"),
+                &GuardEvaluations::new()
+            ),
+            Err(WorkflowError::OperationNotResolved {
+                operation: rejected
+            }) if rejected == operation
+        ));
+    }
 }
 
 #[test]
