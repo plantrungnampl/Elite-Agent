@@ -1,0 +1,183 @@
+import { useEffect, useRef, useState } from "react";
+
+import {
+  getLocalDiagnostics,
+  getStartupStatus,
+  retryStartupValidation,
+} from "../../api/startup";
+import type {
+  LocalDiagnosticDto,
+  StartupStatusDto,
+} from "../../api/startup";
+import { startupViewModel } from "./startup-model";
+
+export function StartupScreen() {
+  const [status, setStatus] = useState<StartupStatusDto | null>(null);
+  const [diagnostics, setDiagnostics] = useState<LocalDiagnosticDto[]>([]);
+  const [ipcFailed, setIpcFailed] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const pageHeading = useRef<HTMLHeadingElement>(null);
+  const statusHeading = useRef<HTMLHeadingElement>(null);
+  const retryInFlight = useRef(false);
+
+  useEffect(() => {
+    let active = true;
+    pageHeading.current?.focus();
+
+    Promise.all([getStartupStatus(), getLocalDiagnostics()])
+      .then(([nextStatus, nextDiagnostics]) => {
+        if (active) {
+          setStatus(nextStatus);
+          setDiagnostics(nextDiagnostics);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setStatus(null);
+          setDiagnostics([]);
+          setIpcFailed(true);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const view = startupViewModel(status, ipcFailed, retrying);
+
+  async function handleRetry() {
+    if (retryInFlight.current) {
+      return;
+    }
+
+    retryInFlight.current = true;
+    setRetrying(true);
+    setIpcFailed(false);
+
+    try {
+      const nextStatus = await retryStartupValidation();
+      const nextDiagnostics = await getLocalDiagnostics();
+      setStatus(nextStatus);
+      setDiagnostics(nextDiagnostics);
+    } catch {
+      setStatus(null);
+      setDiagnostics([]);
+      setIpcFailed(true);
+    } finally {
+      retryInFlight.current = false;
+      setRetrying(false);
+      statusHeading.current?.focus();
+    }
+  }
+
+  return (
+    <>
+      <a className="skip-link" href="#main-content">
+        Skip to startup status
+      </a>
+      <header className="app-header">
+        <div className="shell">
+          <p className="product-name">Local Agent Terminal</p>
+          <p className="product-scope">Local startup health</p>
+        </div>
+      </header>
+      <main
+        className="shell startup-layout"
+        id="main-content"
+        aria-busy={view.state === "loading"}
+      >
+        <h1 ref={pageHeading} tabIndex={-1}>
+          Startup health
+        </h1>
+        <p className="lede">
+          Validate authoritative local storage before any project work begins.
+        </p>
+
+        <section
+          className="status-panel"
+          data-state={view.state}
+          aria-labelledby="startup-status-heading"
+        >
+          <h2 id="startup-status-heading" ref={statusHeading} tabIndex={-1}>
+            {view.heading}
+          </h2>
+          <div role="status" aria-live="polite" aria-atomic="true">
+            <p className="status-label">Status: {view.label}</p>
+            <p>{view.message}</p>
+          </div>
+
+          {status !== null && status.issues.length > 0 ? (
+            <ul className="issue-list" aria-label="Startup issues">
+              {status.issues.map((issue) => (
+                <li key={issue.code}>
+                  <p>{issue.message}</p>
+                  <code>{issue.code}</code>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+
+          {view.retryLabel !== null ? (
+            <button type="button" disabled={retrying} onClick={handleRetry}>
+              {view.retryLabel}
+            </button>
+          ) : null}
+        </section>
+
+        <details className="diagnostics">
+          <summary tabIndex={0}>Local diagnostics ({diagnostics.length})</summary>
+          <p className="diagnostics-note">
+            Sanitized local observations only. Repository content and secrets are
+            excluded.
+          </p>
+          {diagnostics.length > 0 ? (
+            <div className="diagnostic-list">
+              {diagnostics.map((diagnostic) => (
+                <article
+                  className="diagnostic"
+                  key={`${diagnostic.code}-${diagnostic.component}`}
+                >
+                  <h3>{diagnostic.code}</h3>
+                  <dl>
+                    <div>
+                      <dt>Component</dt>
+                      <dd>{diagnostic.component}</dd>
+                    </div>
+                    <div>
+                      <dt>Severity</dt>
+                      <dd>{diagnostic.severity}</dd>
+                    </div>
+                    <div>
+                      <dt>Trust</dt>
+                      <dd>{diagnostic.trustLabel}</dd>
+                    </div>
+                    <div>
+                      <dt>Observation</dt>
+                      <dd>{diagnostic.observationClass}</dd>
+                    </div>
+                    {diagnostic.errorCategory !== null ? (
+                      <div>
+                        <dt>Error category</dt>
+                        <dd>{diagnostic.errorCategory}</dd>
+                      </div>
+                    ) : null}
+                    {diagnostic.correlationId !== null ? (
+                      <div>
+                        <dt>Correlation</dt>
+                        <dd>{diagnostic.correlationId}</dd>
+                      </div>
+                    ) : null}
+                  </dl>
+                  <p>{diagnostic.detail}</p>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p>No local diagnostics are available.</p>
+          )}
+        </details>
+      </main>
+    </>
+  );
+}

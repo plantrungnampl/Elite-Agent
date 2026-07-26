@@ -1,0 +1,240 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  background: var(--color-canvas);
+  color: var(--color-text);
+  font-size: var(--font-size-body);
+  line-height: var(--line-height-body);
+}
+
+button,
+summary {
+  font: inherit;
+}
+
+button {
+  min-block-size: 2.75rem;
+  padding: var(--space-2) var(--space-4);
+  border: 0.125rem solid var(--color-strong);
+  border-radius: var(--radius);
+  background: var(--color-strong);
+  color: var(--color-inverse);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+:focus-visible {
+  outline: 0.2rem solid var(--color-strong);
+  outline-offset: 0.2rem;
+}
+
+.skip-link {
+  position: absolute;
+  inset-block-start: var(--space-2);
+  inset-inline-start: var(--space-2);
+  z-index: 1;
+  padding: var(--space-2) var(--space-3);
+  transform: translateY(-180%);
+  background: var(--color-strong);
+  color: var(--color-inverse);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
+.shell {
+  inline-size: min(calc(100% - 2 * var(--space-5)), 72rem);
+  margin-inline: auto;
+}
+
+.app-header {
+  border-block-end: 0.0625rem solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.app-header .shell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-5);
+  padding-block: var(--space-4);
+}
+
+.product-name,
+.product-scope {
+  margin: 0;
+}
+
+.product-name {
+  font-weight: 750;
+}
+
+.product-scope {
+  color: var(--color-muted);
+  font-size: var(--font-size-sm);
+}
+
+.startup-layout {
+  padding-block: var(--space-7);
+}
+
+h1,
+h2,
+h3 {
+  margin-block: 0;
+  line-height: var(--line-height-tight);
+}
+
+h1 {
+  max-inline-size: 20ch;
+  font-size: var(--font-size-h1);
+}
+
+h2 {
+  font-size: var(--font-size-h2);
+}
+
+h3 {
+  font-size: var(--font-size-body);
+  overflow-wrap: anywhere;
+}
+
+p,
+li,
+dd,
+code {
+  overflow-wrap: anywhere;
+}
+
+.lede {
+  max-inline-size: 65ch;
+  margin-block: var(--space-2) var(--space-6);
+  color: var(--color-muted);
+}
+
+.status-panel,
+.diagnostics {
+  max-inline-size: 75ch;
+  border: 0.0625rem solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+}
+
+.status-panel {
+  padding: var(--space-5);
+  border-inline-start: 0.35rem solid var(--color-strong);
+}
+
+.status-label {
+  margin-block-end: 0;
+  font-weight: 750;
+}
+
+.issue-list {
+  margin-block: var(--space-5);
+  padding-inline-start: var(--space-5);
+}
+
+.issue-list p {
+  margin-block-end: var(--space-1);
+}
+
+.issue-list code {
+  color: var(--color-muted);
+}
+
+.diagnostics {
+  margin-block-start: var(--space-5);
+  padding: var(--space-4) var(--space-5);
+}
+
+.diagnostics summary {
+  cursor: pointer;
+  font-weight: 750;
+}
+
+.diagnostics-note {
+  max-inline-size: 65ch;
+  color: var(--color-muted);
+}
+
+.diagnostic-list {
+  display: grid;
+  gap: var(--space-4);
+  margin-block-start: var(--space-4);
+}
+
+.diagnostic {
+  padding: var(--space-4);
+  border: 0.0625rem solid var(--color-border);
+  background: var(--color-raised);
+}
+
+.diagnostic dl {
+  display: grid;
+  gap: var(--space-1);
+  margin-block: var(--space-3);
+}
+
+.diagnostic dl div {
+  display: grid;
+  grid-template-columns: minmax(7rem, 0.35fr) minmax(0, 1fr);
+  gap: var(--space-3);
+}
+
+.diagnostic dt {
+  color: var(--color-muted);
+  font-weight: 700;
+}
+
+.diagnostic dd,
+.diagnostic p {
+  margin: 0;
+}
+
+@media (max-width: 36rem) {
+  .shell {
+    inline-size: min(calc(100% - 2 * var(--space-4)), 72rem);
+  }
+
+  .startup-layout {
+    padding-block: var(--space-6);
+  }
+
+  .status-panel,
+  .diagnostics {
+    padding: var(--space-4);
+  }
+
+  .diagnostic dl div {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
