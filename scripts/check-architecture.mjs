@@ -20,6 +20,7 @@ try {
     option("--tauri-fixture") ?? join(root, "apps", "desktop", "src-tauri", "src"),
   );
   verifyAdapterConstruction();
+  verifyRepositoryAdapter();
   console.log("architecture contracts: ok");
 } catch (error) {
   console.error(`architecture contracts: ${error.message}`);
@@ -87,6 +88,39 @@ function verifyCargo(metadata) {
       }
     }
   }
+  const repositoryPackage = packages.get(repositoryGit);
+  if (repositoryPackage) {
+    const repositoryExternalAllowed = new Set(["git2", "libgit2-sys", "sha2"]);
+    for (const dependency of dependencies(repositoryGit)) {
+      if (
+        !workspace.has(dependency.name)
+        && !repositoryExternalAllowed.has(dependency.name)
+      ) {
+        throw new Error(`${repositoryGit} has an unjustified external dependency`);
+      }
+    }
+    const git2 = dependencies(repositoryGit).find((dependency) => dependency.name === "git2");
+    const libgit2 = dependencies(repositoryGit).find(
+      (dependency) => dependency.name === "libgit2-sys",
+    );
+    if (
+      !git2
+      || git2.uses_default_features
+      || !git2.features.includes("vendored-libgit2")
+      || !git2.features.includes("unstable-sha256")
+      || git2.features.some((feature) => ["https", "ssh", "cred"].includes(feature))
+    ) {
+      throw new Error(`${repositoryGit} must use offline vendored git2 with SHA-256 support`);
+    }
+    if (
+      !libgit2
+      || libgit2.req !== "=0.18.4"
+      || !libgit2.features.includes("vendored")
+      || !libgit2.features.includes("unstable-sha256")
+    ) {
+      throw new Error(`${repositoryGit} must pin the reviewed libgit2-sys layout`);
+    }
+  }
   const visiting = new Set();
   const visited = new Set();
   const visit = (name) => {
@@ -141,8 +175,24 @@ function verifyAdapterConstruction() {
   ];
   for (const directory of forbiddenRoots) for (const path of filesUnder(directory)) {
     const source = readFileSync(path, "utf8");
-    if (/\b(?:SqliteStore|ContentAddressedArtifactStore)\b/.test(source)) {
+    if (/\b(?:SqliteStore|ContentAddressedArtifactStore|GitRepositoryGateway)\b/.test(source)) {
       throw new Error(`concrete adapters must be constructed only in bootstrap: ${relative(root, path)}`);
+    }
+  }
+}
+
+function verifyRepositoryAdapter() {
+  const sourceRoot = join(root, "crates", "repository-git", "src");
+  for (const path of filesUnder(sourceRoot).filter((path) => path.endsWith(".rs"))) {
+    const source = readFileSync(path, "utf8");
+    const local = relative(sourceRoot, path).replaceAll(sep, "/");
+    if (
+      /\bstd::process\b|\bCommand\s*::|\b(?:powershell|pwsh|cmd\.exe)\b/i.test(source)
+    ) {
+      throw new Error(`repository adapter may not spawn a process: ${local}`);
+    }
+    if (local !== "unsafe_checkout.rs" && /\bunsafe\s*\{/.test(source)) {
+      throw new Error(`repository adapter unsafe code is isolated to unsafe_checkout.rs: ${local}`);
     }
   }
 }

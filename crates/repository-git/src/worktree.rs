@@ -1,0 +1,327 @@
+use std::fs;
+use std::path::Path;
+
+use git2::{Oid, ReferenceType, Repository, WorktreePruneOptions};
+use local_agent_terminal_application::{
+    CreateWorktree, DiscardWorktree, ExpectedPresence, OriginalCheckoutState, PortError,
+    WorktreeSnapshot, WorktreeState,
+};
+use local_agent_terminal_domain::{GitObjectId, TaskBranch, TaskId, WorktreeId};
+
+use crate::{inspect, paths, unsafe_checkout, GitRepositoryGateway};
+
+pub(crate) fn create(
+    gateway: &GitRepositoryGateway,
+    request: CreateWorktree,
+) -> Result<WorktreeSnapshot, PortError> {
+    let target = paths::managed_path(gateway, &request.managed_path)?;
+    let (repository, config) = paths::open_for_locator(&request.repository)?;
+    if paths_overlap(&target, &request.repository.canonical_workdir)
+        || paths_overlap(&target, &request.repository.canonical_common_dir)
+    {
+        return Err(paths::conflict());
+    }
+    let before = inspect::inspect_opened(&repository, &config, &request.repository)?;
+    if !before.hazards.is_empty()
+        || matches!(
+            before.original_checkout,
+            OriginalCheckoutState::Detached | OriginalCheckoutState::Unborn
+        )
+    {
+        return Err(paths::conflict());
+    }
+    let expected_base = before.base_commit.clone().ok_or_else(paths::conflict)?;
+    if expected_base != request.base_commit {
+        return Err(paths::conflict());
+    }
+    let oid = parse_oid(&repository, &request.base_commit)?;
+    let reference_name = format!("refs/heads/{}", request.branch.as_str());
+    if repository
+        .find_reference(&reference_name)
+        .map(|_| true)
+        .or_else(|error| {
+            if error.code() == git2::ErrorCode::NotFound {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(paths::map_git_error)?
+    {
+        return Err(paths::conflict());
+    }
+    let zero = zero_oid(&repository);
+    let reference = repository
+        .reference_matching(
+            &reference_name,
+            oid,
+            false,
+            zero,
+            "local-agent-terminal create managed worktree",
+        )
+        .map_err(paths::map_git_error)?;
+    let worktree_name = request.worktree_id.as_str();
+    validate_worktree_name(worktree_name)?;
+    let parent_guard = paths::DirectoryGuard::open(target.parent().ok_or_else(paths::invalid)?)?;
+    let worktree = unsafe_checkout::add(&repository, worktree_name, &target, &reference)?;
+    parent_guard.verify()?;
+    let target_path = paths::validate_existing_target(gateway, &target)?;
+    if target_path != target {
+        return Err(paths::conflict());
+    }
+    let target_repository = paths::open_repository(&target)?;
+    let target_config =
+        git2::Config::open(&repository.path().join("config")).map_err(|_| paths::unavailable())?;
+    target_repository
+        .set_config(&target_config)
+        .map_err(|_| paths::unavailable())?;
+    let target_snapshot = inspect::worktree_snapshot(
+        &target_repository,
+        &request.repository,
+        inspect::WorktreeSnapshotInput {
+            worktree_id: request.worktree_id,
+            task_id: request.task_id,
+            branch: request.branch,
+            base_commit: request.base_commit,
+            target_path_display: request.managed_path.redacted_display,
+            state: WorktreeState::Present,
+            expected_presence: ExpectedPresence::Present,
+        },
+    )?;
+    let current_reference = repository
+        .find_reference(&reference_name)
+        .map_err(paths::map_git_error)?;
+    if current_reference.target() != Some(oid) {
+        return Err(paths::conflict());
+    }
+    let after = inspect::inspect_opened(&repository, &config, &request.repository)?;
+    if before.fingerprint != after.fingerprint
+        || before.default_branch != after.default_branch
+        || before.base_commit != after.base_commit
+    {
+        return Err(paths::conflict());
+    }
+    drop(worktree);
+    Ok(target_snapshot)
+}
+
+pub(crate) fn list(
+    gateway: &GitRepositoryGateway,
+    locator: &local_agent_terminal_application::RepositoryLocator,
+) -> Result<Vec<WorktreeSnapshot>, PortError> {
+    let (repository, _config) = paths::open_for_locator(locator)?;
+    let names = repository.worktrees().map_err(paths::map_git_error)?;
+    let source_head = repository
+        .head()
+        .ok()
+        .and_then(|head| head.target())
+        .unwrap_or_else(|| zero_oid(&repository));
+    let source_base = GitObjectId::new(source_head.to_string()).map_err(|_| paths::integrity())?;
+    let source_branch = repository
+        .head()
+        .ok()
+        .and_then(|head| head.shorthand().ok().map(str::to_owned))
+        .and_then(|name| TaskBranch::new(name).ok())
+        .unwrap_or_else(|| TaskBranch::new("recovered/unknown").expect("static branch"));
+    let mut snapshots = Vec::new();
+    for name in names.iter() {
+        let Some(name) = name.map_err(|_| paths::integrity())? else {
+            return Err(paths::integrity());
+        };
+        let worktree_id = WorktreeId::new(name).map_err(|_| paths::conflict())?;
+        let worktree = repository
+            .find_worktree(name)
+            .map_err(paths::map_git_error)?;
+        let path = worktree.path().to_path_buf();
+        let display = path
+            .strip_prefix(&gateway.trusted_workspace_root)
+            .ok()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| "<outside-managed-root>".to_owned());
+        let task_id = TaskId::new(format!("recovered-{name}")).map_err(|_| paths::integrity())?;
+        let Some(target) = path.as_path().is_dir().then_some(path.clone()) else {
+            let fingerprint = inspect::fingerprint(&repository, source_head, &[])?;
+            snapshots.push(WorktreeSnapshot {
+                worktree_id,
+                repository_id: locator.repository_id.clone(),
+                repository_identity: locator.stable_identity.clone(),
+                task_id,
+                branch: source_branch.clone(),
+                base_commit: source_base.clone(),
+                target_path_display: display,
+                state: WorktreeState::Missing,
+                expected_presence: ExpectedPresence::Present,
+                fingerprint,
+            });
+            continue;
+        };
+        let target = match paths::canonical_directory(&target) {
+            Ok(target) => target,
+            Err(_) => {
+                let fingerprint = inspect::fingerprint(&repository, source_head, &[])?;
+                snapshots.push(WorktreeSnapshot {
+                    worktree_id,
+                    repository_id: locator.repository_id.clone(),
+                    repository_identity: locator.stable_identity.clone(),
+                    task_id,
+                    branch: source_branch.clone(),
+                    base_commit: source_base.clone(),
+                    target_path_display: display,
+                    state: WorktreeState::Conflict,
+                    expected_presence: ExpectedPresence::Present,
+                    fingerprint,
+                });
+                continue;
+            }
+        };
+        if !paths::is_within(&gateway.trusted_workspace_root, &target)
+            || paths::is_excluded(gateway, &target)
+            || worktree.validate().is_err()
+        {
+            let fingerprint = inspect::fingerprint(&repository, source_head, &[])?;
+            snapshots.push(WorktreeSnapshot {
+                worktree_id,
+                repository_id: locator.repository_id.clone(),
+                repository_identity: locator.stable_identity.clone(),
+                task_id,
+                branch: source_branch.clone(),
+                base_commit: source_base.clone(),
+                target_path_display: display,
+                state: WorktreeState::Conflict,
+                expected_presence: ExpectedPresence::Present,
+                fingerprint,
+            });
+            continue;
+        }
+        let target_repository = paths::open_repository(&target)?;
+        let target_config = git2::Config::open(&repository.path().join("config"))
+            .map_err(|_| paths::unavailable())?;
+        target_repository
+            .set_config(&target_config)
+            .map_err(|_| paths::unavailable())?;
+        let target_head = target_repository
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .unwrap_or(source_head);
+        let target_base =
+            GitObjectId::new(target_head.to_string()).map_err(|_| paths::integrity())?;
+        let target_branch = target_repository
+            .head()
+            .ok()
+            .and_then(|head| head.shorthand().ok().map(str::to_owned))
+            .and_then(|name| TaskBranch::new(name).ok())
+            .unwrap_or_else(|| source_branch.clone());
+        snapshots.push(inspect::worktree_snapshot(
+            &target_repository,
+            locator,
+            inspect::WorktreeSnapshotInput {
+                worktree_id,
+                task_id,
+                branch: target_branch,
+                base_commit: target_base,
+                target_path_display: display,
+                state: WorktreeState::Present,
+                expected_presence: ExpectedPresence::Present,
+            },
+        )?);
+    }
+    Ok(snapshots)
+}
+
+pub(crate) fn discard(
+    gateway: &GitRepositoryGateway,
+    request: DiscardWorktree,
+) -> Result<(), PortError> {
+    let target = gateway
+        .trusted_workspace_root
+        .join(&request.managed_path.relative_leaf);
+    let target = paths::validate_existing_target(gateway, &target)?;
+    let (repository, _config) = paths::open_for_locator(&request.repository)?;
+    let worktree = repository
+        .find_worktree(request.worktree_id.as_str())
+        .map_err(paths::map_git_error)?;
+    let recorded_path = paths::canonical_directory(worktree.path())?;
+    if recorded_path != target {
+        return Err(paths::conflict());
+    }
+    if recorded_path == request.repository.canonical_workdir
+        || paths::is_within(&request.repository.canonical_common_dir, &recorded_path)
+        || paths::is_within(&recorded_path, &request.repository.canonical_common_dir)
+        || paths::is_within(&recorded_path, &request.repository.canonical_workdir)
+    {
+        return Err(paths::conflict());
+    }
+    let target_repository = paths::open_repository(&target)?;
+    let head = target_repository.head().map_err(paths::map_git_error)?;
+    let target_oid = head.target().ok_or_else(paths::conflict)?;
+    let expected_oid = parse_oid(&repository, &request.base_commit)?;
+    if target_oid != expected_oid
+        || head
+            .shorthand()
+            .ok()
+            .and_then(|name| TaskBranch::new(name).ok())
+            .as_ref()
+            != Some(&request.branch)
+    {
+        return Err(paths::conflict());
+    }
+    let reference_name = format!("refs/heads/{}", request.branch.as_str());
+    let reference = repository
+        .find_reference(&reference_name)
+        .map_err(paths::map_git_error)?;
+    if reference.kind() != Some(ReferenceType::Direct) || reference.target() != Some(expected_oid) {
+        return Err(paths::conflict());
+    }
+    reject_reparse_root(&target)?;
+    fs::remove_dir_all(&target).map_err(|_| paths::permission())?;
+    worktree.unlock().map_err(paths::map_git_error)?;
+    let mut prune = WorktreePruneOptions::new();
+    worktree
+        .prune(Some(&mut prune))
+        .map_err(paths::map_git_error)?;
+    let mut reference = repository
+        .find_reference(&reference_name)
+        .map_err(paths::map_git_error)?;
+    if reference.target() == Some(expected_oid) {
+        reference.delete().map_err(paths::map_git_error)?;
+    }
+    Ok(())
+}
+
+fn parse_oid(repository: &Repository, value: &GitObjectId) -> Result<Oid, PortError> {
+    Oid::from_str_ext(value.as_str(), repository.object_format()).map_err(paths::map_git_error)
+}
+
+fn zero_oid(repository: &Repository) -> Oid {
+    match repository.object_format() {
+        git2::ObjectFormat::Sha256 => Oid::ZERO_SHA256,
+        _ => Oid::ZERO_SHA1,
+    }
+}
+
+fn validate_worktree_name(name: &str) -> Result<(), PortError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.bytes().any(|byte| byte <= b' ' || byte == 0x7f)
+    {
+        return Err(paths::invalid());
+    }
+    Ok(())
+}
+
+fn reject_reparse_root(path: &Path) -> Result<(), PortError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| paths::not_found())?;
+    if metadata.file_type().is_symlink() {
+        return Err(paths::conflict());
+    }
+    Ok(())
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    paths::is_within(left, right) || paths::is_within(right, left)
+}
