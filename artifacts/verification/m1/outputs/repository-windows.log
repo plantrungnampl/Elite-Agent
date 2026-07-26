@@ -1,32 +1,36 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
      Running tests\windows_matrix.rs (target\debug\deps\windows_matrix-7b9b70d1506d173c.exe)
 
-running 25 tests
-test inspect_reports_clean_repository_without_exposing_handles ... ok
-Junction created for C:\Users\clone\AppData\Local\Temp\.tmpMWTQWz\managed\task-1 <<===>> C:\Users\clone\AppData\Local\Temp\.tmpMWTQWz\outside
-test branch_conflict_is_preserved_without_creating_target ... ok
+running 29 tests
+test hazard_scan_fails_closed_when_head_object_is_missing ... ok
 test persisted_canonical_repository_path_can_be_reopened ... ok
+test inspect_reports_clean_repository_without_exposing_handles ... ok
 test invalid_windows_target_forms_are_rejected_without_git_side_effects ... ok
 test ref_lock_and_base_cas_conflicts_leave_branch_target_and_index_absent ... ok
-test static_symlink_target_is_rejected_without_touching_its_destination ... ok
-test parent_swap_race_is_blocked_while_checkout_is_in_progress ... ok
-test excluded_artifact_root_and_git_common_dir_targets_are_rejected ... ok
-test rollback_preserves_a_concurrently_replaced_target ... ok
-test long_path_checkout_fails_closed_without_mutating_original_state ... ok
-test successful_unicode_worktree_preserves_original_head_index_and_checkout_bytes ... ok
-test rollback_preserves_a_concurrently_replaced_branch ... ok
+test branch_conflict_is_preserved_without_creating_target ... ok
+test hazard_scan_fails_closed_for_malformed_attributes ... ok
+test hazard_scan_fails_closed_when_attributes_path_is_not_a_blob ... ok
+test hazard_scan_fails_closed_for_non_utf8_attributes ... ok
+test hazard_scan_fails_closed_when_attributes_blob_is_missing ... ok
 test repository_hazards_are_classified_before_worktree_side_effects ... ok
-test sha256_repository_keeps_exact_object_ids ... ok
-test every_execution_capable_git_configuration_fails_closed_and_stays_inert ... ok
+test parent_swap_race_is_blocked_while_checkout_is_in_progress ... ok
+test long_path_checkout_fails_closed_without_mutating_original_state ... ok
+test excluded_artifact_root_and_git_common_dir_targets_are_rejected ... ok
+test failed_create_preserves_replacements_after_ownership_observation ... ok
 test checkout_disables_crlf_filters_and_preserves_blob_bytes ... ok
-test target_inside_original_checkout_and_case_collisions_fail_closed ... ok
-test shallow_and_sparse_repositories_fail_closed ... ok
+test every_execution_capable_git_configuration_fails_closed_and_stays_inert ... ok
 test exact_worktree_can_be_listed_and_discarded ... ok
+Junction created for C:\Users\clone\AppData\Local\Temp\.tmpJZnwYS\managed\task-1 <<===>> C:\Users\clone\AppData\Local\Temp\.tmpJZnwYS\outside
 test worktree_creation_rejects_a_dirty_original_checkout ... ok
 test unsafe_filter_configuration_is_rejected_before_checkout ... ok
+test target_inside_original_checkout_and_case_collisions_fail_closed ... ok
+test sha256_repository_keeps_exact_object_ids ... ok
 test dirty_detached_and_unborn_states_are_explicit ... ok
+test static_symlink_target_is_rejected_without_touching_its_destination ... ok
 test valid_windows_shell_metacharacters_are_supported_in_managed_paths ... ok
 test worktree_creation_preserves_original_and_disables_checkout_filters ... ok
-test every_post_add_failure_rolls_back_owned_state ... ok
+test successful_unicode_worktree_preserves_original_head_index_and_checkout_bytes ... ok
+test shallow_and_sparse_repositories_fail_closed ... ok
+test every_post_add_failure_preserves_owned_state_as_a_conflict ... ok
 
-test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s

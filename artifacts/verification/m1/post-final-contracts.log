@@ -1,0 +1,26 @@
+architecture contracts: local-agent-terminal-repository-git has an outward internal dependency on local-agent-terminal-desktop
+architecture contracts: generic Tauri command is forbidden: run_command
+architecture contracts: repository adapter may not spawn a process: lib.rs
+architecture contracts: repository adapter may not inspect PATH: lib.rs
+✔ immutable design checks still pass (56.0946ms)
+✔ repository adapter cannot depend on an outer desktop adapter (43.0188ms)
+✔ generic Tauri execution commands are rejected (78.9666ms)
+✔ repository adapter rejects process execution (93.9329ms)
+✔ repository adapter rejects PATH lookup (85.6277ms)
+✔ M1 evidence is complete and internally consistent (1385.8347ms)
+✔ Windows CI generates, verifies, and uploads fresh M1 evidence (0.5688ms)
+✔ M1 verifier rejects modified captured output (1355.4113ms)
+✔ M1 verifier rejects a stale source commit (221.1995ms)
+✔ M1 verifier rejects self-asserted fixture classifications (1348.248ms)
+✔ M1 verifier rejects fixture evidence absent from captured output (1350.2707ms)
+✔ M1 verifier rejects dirty tracked source even when HEAD matches sourceCommit (142.9627ms)
+✔ M1 evidence generation preflight rejects dirty tracked source (135.7458ms)
+✔ unknown non-repeatable operations are indeterminate and non-replayable (0.6177ms)
+ℹ tests 14
+ℹ suites 0
+ℹ pass 14
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 6358.2177

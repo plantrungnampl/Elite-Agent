@@ -9,4 +9,4 @@ Running 5 tests using 2 workers
 [3/5] tests\browser\startup-smoke.spec.ts:23:1 › workspace stays behind the authoritative startup gate
 [4/5] tests\browser\startup-smoke.spec.ts:59:1 › reduced motion and narrow reflow stay usable
 [5/5] tests\browser\workspace-recovery.spec.ts:64:1 › supports keyboard flow, reduced motion, narrow reflow, and contrast
-  5 passed (3.9s)
+  5 passed (3.8s)

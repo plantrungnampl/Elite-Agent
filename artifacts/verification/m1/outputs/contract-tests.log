@@ -4,40 +4,24 @@ architecture contracts: domain may not depend on workspace packages
 architecture contracts: generic Tauri command is forbidden: run_command
 architecture contracts: repository adapter may not spawn a process: lib.rs
 architecture contracts: repository adapter may not inspect PATH: lib.rs
-✔ architecture checker accepts the production workspace (106.7924ms)
-✔ architecture checker rejects a frontend Tauri invoke outside its API boundary (102.3005ms)
-✔ architecture checker rejects an outward application dependency (44.9325ms)
-✔ architecture checker rejects even dev-only domain dependencies on adapters (49.4116ms)
-✔ architecture checker allows external domain test dependencies (47.5634ms)
-✔ architecture checker rejects a generic Tauri execution command (88.2678ms)
-✔ architecture checker rejects grouped and aliased process imports (82.7429ms)
-✔ architecture checker rejects grouped and aliased PATH access (80.3078ms)
+✔ architecture checker accepts the production workspace (82.9375ms)
+✔ architecture checker rejects a frontend Tauri invoke outside its API boundary (77.373ms)
+✔ architecture checker rejects an outward application dependency (40.0718ms)
+✔ architecture checker rejects even dev-only domain dependencies on adapters (38.7876ms)
+✔ architecture checker allows external domain test dependencies (41.5116ms)
+✔ architecture checker rejects a generic Tauri execution command (71.368ms)
+✔ architecture checker rejects grouped and aliased process imports (75.8865ms)
+✔ architecture checker rejects grouped and aliased PATH access (77.4276ms)
 design contracts: checksum manifest is not exact
 design contracts: workflow global event target is not a phase
-✔ design verifier accepts the checked-in immutable design artifacts (66.7456ms)
-✔ design verifier rejects incomplete checksum manifests (59.058ms)
-✔ design verifier rejects global events with an unknown target phase (63.8992ms)
-architecture contracts: local-agent-terminal-repository-git has an outward internal dependency on local-agent-terminal-desktop
-architecture contracts: generic Tauri command is forbidden: run_command
-architecture contracts: repository adapter may not spawn a process: lib.rs
-architecture contracts: repository adapter may not inspect PATH: lib.rs
-✔ immutable design checks still pass (69.7959ms)
-✔ repository adapter cannot depend on an outer desktop adapter (54.2091ms)
-✔ generic Tauri execution commands are rejected (99.4754ms)
-✔ repository adapter rejects process execution (91.8967ms)
-✔ repository adapter rejects PATH lookup (82.6487ms)
-﹣ M1 evidence is complete and internally consistent (0.0763ms) # SKIP
-✔ Windows CI generates, verifies, and uploads fresh M1 evidence (0.9056ms)
-﹣ M1 verifier rejects modified captured output (0.0732ms) # SKIP
-﹣ M1 verifier rejects a stale source commit (0.0795ms) # SKIP
-﹣ M1 verifier rejects self-asserted fixture classifications (0.1351ms) # SKIP
-﹣ M1 verifier rejects fixture evidence absent from captured output (0.0638ms) # SKIP
-✔ unknown non-repeatable operations are indeterminate and non-replayable (0.2789ms)
-ℹ tests 23
+✔ design verifier accepts the checked-in immutable design artifacts (59.1057ms)
+✔ design verifier rejects incomplete checksum manifests (47.3463ms)
+✔ design verifier rejects global events with an unknown target phase (49.3915ms)
+ℹ tests 11
 ℹ suites 0
-ℹ pass 18
+ℹ pass 11
 ℹ fail 0
 ℹ cancelled 0
-ℹ skipped 5
+ℹ skipped 0
 ℹ todo 0
-ℹ duration_ms 670.5227
+ℹ duration_ms 562.7831
