@@ -6,9 +6,10 @@ use local_agent_terminal_application::{
     AcquireLease, ArtifactRootMode, ArtifactWriteReservation, CanonicalEvidenceRef, Clock,
     CreateWorktree, ExecutorLeaseStore, ExpectedPresence, IdempotencyClass, InspectRepository,
     IntentTransition, ManagedWorktreePath, NewProject, NewTask, OperationIntent,
-    OperationIntentStatus, PortError, ProjectSettings, RecoveryAction, RecoveryReason,
-    RepositoryGateway, RepositoryInspectionRecord, ReservedArtifact, RiskLevel, StartupStateDto,
-    TaskQuery, WorkspaceDashboardRequestDto, WorkspaceStateStore, WorktreeIntent, WorktreeState,
+    OperationIntentStatus, PortError, ProjectSettings, RecoveryAction, RecoveryCandidateRequestDto,
+    RecoveryReason, RepositoryGateway, RepositoryInspectionRecord, ReservedArtifact, RiskLevel,
+    StartupStateDto, TaskQuery, WorkspaceDashboardRequestDto, WorkspaceStateStore, WorktreeIntent,
+    WorktreeState,
 };
 use local_agent_terminal_bootstrap::{Bootstrap, StartupConfig};
 use local_agent_terminal_domain::{
@@ -245,6 +246,95 @@ fn startup_preserves_an_occupied_managed_path_without_creating_a_branch() {
         b"preserve me"
     );
     assert!(!fixture.branch_exists());
+}
+
+#[test]
+fn startup_inspects_preserved_indeterminate_create_without_adopting_or_discarding_it() {
+    let exact = WorkspaceFixture::new();
+    let exact_intent = exact.seed_started_intent("worktree.create", IdempotencyClass::Queryable);
+    exact.create_git_worktree(&exact_intent);
+    exact.mark_intent_indeterminate();
+
+    let bootstrap = exact.start();
+
+    assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
+    let candidates = bootstrap
+        .workspace_runtime()
+        .expect("runtime")
+        .recovery_candidates();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].reason, RecoveryReason::ExactMatch);
+    assert_eq!(
+        candidates[0]
+            .worktree_id
+            .as_ref()
+            .map(local_agent_terminal_domain::WorktreeId::as_str),
+        Some(WORKTREE_ID)
+    );
+    assert!(candidates[0].expected_worktree.is_some());
+    assert!(candidates[0]
+        .actions
+        .contains(&RecoveryAction::AdoptExactMatch));
+    assert!(candidates[0]
+        .actions
+        .contains(&RecoveryAction::DiscardExactWorktree));
+    assert_eq!(exact.intent_status(), "indeterminate");
+    assert!(exact.workspace_root.join(WORKTREE_ID).is_dir());
+
+    let dashboard = bootstrap
+        .workspace_runtime()
+        .expect("runtime")
+        .get_workspace_dashboard(WorkspaceDashboardRequestDto {
+            project_id: PROJECT_ID.to_owned(),
+        })
+        .expect("dashboard");
+    assert_eq!(
+        dashboard.tasks[0].recovery_candidates[0].actions,
+        candidates[0].actions
+    );
+    let adopted = bootstrap
+        .workspace_runtime()
+        .expect("runtime")
+        .reconcile_workspace(RecoveryCandidateRequestDto {
+            candidate_id: "intent-worktree-1".to_owned(),
+            project_id: PROJECT_ID.to_owned(),
+            task_id: TASK_ID.to_owned(),
+            expected_workspace_version: dashboard.tasks[0].workspace_version.get(),
+        })
+        .expect("explicit exact adoption");
+    assert_eq!(exact.intent_status(), "succeeded");
+    assert!(exact.workspace_root.join(WORKTREE_ID).is_dir());
+    assert!(!adopted.tasks[0].recovery_candidates[0]
+        .actions
+        .contains(&RecoveryAction::AdoptExactMatch));
+    assert!(adopted.tasks[0].recovery_candidates[0]
+        .actions
+        .contains(&RecoveryAction::DiscardExactWorktree));
+
+    let mismatch = WorkspaceFixture::new();
+    mismatch.seed_started_intent("worktree.create", IdempotencyClass::Queryable);
+    let occupied = mismatch.workspace_root.join(WORKTREE_ID);
+    fs::create_dir(&occupied).expect("occupied path");
+    fs::write(occupied.join("FOREIGN.txt"), b"preserve").expect("foreign marker");
+    mismatch.mark_intent_indeterminate();
+
+    let mismatch_bootstrap = mismatch.start();
+    let mismatch_candidate = &mismatch_bootstrap
+        .workspace_runtime()
+        .expect("runtime")
+        .recovery_candidates()[0];
+    assert_eq!(mismatch_candidate.reason, RecoveryReason::PresenceMismatch);
+    assert!(!mismatch_candidate
+        .actions
+        .contains(&RecoveryAction::AdoptExactMatch));
+    assert!(!mismatch_candidate
+        .actions
+        .contains(&RecoveryAction::DiscardExactWorktree));
+    assert_eq!(mismatch.intent_status(), "indeterminate");
+    assert_eq!(
+        fs::read(occupied.join("FOREIGN.txt")).expect("foreign marker"),
+        b"preserve"
+    );
 }
 
 #[test]
@@ -493,6 +583,22 @@ impl WorkspaceFixture {
                 base_commit: intent.base_commit.clone(),
             })
             .expect("worktree");
+    }
+
+    fn mark_intent_indeterminate(&self) {
+        let database = SqliteStore::open(&self.database_path).expect("database");
+        database
+            .transition_worktree_intent(IntentTransition {
+                intent_id: "intent-worktree-1".to_owned(),
+                expected_status: OperationIntentStatus::Started,
+                next_status: OperationIntentStatus::Indeterminate,
+                executor_fencing_token: Some(FencingToken::new(1).expect("token")),
+                attempt_count: 1,
+                updated_at: "2026-07-26T00:00:05Z".to_owned(),
+                error: Some(local_agent_terminal_application::SafeErrorClassification::Conflict),
+                observed_fingerprint: None,
+            })
+            .expect("indeterminate intent");
     }
 
     fn create_orphan_branch(&self) -> String {

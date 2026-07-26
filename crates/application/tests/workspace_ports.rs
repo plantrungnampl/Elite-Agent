@@ -770,9 +770,54 @@ fn task_timeline_contract_preserves_persisted_sequence_order() {
 }
 
 #[test]
-fn indeterminate_non_repeatable_candidate_never_exposes_retry() {
-    let intent = operation_intent(IdempotencyClass::NonRepeatable);
+fn indeterminate_known_worktree_candidate_retains_exact_linkage() {
+    let intent = worktree_intent();
+    let candidate = RecoveryCandidate::indeterminate_worktree(
+        &intent,
+        RecoveryEvidence {
+            summary: "Create outcome requires exact inspection".to_owned(),
+            artifact_id: Some(ArtifactId::new("artifact-evidence-1").unwrap()),
+        },
+    );
+
+    assert_eq!(candidate.intent_id.as_deref(), Some("intent-1"));
+    assert_eq!(
+        candidate.worktree_id.as_ref().map(WorktreeId::as_str),
+        Some("worktree-1")
+    );
+    assert_eq!(candidate.expected_worktree, Some(intent));
+    assert_eq!(candidate.reason, RecoveryReason::OutcomeIndeterminate);
+    assert!(!candidate.actions.contains(&RecoveryAction::AdoptExactMatch));
+    assert!(!candidate
+        .actions
+        .contains(&RecoveryAction::DiscardExactWorktree));
+}
+
+#[test]
+fn indeterminate_unknown_candidate_has_no_worktree_linkage() {
+    let mut intent = operation_intent(IdempotencyClass::Queryable);
+    intent.operation_kind = "future.unknown".to_owned();
     let candidate = RecoveryCandidate::indeterminate(
+        &intent,
+        RecoveryEvidence {
+            summary: "Unknown outcome cannot be queried".to_owned(),
+            artifact_id: Some(ArtifactId::new("artifact-evidence-1").unwrap()),
+        },
+    );
+
+    assert!(candidate.worktree_id.is_none());
+    assert!(candidate.expected_worktree.is_none());
+    assert!(!candidate.actions.contains(&RecoveryAction::AdoptExactMatch));
+    assert!(!candidate
+        .actions
+        .contains(&RecoveryAction::DiscardExactWorktree));
+}
+
+#[test]
+fn indeterminate_non_repeatable_candidate_never_exposes_retry() {
+    let mut intent = worktree_intent();
+    intent.operation.idempotency_class = IdempotencyClass::NonRepeatable;
+    let candidate = RecoveryCandidate::indeterminate_worktree(
         &intent,
         RecoveryEvidence {
             summary: "Outcome cannot be proven".to_owned(),
@@ -786,6 +831,8 @@ fn indeterminate_non_repeatable_candidate_never_exposes_retry() {
         .contains(&RecoveryAction::RetryAfterAuthoritativeAbsence));
     assert!(candidate.actions.contains(&RecoveryAction::InspectEvidence));
     assert!(candidate.actions.contains(&RecoveryAction::PreserveTask));
+    assert!(candidate.worktree_id.is_none());
+    assert!(candidate.expected_worktree.is_none());
 }
 
 #[test]

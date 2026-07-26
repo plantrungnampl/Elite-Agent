@@ -354,6 +354,17 @@ pub trait WorkspaceRecoveryStore: Send + Sync {
 }
 
 impl RecoveryCandidate {
+    pub fn indeterminate_worktree(intent: &WorktreeIntent, evidence: RecoveryEvidence) -> Self {
+        let mut candidate = Self::indeterminate(&intent.operation, evidence);
+        if intent.operation.operation_kind == "worktree.create"
+            && intent.operation.idempotency_class != IdempotencyClass::NonRepeatable
+        {
+            candidate.worktree_id = Some(intent.worktree_id.clone());
+            candidate.expected_worktree = Some(intent.clone());
+        }
+        candidate
+    }
+
     pub fn indeterminate(intent: &OperationIntent, evidence: RecoveryEvidence) -> Self {
         let (reason, actions) = match intent.idempotency_class {
             IdempotencyClass::NonRepeatable => (

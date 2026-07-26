@@ -424,8 +424,10 @@ impl WorkspaceRuntime {
         &self,
         request: RecoveryCandidateRequestDto,
     ) -> Result<WorkspaceDashboardDto, PortError> {
-        let (project_id, task, candidate) =
-            self.authorize_recovery(&request, RecoveryAction::RetryAfterAuthoritativeAbsence)?;
+        let (project_id, task, candidate, action) = self.authorize_reconcile(&request)?;
+        if action == RecoveryAction::AdoptExactMatch {
+            return self.adopt_exact_workspace(&request, project_id, task, candidate);
+        }
         let mut expected = candidate.expected_worktree.ok_or_else(invalid_input)?;
         if expected.operation.status != OperationIntentStatus::Interrupted {
             return Err(conflict());
@@ -537,6 +539,127 @@ impl WorkspaceRuntime {
         if let Err(error) = effect {
             return self.finish_with_revoked_lease(claim, &observed_at, Err(error));
         }
+        self.dashboard(&project_id)
+    }
+
+    fn adopt_exact_workspace(
+        &self,
+        request: &RecoveryCandidateRequestDto,
+        project_id: ProjectId,
+        task: TaskSnapshot,
+        candidate: RecoveryCandidate,
+    ) -> Result<WorkspaceDashboardDto, PortError> {
+        let expected = candidate.expected_worktree.ok_or_else(invalid_input)?;
+        if expected.operation.status != OperationIntentStatus::Indeterminate {
+            return Err(conflict());
+        }
+        let observed_at = self.database.now_utc()?;
+        let project = self.recovery_project(&project_id)?;
+        let locator = self
+            .repositories
+            .locate_persisted(Path::new(&project.repository_path))?;
+        if locator.repository_id != expected.repository_id
+            || locator.stable_identity != expected.repository_identity
+            || locator.repository_id != project.repository.repository_id
+            || locator.stable_identity != project.repository.stable_identity
+        {
+            return Err(conflict());
+        }
+        let claim = self.lease_claim_for_task(&project_id, &task, &observed_at)?;
+        let result = (|| {
+            let recovery = self.begin_recovery_operation(
+                &project_id,
+                &task,
+                &request.candidate_id,
+                RecoveryAction::AdoptExactMatch,
+                &observed_at,
+            )?;
+            if recovery.status != OperationIntentStatus::Pending {
+                return Err(conflict());
+            }
+            let attempt_count = recovery
+                .attempt_count
+                .checked_add(1)
+                .ok_or_else(invalid_input)?;
+            self.transition_operation(
+                &recovery,
+                (
+                    OperationIntentStatus::Pending,
+                    OperationIntentStatus::Started,
+                ),
+                Some(claim.token()),
+                attempt_count,
+                &observed_at,
+                None,
+            )?;
+            self.database.assert_current(claim.clone())?;
+            let observation = self.repositories.inspect_worktree(InspectWorktree {
+                repository: locator,
+                managed_path: ManagedWorktreePath {
+                    trusted_root_id: self.repositories.trusted_root_id().to_owned(),
+                    relative_leaf: PathBuf::from(expected.worktree_id.as_str()),
+                    redacted_display: expected.target_path_display.clone(),
+                },
+                task_id: task.task_id,
+                worktree_id: expected.worktree_id,
+                branch: expected.branch,
+                base_commit: expected.base_commit,
+            });
+            let snapshot = match observation {
+                Ok(WorktreeObservation::Exact(snapshot))
+                    if snapshot.expected_presence == ExpectedPresence::Present =>
+                {
+                    Ok(snapshot)
+                }
+                Ok(WorktreeObservation::AuthoritativelyAbsent) => Err(PortError::failure(
+                    SafeErrorClassification::NotFound,
+                    local_agent_terminal_application::Retryability::NonRetryable,
+                )),
+                Ok(WorktreeObservation::Conflict(_)) | Ok(WorktreeObservation::Exact(_)) => {
+                    Err(conflict())
+                }
+                Err(error) => Err(error),
+            };
+            let snapshot = match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.transition_operation(
+                        &recovery,
+                        (
+                            OperationIntentStatus::Started,
+                            OperationIntentStatus::Failed,
+                        ),
+                        Some(claim.token()),
+                        attempt_count,
+                        &observed_at,
+                        Some(error.safe_classification()),
+                    )?;
+                    return Err(error);
+                }
+            };
+            self.database.transition_worktree_intent(IntentTransition {
+                intent_id: expected.operation.id,
+                expected_status: OperationIntentStatus::Indeterminate,
+                next_status: OperationIntentStatus::Succeeded,
+                executor_fencing_token: Some(claim.token()),
+                attempt_count: expected.operation.attempt_count,
+                updated_at: observed_at.clone(),
+                error: None,
+                observed_fingerprint: Some(snapshot.fingerprint),
+            })?;
+            self.transition_operation(
+                &recovery,
+                (
+                    OperationIntentStatus::Started,
+                    OperationIntentStatus::Succeeded,
+                ),
+                Some(claim.token()),
+                attempt_count,
+                &observed_at,
+                None,
+            )
+        })();
+        self.finish_with_revoked_lease(claim, &observed_at, result)?;
         self.dashboard(&project_id)
     }
 
@@ -692,6 +815,35 @@ impl WorkspaceRuntime {
         request: &RecoveryCandidateRequestDto,
         required_action: RecoveryAction,
     ) -> Result<(ProjectId, TaskSnapshot, RecoveryCandidate), PortError> {
+        let (project_id, task, candidate) = self.recovery_candidate(request)?;
+        if !candidate.actions.contains(&required_action) {
+            return Err(invalid_input());
+        }
+        Ok((project_id, task, candidate))
+    }
+
+    fn authorize_reconcile(
+        &self,
+        request: &RecoveryCandidateRequestDto,
+    ) -> Result<(ProjectId, TaskSnapshot, RecoveryCandidate, RecoveryAction), PortError> {
+        let (project_id, task, candidate) = self.recovery_candidate(request)?;
+        let action = if candidate.actions.contains(&RecoveryAction::AdoptExactMatch) {
+            RecoveryAction::AdoptExactMatch
+        } else if candidate
+            .actions
+            .contains(&RecoveryAction::RetryAfterAuthoritativeAbsence)
+        {
+            RecoveryAction::RetryAfterAuthoritativeAbsence
+        } else {
+            return Err(invalid_input());
+        };
+        Ok((project_id, task, candidate, action))
+    }
+
+    fn recovery_candidate(
+        &self,
+        request: &RecoveryCandidateRequestDto,
+    ) -> Result<(ProjectId, TaskSnapshot, RecoveryCandidate), PortError> {
         validate_candidate_id(&request.candidate_id)?;
         let project_id = project_id(&request.project_id)?;
         let task_id = task_id(&request.task_id)?;
@@ -701,13 +853,19 @@ impl WorkspaceRuntime {
         {
             return Err(conflict());
         }
-        let candidate = task
+        let mut candidate = task
             .recovery_candidates
             .iter()
             .find(|candidate| candidate_matches_id(candidate, &request.candidate_id))
-            .filter(|candidate| candidate.actions.contains(&required_action))
             .cloned()
             .ok_or_else(invalid_input)?;
+        if let Some(authoritative) = self
+            .recovery_candidates
+            .iter()
+            .find(|authoritative| same_candidate(authoritative, &candidate))
+        {
+            candidate = authoritative.clone();
+        }
         Ok((project_id, task, candidate))
     }
 
@@ -1028,6 +1186,53 @@ pub(crate) fn reconcile_startup(
         };
         if let Some(reason) = conflicts.get(intent_id) {
             candidate.reason = *reason;
+        }
+        let Some(expected) = candidate
+            .expected_worktree
+            .as_ref()
+            .filter(|expected| {
+                expected.operation.status == OperationIntentStatus::Indeterminate
+                    && expected.operation.operation_kind == "worktree.create"
+            })
+            .cloned()
+        else {
+            continue;
+        };
+        match observe_expected_worktree(&projects, repositories, &mut scanned, &expected) {
+            WorktreeObservation::Exact(snapshot)
+                if snapshot.expected_presence == ExpectedPresence::Present =>
+            {
+                candidate.reason = RecoveryReason::ExactMatch;
+                candidate.actions = vec![
+                    RecoveryAction::InspectEvidence,
+                    RecoveryAction::AdoptExactMatch,
+                    RecoveryAction::PreserveTask,
+                    RecoveryAction::DiscardExactWorktree,
+                ];
+            }
+            WorktreeObservation::AuthoritativelyAbsent => {
+                candidate.reason = RecoveryReason::AuthoritativeAbsence;
+                candidate.actions = vec![
+                    RecoveryAction::InspectEvidence,
+                    RecoveryAction::RetryAfterAuthoritativeAbsence,
+                    RecoveryAction::PreserveTask,
+                    RecoveryAction::CancelTask,
+                ];
+            }
+            WorktreeObservation::Conflict(reason) => {
+                candidate.reason = reason;
+                candidate.actions = vec![
+                    RecoveryAction::InspectEvidence,
+                    RecoveryAction::PreserveTask,
+                ];
+            }
+            WorktreeObservation::Exact(_) => {
+                candidate.reason = RecoveryReason::PresenceMismatch;
+                candidate.actions = vec![
+                    RecoveryAction::InspectEvidence,
+                    RecoveryAction::PreserveTask,
+                ];
+            }
         }
     }
     Ok(WorkspaceRecoveryReport {

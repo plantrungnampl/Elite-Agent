@@ -312,7 +312,9 @@ impl SqliteStore {
                 continue;
             }
             if operation.status == OperationIntentStatus::Indeterminate {
-                if operation.operation_kind != "worktree.create" {
+                if operation.idempotency_class == IdempotencyClass::NonRepeatable {
+                    candidates.push(RecoveryCandidate::indeterminate(&operation, evidence));
+                } else if operation.operation_kind != "worktree.create" {
                     candidates.push(RecoveryCandidate {
                         intent_id: Some(operation.id),
                         worktree_id: None,
@@ -325,7 +327,10 @@ impl SqliteStore {
                         expected_worktree: None,
                     });
                 } else {
-                    candidates.push(RecoveryCandidate::indeterminate(&operation, evidence));
+                    let expected = self.load_worktree_intent(&operation)?;
+                    candidates.push(RecoveryCandidate::indeterminate_worktree(
+                        &expected, evidence,
+                    ));
                 }
                 continue;
             }

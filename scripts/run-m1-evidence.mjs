@@ -93,6 +93,7 @@ const fixtureClassifications = [
     evidence("rust-tests", "crash_boundaries_reconcile_to_deterministic_states"),
     evidence("recovery-matrix", "startup_leaves_pending_intent_for_exact_command_retry_without_git_effects"),
     evidence("recovery-matrix", "startup_adopts_only_the_exact_durable_worktree"),
+    evidence("recovery-matrix", "startup_inspects_preserved_indeterminate_create_without_adopting_or_discarding_it"),
   ]),
   fixture("stale lease replacement", "recovered", [
     evidence("rust-tests", "stale_monitor_claim_is_rejected_before_evidence_or_repository_bytes_change"),
