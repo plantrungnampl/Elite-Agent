@@ -46,7 +46,7 @@ pub(crate) fn create(
         return Err(paths::conflict());
     }
     let zero = zero_oid(&repository);
-    let mut reference = repository
+    let reference = repository
         .reference_matching(
             &reference_name,
             oid,
@@ -55,55 +55,96 @@ pub(crate) fn create(
             "local-agent-terminal create managed worktree",
         )
         .map_err(paths::map_git_error)?;
-    let worktree_name = request.worktree_id.as_str();
-    validate_worktree_name(worktree_name)?;
+    let worktree_name = request.worktree_id.as_str().to_owned();
+    validate_worktree_name(&worktree_name)?;
     let parent_guard = paths::DirectoryGuard::open(target.parent().ok_or_else(paths::invalid)?)?;
-    let worktree = match unsafe_checkout::add(&repository, worktree_name, &target, &reference) {
+    pause_before_checkout(gateway);
+    let worktree = match unsafe_checkout::add(&repository, &worktree_name, &target, &reference) {
         Ok(worktree) => worktree,
         Err(error) => {
-            rollback_failed_create(&repository, worktree_name, &target, &mut reference, oid)?;
+            drop(reference);
+            pause_before_rollback(gateway);
+            rollback_failed_create(
+                &repository,
+                &worktree_name,
+                &target,
+                &reference_name,
+                oid,
+                &request.repository,
+                &request.branch,
+            )?;
             return Err(error);
         }
     };
-    parent_guard.verify()?;
-    let target_path = paths::validate_existing_target(gateway, &target)?;
-    if target_path != target {
-        return Err(paths::conflict());
+    drop(reference);
+    let result = (|| {
+        fail_after(gateway, PostAddPoint::Add)?;
+        parent_guard.verify()?;
+        fail_after(gateway, PostAddPoint::ParentVerify)?;
+        let target_path = paths::validate_existing_target(gateway, &target)?;
+        if target_path != target {
+            return Err(paths::conflict());
+        }
+        fail_after(gateway, PostAddPoint::TargetValidate)?;
+        let target_repository = paths::open_repository(&target)?;
+        fail_after(gateway, PostAddPoint::TargetOpen)?;
+        let target_config = git2::Config::open(&repository.path().join("config"))
+            .map_err(|_| paths::unavailable())?;
+        target_repository
+            .set_config(&target_config)
+            .map_err(|_| paths::unavailable())?;
+        fail_after(gateway, PostAddPoint::ConfigAttach)?;
+        let target_snapshot = inspect::worktree_snapshot(
+            &target_repository,
+            &request.repository,
+            inspect::WorktreeSnapshotInput {
+                worktree_id: request.worktree_id.clone(),
+                task_id: request.task_id.clone(),
+                branch: request.branch.clone(),
+                base_commit: request.base_commit.clone(),
+                target_path_display: request.managed_path.redacted_display.clone(),
+                state: WorktreeState::Present,
+                expected_presence: ExpectedPresence::Present,
+            },
+        )?;
+        fail_after(gateway, PostAddPoint::Snapshot)?;
+        let current_reference = repository
+            .find_reference(&reference_name)
+            .map_err(paths::map_git_error)?;
+        if current_reference.target() != Some(oid) {
+            return Err(paths::conflict());
+        }
+        fail_after(gateway, PostAddPoint::RefVerify)?;
+        let after = inspect::inspect_opened(&repository, &config, &request.repository)?;
+        if before.fingerprint != after.fingerprint
+            || before.default_branch != after.default_branch
+            || before.base_commit != after.base_commit
+        {
+            return Err(paths::conflict());
+        }
+        fail_after(gateway, PostAddPoint::OriginalVerify)?;
+        Ok(target_snapshot)
+    })();
+    match result {
+        Ok(snapshot) => {
+            drop(worktree);
+            Ok(snapshot)
+        }
+        Err(error) => {
+            drop(worktree);
+            pause_before_rollback(gateway);
+            rollback_failed_create(
+                &repository,
+                &worktree_name,
+                &target,
+                &reference_name,
+                oid,
+                &request.repository,
+                &request.branch,
+            )?;
+            Err(error)
+        }
     }
-    let target_repository = paths::open_repository(&target)?;
-    let target_config =
-        git2::Config::open(&repository.path().join("config")).map_err(|_| paths::unavailable())?;
-    target_repository
-        .set_config(&target_config)
-        .map_err(|_| paths::unavailable())?;
-    let target_snapshot = inspect::worktree_snapshot(
-        &target_repository,
-        &request.repository,
-        inspect::WorktreeSnapshotInput {
-            worktree_id: request.worktree_id,
-            task_id: request.task_id,
-            branch: request.branch,
-            base_commit: request.base_commit,
-            target_path_display: request.managed_path.redacted_display,
-            state: WorktreeState::Present,
-            expected_presence: ExpectedPresence::Present,
-        },
-    )?;
-    let current_reference = repository
-        .find_reference(&reference_name)
-        .map_err(paths::map_git_error)?;
-    if current_reference.target() != Some(oid) {
-        return Err(paths::conflict());
-    }
-    let after = inspect::inspect_opened(&repository, &config, &request.repository)?;
-    if before.fingerprint != after.fingerprint
-        || before.default_branch != after.default_branch
-        || before.base_commit != after.base_commit
-    {
-        return Err(paths::conflict());
-    }
-    drop(worktree);
-    Ok(target_snapshot)
 }
 
 pub(crate) fn list(
@@ -430,25 +471,127 @@ fn rollback_failed_create(
     repository: &Repository,
     worktree_name: &str,
     target: &Path,
-    reference: &mut git2::Reference<'_>,
+    reference_name: &str,
     expected_oid: Oid,
+    locator: &local_agent_terminal_application::RepositoryLocator,
+    branch: &TaskBranch,
 ) -> Result<(), PortError> {
-    if fs::symlink_metadata(target).is_ok() {
-        reject_reparse_root(target)?;
-        fs::remove_dir_all(target).map_err(|_| paths::permission())?;
+    let mut transaction = repository.transaction().map_err(paths::map_git_error)?;
+    transaction
+        .lock_ref(reference_name)
+        .map_err(paths::map_git_error)?;
+    let reference = repository
+        .find_reference(reference_name)
+        .map_err(paths::map_git_error)?;
+    if reference.kind() != Some(ReferenceType::Direct) || reference.target() != Some(expected_oid) {
+        return Err(paths::conflict());
     }
-    if let Ok(worktree) = repository.find_worktree(worktree_name) {
-        worktree.unlock().map_err(paths::map_git_error)?;
-        let mut prune = WorktreePruneOptions::new();
-        worktree
-            .prune(Some(&mut prune))
-            .map_err(paths::map_git_error)?;
+    drop(reference);
+
+    let target_exists = fs::symlink_metadata(target).is_ok();
+    let worktree = match repository.find_worktree(worktree_name) {
+        Ok(worktree) => Some(worktree),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+        Err(error) => return Err(paths::map_git_error(error)),
+    };
+    match (target_exists, worktree) {
+        (false, None) => {}
+        (true, Some(worktree)) => {
+            reject_reparse_root(target)?;
+            worktree.validate().map_err(|_| paths::conflict())?;
+            if paths::canonical_directory(worktree.path())? != target
+                || paths::canonical_directory(target)? != target
+            {
+                return Err(paths::conflict());
+            }
+            let target_repository =
+                paths::open_repository(target).map_err(|_| paths::conflict())?;
+            if paths::canonical_directory(target_repository.commondir())?
+                != locator.canonical_common_dir
+            {
+                return Err(paths::conflict());
+            }
+            let head = target_repository.head().map_err(|_| paths::conflict())?;
+            if head.target() != Some(expected_oid)
+                || head.name().ok() != Some(reference_name)
+                || head.shorthand().ok() != Some(branch.as_str())
+            {
+                return Err(paths::conflict());
+            }
+            fs::remove_dir_all(target).map_err(|_| paths::permission())?;
+            worktree.unlock().map_err(paths::map_git_error)?;
+            let mut prune = WorktreePruneOptions::new();
+            worktree
+                .prune(Some(&mut prune))
+                .map_err(paths::map_git_error)?;
+        }
+        _ => return Err(paths::conflict()),
     }
-    if reference.target() == Some(expected_oid) {
-        reference.delete().map_err(paths::map_git_error)?;
+    transaction
+        .remove(reference_name)
+        .map_err(paths::map_git_error)?;
+    transaction.commit().map_err(paths::map_git_error)
+}
+
+#[derive(Clone, Copy)]
+enum PostAddPoint {
+    Add,
+    ParentVerify,
+    TargetValidate,
+    TargetOpen,
+    ConfigAttach,
+    Snapshot,
+    RefVerify,
+    OriginalVerify,
+}
+
+#[cfg(feature = "test-seams")]
+fn fail_after(gateway: &GitRepositoryGateway, point: PostAddPoint) -> Result<(), PortError> {
+    use crate::PostAddStage;
+
+    let stage = match point {
+        PostAddPoint::Add => PostAddStage::AfterAdd,
+        PostAddPoint::ParentVerify => PostAddStage::AfterParentVerify,
+        PostAddPoint::TargetValidate => PostAddStage::AfterTargetValidate,
+        PostAddPoint::TargetOpen => PostAddStage::AfterTargetOpen,
+        PostAddPoint::ConfigAttach => PostAddStage::AfterConfigAttach,
+        PostAddPoint::Snapshot => PostAddStage::AfterSnapshot,
+        PostAddPoint::RefVerify => PostAddStage::AfterRefVerify,
+        PostAddPoint::OriginalVerify => PostAddStage::AfterOriginalVerify,
+    };
+    if gateway.test_hooks.fail_at == Some(stage) {
+        Err(paths::unavailable())
+    } else {
+        Ok(())
     }
+}
+
+#[cfg(not(feature = "test-seams"))]
+fn fail_after(_gateway: &GitRepositoryGateway, _point: PostAddPoint) -> Result<(), PortError> {
     Ok(())
 }
+
+#[cfg(feature = "test-seams")]
+fn pause_before_checkout(gateway: &GitRepositoryGateway) {
+    if let Some(barrier) = &gateway.test_hooks.before_checkout {
+        barrier.wait();
+        barrier.wait();
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+fn pause_before_checkout(_gateway: &GitRepositoryGateway) {}
+
+#[cfg(feature = "test-seams")]
+fn pause_before_rollback(gateway: &GitRepositoryGateway) {
+    if let Some(barrier) = &gateway.test_hooks.before_rollback {
+        barrier.wait();
+        barrier.wait();
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+fn pause_before_rollback(_gateway: &GitRepositoryGateway) {}
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     paths::is_within(left, right) || paths::is_within(right, left)

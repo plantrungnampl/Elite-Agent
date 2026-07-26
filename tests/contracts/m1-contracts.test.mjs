@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import {
+  appendFileSync,
+  cpSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 const run = (...args) =>
@@ -58,18 +67,21 @@ test("repository adapter rejects PATH lookup", () => {
   );
 });
 
-test("M1 evidence is complete and internally consistent", () => {
+test("M1 evidence is complete and internally consistent", {
+  skip: process.env.M1_EVIDENCE_GENERATING === "1",
+}, () => {
   assert.match(run("scripts/verify-m1-evidence.mjs"), /M1 evidence: ok/);
 });
 
-test("Windows CI runs every M1 acceptance gate", () => {
+test("Windows CI generates, verifies, and uploads fresh M1 evidence", () => {
   const workflow = readFileSync(".github/workflows/ci.yml", "utf8");
+  const runner = readFileSync("scripts/run-m1-evidence.mjs", "utf8");
   for (const command of [
+    "pnpm install --frozen-lockfile",
     "node scripts/verify-design-contracts.mjs",
     "node --test tests/contracts/*.test.mjs",
-    "node scripts/verify-m1-evidence.mjs",
     "node scripts/check-architecture.mjs",
-    "cargo test -p local-agent-terminal-repository-git --test windows_matrix",
+    "cargo test -p local-agent-terminal-repository-git --test windows_matrix --features test-seams",
     "cargo test -p local-agent-terminal-bootstrap --test recovery_matrix",
     "cargo fmt --all -- --check",
     "cargo clippy --workspace --all-targets -- -D warnings",
@@ -81,8 +93,56 @@ test("Windows CI runs every M1 acceptance gate", () => {
     "git diff --check",
     "git diff --exit-code 321734f -- docs/multi-agent-terminal-design",
   ]) {
-    assert.match(workflow, new RegExp(escapeRegExp(command)), command);
+    assert.match(runner, new RegExp(escapeRegExp(command)), command);
   }
+  const generate = workflow.indexOf("node scripts/run-m1-evidence.mjs");
+  const verify = workflow.indexOf("node scripts/verify-m1-evidence.mjs");
+  const upload = workflow.indexOf("actions/upload-artifact@v4");
+  assert.ok(generate >= 0 && verify > generate && upload > verify);
+  assert.match(workflow, /artifacts\/verification\/m1/);
+});
+
+test("M1 verifier rejects modified captured output", {
+  skip: process.env.M1_EVIDENCE_GENERATING === "1",
+}, () => {
+  withEvidenceCopy((directory, manifest) => {
+    appendFileSync(join(directory, manifest.commands[0].outputFile), "tampered\n");
+    assertVerifierFails(directory, /output hash mismatch/);
+  });
+});
+
+test("M1 verifier rejects a stale source commit", {
+  skip: process.env.M1_EVIDENCE_GENERATING === "1",
+}, () => {
+  withEvidenceCopy((directory, manifest) => {
+    manifest.sourceCommit = "0".repeat(40);
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /source commit|ancestor/);
+  });
+});
+
+test("M1 verifier rejects self-asserted fixture classifications", {
+  skip: process.env.M1_EVIDENCE_GENERATING === "1",
+}, () => {
+  withEvidenceCopy((directory, manifest) => {
+    manifest.fixtureClassifications.find(
+      (entry) => entry.case === "long paths",
+    ).classification = "supported";
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /fixture classification mismatch/);
+  });
+});
+
+test("M1 verifier rejects fixture evidence absent from captured output", {
+  skip: process.env.M1_EVIDENCE_GENERATING === "1",
+}, () => {
+  withEvidenceCopy((directory, manifest) => {
+    manifest.fixtureClassifications.find(
+      (entry) => entry.case === "spaces\/metacharacters",
+    ).evidence[0].needle = "unobserved_test_name";
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /fixture evidence mismatch|test evidence not observed/);
+  });
 });
 
 test("unknown non-repeatable operations are indeterminate and non-replayable", () => {
@@ -99,4 +159,29 @@ test("unknown non-repeatable operations are indeterminate and non-replayable", (
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function withEvidenceCopy(callback) {
+  const directory = mkdtempSync(join(tmpdir(), "m1-evidence-"));
+  try {
+    cpSync("artifacts/verification/m1", directory, { recursive: true });
+    const manifest = JSON.parse(readFileSync(join(directory, "manifest.json"), "utf8"));
+    callback(directory, manifest);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function writeManifest(directory, manifest) {
+  writeFileSync(join(directory, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+function assertVerifierFails(directory, pattern) {
+  const result = spawnSync(
+    process.execPath,
+    ["scripts/verify-m1-evidence.mjs", "--manifest", join(directory, "manifest.json")],
+    { cwd: process.cwd(), encoding: "utf8" },
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stdout}${result.stderr}`, pattern);
 }

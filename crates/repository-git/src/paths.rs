@@ -32,6 +32,8 @@ pub(crate) fn new_gateway(
         excluded_roots,
         trusted_root_id,
         calls: std::sync::Mutex::new(()),
+        #[cfg(feature = "test-seams")]
+        test_hooks: crate::TestHooks::default(),
     })
 }
 

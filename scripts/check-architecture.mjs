@@ -187,12 +187,24 @@ function verifyRepositoryAdapter(sourceRoot) {
   for (const path of filesUnder(sourceRoot).filter((path) => path.endsWith(".rs"))) {
     const source = readFileSync(path, "utf8");
     const local = relative(sourceRoot, path).replaceAll(sep, "/");
+    const standardLibraryImports = [
+      ...source.matchAll(/\buse\s+std\b[\s\S]*?;/g),
+      ...source.matchAll(/\bextern\s+crate\s+std\b[\s\S]*?;/g),
+    ].map((match) => match[0]);
     if (
+      standardLibraryImports.some(
+        (statement) => /\bprocess\b/.test(statement) || /\bstd\s+as\b/.test(statement),
+      )
+      ||
       /\bstd::process\b|\bCommand\s*::|\b(?:powershell|pwsh|cmd\.exe)\b/i.test(source)
     ) {
       throw new Error(`repository adapter may not spawn a process: ${local}`);
     }
     if (
+      standardLibraryImports.some(
+        (statement) => /\benv\b/.test(statement) || /\bstd\s+as\b/.test(statement),
+      )
+      ||
       /(?:\b(?:std::)?env::(?:var|var_os)\s*\(\s*["']PATH["']|\b(?:std::)?env::vars(?:_os)?\s*\(\s*\)[\s\S]{0,160}["']PATH["']|(?:env|option_env)!\s*\(\s*["']PATH["']|\bwhich(?:::|!))/i.test(source)
     ) {
       throw new Error(`repository adapter may not inspect PATH: ${local}`);

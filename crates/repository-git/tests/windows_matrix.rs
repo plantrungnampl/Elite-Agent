@@ -14,6 +14,51 @@ use local_agent_terminal_domain::{
 use local_agent_terminal_repository_git::GitRepositoryGateway;
 use tempfile::TempDir;
 
+fn commit_all(repository: &Repository, message: &str) -> String {
+    let mut index = repository.index().expect("index");
+    index
+        .add_all(["*"], IndexAddOption::DEFAULT, None)
+        .expect("add all");
+    let tree_id = index.write_tree().expect("tree");
+    index.write().expect("write index");
+    let tree = repository.find_tree(tree_id).expect("find tree");
+    let parent = repository
+        .head()
+        .expect("head")
+        .peel_to_commit()
+        .expect("parent");
+    let signature = Signature::now("fixture", "fixture@example.invalid").expect("signature");
+    repository
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[&parent],
+        )
+        .expect("commit")
+        .to_string()
+}
+
+#[cfg(feature = "test-seams")]
+fn dangling_commit(repository: &Repository, message: &str) -> git2::Oid {
+    let tree = repository
+        .head()
+        .expect("head")
+        .peel_to_tree()
+        .expect("tree");
+    let parent = repository
+        .head()
+        .expect("head")
+        .peel_to_commit()
+        .expect("parent");
+    let signature = Signature::now("fixture", "fixture@example.invalid").expect("signature");
+    repository
+        .commit(None, &signature, &signature, message, &tree, &[&parent])
+        .expect("dangling commit")
+}
+
 fn commit_repository(root: &Path) -> (Repository, String) {
     commit_repository_with_format(root, GitObjectFormat::Sha1)
 }
@@ -223,7 +268,7 @@ fn sha256_repository_keeps_exact_object_ids() {
     let fixture = TempDir::new().expect("tempdir");
     let source = fixture.path().join("source");
     fs::create_dir(&source).expect("source");
-    let (_repository, commit) = commit_repository_with_format(&source, GitObjectFormat::Sha256);
+    let (repository, commit) = commit_repository_with_format(&source, GitObjectFormat::Sha256);
     assert_eq!(commit.len(), 64);
     let managed_root = fixture.path().join("managed");
     fs::create_dir(&managed_root).expect("managed");
@@ -235,11 +280,30 @@ fn sha256_repository_keeps_exact_object_ids() {
             locator: locator.clone(),
         })
         .expect("inspect");
-    assert_eq!(snapshot.base_commit.expect("base").as_str().len(), 64);
-    let created = gateway
-        .create_worktree(request(&gateway, &locator, &source))
-        .expect("create");
-    assert_eq!(created.base_commit.as_str().len(), 64);
+    assert_eq!(snapshot.base_commit.expect("base").as_str(), commit);
+    let create = request(&gateway, &locator, &source);
+    assert_eq!(create.base_commit.as_str(), commit);
+    let created = gateway.create_worktree(create).expect("create");
+    assert_eq!(created.base_commit.as_str(), commit);
+    assert_eq!(
+        repository
+            .find_reference("refs/heads/agent/task-1")
+            .expect("branch")
+            .target()
+            .expect("branch target")
+            .to_string(),
+        commit
+    );
+    assert_eq!(
+        Repository::open(managed_root.join("task-1"))
+            .expect("worktree repository")
+            .head()
+            .expect("worktree head")
+            .target()
+            .expect("worktree target")
+            .to_string(),
+        commit
+    );
 }
 
 #[test]
@@ -438,6 +502,12 @@ fn repository_hazards_are_classified_before_worktree_side_effects() {
         .expect("remote");
     fs::write(source.join(".gitmodules"), b"[submodule \"child\"]\n").expect("modules");
     fs::write(source.join(".lfsconfig"), b"[lfs]\nurl = https://invalid\n").expect("lfs");
+    fs::write(source.join(".gitattributes"), b"*.bin filter=lfs\n").expect("attributes");
+    commit_all(&repository, "committed hazards");
+    fs::remove_file(source.join(".gitmodules")).expect("remove working modules");
+    fs::remove_file(source.join(".lfsconfig")).expect("remove working lfs");
+    fs::write(source.join(".gitattributes"), b"*.bin -filter\n")
+        .expect("replace working attributes");
     let managed_root = fixture.path().join("managed");
     fs::create_dir(&managed_root).expect("managed");
     let gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
@@ -599,6 +669,25 @@ fn invalid_windows_target_forms_are_rejected_without_git_side_effects() {
 }
 
 #[test]
+fn valid_windows_shell_metacharacters_are_supported_in_managed_paths() {
+    let fixture = TempDir::new().expect("tempdir");
+    let source = fixture.path().join("source");
+    fs::create_dir(&source).expect("source");
+    let (_repository, _commit) = commit_repository(&source);
+    let managed_root = fixture.path().join("managed");
+    fs::create_dir(&managed_root).expect("managed");
+    let gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+    let locator = locator(&gateway, &source);
+    let leaf = PathBuf::from("task &()^%;");
+
+    gateway
+        .create_worktree(request_at(&gateway, &locator, &source, leaf.clone()))
+        .expect("metacharacter path");
+
+    assert!(managed_root.join(leaf).join("README.md").is_file());
+}
+
+#[test]
 fn excluded_artifact_root_and_git_common_dir_targets_are_rejected() {
     let fixture = TempDir::new().expect("tempdir");
     let source = fixture.path().join("source");
@@ -671,23 +760,55 @@ fn every_execution_capable_git_configuration_fails_closed_and_stays_inert() {
     let source = fixture.path().join("source");
     fs::create_dir(&source).expect("source");
     let (repository, _commit) = commit_repository(&source);
-    let sentinel = fixture.path().join("sentinel.cmd");
-    fs::write(&sentinel, b"@echo sentinel-must-not-run").expect("sentinel");
+    let commands = fixture.path().join("commands");
+    fs::create_dir(&commands).expect("commands");
+    let mut sentinels = Vec::new();
+    let mut command = |name: &str| {
+        let marker = fixture.path().join(format!("{name}.executed"));
+        let executable = commands.join(format!("{name}.cmd"));
+        fs::write(
+            &executable,
+            format!("@echo off\r\n> \"{}\" echo executed\r\n", marker.display()),
+        )
+        .expect("sentinel command");
+        sentinels.push(marker);
+        format!("\"{}\"", executable.display())
+    };
+    let filter = command("filter");
+    let fsmonitor = command("fsmonitor");
+    let credential = command("credential");
+    let ssh = command("ssh");
+    let remote = command("remote");
+    let diff = command("diff");
+    let merge = command("merge");
+    let hooks = fixture.path().join("hooks");
+    fs::create_dir(&hooks).expect("hooks");
+    let hook_marker = fixture.path().join("hook.executed");
+    fs::write(
+        hooks.join("post-checkout"),
+        format!(
+            "#!/bin/sh\nprintf executed > \"{}\"\n",
+            hook_marker.display()
+        ),
+    )
+    .expect("hook sentinel");
+    sentinels.push(hook_marker);
     let included = fixture.path().join("included.cfg");
     fs::write(&included, b"[safe]\n\tvalue = inert\n").expect("include");
     let mut config = repository.config().expect("config");
-    let sentinel_value = sentinel.to_string_lossy().into_owned();
+    let hooks_value = hooks.to_string_lossy().into_owned();
     let included_value = included.to_string_lossy().into_owned();
+    let remote_value = format!("ext::{remote}");
     for (name, value) in [
-        ("filter.hostile.process", sentinel_value.as_str()),
-        ("core.hooksPath", sentinel_value.as_str()),
-        ("core.fsmonitor", sentinel_value.as_str()),
+        ("filter.hostile.process", filter.as_str()),
+        ("core.hooksPath", hooks_value.as_str()),
+        ("core.fsmonitor", fsmonitor.as_str()),
         ("include.path", included_value.as_str()),
-        ("credential.helper", sentinel_value.as_str()),
-        ("core.sshCommand", sentinel_value.as_str()),
-        ("remote.origin.url", "ext::sentinel-helper"),
-        ("diff.hostile.command", sentinel_value.as_str()),
-        ("merge.hostile.driver", sentinel_value.as_str()),
+        ("credential.helper", credential.as_str()),
+        ("core.sshCommand", ssh.as_str()),
+        ("remote.origin.url", remote_value.as_str()),
+        ("diff.hostile.command", diff.as_str()),
+        ("merge.hostile.driver", merge.as_str()),
     ] {
         config.set_str(name, value).expect(name);
     }
@@ -706,10 +827,13 @@ fn every_execution_capable_git_configuration_fails_closed_and_stays_inert() {
     assert!(gateway
         .create_worktree(request(&gateway, &locator, &source))
         .is_err());
-    assert_eq!(
-        fs::read(&sentinel).expect("sentinel after"),
-        b"@echo sentinel-must-not-run"
-    );
+    for sentinel in sentinels {
+        assert!(
+            !sentinel.exists(),
+            "{} must remain inert",
+            sentinel.display()
+        );
+    }
     assert!(!managed_root.join("task-1").exists());
 }
 
@@ -811,61 +935,206 @@ fn create_directory_symlink(target: &Path, link: &Path) {
     std::os::unix::fs::symlink(target, link).expect("directory symlink");
 }
 
-#[cfg(windows)]
+#[cfg(feature = "test-seams")]
 #[test]
-fn parent_swap_race_is_blocked_while_checkout_is_in_progress() {
-    use std::time::{Duration, Instant};
+fn every_post_add_failure_rolls_back_owned_state() {
+    use local_agent_terminal_repository_git::{PostAddStage, TestHooks};
+
+    for stage in [
+        PostAddStage::AfterAdd,
+        PostAddStage::AfterParentVerify,
+        PostAddStage::AfterTargetValidate,
+        PostAddStage::AfterTargetOpen,
+        PostAddStage::AfterConfigAttach,
+        PostAddStage::AfterSnapshot,
+        PostAddStage::AfterRefVerify,
+        PostAddStage::AfterOriginalVerify,
+    ] {
+        let fixture = TempDir::new().expect("tempdir");
+        let source = fixture.path().join("source");
+        fs::create_dir(&source).expect("source");
+        let (repository, commit) = commit_repository(&source);
+        let index_before = fs::read(repository.path().join("index")).expect("index");
+        let managed_root = fixture.path().join("managed");
+        fs::create_dir(&managed_root).expect("managed");
+        let mut gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+        gateway.set_test_hooks(TestHooks {
+            fail_at: Some(stage),
+            ..TestHooks::default()
+        });
+        let locator = locator(&gateway, &source);
+
+        gateway
+            .create_worktree(request(&gateway, &locator, &source))
+            .expect_err("injected post-add failure");
+
+        assert!(!managed_root.join("task-1").exists(), "{stage:?}");
+        assert!(
+            repository
+                .find_reference("refs/heads/agent/task-1")
+                .is_err(),
+            "{stage:?}"
+        );
+        assert!(repository.find_worktree("wt-task-1").is_err(), "{stage:?}");
+        assert_eq!(
+            repository
+                .head()
+                .expect("head")
+                .target()
+                .expect("target")
+                .to_string(),
+            commit,
+            "{stage:?}"
+        );
+        assert_eq!(
+            fs::read(repository.path().join("index")).expect("index after"),
+            index_before,
+            "{stage:?}"
+        );
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn rollback_preserves_a_concurrently_replaced_branch() {
+    use std::sync::{Arc, Barrier};
+
+    use local_agent_terminal_application::{PortError, SafeErrorClassification};
+    use local_agent_terminal_repository_git::{PostAddStage, TestHooks};
 
     let fixture = TempDir::new().expect("tempdir");
     let source = fixture.path().join("source");
     fs::create_dir(&source).expect("source");
     let (repository, _commit) = commit_repository(&source);
-    for index in 0..1_000 {
-        fs::write(source.join(format!("file-{index:04}.txt")), b"fixture\n").expect("fixture file");
-    }
-    let mut index = repository.index().expect("index");
-    index
-        .add_all(["*.txt"], IndexAddOption::DEFAULT, None)
-        .expect("add files");
-    let tree_id = index.write_tree().expect("tree");
-    index.write().expect("index");
-    let tree = repository.find_tree(tree_id).expect("tree");
-    let parent = repository
-        .head()
-        .expect("head")
-        .peel_to_commit()
-        .expect("parent");
-    let signature = Signature::now("fixture", "fixture@example.invalid").expect("signature");
+    let replacement = dangling_commit(&repository, "replacement");
+    let managed_root = fixture.path().join("managed");
+    fs::create_dir(&managed_root).expect("managed");
+    let mut gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+    let barrier = Arc::new(Barrier::new(2));
+    gateway.set_test_hooks(TestHooks {
+        before_rollback: Some(barrier.clone()),
+        fail_at: Some(PostAddStage::AfterAdd),
+        ..TestHooks::default()
+    });
+    let locator = locator(&gateway, &source);
+    let create = request(&gateway, &locator, &source);
+    let worker = std::thread::spawn(move || gateway.create_worktree(create));
+    barrier.wait();
     repository
-        .commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            "large fixture",
-            &tree,
-            &[&parent],
+        .reference(
+            "refs/heads/agent/task-1",
+            replacement,
+            true,
+            "concurrent replacement",
         )
-        .expect("commit");
-    drop(parent);
-    drop(tree);
+        .expect("replace branch");
+    barrier.wait();
+
+    let result = worker.join().expect("worker");
+
+    assert!(matches!(
+        result,
+        Err(PortError::Failure {
+            classification: SafeErrorClassification::Conflict,
+            ..
+        })
+    ));
+    assert_eq!(
+        repository
+            .find_reference("refs/heads/agent/task-1")
+            .expect("replacement branch")
+            .target(),
+        Some(replacement)
+    );
+    assert!(managed_root.join("task-1").join("README.md").is_file());
+    assert!(repository.find_worktree("wt-task-1").is_ok());
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn rollback_preserves_a_concurrently_replaced_target() {
+    use std::sync::{Arc, Barrier};
+
+    use local_agent_terminal_application::{PortError, SafeErrorClassification};
+    use local_agent_terminal_repository_git::{PostAddStage, TestHooks};
+
+    let fixture = TempDir::new().expect("tempdir");
+    let source = fixture.path().join("source");
+    fs::create_dir(&source).expect("source");
+    let (repository, commit) = commit_repository(&source);
+    let managed_root = fixture.path().join("managed");
+    fs::create_dir(&managed_root).expect("managed");
+    let mut gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+    let barrier = Arc::new(Barrier::new(2));
+    gateway.set_test_hooks(TestHooks {
+        before_rollback: Some(barrier.clone()),
+        fail_at: Some(PostAddStage::AfterAdd),
+        ..TestHooks::default()
+    });
+    let locator = locator(&gateway, &source);
+    let create = request(&gateway, &locator, &source);
+    let worker = std::thread::spawn(move || gateway.create_worktree(create));
+    barrier.wait();
+    let target = managed_root.join("task-1");
+    let displaced = managed_root.join("owned-but-displaced");
+    fs::rename(&target, &displaced).expect("displace owned target");
+    fs::create_dir(&target).expect("replacement target");
+    fs::write(target.join("FOREIGN.txt"), b"preserve").expect("foreign marker");
+    barrier.wait();
+
+    let result = worker.join().expect("worker");
+
+    assert!(matches!(
+        result,
+        Err(PortError::Failure {
+            classification: SafeErrorClassification::Conflict,
+            ..
+        })
+    ));
+    assert_eq!(
+        fs::read(target.join("FOREIGN.txt")).expect("foreign marker after"),
+        b"preserve"
+    );
+    assert!(displaced.join("README.md").is_file());
+    assert_eq!(
+        repository
+            .find_reference("refs/heads/agent/task-1")
+            .expect("owned branch preserved")
+            .target()
+            .expect("branch target")
+            .to_string(),
+        commit
+    );
+    assert!(repository.find_worktree("wt-task-1").is_ok());
+}
+
+#[cfg(all(windows, feature = "test-seams"))]
+#[test]
+fn parent_swap_race_is_blocked_while_checkout_is_in_progress() {
+    use std::sync::{Arc, Barrier};
+
+    use local_agent_terminal_repository_git::TestHooks;
+
+    let fixture = TempDir::new().expect("tempdir");
+    let source = fixture.path().join("source");
+    fs::create_dir(&source).expect("source");
+    let (_repository, _commit) = commit_repository(&source);
 
     let managed_root = fixture.path().join("managed");
     fs::create_dir(&managed_root).expect("managed");
     let moved_root = fixture.path().join("managed-swapped");
-    let gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+    let mut gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+    let barrier = Arc::new(Barrier::new(2));
+    gateway.set_test_hooks(TestHooks {
+        before_checkout: Some(barrier.clone()),
+        ..TestHooks::default()
+    });
     let locator = locator(&gateway, &source);
     let create = request(&gateway, &locator, &source);
     let worker = std::thread::spawn(move || gateway.create_worktree(create));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline
-        && repository
-            .find_reference("refs/heads/agent/task-1")
-            .is_err()
-    {
-        std::thread::yield_now();
-    }
-
+    barrier.wait();
     let swap = fs::rename(&managed_root, &moved_root);
+    barrier.wait();
     let created = worker.join().expect("worker").expect("create");
 
     assert!(swap.is_err(), "parent directory swap must be denied");

@@ -67,3 +67,27 @@ test("architecture checker rejects a generic Tauri execution command", () => {
     /generic Tauri command is forbidden: run_command/,
   );
 });
+
+test("architecture checker rejects grouped and aliased process imports", () => {
+  assert.throws(
+    () =>
+      run(
+        "scripts/check-architecture.mjs",
+        "--repository-fixture",
+        "tests/contracts/fixtures/architecture/repository-process-alias",
+      ),
+    /repository adapter may not spawn a process/,
+  );
+});
+
+test("architecture checker rejects grouped and aliased PATH access", () => {
+  assert.throws(
+    () =>
+      run(
+        "scripts/check-architecture.mjs",
+        "--repository-fixture",
+        "tests/contracts/fixtures/architecture/repository-path-alias",
+      ),
+    /repository adapter may not inspect PATH/,
+  );
+});

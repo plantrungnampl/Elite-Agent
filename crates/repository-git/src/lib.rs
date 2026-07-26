@@ -8,6 +8,8 @@ mod worktree;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(feature = "test-seams")]
+use std::sync::{Arc, Barrier};
 
 use local_agent_terminal_application::{
     CreateWorktree, DiscardWorktree, InspectRepository, InspectWorktree, PortError,
@@ -20,6 +22,29 @@ pub struct GitRepositoryGateway {
     pub(crate) excluded_roots: Vec<PathBuf>,
     pub(crate) trusted_root_id: String,
     pub(crate) calls: Mutex<()>,
+    #[cfg(feature = "test-seams")]
+    pub(crate) test_hooks: TestHooks,
+}
+
+#[cfg(feature = "test-seams")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostAddStage {
+    AfterAdd,
+    AfterParentVerify,
+    AfterTargetValidate,
+    AfterTargetOpen,
+    AfterConfigAttach,
+    AfterSnapshot,
+    AfterRefVerify,
+    AfterOriginalVerify,
+}
+
+#[cfg(feature = "test-seams")]
+#[derive(Clone, Default)]
+pub struct TestHooks {
+    pub before_checkout: Option<Arc<Barrier>>,
+    pub before_rollback: Option<Arc<Barrier>>,
+    pub fail_at: Option<PostAddStage>,
 }
 
 impl GitRepositoryGateway {
@@ -42,6 +67,11 @@ impl GitRepositoryGateway {
 
     pub fn trusted_root_id(&self) -> &str {
         &self.trusted_root_id
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub fn set_test_hooks(&mut self, hooks: TestHooks) {
+        self.test_hooks = hooks;
     }
 }
 

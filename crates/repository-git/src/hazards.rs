@@ -1,4 +1,4 @@
-use std::fs;
+use std::path::Path;
 
 use git2::{Config, ConfigLevel, Repository};
 use local_agent_terminal_application::{RepositoryHazard, RepositoryHazardReason};
@@ -98,27 +98,32 @@ pub(crate) fn scan(repository: &Repository, config: &Config) -> Vec<RepositoryHa
     if common_dir.join("hooks").is_dir() {
         // A default hooks directory is inert; only an explicit core.hooksPath is hazardous.
     }
-    if let Some(workdir) = repository.workdir() {
-        if workdir.join(".gitmodules").is_file() {
+    if let Ok(tree) = repository.head().and_then(|head| head.peel_to_tree()) {
+        if tree.get_path(Path::new(".gitmodules")).is_ok() {
             hazards.push(hazard(
                 RepositoryHazardReason::SubmodulesPresent,
-                "gitmodules file present",
+                "gitmodules file present in HEAD",
             ));
         }
-        if workdir.join(".lfsconfig").is_file() {
+        if tree.get_path(Path::new(".lfsconfig")).is_ok() {
             hazards.push(hazard(
                 RepositoryHazardReason::LfsConfigured,
-                "lfs configuration file present",
+                "lfs configuration file present in HEAD",
             ));
         }
-        if let Ok(attributes) = fs::read(workdir.join(".gitattributes")) {
-            if attributes
-                .split(|byte| byte.is_ascii_whitespace())
-                .any(|token| token.eq_ignore_ascii_case(b"filter=lfs"))
+        if let Ok(entry) = tree.get_path(Path::new(".gitattributes")) {
+            if repository
+                .find_blob(entry.id())
+                .map(|blob| {
+                    blob.content()
+                        .split(|byte| byte.is_ascii_whitespace())
+                        .any(|token| token.eq_ignore_ascii_case(b"filter=lfs"))
+                })
+                .unwrap_or(false)
             {
                 hazards.push(hazard(
                     RepositoryHazardReason::LfsConfigured,
-                    "lfs attribute present",
+                    "lfs attribute present in HEAD",
                 ));
             }
         }
