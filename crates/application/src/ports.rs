@@ -108,6 +108,8 @@ pub struct ArtifactWriteReservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactJournalEntry {
     pub reservation: ArtifactWriteReservation,
+    pub expected_hash: String,
+    pub expected_size: u64,
     pub status: ArtifactJournalStatus,
     pub updated_at: String,
     pub completed_at: Option<String>,

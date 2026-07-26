@@ -178,7 +178,8 @@ impl SqliteStore {
                     o.id, a.id, a.task_id, a.project_id, a.artifact_type, a.logical_path,
                     a.content_hash, a.storage_key, a.size_bytes, a.mime_type, a.created_by_type,
                     a.created_by_id, a.created_at, a.supersedes, o.temp_name, o.created_at,
-                    o.status, o.updated_at, o.completed_at, o.error_json
+                    o.expected_hash, o.expected_size, o.status, o.updated_at, o.completed_at,
+                    o.error_json
                  FROM artifact_operations o
                  JOIN artifacts a ON a.id = o.artifact_id
                  WHERE (?1 AND o.status = 'completed' AND a.availability = 'available')
@@ -205,10 +206,12 @@ impl SqliteStore {
                     supersedes: row.get(13)?,
                     temp_name: row.get(14)?,
                     operation_created_at: row.get(15)?,
-                    status: row.get(16)?,
-                    updated_at: row.get(17)?,
-                    completed_at: row.get(18)?,
-                    error_json: row.get(19)?,
+                    expected_hash: row.get(16)?,
+                    expected_size: row.get(17)?,
+                    status: row.get(18)?,
+                    updated_at: row.get(19)?,
+                    completed_at: row.get(20)?,
+                    error_json: row.get(21)?,
                 })
             })
             .map_err(sqlite_error_to_port)?;
@@ -238,6 +241,8 @@ struct RawJournalEntry {
     supersedes: Option<String>,
     temp_name: String,
     operation_created_at: String,
+    expected_hash: String,
+    expected_size: i64,
     status: String,
     updated_at: String,
     completed_at: Option<String>,
@@ -254,6 +259,7 @@ impl TryFrom<RawJournalEntry> for ArtifactJournalEntry {
             .transpose()
             .map_err(|_| integrity_failure())?;
         let size_bytes = u64::try_from(row.size_bytes).map_err(|_| integrity_failure())?;
+        let expected_size = u64::try_from(row.expected_size).map_err(|_| integrity_failure())?;
         let status = parse_status(&row.status).ok_or_else(integrity_failure)?;
         let error = row
             .error_json
@@ -280,6 +286,8 @@ impl TryFrom<RawJournalEntry> for ArtifactJournalEntry {
                 temp_name: row.temp_name,
                 created_at: row.operation_created_at,
             },
+            expected_hash: row.expected_hash,
+            expected_size,
             status,
             updated_at: row.updated_at,
             completed_at: row.completed_at,

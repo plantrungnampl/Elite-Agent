@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use local_agent_terminal_application::{
-    ArtifactJournal, ArtifactWriteReservation, Clock, PortError, ReservedArtifact, Retryability,
-    SafeErrorClassification,
+    ArtifactJournal, ArtifactStore, ArtifactWriteReservation, Clock, NewArtifact, PortError,
+    ReservedArtifact, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_storage_files::{
     reconcile_artifacts, ContentAddressedArtifactStore, FaultPoint, JournaledArtifactWriter,
@@ -13,6 +13,7 @@ use rusqlite::{params, Connection};
 use tempfile::TempDir;
 
 const HELLO_HASH: &str = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+const WORLD_HASH: &str = "sha256:486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7";
 
 struct Fixture {
     _directory: TempDir,
@@ -96,6 +97,14 @@ fn crash_boundaries_reconcile_to_deterministic_states() {
         };
         assert_eq!(fixture.state(&operation_id), expected, "{fault:?}");
         assert!(fixture.journal.incomplete().unwrap().is_empty());
+        let evidence = quarantine_evidence(&fixture);
+        assert_eq!(
+            reconcile_artifacts(&fixture.store, &fixture.journal, &fixture.clock).unwrap(),
+            Default::default(),
+            "{fault:?} was not idempotent"
+        );
+        assert_eq!(fixture.state(&operation_id), expected, "{fault:?}");
+        assert_eq!(quarantine_evidence(&fixture), evidence, "{fault:?}");
     }
 }
 
@@ -131,6 +140,15 @@ fn invalid_staging_bytes_are_quarantined_and_preserved() {
         .map(|entry| fs::read(entry.unwrap().path()).unwrap())
         .collect();
     assert_eq!(quarantined, [b"tampered".to_vec()]);
+    assert_eq!(
+        reconcile_artifacts(&fixture.store, &fixture.journal, &fixture.clock).unwrap(),
+        Default::default()
+    );
+    assert_eq!(
+        fixture.state("operation-bad"),
+        ("quarantined".to_owned(), "quarantined".to_owned())
+    );
+    assert_eq!(quarantine_evidence(&fixture), quarantined);
 }
 
 #[test]
@@ -161,6 +179,16 @@ fn completed_missing_and_corrupt_objects_are_invalidated() {
             fixture.state(&operation_id),
             ("completed".to_owned(), expected.to_owned())
         );
+        let evidence = quarantine_evidence(&fixture);
+        assert_eq!(
+            reconcile_artifacts(&fixture.store, &fixture.journal, &fixture.clock).unwrap(),
+            Default::default()
+        );
+        assert_eq!(
+            fixture.state(&operation_id),
+            ("completed".to_owned(), expected.to_owned())
+        );
+        assert_eq!(quarantine_evidence(&fixture), evidence);
     }
 }
 
@@ -212,6 +240,11 @@ fn staging_bytes_without_an_intent_are_quarantined_not_deleted() {
         .map(|entry| fs::read(entry.unwrap().path()).unwrap())
         .collect();
     assert_eq!(preserved, [b"unrecognized".to_vec()]);
+    assert_eq!(
+        reconcile_artifacts(&fixture.store, &fixture.journal, &fixture.clock).unwrap(),
+        Default::default()
+    );
+    assert_eq!(quarantine_evidence(&fixture), preserved);
 }
 
 #[test]
@@ -242,6 +275,10 @@ fn artifact_reconciliation_does_not_retry_indeterminate_non_repeatable_operation
     drop(connection);
 
     reconcile_artifacts(&fixture.store, &fixture.journal, &fixture.clock).unwrap();
+    assert_eq!(
+        reconcile_artifacts(&fixture.store, &fixture.journal, &fixture.clock).unwrap(),
+        Default::default()
+    );
 
     let state: (String, i64) = Connection::open(&fixture.database_path)
         .unwrap()
@@ -252,6 +289,57 @@ fn artifact_reconciliation_does_not_retry_indeterminate_non_repeatable_operation
         )
         .unwrap();
     assert_eq!(state, ("indeterminate".to_owned(), 1));
+}
+
+#[test]
+fn reconciliation_rejects_artifact_metadata_that_disagrees_with_the_write_intent() {
+    let fixture = Fixture::new();
+    fixture
+        .store
+        .put(NewArtifact {
+            expected_hash: WORLD_HASH.to_owned(),
+            expected_size: 5,
+            content: b"world".to_vec(),
+        })
+        .unwrap();
+    let writer = JournaledArtifactWriter::new(&fixture.store, &fixture.journal, &fixture.clock);
+    assert!(writer
+        .write_with_fault(
+            reservation("operation-metadata", "artifact-metadata", "metadata.txt"),
+            b"hello",
+            |point| {
+                if point == FaultPoint::BeforeWrite {
+                    Err(injected_crash())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .is_err());
+    Connection::open(&fixture.database_path)
+        .unwrap()
+        .execute(
+            "UPDATE artifacts SET content_hash = ?1, storage_key = ?2
+             WHERE id = 'artifact-metadata'",
+            params![WORLD_HASH, format!("objects/48/{}", &WORLD_HASH[7..])],
+        )
+        .unwrap();
+
+    reconcile_artifacts(&fixture.store, &fixture.journal, &fixture.clock).unwrap();
+
+    assert_eq!(
+        fixture.state("operation-metadata"),
+        ("quarantined".to_owned(), "quarantined".to_owned())
+    );
+}
+
+fn quarantine_evidence(fixture: &Fixture) -> Vec<Vec<u8>> {
+    let mut evidence: Vec<_> = fs::read_dir(fixture.store.root().join("quarantine"))
+        .unwrap()
+        .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+        .collect();
+    evidence.sort();
+    evidence
 }
 
 fn reservation(

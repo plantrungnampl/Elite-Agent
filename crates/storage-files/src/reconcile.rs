@@ -57,6 +57,11 @@ fn reconcile_incomplete(
     entry: &ArtifactJournalEntry,
     report: &mut ReconcileReport,
 ) -> Result<(), PortError> {
+    if intent_disagrees_with_metadata(entry) {
+        transition(journal, clock, entry, ArtifactJournalStatus::Quarantined)?;
+        report.quarantined += 1;
+        return Ok(());
+    }
     if store
         .validate_reservation_metadata(&entry.reservation)
         .is_err()
@@ -149,6 +154,17 @@ fn reconcile_completed(
     entry: &ArtifactJournalEntry,
     report: &mut ReconcileReport,
 ) -> Result<(), PortError> {
+    if intent_disagrees_with_metadata(entry) {
+        invalidate(
+            journal,
+            clock,
+            entry,
+            ArtifactUnavailableState::Quarantined,
+            "intent_metadata_mismatch",
+        )?;
+        report.invalidated += 1;
+        return Ok(());
+    }
     if store
         .validate_reservation_metadata(&entry.reservation)
         .is_err()
@@ -190,6 +206,11 @@ fn reconcile_completed(
         report.invalidated += 1;
     }
     Ok(())
+}
+
+fn intent_disagrees_with_metadata(entry: &ArtifactJournalEntry) -> bool {
+    entry.expected_hash != entry.reservation.artifact.content_hash
+        || entry.expected_size != entry.reservation.artifact.size_bytes
 }
 
 fn complete(
