@@ -104,6 +104,47 @@ fn later_startup_rejects_changed_or_unsupported_schema() {
 }
 
 #[test]
+fn startup_rejects_unknown_nonempty_database_without_mutating_it() {
+    let directory = TempDirectory::new();
+    let path = directory.0.join("state.sqlite3");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute("CREATE TABLE unrelated (value TEXT NOT NULL)", [])
+        .unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        SqliteStore::open(&path),
+        Err(OpenError::UnsupportedSchema {
+            found: 0,
+            supported: 1
+        })
+    ));
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'unrelated'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'events'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn every_initialized_connection_enables_required_pragmas() {
     let directory = TempDirectory::new();
     let store = SqliteStore::open(directory.0.join("state.sqlite3")).unwrap();
@@ -115,6 +156,7 @@ fn every_initialized_connection_enables_required_pragmas() {
     assert_eq!(pragmas.busy_timeout_ms, 5000);
     assert_eq!(pragmas.synchronous, 2);
     assert_eq!(pragmas.wal_autocheckpoint, 1000);
+    assert!(pragmas.recursive_triggers);
 }
 
 #[test]
@@ -137,4 +179,72 @@ fn database_and_artifact_root_health_are_typed() {
         Err(ArtifactRootIssue::NotDirectory)
     );
     assert_eq!(artifact_root_health(&directory.0), Ok(()));
+}
+
+#[test]
+fn artifact_root_probe_collision_preserves_preexisting_paths() {
+    let directory = TempDirectory::new();
+    for suffix in 0..64 {
+        fs::write(
+            directory
+                .0
+                .join(format!(".write-probe-{}-{suffix}", std::process::id())),
+            b"owned-by-someone-else",
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        artifact_root_health(&directory.0),
+        Err(ArtifactRootIssue::NotWritable)
+    );
+    for suffix in 0..64 {
+        assert_eq!(
+            fs::read(
+                directory
+                    .0
+                    .join(format!(".write-probe-{}-{suffix}", std::process::id()))
+            )
+            .unwrap(),
+            b"owned-by-someone-else"
+        );
+    }
+}
+
+#[test]
+fn artifact_root_symlink_is_rejected_without_touching_target() {
+    let directory = TempDirectory::new();
+    let target = directory.0.join("target");
+    let link = directory.0.join("link");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("marker"), b"keep").unwrap();
+    create_directory_symlink(&target, &link);
+
+    assert_eq!(
+        artifact_root_health(&link),
+        Err(ArtifactRootIssue::NotDirectory)
+    );
+    let mut target_entries: Vec<_> = fs::read_dir(target)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    target_entries.sort();
+    assert_eq!(target_entries, ["marker"]);
+}
+
+#[cfg(unix)]
+fn create_directory_symlink(target: &std::path::Path, link: &std::path::Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[cfg(windows)]
+fn create_directory_symlink(target: &std::path::Path, link: &std::path::Path) {
+    assert!(std::process::Command::new("cmd.exe")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .unwrap()
+        .status
+        .success());
 }

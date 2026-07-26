@@ -95,6 +95,19 @@ pub(crate) fn validate_or_migrate(connection: &mut Connection) -> Result<(), Ope
     )?;
 
     if !has_migration_table {
+        let has_user_objects: bool = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_user_objects {
+            return Err(OpenError::UnsupportedSchema {
+                found: 0,
+                supported: SUPPORTED_SCHEMA_VERSION,
+            });
+        }
         apply_initial_migration(connection)?;
         return Ok(());
     }

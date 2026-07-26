@@ -55,14 +55,14 @@ impl SqliteStore {
 }
 
 pub fn artifact_root_health(root: &Path) -> Result<(), ArtifactRootIssue> {
-    let metadata = fs::metadata(root).map_err(|error| {
+    let metadata = fs::symlink_metadata(root).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             ArtifactRootIssue::Missing
         } else {
             ArtifactRootIssue::NotWritable
         }
     })?;
-    if !metadata.is_dir() {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(ArtifactRootIssue::NotDirectory);
     }
 
@@ -71,16 +71,15 @@ pub fn artifact_root_health(root: &Path) -> Result<(), ArtifactRootIssue> {
         std::process::id(),
         NEXT_PROBE.fetch_add(1, Ordering::Relaxed)
     ));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe)?;
-        file.write_all(b"probe")?;
-        file.sync_all()?;
-        fs::remove_file(&probe)
-    })();
-    if result.is_err() {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|_| ArtifactRootIssue::NotWritable)?;
+    let write_result = file.write_all(b"probe").and_then(|()| file.sync_all());
+    drop(file);
+    let remove_result = fs::remove_file(&probe);
+    if write_result.is_err() || remove_result.is_err() {
         let _ = fs::remove_file(probe);
         return Err(ArtifactRootIssue::NotWritable);
     }

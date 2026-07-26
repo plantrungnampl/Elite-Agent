@@ -24,6 +24,7 @@ pub struct PragmaSettings {
     pub synchronous: i64,
     pub busy_timeout_ms: i64,
     pub wal_autocheckpoint: i64,
+    pub recursive_triggers: bool,
 }
 
 impl SqliteStore {
@@ -45,6 +46,8 @@ impl SqliteStore {
             busy_timeout_ms: connection.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?,
             wal_autocheckpoint: connection
                 .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?,
+            recursive_triggers: connection
+                .query_row("PRAGMA recursive_triggers", [], |row| row.get(0))?,
         })
     }
 
@@ -61,5 +64,6 @@ fn initialize_connection(connection: &Connection) -> Result<(), OpenError> {
     connection.pragma_update(None, "synchronous", "FULL")?;
     connection.pragma_update(None, "busy_timeout", 5000)?;
     connection.pragma_update(None, "wal_autocheckpoint", 1000)?;
+    connection.pragma_update(None, "recursive_triggers", "ON")?;
     Ok(())
 }

@@ -294,6 +294,33 @@ fn persisted_events_are_immutable() {
     assert!(connection
         .execute("DELETE FROM events WHERE event_id = ?1", ["event-1"])
         .is_err());
+    connection
+        .pragma_update(None, "recursive_triggers", "ON")
+        .unwrap();
+    assert!(connection
+        .execute(
+            "INSERT OR REPLACE INTO events (
+                event_id, stream_id, sequence, event_type, schema_version, actor_type,
+                actor_id, observation_class, payload_json, metadata_json, causation_id,
+                correlation_id, created_at
+             ) SELECT
+                event_id, stream_id, sequence, ?1, schema_version, actor_type,
+                actor_id, observation_class, payload_json, metadata_json, causation_id,
+                correlation_id, created_at
+             FROM events WHERE event_id = ?2",
+            params!["replaced", "event-1"]
+        )
+        .is_err());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT event_type FROM events WHERE event_id = ?1",
+                ["event-1"],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "task.created"
+    );
 }
 
 #[test]
