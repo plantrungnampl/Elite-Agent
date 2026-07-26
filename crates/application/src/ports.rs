@@ -3,7 +3,9 @@ use local_agent_terminal_domain::{
 };
 use serde_json::Value;
 
-use crate::PortError;
+use crate::{
+    PortError, TaskSnapshot, TimelineEntryDto, WorkspaceMutationRequest, WorkspaceMutationResult,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewEvent {
@@ -44,6 +46,18 @@ pub struct AppendResult {
 
 pub trait EventStore: Send + Sync {
     fn append(&self, operation: AppendOperation) -> Result<AppendResult, PortError>;
+}
+
+pub trait WorkspaceMutationStore: Send + Sync {
+    fn record_workspace_mutation(
+        &self,
+        request: WorkspaceMutationRequest,
+    ) -> Result<WorkspaceMutationResult, PortError>;
+}
+
+pub trait TaskQuery: Send + Sync {
+    fn task(&self, task_id: &TaskId) -> Result<TaskSnapshot, PortError>;
+    fn timeline(&self, task_id: &TaskId) -> Result<Vec<TimelineEntryDto>, PortError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

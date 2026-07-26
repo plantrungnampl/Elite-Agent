@@ -1,6 +1,6 @@
 use std::fmt;
 
-use local_agent_terminal_domain::Sequence;
+use local_agent_terminal_domain::{FencingToken, Sequence};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retryability {
@@ -26,6 +26,10 @@ pub enum PortError {
         expected: Sequence,
         actual: Sequence,
     },
+    StaleLease {
+        current: FencingToken,
+        supplied: FencingToken,
+    },
     Failure {
         classification: SafeErrorClassification,
         retryability: Retryability,
@@ -35,6 +39,10 @@ pub enum PortError {
 impl PortError {
     pub const fn version_conflict(expected: Sequence, actual: Sequence) -> Self {
         Self::VersionConflict { expected, actual }
+    }
+
+    pub const fn stale_lease(current: FencingToken, supplied: FencingToken) -> Self {
+        Self::StaleLease { current, supplied }
     }
 
     pub const fn failure(
@@ -49,14 +57,16 @@ impl PortError {
 
     pub const fn retryability(&self) -> Retryability {
         match self {
-            Self::VersionConflict { .. } => Retryability::NonRetryable,
+            Self::VersionConflict { .. } | Self::StaleLease { .. } => Retryability::NonRetryable,
             Self::Failure { retryability, .. } => *retryability,
         }
     }
 
     pub const fn safe_classification(&self) -> SafeErrorClassification {
         match self {
-            Self::VersionConflict { .. } => SafeErrorClassification::Conflict,
+            Self::VersionConflict { .. } | Self::StaleLease { .. } => {
+                SafeErrorClassification::Conflict
+            }
             Self::Failure { classification, .. } => *classification,
         }
     }
@@ -70,6 +80,12 @@ impl fmt::Display for PortError {
                 "event stream version conflict: expected {}, actual {}",
                 expected.get(),
                 actual.get()
+            ),
+            Self::StaleLease { current, supplied } => write!(
+                formatter,
+                "stale executor lease: current token {}, supplied token {}",
+                current.get(),
+                supplied.get()
             ),
             Self::Failure {
                 classification,

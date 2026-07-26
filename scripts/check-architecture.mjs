@@ -51,7 +51,14 @@ function verifyCargo(metadata) {
   ) {
     throw new Error("domain may depend only on justified general-purpose libraries");
   }
-  const applicationAllowed = new Set([domain, "serde", "serde_json", "thiserror"]);
+  const applicationAllowed = new Set([
+    domain,
+    "serde",
+    "serde_json",
+    "serde_json_canonicalizer",
+    "sha2",
+    "thiserror",
+  ]);
   if (
     allDependencies(application).some(
       (dependency) => workspace.has(dependency.name) && dependency.name !== domain,
