@@ -107,6 +107,64 @@ fn startup_adopts_only_the_exact_durable_worktree() {
 }
 
 #[test]
+fn startup_leaves_pending_intent_for_exact_command_retry_without_git_effects() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_pending_intent("worktree.create", IdempotencyClass::Queryable);
+    let source_head = fixture.source_head();
+
+    let bootstrap = fixture.start();
+
+    assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
+    assert!(bootstrap
+        .workspace_runtime()
+        .expect("runtime")
+        .recovery_candidates()
+        .is_empty());
+    assert_eq!(fixture.intent_status(), "pending");
+    assert_eq!(fixture.source_head(), source_head);
+    assert!(!fixture.branch_exists());
+    assert!(!fixture.workspace_root.join(WORKTREE_ID).exists());
+}
+
+#[test]
+fn repeated_startup_replays_recovery_projection_without_duplicate_side_effects() {
+    let fixture = WorkspaceFixture::new();
+    let intent = fixture.seed_started_intent("worktree.create", IdempotencyClass::Queryable);
+    fixture.create_git_worktree(&intent);
+    let first = fixture.start();
+    assert_eq!(first.status().state, StartupStateDto::Ready);
+    let before: (i64, String, String) = Connection::open(&fixture.database_path)
+        .expect("database")
+        .query_row(
+            "SELECT COUNT(*),
+                    (SELECT status FROM operation_intents WHERE id = 'intent-worktree-1'),
+                    (SELECT worktree_path FROM tasks WHERE id = ?1)
+             FROM events",
+            [TASK_ID],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("before replay");
+
+    let second = fixture.start();
+    assert_eq!(second.status().state, StartupStateDto::Ready);
+    let after: (i64, String, String) = Connection::open(&fixture.database_path)
+        .expect("database")
+        .query_row(
+            "SELECT COUNT(*),
+                    (SELECT status FROM operation_intents WHERE id = 'intent-worktree-1'),
+                    (SELECT worktree_path FROM tasks WHERE id = ?1)
+             FROM events",
+            [TASK_ID],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("after replay");
+
+    assert_eq!(after, before);
+    assert_eq!(after.1, "succeeded");
+    assert!(fixture.workspace_root.join(WORKTREE_ID).is_dir());
+}
+
+#[test]
 fn startup_marks_retryable_only_after_authoritative_worktree_absence() {
     let fixture = WorkspaceFixture::new();
     fixture.seed_started_intent("worktree.create", IdempotencyClass::Queryable);
@@ -350,6 +408,28 @@ impl WorkspaceFixture {
         operation_kind: &str,
         idempotency_class: IdempotencyClass,
     ) -> WorktreeIntent {
+        let intent = self.seed_pending_intent(operation_kind, idempotency_class);
+        let database = SqliteStore::open(&self.database_path).expect("database");
+        database
+            .transition_worktree_intent(IntentTransition {
+                intent_id: intent.operation.id.clone(),
+                expected_status: OperationIntentStatus::Pending,
+                next_status: OperationIntentStatus::Started,
+                executor_fencing_token: Some(FencingToken::new(1).expect("token")),
+                attempt_count: 1,
+                updated_at: "2026-07-26T00:00:04Z".to_owned(),
+                error: None,
+                observed_fingerprint: None,
+            })
+            .expect("started intent");
+        intent
+    }
+
+    fn seed_pending_intent(
+        &self,
+        operation_kind: &str,
+        idempotency_class: IdempotencyClass,
+    ) -> WorktreeIntent {
         let database = SqliteStore::open(&self.database_path).expect("database");
         let artifacts = ContentAddressedArtifactStore::open(self.app_data.join("artifacts"))
             .expect("artifact store");
@@ -386,18 +466,6 @@ impl WorkspaceFixture {
         database
             .begin_worktree_intent(intent.clone())
             .expect("worktree intent");
-        database
-            .transition_worktree_intent(IntentTransition {
-                intent_id: intent.operation.id.clone(),
-                expected_status: OperationIntentStatus::Pending,
-                next_status: OperationIntentStatus::Started,
-                executor_fencing_token: Some(FencingToken::new(1).expect("token")),
-                attempt_count: 1,
-                updated_at: "2026-07-26T00:00:04Z".to_owned(),
-                error: None,
-                observed_fingerprint: None,
-            })
-            .expect("started intent");
         intent
     }
 

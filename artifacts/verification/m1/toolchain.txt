@@ -1,0 +1,9 @@
+os=Microsoft Windows 11 Pro
+os-version=10.0.26200
+node=v24.16.0
+pnpm=11.7.0
+git=git version 2.54.0.windows.1
+rustup=rustup 1.29.0 (28d1352db 2026-03-05)
+rust-toolchain=1.97.1-x86_64-pc-windows-msvc
+rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo=cargo 1.97.1 (c980f4866 2026-06-30)

@@ -20,7 +20,9 @@ try {
     option("--tauri-fixture") ?? join(root, "apps", "desktop", "src-tauri", "src"),
   );
   verifyAdapterConstruction();
-  verifyRepositoryAdapter();
+  verifyRepositoryAdapter(
+    option("--repository-fixture") ?? join(root, "crates", "repository-git", "src"),
+  );
   console.log("architecture contracts: ok");
 } catch (error) {
   console.error(`architecture contracts: ${error.message}`);
@@ -181,8 +183,7 @@ function verifyAdapterConstruction() {
   }
 }
 
-function verifyRepositoryAdapter() {
-  const sourceRoot = join(root, "crates", "repository-git", "src");
+function verifyRepositoryAdapter(sourceRoot) {
   for (const path of filesUnder(sourceRoot).filter((path) => path.endsWith(".rs"))) {
     const source = readFileSync(path, "utf8");
     const local = relative(sourceRoot, path).replaceAll(sep, "/");
@@ -190,6 +191,11 @@ function verifyRepositoryAdapter() {
       /\bstd::process\b|\bCommand\s*::|\b(?:powershell|pwsh|cmd\.exe)\b/i.test(source)
     ) {
       throw new Error(`repository adapter may not spawn a process: ${local}`);
+    }
+    if (
+      /(?:\b(?:std::)?env::(?:var|var_os)\s*\(\s*["']PATH["']|\b(?:std::)?env::vars(?:_os)?\s*\(\s*\)[\s\S]{0,160}["']PATH["']|(?:env|option_env)!\s*\(\s*["']PATH["']|\bwhich(?:::|!))/i.test(source)
+    ) {
+      throw new Error(`repository adapter may not inspect PATH: ${local}`);
     }
     if (local !== "unsafe_checkout.rs" && /\bunsafe\s*\{/.test(source)) {
       throw new Error(`repository adapter unsafe code is isolated to unsafe_checkout.rs: ${local}`);

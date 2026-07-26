@@ -46,7 +46,7 @@ pub(crate) fn create(
         return Err(paths::conflict());
     }
     let zero = zero_oid(&repository);
-    let reference = repository
+    let mut reference = repository
         .reference_matching(
             &reference_name,
             oid,
@@ -58,7 +58,13 @@ pub(crate) fn create(
     let worktree_name = request.worktree_id.as_str();
     validate_worktree_name(worktree_name)?;
     let parent_guard = paths::DirectoryGuard::open(target.parent().ok_or_else(paths::invalid)?)?;
-    let worktree = unsafe_checkout::add(&repository, worktree_name, &target, &reference)?;
+    let worktree = match unsafe_checkout::add(&repository, worktree_name, &target, &reference) {
+        Ok(worktree) => worktree,
+        Err(error) => {
+            rollback_failed_create(&repository, worktree_name, &target, &mut reference, oid)?;
+            return Err(error);
+        }
+    };
     parent_guard.verify()?;
     let target_path = paths::validate_existing_target(gateway, &target)?;
     if target_path != target {
@@ -408,6 +414,38 @@ fn reject_reparse_root(path: &Path) -> Result<(), PortError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| paths::not_found())?;
     if metadata.file_type().is_symlink() {
         return Err(paths::conflict());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(paths::conflict());
+        }
+    }
+    Ok(())
+}
+
+fn rollback_failed_create(
+    repository: &Repository,
+    worktree_name: &str,
+    target: &Path,
+    reference: &mut git2::Reference<'_>,
+    expected_oid: Oid,
+) -> Result<(), PortError> {
+    if fs::symlink_metadata(target).is_ok() {
+        reject_reparse_root(target)?;
+        fs::remove_dir_all(target).map_err(|_| paths::permission())?;
+    }
+    if let Ok(worktree) = repository.find_worktree(worktree_name) {
+        worktree.unlock().map_err(paths::map_git_error)?;
+        let mut prune = WorktreePruneOptions::new();
+        worktree
+            .prune(Some(&mut prune))
+            .map_err(paths::map_git_error)?;
+    }
+    if reference.target() == Some(expected_oid) {
+        reference.delete().map_err(paths::map_git_error)?;
     }
     Ok(())
 }
