@@ -32,8 +32,9 @@ impl SqliteStore {
         let store = Self {
             path: path.as_ref().to_owned(),
         };
-        let mut connection = store.connection()?;
+        let mut connection = Connection::open(&store.path)?;
         migrations::validate_or_migrate(&mut connection)?;
+        initialize_connection(&connection)?;
         Ok(store)
     }
 

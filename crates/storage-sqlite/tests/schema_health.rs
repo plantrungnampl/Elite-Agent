@@ -111,7 +111,11 @@ fn startup_rejects_unknown_nonempty_database_without_mutating_it() {
     connection
         .execute("CREATE TABLE unrelated (value TEXT NOT NULL)", [])
         .unwrap();
+    let original_journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
     drop(connection);
+    let original_files = directory_entries(&directory.0);
 
     assert!(matches!(
         SqliteStore::open(&path),
@@ -122,6 +126,10 @@ fn startup_rejects_unknown_nonempty_database_without_mutating_it() {
     ));
 
     let connection = Connection::open(path).unwrap();
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode, original_journal_mode);
     assert_eq!(
         connection
             .query_row(
@@ -142,6 +150,17 @@ fn startup_rejects_unknown_nonempty_database_without_mutating_it() {
             .unwrap(),
         0
     );
+    drop(connection);
+    assert_eq!(directory_entries(&directory.0), original_files);
+}
+
+fn directory_entries(directory: &std::path::Path) -> Vec<std::ffi::OsString> {
+    let mut entries: Vec<_> = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    entries.sort();
+    entries
 }
 
 #[test]
