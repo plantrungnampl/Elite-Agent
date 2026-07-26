@@ -4,6 +4,7 @@ use std::num::NonZeroU64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueError {
     Empty { kind: &'static str },
+    Invalid { kind: &'static str },
     Negative { kind: &'static str, value: i64 },
     MustBePositive { kind: &'static str, value: i64 },
 }
@@ -12,6 +13,7 @@ impl fmt::Display for ValueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty { kind } => write!(formatter, "{kind} must not be empty"),
+            Self::Invalid { kind } => write!(formatter, "{kind} is invalid"),
             Self::Negative { kind, value } => {
                 write!(formatter, "{kind} must be nonnegative, got {value}")
             }
@@ -55,6 +57,11 @@ non_empty_id!(TaskId, "task ID");
 non_empty_id!(StreamId, "stream ID");
 non_empty_id!(EventId, "event ID");
 non_empty_id!(ActorId, "actor ID");
+non_empty_id!(ProjectId, "project ID");
+non_empty_id!(RunId, "run ID");
+non_empty_id!(ArtifactId, "artifact ID");
+non_empty_id!(RepositoryId, "repository ID");
+non_empty_id!(WorktreeId, "worktree ID");
 
 macro_rules! nonnegative_value {
     ($name:ident, $kind:literal) => {
