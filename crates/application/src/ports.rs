@@ -81,14 +81,34 @@ pub enum ArtifactJournalStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactJournalEntry {
-    pub operation_id: String,
+pub struct ReservedArtifact {
     pub artifact_id: String,
-    pub temp_name: String,
-    pub expected_hash: String,
-    pub expected_size: u64,
-    pub status: ArtifactJournalStatus,
+    pub task_id: Option<TaskId>,
+    pub project_id: String,
+    pub artifact_type: String,
+    pub logical_path: String,
+    pub content_hash: String,
+    pub storage_key: String,
+    pub size_bytes: u64,
+    pub mime_type: Option<String>,
+    pub created_by_type: String,
+    pub created_by_id: String,
     pub created_at: String,
+    pub supersedes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactWriteReservation {
+    pub operation_id: String,
+    pub artifact: ReservedArtifact,
+    pub temp_name: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactJournalEntry {
+    pub reservation: ArtifactWriteReservation,
+    pub status: ArtifactJournalStatus,
     pub updated_at: String,
     pub completed_at: Option<String>,
     pub error: Option<Value>,
@@ -105,7 +125,8 @@ pub struct ArtifactJournalTransition {
 }
 
 pub trait ArtifactJournal: Send + Sync {
-    fn record_intent(&self, entry: ArtifactJournalEntry) -> Result<(), PortError>;
+    /// Atomically creates reserved artifact metadata and its write intent.
+    fn reserve(&self, reservation: ArtifactWriteReservation) -> Result<(), PortError>;
     fn transition(&self, transition: ArtifactJournalTransition) -> Result<(), PortError>;
     fn incomplete(&self) -> Result<Vec<ArtifactJournalEntry>, PortError>;
 }

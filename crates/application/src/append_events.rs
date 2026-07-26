@@ -1,4 +1,4 @@
-use crate::{AppendEventsError, AppendOperation, AppendResult, EventStore};
+use crate::{AppendOperation, AppendResult, EventStore, PortError};
 
 pub struct AppendEvents<'a> {
     event_store: &'a dyn EventStore,
@@ -9,7 +9,7 @@ impl<'a> AppendEvents<'a> {
         Self { event_store }
     }
 
-    pub fn execute(&self, operation: AppendOperation) -> Result<AppendResult, AppendEventsError> {
-        self.event_store.append(operation).map_err(Into::into)
+    pub fn execute(&self, operation: AppendOperation) -> Result<AppendResult, PortError> {
+        self.event_store.append(operation)
     }
 }

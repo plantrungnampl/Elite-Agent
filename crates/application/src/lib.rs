@@ -9,9 +9,10 @@ pub use append_events::AppendEvents;
 pub use dto::{
     LocalDiagnosticDto, RecoveryActionDto, StartupIssueDto, StartupStateDto, StartupStatusDto,
 };
-pub use error::{AppendEventsError, PortError, Retryability, SafeErrorClassification};
+pub use error::{PortError, Retryability, SafeErrorClassification};
 pub use ports::{
     AppendOperation, AppendResult, ArtifactContent, ArtifactJournal, ArtifactJournalEntry,
-    ArtifactJournalStatus, ArtifactJournalTransition, ArtifactRef, ArtifactStore, Clock,
-    EventStore, IdGenerator, NewArtifact, NewEvent, ProjectionChange,
+    ArtifactJournalStatus, ArtifactJournalTransition, ArtifactRef, ArtifactStore,
+    ArtifactWriteReservation, Clock, EventStore, IdGenerator, NewArtifact, NewEvent,
+    ProjectionChange, ReservedArtifact,
 };

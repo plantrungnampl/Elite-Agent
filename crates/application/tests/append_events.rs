@@ -1,11 +1,10 @@
 use std::sync::Mutex;
 
 use local_agent_terminal_application::{
-    AppendEvents, AppendEventsError, AppendOperation, AppendResult, ArtifactContent,
-    ArtifactJournal, ArtifactJournalEntry, ArtifactJournalTransition, ArtifactRef, ArtifactStore,
-    Clock, EventStore, IdGenerator, LocalDiagnosticDto, NewArtifact, NewEvent, PortError,
-    ProjectionChange, RecoveryActionDto, Retryability, SafeErrorClassification, StartupIssueDto,
-    StartupStateDto, StartupStatusDto,
+    AppendEvents, AppendOperation, AppendResult, ArtifactContent, ArtifactJournal,
+    ArtifactJournalEntry, ArtifactJournalTransition, ArtifactRef, ArtifactStore,
+    ArtifactWriteReservation, Clock, EventStore, IdGenerator, NewArtifact, NewEvent, PortError,
+    ProjectionChange, ReservedArtifact, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     ActorId, EventId, FencingToken, OperationState, Phase, Sequence, StreamId, TaskId,
@@ -40,6 +39,29 @@ impl EventStore for RecordingEventStore {
             .expect("result lock")
             .take()
             .expect("one configured result")
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecordingArtifactJournal {
+    reservations: Mutex<Vec<ArtifactWriteReservation>>,
+}
+
+impl ArtifactJournal for RecordingArtifactJournal {
+    fn reserve(&self, reservation: ArtifactWriteReservation) -> Result<(), PortError> {
+        self.reservations
+            .lock()
+            .expect("reservations lock")
+            .push(reservation);
+        Ok(())
+    }
+
+    fn transition(&self, _transition: ArtifactJournalTransition) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    fn incomplete(&self) -> Result<Vec<ArtifactJournalEntry>, PortError> {
+        Ok(Vec::new())
     }
 }
 
@@ -119,10 +141,7 @@ fn version_conflict_is_typed_non_retryable_and_safe_to_show() {
         .execute(sample_operation(expected))
         .unwrap_err();
 
-    assert_eq!(
-        error,
-        AppendEventsError::VersionConflict { expected, actual }
-    );
+    assert_eq!(error, PortError::VersionConflict { expected, actual });
     assert_eq!(error.retryability(), Retryability::NonRetryable);
     assert_eq!(
         error.safe_classification(),
@@ -165,26 +184,38 @@ fn every_port_error_has_explicit_retryability_and_safe_classification() {
 }
 
 #[test]
-fn startup_dtos_separate_safe_status_from_local_diagnostics() {
-    let status = StartupStatusDto {
-        state: StartupStateDto::RecoverableFailure,
-        issues: vec![StartupIssueDto {
-            code: "artifact_root_unavailable".to_owned(),
-            message: "The artifact store is unavailable.".to_owned(),
-            recovery_actions: vec![RecoveryActionDto {
-                code: "retry_startup_validation".to_owned(),
-                label: "Retry validation".to_owned(),
-            }],
-        }],
-    };
-    let diagnostic = LocalDiagnosticDto {
-        code: "artifact_root_unavailable".to_owned(),
-        detail: "Access denied while opening the configured artifact root.".to_owned(),
+fn artifact_reservation_carries_metadata_and_intent_in_one_journal_call() {
+    let journal = RecordingArtifactJournal::default();
+    let reservation = ArtifactWriteReservation {
+        operation_id: "artifact-operation-1".to_owned(),
+        artifact: ReservedArtifact {
+            artifact_id: "artifact-1".to_owned(),
+            task_id: Some(TaskId::new("task-1").unwrap()),
+            project_id: "project-1".to_owned(),
+            artifact_type: "approved_plan".to_owned(),
+            logical_path: "plans/approved-plan.md".to_owned(),
+            content_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_owned(),
+            storage_key:
+                "objects/00/0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_owned(),
+            size_bytes: 12,
+            mime_type: Some("text/markdown".to_owned()),
+            created_by_type: "core".to_owned(),
+            created_by_id: "core".to_owned(),
+            created_at: "2026-07-24T12:00:00Z".to_owned(),
+            supersedes: Some("artifact-0".to_owned()),
+        },
+        temp_name: "artifact-operation-1.tmp".to_owned(),
+        created_at: "2026-07-24T12:00:00Z".to_owned(),
     };
 
-    assert_eq!(status.state, StartupStateDto::RecoverableFailure);
-    assert_eq!(status.issues[0].code, diagnostic.code);
-    assert_ne!(status.issues[0].message, diagnostic.detail);
+    journal.reserve(reservation.clone()).unwrap();
+
+    assert_eq!(
+        journal.reservations.lock().unwrap().as_slice(),
+        [reservation]
+    );
 }
 
 #[test]
@@ -228,12 +259,12 @@ fn artifact_port_contracts_are_object_safe(
     artifact_journal: &dyn ArtifactJournal,
     artifact: NewArtifact,
     reference: &ArtifactRef,
-    journal_entry: ArtifactJournalEntry,
+    reservation: ArtifactWriteReservation,
     transition: ArtifactJournalTransition,
 ) {
     let _: Result<ArtifactRef, PortError> = artifact_store.put(artifact);
     let _: Result<ArtifactContent, PortError> = artifact_store.read(reference);
-    let _: Result<(), PortError> = artifact_journal.record_intent(journal_entry);
+    let _: Result<(), PortError> = artifact_journal.reserve(reservation);
     let _: Result<(), PortError> = artifact_journal.transition(transition);
     let _: Result<Vec<ArtifactJournalEntry>, PortError> = artifact_journal.incomplete();
 }
