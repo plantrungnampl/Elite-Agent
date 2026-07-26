@@ -1,18 +1,22 @@
+use std::fs;
 use std::path::PathBuf;
 
 use local_agent_terminal_application::{
     DiagnosticSeverityDto, LocalDiagnosticDto, ObservationClassDto, PortError, RecoveryActionDto,
     SafeErrorClassification, StartupIssueDto, StartupStateDto, StartupStatusDto, TrustLabelDto,
 };
+use local_agent_terminal_repository_git::GitRepositoryGateway;
 use local_agent_terminal_storage_files::{
     reconcile_artifacts, ContentAddressedArtifactStore, RecoveryLock,
 };
 use local_agent_terminal_storage_sqlite::{DatabaseHealth, DatabaseIssue, OpenError, SqliteStore};
 
 use crate::logging::LocalLog;
+use crate::workspace_runtime::{reconcile_startup, WorkspaceRuntime};
 
 pub struct StartupConfig {
     pub app_data_dir: PathBuf,
+    pub trusted_workspace_root: PathBuf,
     pub secret_values: Vec<String>,
 }
 
@@ -20,12 +24,7 @@ pub struct Bootstrap {
     config: Option<StartupConfig>,
     status: StartupStatusDto,
     diagnostics: Vec<LocalDiagnosticDto>,
-    _runtime: Option<Runtime>,
-}
-
-struct Runtime {
-    _database: SqliteStore,
-    _artifacts: ContentAddressedArtifactStore,
+    runtime: Option<WorkspaceRuntime>,
 }
 
 struct StartupFailure {
@@ -52,7 +51,7 @@ impl Bootstrap {
                 issues: Vec::new(),
             },
             diagnostics: Vec::new(),
-            _runtime: None,
+            runtime: None,
         };
         bootstrap.retry_startup_validation();
         bootstrap
@@ -94,6 +93,7 @@ impl Bootstrap {
         let Some(config) = self.config.as_ref() else {
             return &self.status;
         };
+        self.runtime = None;
         let mut log = LocalLog::new(config.secret_values.clone());
         match start(config, &mut log) {
             Ok(runtime) => {
@@ -108,7 +108,7 @@ impl Bootstrap {
                     state: StartupStateDto::Ready,
                     issues: Vec::new(),
                 };
-                self._runtime = Some(runtime);
+                self.runtime = Some(runtime);
             }
             Err(failure) => {
                 log.push(record(
@@ -126,7 +126,7 @@ impl Bootstrap {
                         recovery_actions: recovery_actions(failure.recovery),
                     }],
                 };
-                self._runtime = None;
+                self.runtime = None;
             }
         }
         self.diagnostics = log.into_records();
@@ -135,6 +135,10 @@ impl Bootstrap {
 
     pub fn local_diagnostics(&self) -> &[LocalDiagnosticDto] {
         &self.diagnostics
+    }
+
+    pub fn workspace_runtime(&self) -> Option<&WorkspaceRuntime> {
+        self.runtime.as_ref()
     }
 
     fn failed(failure: StartupFailure) -> Self {
@@ -157,27 +161,27 @@ impl Bootstrap {
                 }],
             },
             diagnostics: log.into_records(),
-            _runtime: None,
+            runtime: None,
         }
     }
 }
 
-fn start(config: &StartupConfig, log: &mut LocalLog) -> Result<Runtime, StartupFailure> {
+fn start(config: &StartupConfig, log: &mut LocalLog) -> Result<WorkspaceRuntime, StartupFailure> {
     let _recovery_lock =
         RecoveryLock::acquire(&config.app_data_dir).map_err(recovery_lock_failure)?;
-    log.push(record(
-        "startup.app_directories.validated",
-        "bootstrap",
-        DiagnosticSeverityDto::Info,
-        None,
-        "Required application directories are available.",
-    ));
     log.push(record(
         "startup.recovery_lock.acquired",
         "bootstrap",
         DiagnosticSeverityDto::Info,
         None,
         "Exclusive startup recovery lock acquired.",
+    ));
+    log.push(record(
+        "startup.app_directories.validated",
+        "bootstrap",
+        DiagnosticSeverityDto::Info,
+        None,
+        "Required application directories are available.",
     ));
 
     let database = SqliteStore::open(config.app_data_dir.join("state.sqlite3"))
@@ -220,10 +224,71 @@ fn start(config: &StartupConfig, log: &mut LocalLog) -> Result<Runtime, StartupF
         ),
     ));
 
-    Ok(Runtime {
-        _database: database,
-        _artifacts: artifacts,
-    })
+    fs::create_dir_all(&config.trusted_workspace_root).map_err(|_| StartupFailure {
+        state: StartupStateDto::RecoverableFailure,
+        code: "startup.workspace_root_unavailable",
+        message: "The managed workspace root could not be prepared.",
+        category: "unavailable",
+        detail: "Managed workspace directory creation failed.".to_owned(),
+        recovery: RecoveryMode::Retry,
+    })?;
+    let artifact_root = config.app_data_dir.join("artifacts");
+    let repositories = GitRepositoryGateway::open(&config.trusted_workspace_root, &[artifact_root])
+        .map_err(workspace_reconciliation_failure)?;
+    let workspace_report =
+        reconcile_startup(&database, &repositories).map_err(workspace_reconciliation_failure)?;
+    log.push(record(
+        "startup.leases.fenced",
+        "storage-sqlite",
+        DiagnosticSeverityDto::Info,
+        None,
+        &format!(
+            "Stale executor lease fencing completed: fenced={}.",
+            workspace_report.fenced_leases
+        ),
+    ));
+    log.push(record(
+        "startup.repositories.reconciled",
+        "repository-git",
+        DiagnosticSeverityDto::Info,
+        None,
+        &format!(
+            "Managed repository reconciliation completed: scanned={}.",
+            workspace_report.repositories_scanned
+        ),
+    ));
+    log.push(record(
+        "startup.intents.reconciled",
+        "bootstrap",
+        DiagnosticSeverityDto::Info,
+        None,
+        &format!(
+            "Operation intent reconciliation completed: candidates={}.",
+            workspace_report.recovery_candidates.len()
+        ),
+    ));
+
+    Ok(WorkspaceRuntime::new(
+        database,
+        artifacts,
+        repositories,
+        workspace_report.recovery_candidates,
+    ))
+}
+
+fn workspace_reconciliation_failure(error: PortError) -> StartupFailure {
+    StartupFailure {
+        state: StartupStateDto::Indeterminate,
+        code: "startup.workspace_reconciliation_failed",
+        message: "Workspace recovery could not determine a safe startup state.",
+        category: classification_name(error.safe_classification()),
+        detail: format!(
+            "Workspace reconciliation failed ({:?}, {:?}).",
+            error.safe_classification(),
+            error.retryability()
+        ),
+        recovery: RecoveryMode::Retry,
+    }
 }
 
 fn recovery_lock_failure(error: PortError) -> StartupFailure {

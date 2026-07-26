@@ -67,6 +67,7 @@ fn get_local_diagnostics(state: tauri::State<'_, ManagedBootstrap>) -> Vec<Local
 
 fn config(app_data_dir: PathBuf) -> StartupConfig {
     StartupConfig {
+        trusted_workspace_root: app_data_dir.join("workspaces"),
         app_data_dir,
         secret_values: Vec::new(),
     }

@@ -216,6 +216,23 @@ pub struct DiscardWorktree {
     pub base_commit: GitObjectId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectWorktree {
+    pub repository: RepositoryLocator,
+    pub managed_path: ManagedWorktreePath,
+    pub task_id: TaskId,
+    pub worktree_id: WorktreeId,
+    pub branch: TaskBranch,
+    pub base_commit: GitObjectId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeObservation {
+    Exact(Box<WorktreeSnapshot>),
+    AuthoritativelyAbsent,
+    Conflict(crate::RecoveryReason),
+}
+
 pub trait RepositoryGateway: Send + Sync {
     fn inspect(&self, request: InspectRepository) -> Result<RepositorySnapshot, PortError>;
     fn create_worktree(&self, request: CreateWorktree) -> Result<WorktreeSnapshot, PortError>;
@@ -224,6 +241,15 @@ pub trait RepositoryGateway: Send + Sync {
         repository: &RepositoryLocator,
     ) -> Result<Vec<WorktreeSnapshot>, PortError>;
     fn discard_worktree(&self, request: DiscardWorktree) -> Result<(), PortError>;
+    fn inspect_worktree(
+        &self,
+        _request: InspectWorktree,
+    ) -> Result<WorktreeObservation, PortError> {
+        Err(PortError::failure(
+            SafeErrorClassification::Unavailable,
+            Retryability::NonRetryable,
+        ))
+    }
 }
 
 pub struct OnboardRepository<'a> {

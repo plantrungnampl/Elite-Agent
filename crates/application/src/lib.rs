@@ -28,16 +28,17 @@ pub use ports::{
     WorkspaceMutationStore,
 };
 pub use repository::{
-    CreateWorktree, DiscardWorktree, ExpectedPresence, InspectRepository, ManagedWorktreePath,
-    ObjectFormat, OnboardRepository, OriginalCheckoutState, RepositoryGateway, RepositoryHazard,
-    RepositoryHazardReason, RepositoryHealth, RepositoryLocator, RepositorySnapshot,
-    WorktreeSnapshot, WorktreeState,
+    CreateWorktree, DiscardWorktree, ExpectedPresence, InspectRepository, InspectWorktree,
+    ManagedWorktreePath, ObjectFormat, OnboardRepository, OriginalCheckoutState, RepositoryGateway,
+    RepositoryHazard, RepositoryHazardReason, RepositoryHealth, RepositoryLocator,
+    RepositorySnapshot, WorktreeObservation, WorktreeSnapshot, WorktreeState,
 };
 pub use workspace::{
     ArtifactRootMode, GetWorkspaceDashboard, IdempotencyClass, IntentTransition, NewProject,
     NewTask, ObserveWorkspaceMutation, OperationIntent, OperationIntentStatus,
     PrepareTaskWorkspace, ProjectSettings, ProjectSnapshot, ReconcileWorkspaces, RecoveryAction,
-    RecoveryCandidate, RecoveryEvidence, RecoveryReason, RepositoryInspectionRecord, RiskLevel,
-    TaskLeaseState, TaskSnapshot, WorkspaceMutationRequest, WorkspaceMutationResult,
-    WorkspaceStateStore, WorktreeIntent, WorktreeMatch,
+    RecoveryCandidate, RecoveryEvidence, RecoveryProject, RecoveryReason,
+    RepositoryInspectionRecord, RiskLevel, StartedRecovery, TaskLeaseState, TaskSnapshot,
+    WorkspaceMutationRequest, WorkspaceMutationResult, WorkspaceRecoveryStore, WorkspaceStateStore,
+    WorktreeIntent, WorktreeMatch,
 };

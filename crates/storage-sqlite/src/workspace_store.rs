@@ -4,8 +4,9 @@ use local_agent_terminal_application::{
     Clock, ExpectedPresence, IdempotencyClass, IntentTransition, NewProject, NewTask,
     OperationIntent, OperationIntentStatus, PortError, ProjectSnapshot, RecoveryAction,
     RecoveryCandidate, RecoveryEvidence, RecoveryReason, RepositoryInspectionRecord, Retryability,
-    SafeErrorClassification, TaskLeaseState, TaskSnapshot, WorkspaceMutationRequest,
-    WorkspaceMutationResult, WorkspaceMutationStore, WorkspaceStateStore, WorktreeIntent,
+    SafeErrorClassification, StartedRecovery, TaskLeaseState, TaskSnapshot,
+    WorkspaceMutationRequest, WorkspaceMutationResult, WorkspaceMutationStore,
+    WorkspaceRecoveryStore, WorkspaceStateStore, WorktreeIntent,
 };
 use local_agent_terminal_domain::{
     reduce, ArtifactId, Condition, FencingToken, GitObjectId, GuardEvaluations, OperationState,
@@ -383,6 +384,68 @@ impl WorkspaceStateStore for SqliteStore {
         project: &ProjectId,
     ) -> Result<local_agent_terminal_application::WorkspaceDashboardDto, PortError> {
         self.load_dashboard(project)
+    }
+}
+
+impl WorkspaceRecoveryStore for SqliteStore {
+    fn recovery_projects(
+        &self,
+    ) -> Result<Vec<local_agent_terminal_application::RecoveryProject>, PortError> {
+        self.load_recovery_projects()
+    }
+
+    fn started_recoveries(&self) -> Result<Vec<StartedRecovery>, PortError> {
+        self.started_operations()?
+            .into_iter()
+            .map(|operation| {
+                let evidence = RecoveryEvidence {
+                    summary: "Started operation requires authoritative reconciliation".to_owned(),
+                    artifact_id: Some(operation.canonical_request_artifact_id.clone()),
+                };
+                let candidate = if operation.idempotency_class == IdempotencyClass::NonRepeatable {
+                    RecoveryCandidate::indeterminate(&operation, evidence)
+                } else if operation.operation_kind != "worktree.create" {
+                    RecoveryCandidate {
+                        intent_id: Some(operation.id.clone()),
+                        worktree_id: None,
+                        reason: RecoveryReason::UnknownOperation,
+                        evidence,
+                        actions: vec![
+                            RecoveryAction::InspectEvidence,
+                            RecoveryAction::PreserveTask,
+                            RecoveryAction::CancelTask,
+                        ],
+                        expected_worktree: None,
+                    }
+                } else {
+                    let expected = self.load_worktree_intent(&operation)?;
+                    RecoveryCandidate {
+                        intent_id: Some(operation.id.clone()),
+                        worktree_id: Some(expected.worktree_id.clone()),
+                        reason: RecoveryReason::OutcomeIndeterminate,
+                        evidence,
+                        actions: vec![
+                            RecoveryAction::InspectEvidence,
+                            RecoveryAction::PreserveTask,
+                        ],
+                        expected_worktree: Some(expected),
+                    }
+                };
+                Ok(StartedRecovery {
+                    operation,
+                    candidate,
+                })
+            })
+            .collect()
+    }
+
+    fn persisted_recovery_candidates(&self) -> Result<Vec<RecoveryCandidate>, PortError> {
+        let projects = self.load_recovery_projects()?;
+        let mut candidates = Vec::new();
+        for project in projects {
+            candidates.extend(self.load_dashboard(&project.project_id)?.recovery);
+        }
+        Ok(candidates)
     }
 }
 

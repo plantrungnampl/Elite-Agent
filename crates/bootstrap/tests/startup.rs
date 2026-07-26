@@ -45,11 +45,14 @@ fn first_startup_creates_and_validates_required_local_state() {
     assert_eq!(
         codes,
         [
-            "startup.app_directories.validated",
             "startup.recovery_lock.acquired",
+            "startup.app_directories.validated",
             "startup.database.validated",
             "startup.artifacts.validated",
             "startup.artifacts.reconciled",
+            "startup.leases.fenced",
+            "startup.repositories.reconciled",
+            "startup.intents.reconciled",
             "startup.ready",
         ]
     );
@@ -115,6 +118,7 @@ fn schema_failure_has_stable_safe_recovery_and_sanitized_diagnostics() {
         .unwrap();
 
     let bootstrap = Bootstrap::new(StartupConfig {
+        trusted_workspace_root: app_data.join("workspaces"),
         app_data_dir: app_data,
         secret_values: vec!["sha256:".to_owned()],
     });
@@ -333,6 +337,7 @@ fn desktop_depends_on_bootstrap_instead_of_concrete_storage_adapters() {
 fn config(app_data_dir: &Path) -> StartupConfig {
     StartupConfig {
         app_data_dir: app_data_dir.to_owned(),
+        trusted_workspace_root: app_data_dir.join("workspaces"),
         secret_values: Vec::new(),
     }
 }

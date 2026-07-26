@@ -118,6 +118,19 @@ pub(crate) fn managed_path(
     gateway: &GitRepositoryGateway,
     path: &ManagedWorktreePath,
 ) -> Result<PathBuf, PortError> {
+    let target = recovery_path(gateway, path)?;
+    match fs::symlink_metadata(&target) {
+        Ok(_) => return Err(conflict()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(unavailable()),
+    }
+    Ok(target)
+}
+
+pub(crate) fn recovery_path(
+    gateway: &GitRepositoryGateway,
+    path: &ManagedWorktreePath,
+) -> Result<PathBuf, PortError> {
     if path.trusted_root_id != gateway.trusted_root_id
         || path.relative_leaf.is_absolute()
         || path.relative_leaf.as_os_str().is_empty()
@@ -137,11 +150,6 @@ pub(crate) fn managed_path(
                 return Err(invalid());
             }
         }
-    }
-    match fs::symlink_metadata(&target) {
-        Ok(_) => return Err(conflict()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err(unavailable()),
     }
     if is_excluded(gateway, &target) {
         return Err(conflict());

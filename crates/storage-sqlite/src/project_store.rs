@@ -1,7 +1,7 @@
 use local_agent_terminal_application::{
-    ArtifactRootMode, NewProject, PortError, ProjectSettings, ProjectSnapshot, RepositoryHazard,
-    RepositoryHazardReason, RepositoryHealth, RepositoryInspectionRecord, RepositorySnapshot,
-    Retryability, SafeErrorClassification,
+    ArtifactRootMode, NewProject, PortError, ProjectSettings, ProjectSnapshot, RecoveryProject,
+    RepositoryHazard, RepositoryHazardReason, RepositoryHealth, RepositoryInspectionRecord,
+    RepositorySnapshot, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     ArtifactId, GitObjectId, ProjectId, RepositoryId, TaskBranch, WorkspaceFingerprint,
@@ -13,6 +13,59 @@ use crate::event_store::{open_error_to_port, sqlite_error_to_port};
 use crate::SqliteStore;
 
 impl SqliteStore {
+    pub(crate) fn load_recovery_projects(&self) -> Result<Vec<RecoveryProject>, PortError> {
+        let connection = self.connection().map_err(open_error_to_port)?;
+        let projects = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, repository_path, repository_identity
+                     FROM projects ORDER BY created_at, id",
+                )
+                .map_err(sqlite_error_to_port)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(sqlite_error_to_port)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_error_to_port)?;
+            rows
+        };
+        let mut recovery = Vec::with_capacity(projects.len());
+        for (project_id, repository_path, repository_identity) in projects {
+            let project_id = ProjectId::new(project_id).map_err(|_| integrity_failure())?;
+            let payload: Option<String> = connection
+                .query_row(
+                    "SELECT payload_json FROM events
+                     WHERE stream_id = ?1 AND event_type = 'repository.inspected'
+                     ORDER BY sequence DESC LIMIT 1",
+                    [project_stream_id(&project_id)],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error_to_port)?;
+            let Some(payload) = payload else {
+                continue;
+            };
+            let repository = parse_repository_snapshot(
+                &serde_json::from_str(&payload).map_err(|_| integrity_failure())?,
+            )?;
+            if repository.stable_identity != repository_identity {
+                return Err(integrity_failure());
+            }
+            recovery.push(RecoveryProject {
+                project_id,
+                repository_path,
+                repository,
+            });
+        }
+        Ok(recovery)
+    }
+
     pub(crate) fn insert_project(&self, project: NewProject) -> Result<ProjectSnapshot, PortError> {
         validate_new_project(&project)?;
         let mut connection = self.connection().map_err(open_error_to_port)?;

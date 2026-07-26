@@ -321,6 +321,25 @@ pub struct RecoveryCandidate {
     pub expected_worktree: Option<WorktreeIntent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryProject {
+    pub project_id: ProjectId,
+    pub repository_path: String,
+    pub repository: RepositorySnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartedRecovery {
+    pub operation: OperationIntent,
+    pub candidate: RecoveryCandidate,
+}
+
+pub trait WorkspaceRecoveryStore: Send + Sync {
+    fn recovery_projects(&self) -> Result<Vec<RecoveryProject>, PortError>;
+    fn started_recoveries(&self) -> Result<Vec<StartedRecovery>, PortError>;
+    fn persisted_recovery_candidates(&self) -> Result<Vec<RecoveryCandidate>, PortError>;
+}
+
 impl RecoveryCandidate {
     pub fn indeterminate(intent: &OperationIntent, evidence: RecoveryEvidence) -> Self {
         let (reason, actions) = match intent.idempotency_class {

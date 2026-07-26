@@ -3,8 +3,8 @@ use std::path::Path;
 
 use git2::{Oid, ReferenceType, Repository, WorktreePruneOptions};
 use local_agent_terminal_application::{
-    CreateWorktree, DiscardWorktree, ExpectedPresence, OriginalCheckoutState, PortError,
-    WorktreeSnapshot, WorktreeState,
+    CreateWorktree, DiscardWorktree, ExpectedPresence, InspectWorktree, OriginalCheckoutState,
+    PortError, RecoveryReason, WorktreeObservation, WorktreeSnapshot, WorktreeState,
 };
 use local_agent_terminal_domain::{GitObjectId, TaskBranch, TaskId, WorktreeId};
 
@@ -289,6 +289,101 @@ pub(crate) fn discard(
     Ok(())
 }
 
+pub(crate) fn inspect_expected(
+    gateway: &GitRepositoryGateway,
+    request: InspectWorktree,
+) -> Result<WorktreeObservation, PortError> {
+    let target = paths::recovery_path(gateway, &request.managed_path)?;
+    let (repository, config) = paths::open_for_locator(&request.repository)?;
+    let repository_snapshot = inspect::inspect_opened(&repository, &config, &request.repository)?;
+    if !repository_snapshot.hazards.is_empty()
+        || paths_overlap(&target, &request.repository.canonical_workdir)
+        || paths_overlap(&target, &request.repository.canonical_common_dir)
+    {
+        return Ok(WorktreeObservation::Conflict(
+            RecoveryReason::RepositoryMismatch,
+        ));
+    }
+    let worktree = optional_git(repository.find_worktree(request.worktree_id.as_str()))?;
+    let reference_name = format!("refs/heads/{}", request.branch.as_str());
+    let reference = optional_git(repository.find_reference(&reference_name))?;
+    let target_exists = match fs::symlink_metadata(&target) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return Err(paths::unavailable()),
+    };
+    if worktree.is_none() && reference.is_none() && !target_exists {
+        return Ok(WorktreeObservation::AuthoritativelyAbsent);
+    }
+    let (Some(worktree), Some(reference)) = (worktree, reference) else {
+        return Ok(WorktreeObservation::Conflict(
+            RecoveryReason::PresenceMismatch,
+        ));
+    };
+    if !target_exists
+        || reference.kind() != Some(ReferenceType::Direct)
+        || reference.target() != Some(parse_oid(&repository, &request.base_commit)?)
+        || worktree.validate().is_err()
+    {
+        return Ok(WorktreeObservation::Conflict(
+            RecoveryReason::PresenceMismatch,
+        ));
+    }
+    let recorded_path = match paths::canonical_directory(worktree.path()) {
+        Ok(path) => path,
+        Err(_) => return Ok(WorktreeObservation::Conflict(RecoveryReason::PathMismatch)),
+    };
+    let target = match paths::validate_existing_target(gateway, &target) {
+        Ok(path) => path,
+        Err(_) => return Ok(WorktreeObservation::Conflict(RecoveryReason::PathMismatch)),
+    };
+    if recorded_path != target {
+        return Ok(WorktreeObservation::Conflict(RecoveryReason::PathMismatch));
+    }
+    let target_repository = match paths::open_repository(&target) {
+        Ok(repository) => repository,
+        Err(_) => {
+            return Ok(WorktreeObservation::Conflict(
+                RecoveryReason::PresenceMismatch,
+            ))
+        }
+    };
+    if paths::canonical_directory(target_repository.commondir())?
+        != request.repository.canonical_common_dir
+    {
+        return Ok(WorktreeObservation::Conflict(
+            RecoveryReason::RepositoryMismatch,
+        ));
+    }
+    let head = target_repository.head().map_err(paths::map_git_error)?;
+    if head.target() != Some(parse_oid(&repository, &request.base_commit)?)
+        || head.shorthand().ok() != Some(request.branch.as_str())
+    {
+        return Ok(WorktreeObservation::Conflict(
+            RecoveryReason::BranchMismatch,
+        ));
+    }
+    let target_config =
+        git2::Config::open(&repository.path().join("config")).map_err(|_| paths::unavailable())?;
+    target_repository
+        .set_config(&target_config)
+        .map_err(|_| paths::unavailable())?;
+    let snapshot = inspect::worktree_snapshot(
+        &target_repository,
+        &request.repository,
+        inspect::WorktreeSnapshotInput {
+            worktree_id: request.worktree_id,
+            task_id: request.task_id,
+            branch: request.branch,
+            base_commit: request.base_commit,
+            target_path_display: request.managed_path.redacted_display,
+            state: WorktreeState::Present,
+            expected_presence: ExpectedPresence::Present,
+        },
+    )?;
+    Ok(WorktreeObservation::Exact(Box::new(snapshot)))
+}
+
 fn parse_oid(repository: &Repository, value: &GitObjectId) -> Result<Oid, PortError> {
     Oid::from_str_ext(value.as_str(), repository.object_format()).map_err(paths::map_git_error)
 }
@@ -324,4 +419,12 @@ fn reject_reparse_root(path: &Path) -> Result<(), PortError> {
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     paths::is_within(left, right) || paths::is_within(right, left)
+}
+
+fn optional_git<T>(result: Result<T, git2::Error>) -> Result<Option<T>, PortError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(paths::map_git_error(error)),
+    }
 }

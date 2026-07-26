@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use local_agent_terminal_application::{
-    CreateWorktree, DiscardWorktree, InspectRepository, PortError, RepositoryGateway,
-    RepositoryLocator, RepositorySnapshot, WorktreeSnapshot,
+    CreateWorktree, DiscardWorktree, InspectRepository, InspectWorktree, PortError,
+    RepositoryGateway, RepositoryLocator, RepositorySnapshot, WorktreeObservation,
+    WorktreeSnapshot,
 };
 
 pub struct GitRepositoryGateway {
@@ -61,5 +62,10 @@ impl RepositoryGateway for GitRepositoryGateway {
     fn discard_worktree(&self, request: DiscardWorktree) -> Result<(), PortError> {
         let _guard = self.calls.lock().map_err(|_| paths::internal())?;
         worktree::discard(self, request)
+    }
+
+    fn inspect_worktree(&self, request: InspectWorktree) -> Result<WorktreeObservation, PortError> {
+        let _guard = self.calls.lock().map_err(|_| paths::internal())?;
+        worktree::inspect_expected(self, request)
     }
 }

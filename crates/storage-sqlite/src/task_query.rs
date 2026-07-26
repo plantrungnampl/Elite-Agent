@@ -139,7 +139,9 @@ impl SqliteStore {
             OperationIntentStatus::Succeeded => {
                 local_agent_terminal_application::WorktreeState::Present
             }
-            OperationIntentStatus::Failed | OperationIntentStatus::Cancelled => {
+            OperationIntentStatus::Failed
+            | OperationIntentStatus::Interrupted
+            | OperationIntentStatus::Cancelled => {
                 local_agent_terminal_application::WorktreeState::Missing
             }
             _ => local_agent_terminal_application::WorktreeState::Planned,
@@ -166,7 +168,7 @@ impl SqliteStore {
                         canonical_request_artifact_id, operation_digest, status,
                         executor_fencing_token, attempt_count, created_at, updated_at
                  FROM operation_intents
-                 WHERE task_id = ?1 AND status IN ('started', 'indeterminate')
+                 WHERE task_id = ?1 AND status IN ('started', 'interrupted', 'indeterminate')
                  ORDER BY created_at, id",
             )
             .map_err(sqlite_error_to_port)?;
@@ -188,6 +190,23 @@ impl SqliteStore {
                 summary: "Persisted operation requires recovery review".to_owned(),
                 artifact_id: Some(operation.canonical_request_artifact_id.clone()),
             };
+            if operation.status == OperationIntentStatus::Interrupted {
+                let expected = self.load_worktree_intent(&operation)?;
+                candidates.push(RecoveryCandidate {
+                    intent_id: Some(operation.id),
+                    worktree_id: Some(expected.worktree_id.clone()),
+                    reason: RecoveryReason::AuthoritativeAbsence,
+                    evidence,
+                    actions: vec![
+                        RecoveryAction::InspectEvidence,
+                        RecoveryAction::RetryAfterAuthoritativeAbsence,
+                        RecoveryAction::PreserveTask,
+                        RecoveryAction::CancelTask,
+                    ],
+                    expected_worktree: Some(expected),
+                });
+                continue;
+            }
             if operation.status == OperationIntentStatus::Indeterminate {
                 if operation.operation_kind != "worktree.create" {
                     candidates.push(RecoveryCandidate {
