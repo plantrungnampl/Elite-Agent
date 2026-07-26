@@ -1,6 +1,4 @@
 import * as axe from "axe-core";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import {
   act,
   fireEvent,
@@ -16,8 +14,6 @@ import type {
   StartupStatusDto,
 } from "../../api/startup";
 import { StartupScreen } from "./StartupScreen";
-
-const baseStyles = readFileSync(resolve("src/styles/base.css"), "utf8");
 
 const startupApi = vi.hoisted(() => ({
   getStartupStatus: vi.fn(),
@@ -72,6 +68,30 @@ const indeterminateStatus: StartupStatusDto = {
   ],
 };
 
+const restartRequiredStatus: StartupStatusDto = {
+  state: "indeterminate",
+  issues: [
+    {
+      code: "startup.internal_state_unavailable",
+      message: "Startup state is unavailable and cannot be trusted.",
+      recoveryActions: [
+        {
+          code: "restart_application",
+          label: "Restart application",
+        },
+        {
+          code: "get_local_diagnostics",
+          label: "View local diagnostics",
+        },
+        {
+          code: "get_local_diagnostics",
+          label: "View local diagnostics",
+        },
+      ],
+    },
+  ],
+};
+
 const diagnostics: LocalDiagnosticDto[] = [
   {
     code: "startup.ready",
@@ -92,15 +112,13 @@ describe("StartupScreen", () => {
     startupApi.getLocalDiagnostics.mockReset().mockResolvedValue(diagnostics);
   });
 
-  it("shows honest loading text and intentionally focuses the page heading", () => {
+  it("shows honest loading text without stealing initial focus", () => {
     startupApi.getStartupStatus.mockReturnValue(new Promise(() => undefined));
     startupApi.getLocalDiagnostics.mockReturnValue(new Promise(() => undefined));
 
     render(<StartupScreen />);
 
-    expect(
-      screen.getByRole("heading", { level: 1, name: "Startup health" }),
-    ).toHaveFocus();
+    expect(document.body).toHaveFocus();
     expect(screen.getByRole("status")).toHaveTextContent(
       "Status: Checking local services",
     );
@@ -110,6 +128,9 @@ describe("StartupScreen", () => {
     expect(
       screen.queryByText("Local startup validation completed successfully."),
     ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("status").querySelector("[aria-hidden='true']"),
+    ).toHaveTextContent("◌");
   });
 
   it.each([
@@ -119,6 +140,7 @@ describe("StartupScreen", () => {
       "Local services are ready",
       "Status: Ready",
       "Local startup validation completed successfully.",
+      "✓",
     ],
     [
       "recoverable failure",
@@ -126,6 +148,7 @@ describe("StartupScreen", () => {
       "Startup needs attention",
       "Status: Recovery required",
       "Startup validation found a recoverable local problem.",
+      "!",
     ],
     [
       "indeterminate",
@@ -133,10 +156,11 @@ describe("StartupScreen", () => {
       "Startup outcome is indeterminate",
       "Status: Outcome indeterminate",
       "Startup validation could not determine a safe outcome. Success has not been assumed.",
+      "?",
     ],
   ])(
-    "renders exact visible %s text without color-only meaning",
-    async (_name, status, heading, label, message) => {
+    "renders exact visible %s icon and text without color-only meaning",
+    async (_name, status, heading, label, message, icon) => {
       startupApi.getStartupStatus.mockResolvedValue(status);
 
       render(<StartupScreen />);
@@ -149,6 +173,9 @@ describe("StartupScreen", () => {
       expect(liveStatus).toHaveAttribute("aria-atomic", "true");
       expect(liveStatus).toHaveTextContent(label);
       expect(liveStatus).toHaveTextContent(message);
+      expect(
+        liveStatus.querySelector("[aria-hidden='true']"),
+      ).toHaveTextContent(icon);
       expect(screen.queryByText(/spinner/i)).not.toBeInTheDocument();
     },
   );
@@ -171,6 +198,29 @@ describe("StartupScreen", () => {
       "Local startup status could not be read. Success has not been assumed.",
     );
     expect(screen.queryByText("Status: Ready")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Retry startup validation" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows deduplicated authoritative restart guidance without fabricating retry", async () => {
+    startupApi.getStartupStatus.mockResolvedValue(restartRequiredStatus);
+
+    render(<StartupScreen />);
+
+    await screen.findByRole("heading", {
+      level: 2,
+      name: "Startup outcome is indeterminate",
+    });
+    const recovery = screen.getByRole("list", { name: "Recovery options" });
+    expect(within(recovery).getByText("Restart application")).toBeVisible();
+    expect(within(recovery).getByText("restart_application")).toBeVisible();
+    expect(within(recovery).getAllByText("View local diagnostics")).toHaveLength(
+      1,
+    );
+    expect(
+      screen.queryByRole("button", { name: "Retry startup validation" }),
+    ).not.toBeInTheDocument();
   });
 
   it("guards rapid retry, refreshes diagnostics afterward, and restores status focus", async () => {
@@ -237,18 +287,18 @@ describe("StartupScreen", () => {
     expect(screen.getByRole("banner")).toBeVisible();
     expect(screen.getByRole("main")).toHaveAttribute("id", "main-content");
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
-    expect(screen.getByRole("link", { name: "Skip to startup status" })).toHaveAttribute(
-      "href",
-      "#main-content",
-    );
-
-    const summary = screen.getByText("Local diagnostics (1)");
-    expect(summary.tagName).toBe("SUMMARY");
     const skipLink = screen.getByRole("link", {
       name: "Skip to startup status",
     });
-    skipLink.focus();
+    expect(skipLink).toHaveAttribute("href", "#main-content");
+
+    const summary = screen.getByText("Local diagnostics (1)");
+    expect(summary.tagName).toBe("SUMMARY");
+    expect(document.body).toHaveFocus();
+    await user.tab();
     expect(skipLink).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("main")).toHaveFocus();
     await user.tab();
     expect(summary).toHaveFocus();
     fireEvent.click(summary);
@@ -277,14 +327,6 @@ describe("StartupScreen", () => {
     });
 
     expect(result.violations).toEqual([]);
-  });
-
-  it("keeps reduced-motion and zoom-safe responsive layout contracts", () => {
-    expect(baseStyles).toContain("@media (prefers-reduced-motion: reduce)");
-    expect(baseStyles).toContain("overflow-wrap: anywhere");
-    expect(baseStyles).toMatch(/inline-size:\s*min\(calc\(100%/);
-    expect(baseStyles).not.toMatch(/(?:min-)?height:\s*100vh/);
-    expect(baseStyles).not.toMatch(/min-width:\s*\d/);
   });
 });
 

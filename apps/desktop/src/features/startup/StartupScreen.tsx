@@ -16,13 +16,12 @@ export function StartupScreen() {
   const [diagnostics, setDiagnostics] = useState<LocalDiagnosticDto[]>([]);
   const [ipcFailed, setIpcFailed] = useState(false);
   const [retrying, setRetrying] = useState(false);
-  const pageHeading = useRef<HTMLHeadingElement>(null);
+  const mainContent = useRef<HTMLElement>(null);
   const statusHeading = useRef<HTMLHeadingElement>(null);
   const retryInFlight = useRef(false);
 
   useEffect(() => {
     let active = true;
-    pageHeading.current?.focus();
 
     Promise.all([getStartupStatus(), getLocalDiagnostics()])
       .then(([nextStatus, nextDiagnostics]) => {
@@ -45,6 +44,10 @@ export function StartupScreen() {
   }, []);
 
   const view = startupViewModel(status, ipcFailed, retrying);
+
+  function handleSkipToContent() {
+    mainContent.current?.focus();
+  }
 
   async function handleRetry() {
     if (retryInFlight.current) {
@@ -73,7 +76,11 @@ export function StartupScreen() {
 
   return (
     <>
-      <a className="skip-link" href="#main-content">
+      <a
+        className="skip-link"
+        href="#main-content"
+        onClick={handleSkipToContent}
+      >
         Skip to startup status
       </a>
       <header className="app-header">
@@ -83,13 +90,13 @@ export function StartupScreen() {
         </div>
       </header>
       <main
+        ref={mainContent}
         className="shell startup-layout"
         id="main-content"
+        tabIndex={-1}
         aria-busy={view.state === "loading"}
       >
-        <h1 ref={pageHeading} tabIndex={-1}>
-          Startup health
-        </h1>
+        <h1>Startup health</h1>
         <p className="lede">
           Validate authoritative local storage before any project work begins.
         </p>
@@ -103,7 +110,12 @@ export function StartupScreen() {
             {view.heading}
           </h2>
           <div role="status" aria-live="polite" aria-atomic="true">
-            <p className="status-label">Status: {view.label}</p>
+            <p className="status-label">
+              <span className="status-symbol" aria-hidden="true">
+                {view.symbol}
+              </span>
+              <span>Status: {view.label}</span>
+            </p>
             <p>{view.message}</p>
           </div>
 
@@ -116,6 +128,20 @@ export function StartupScreen() {
                 </li>
               ))}
             </ul>
+          ) : null}
+
+          {view.recoveryActions.length > 0 ? (
+            <>
+              <h3 className="recovery-heading">Recovery options</h3>
+              <ul className="recovery-options" aria-label="Recovery options">
+                {view.recoveryActions.map((action) => (
+                  <li key={action.code}>
+                    <span>{action.label}</span>
+                    <code>{action.code}</code>
+                  </li>
+                ))}
+              </ul>
+            </>
           ) : null}
 
           {view.retryLabel !== null ? (

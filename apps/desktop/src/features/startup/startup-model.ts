@@ -1,11 +1,13 @@
-import type { StartupStatusDto } from "../../api/startup";
+import type { RecoveryActionDto, StartupStatusDto } from "../../api/startup";
 
 interface StartupViewModel {
   heading: string;
   label: string;
   message: string;
+  recoveryActions: RecoveryActionDto[];
   retryLabel: string | null;
   state: "loading" | "ready" | "recoverable" | "indeterminate";
+  symbol: string;
 }
 
 export function startupViewModel(
@@ -18,8 +20,10 @@ export function startupViewModel(
       heading: "Validation in progress",
       label: "Checking local services",
       message: "Retrying startup validation. Success has not been assumed.",
+      recoveryActions: recoveryActions(status),
       retryLabel: retryLabel(status),
       state: "loading",
+      symbol: "◌",
     };
   }
 
@@ -29,8 +33,10 @@ export function startupViewModel(
       label: "Outcome indeterminate",
       message:
         "Local startup status could not be read. Success has not been assumed.",
-      retryLabel: "Retry startup validation",
+      recoveryActions: [],
+      retryLabel: null,
       state: "indeterminate",
+      symbol: "?",
     };
   }
 
@@ -40,8 +46,10 @@ export function startupViewModel(
       label: "Checking local services",
       message:
         "Checking local startup health. No success is assumed while validation is running.",
+      recoveryActions: [],
       retryLabel: null,
       state: "loading",
+      symbol: "◌",
     };
   }
 
@@ -50,8 +58,10 @@ export function startupViewModel(
       heading: "Local services are ready",
       label: "Ready",
       message: "Local startup validation completed successfully.",
+      recoveryActions: [],
       retryLabel: null,
       state: "ready",
+      symbol: "✓",
     };
   }
 
@@ -60,8 +70,10 @@ export function startupViewModel(
       heading: "Startup needs attention",
       label: "Recovery required",
       message: "Startup validation found a recoverable local problem.",
+      recoveryActions: recoveryActions(status),
       retryLabel: retryLabel(status),
       state: "recoverable",
+      symbol: "!",
     };
   }
 
@@ -70,8 +82,10 @@ export function startupViewModel(
     label: "Outcome indeterminate",
     message:
       "Startup validation could not determine a safe outcome. Success has not been assumed.",
+    recoveryActions: recoveryActions(status),
     retryLabel: retryLabel(status),
     state: "indeterminate",
+    symbol: "?",
   };
 }
 
@@ -85,4 +99,20 @@ function retryLabel(status: StartupStatusDto | null): string | null {
     }
   }
   return null;
+}
+
+function recoveryActions(status: StartupStatusDto | null): RecoveryActionDto[] {
+  const seen = new Set<string>();
+  const actions: RecoveryActionDto[] = [];
+
+  for (const issue of status?.issues ?? []) {
+    for (const action of issue.recoveryActions) {
+      if (action.code !== "retry_startup_validation" && !seen.has(action.code)) {
+        seen.add(action.code);
+        actions.push(action);
+      }
+    }
+  }
+
+  return actions;
 }
