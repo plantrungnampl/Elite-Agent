@@ -8,10 +8,10 @@ local-agent-terminal-application = { path = "../application" }
 local-agent-terminal-repository-git = { path = "../repository-git" }
 local-agent-terminal-storage-files = { path = "../storage-files" }
 local-agent-terminal-storage-sqlite = { path = "../storage-sqlite" }
+serde_json = "1.0"
 
 [dev-dependencies]
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2", "unstable-sha256"] }
 local-agent-terminal-domain = { path = "../domain" }
 rusqlite = { version = "0.32", features = ["bundled"] }
-serde_json = "1.0"
 tempfile = "3.27"

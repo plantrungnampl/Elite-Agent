@@ -2,6 +2,7 @@
 
 mod logging;
 mod startup;
+mod workspace_monitor;
 mod workspace_runtime;
 
 pub use local_agent_terminal_application::{LocalDiagnosticDto, StartupStateDto, StartupStatusDto};

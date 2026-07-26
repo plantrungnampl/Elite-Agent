@@ -8,7 +8,7 @@ use local_agent_terminal_application::{
 };
 use local_agent_terminal_domain::{
     Condition, GitObjectId, OperationState, Phase, ProjectId, Sequence, TaskBranch, TaskId,
-    WorkspaceVersion,
+    WorkspaceFingerprint, WorkspaceVersion,
 };
 use rusqlite::OptionalExtension;
 use serde_json::Value;
@@ -146,6 +146,22 @@ impl SqliteStore {
             }
             _ => local_agent_terminal_application::WorktreeState::Planned,
         };
+        let observed_fingerprint = connection
+            .query_row(
+                "SELECT payload_json FROM events
+                 WHERE stream_id = ?1 AND event_type = 'operation.intent.transitioned'
+                   AND json_extract(payload_json, '$.intentId') = ?2
+                   AND json_extract(payload_json, '$.to') = 'succeeded'
+                 ORDER BY sequence DESC LIMIT 1",
+                [task_id.as_str(), operation.id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?
+            .map(|payload| parse_observed_fingerprint(&payload))
+            .transpose()?
+            .flatten()
+            .unwrap_or_else(|| repository.fingerprint.clone());
         Ok(Some(local_agent_terminal_application::WorktreeSnapshot {
             worktree_id: intent.worktree_id,
             repository_id: intent.repository_id,
@@ -156,7 +172,7 @@ impl SqliteStore {
             target_path_display: intent.target_path_display,
             state,
             expected_presence: intent.expected_presence,
-            fingerprint: repository.fingerprint,
+            fingerprint: observed_fingerprint,
         }))
     }
 
@@ -322,6 +338,28 @@ impl SqliteStore {
             recovery,
         })
     }
+}
+
+fn parse_observed_fingerprint(payload: &str) -> Result<Option<WorkspaceFingerprint>, PortError> {
+    let value: serde_json::Value =
+        serde_json::from_str(payload).map_err(|_| integrity_failure())?;
+    let Some(fingerprint) = value.get("observedFingerprint") else {
+        return Ok(None);
+    };
+    let text = |name: &str| {
+        fingerprint
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(integrity_failure)
+    };
+    Ok(Some(
+        WorkspaceFingerprint::new(
+            GitObjectId::new(text("head")?).map_err(|_| integrity_failure())?,
+            text("indexDigest")?,
+            text("statusDigest")?,
+        )
+        .map_err(|_| integrity_failure())?,
+    ))
 }
 
 struct RawTask {

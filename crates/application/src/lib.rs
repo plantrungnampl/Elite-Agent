@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 
+pub use local_agent_terminal_domain::{
+    ActorId, ArtifactId, FencingToken, GitObjectId, LeaseClaim, Phase, ProjectId, RepositoryId,
+    RunId, Sequence, TaskBranch, TaskId, WorkspaceFingerprint, WorkspaceVersion, WorktreeId,
+};
+
 mod append_events;
 mod canonical_json;
 mod dto;
@@ -25,7 +30,7 @@ pub use ports::{
     ArtifactJournalInvalidation, ArtifactJournalStatus, ArtifactJournalTransition, ArtifactRef,
     ArtifactStore, ArtifactUnavailableState, ArtifactWriteReservation, Clock, EventStore,
     IdGenerator, NewArtifact, NewEvent, ProjectionChange, ReservedArtifact, TaskQuery,
-    WorkspaceMutationStore,
+    WorkspaceEvidenceStore, WorkspaceMutationStore,
 };
 pub use repository::{
     CreateWorktree, DiscardWorktree, ExpectedPresence, InspectRepository, InspectWorktree,
@@ -40,5 +45,5 @@ pub use workspace::{
     RecoveryCandidate, RecoveryEvidence, RecoveryProject, RecoveryReason,
     RepositoryInspectionRecord, RiskLevel, StartedRecovery, TaskLeaseState, TaskSnapshot,
     WorkspaceMutationRequest, WorkspaceMutationResult, WorkspaceRecoveryStore, WorkspaceStateStore,
-    WorktreeIntent, WorktreeMatch,
+    WorkspaceWriteCoordinator, WorkspaceWritePermit, WorktreeIntent, WorktreeMatch,
 };

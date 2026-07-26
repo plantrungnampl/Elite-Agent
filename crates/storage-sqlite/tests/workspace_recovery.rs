@@ -853,6 +853,7 @@ fn started_unknown_and_non_repeatable_intents_become_indeterminate_without_retry
                 attempt_count: 1,
                 updated_at: "2026-07-26T00:00:10Z".to_owned(),
                 error: None,
+                observed_fingerprint: None,
             })
             .unwrap();
     }
@@ -907,6 +908,7 @@ fn recovery_candidate_keeps_every_exact_worktree_identity_for_adoption() {
             attempt_count: 1,
             updated_at: "2026-07-26T00:00:10Z".to_owned(),
             error: None,
+            observed_fingerprint: None,
         })
         .unwrap();
 

@@ -384,6 +384,7 @@ impl WorkspaceFixture {
                 attempt_count: 1,
                 updated_at: "2026-07-26T00:00:04Z".to_owned(),
                 error: None,
+                observed_fingerprint: None,
             })
             .expect("started intent");
         intent

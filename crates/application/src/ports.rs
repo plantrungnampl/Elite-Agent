@@ -1,10 +1,11 @@
 use local_agent_terminal_domain::{
-    ActorId, EventId, Sequence, StreamId, TaskId, WorkflowEvent, WorkflowState,
+    ActorId, ArtifactId, EventId, Sequence, StreamId, TaskId, WorkflowEvent, WorkflowState,
 };
 use serde_json::Value;
 
 use crate::{
-    PortError, TaskSnapshot, TimelineEntryDto, WorkspaceMutationRequest, WorkspaceMutationResult,
+    CanonicalEvidenceRef, PortError, TaskSnapshot, TimelineEntryDto, WorkspaceMutationRequest,
+    WorkspaceMutationResult,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,13 @@ pub trait WorkspaceMutationStore: Send + Sync {
         &self,
         request: WorkspaceMutationRequest,
     ) -> Result<WorkspaceMutationResult, PortError>;
+}
+
+pub trait WorkspaceEvidenceStore: Send + Sync {
+    fn available_evidence(
+        &self,
+        artifact_id: &ArtifactId,
+    ) -> Result<Option<CanonicalEvidenceRef>, PortError>;
 }
 
 pub trait TaskQuery: Send + Sync {

@@ -1,3 +1,5 @@
+use std::sync::{Mutex, MutexGuard};
+
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, Condition, EventId, FencingToken, GitObjectId, LeaseClaim, OperationState,
     Phase, ProjectId, RepositoryId, Sequence, TaskBranch, TaskId, WorkflowState,
@@ -5,9 +7,10 @@ use local_agent_terminal_domain::{
 };
 
 use crate::{
-    CanonicalEvidenceRef, CreateWorktree, ExpectedPresence, PortError, RecoveryActionDto,
-    RepositoryGateway, RepositorySnapshot, Retryability, SafeErrorClassification,
-    WorkspaceDashboardDto, WorkspaceMutationStore, WorktreeSnapshot,
+    AcquireLease, CanonicalEvidenceRef, CreateWorktree, DiscardWorktree, ExecutorLeaseStore,
+    ExpectedPresence, LeaseSnapshot, PortError, RecoveryActionDto, RepositoryGateway,
+    RepositorySnapshot, Retryability, RevokeLease, SafeErrorClassification, WorkspaceDashboardDto,
+    WorkspaceMutationStore, WorktreeSnapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,6 +274,7 @@ pub struct IntentTransition {
     pub attempt_count: u32,
     pub updated_at: String,
     pub error: Option<SafeErrorClassification>,
+    pub observed_fingerprint: Option<WorkspaceFingerprint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,16 +420,19 @@ pub struct WorkspaceMutationResult {
 pub struct PrepareTaskWorkspace<'a> {
     workspaces: &'a dyn WorkspaceStateStore,
     repositories: &'a dyn RepositoryGateway,
+    leases: &'a dyn ExecutorLeaseStore,
 }
 
 impl<'a> PrepareTaskWorkspace<'a> {
     pub const fn new(
         workspaces: &'a dyn WorkspaceStateStore,
         repositories: &'a dyn RepositoryGateway,
+        leases: &'a dyn ExecutorLeaseStore,
     ) -> Self {
         Self {
             workspaces,
             repositories,
+            leases,
         }
     }
 
@@ -454,9 +461,14 @@ impl<'a> PrepareTaskWorkspace<'a> {
                 attempt_count,
                 updated_at: observed_at.clone(),
                 error: None,
+                observed_fingerprint: None,
             })?;
 
-        match self.repositories.create_worktree(request) {
+        let result = self
+            .leases
+            .assert_current(request.lease_claim.clone())
+            .and_then(|()| self.repositories.create_worktree(request));
+        match result {
             Ok(worktree) => {
                 self.workspaces
                     .transition_worktree_intent(IntentTransition {
@@ -467,6 +479,7 @@ impl<'a> PrepareTaskWorkspace<'a> {
                         attempt_count,
                         updated_at: observed_at,
                         error: None,
+                        observed_fingerprint: Some(worktree.fingerprint.clone()),
                     })?;
                 Ok(worktree)
             }
@@ -480,10 +493,101 @@ impl<'a> PrepareTaskWorkspace<'a> {
                         attempt_count,
                         updated_at: observed_at,
                         error: Some(error.safe_classification()),
+                        observed_fingerprint: None,
                     })?;
                 Err(error)
             }
         }
+    }
+}
+
+pub struct WorkspaceWriteCoordinator {
+    gate: Mutex<()>,
+}
+
+pub struct WorkspaceWritePermit<'a> {
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl WorkspaceWriteCoordinator {
+    pub const fn new() -> Self {
+        Self {
+            gate: Mutex::new(()),
+        }
+    }
+
+    pub fn acquire_lease(
+        &self,
+        leases: &dyn ExecutorLeaseStore,
+        request: AcquireLease,
+    ) -> Result<LeaseSnapshot, PortError> {
+        let _guard = self.gate.lock().map_err(|_| internal_failure())?;
+        leases.acquire(request)
+    }
+
+    pub fn revoke_lease(
+        &self,
+        leases: &dyn ExecutorLeaseStore,
+        request: RevokeLease,
+    ) -> Result<(), PortError> {
+        let _guard = self.gate.lock().map_err(|_| internal_failure())?;
+        leases.revoke(request)
+    }
+
+    pub fn monitor_permit<'a>(
+        &'a self,
+        leases: &dyn ExecutorLeaseStore,
+        claim: LeaseClaim,
+    ) -> Result<WorkspaceWritePermit<'a>, PortError> {
+        let guard = self.gate.lock().map_err(|_| internal_failure())?;
+        leases.assert_current(claim)?;
+        Ok(WorkspaceWritePermit { _guard: guard })
+    }
+
+    pub fn prepare_worktree(
+        &self,
+        workspaces: &dyn WorkspaceStateStore,
+        repositories: &dyn RepositoryGateway,
+        leases: &dyn ExecutorLeaseStore,
+        intent: WorktreeIntent,
+        request: CreateWorktree,
+        observed_at: String,
+    ) -> Result<WorktreeSnapshot, PortError> {
+        let _guard = self.gate.lock().map_err(|_| internal_failure())?;
+        PrepareTaskWorkspace::new(workspaces, repositories, leases).execute(
+            intent,
+            request,
+            observed_at,
+        )
+    }
+
+    pub fn discard_worktree(
+        &self,
+        leases: &dyn ExecutorLeaseStore,
+        repositories: &dyn RepositoryGateway,
+        request: DiscardWorktree,
+    ) -> Result<(), PortError> {
+        if request.lease_claim.task_id() != &request.task_id {
+            return Err(invalid_input());
+        }
+        let _guard = self.gate.lock().map_err(|_| internal_failure())?;
+        leases.assert_current(request.lease_claim.clone())?;
+        repositories.discard_worktree(request)
+    }
+
+    pub fn record_mutation(
+        &self,
+        mutations: &dyn WorkspaceMutationStore,
+        request: WorkspaceMutationRequest,
+    ) -> Result<WorkspaceMutationResult, PortError> {
+        let _guard = self.gate.lock().map_err(|_| internal_failure())?;
+        mutations.record_workspace_mutation(request)
+    }
+}
+
+impl Default for WorkspaceWriteCoordinator {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

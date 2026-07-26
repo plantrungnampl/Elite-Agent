@@ -306,7 +306,17 @@ fn prepare_workspace_persists_and_starts_intent_before_git_create() {
     let workspaces = FakeWorkspaceStateStore {
         calls: Arc::clone(&calls),
     };
-    let use_case = PrepareTaskWorkspace::new(&workspaces, &repositories);
+    let leases = FakeLeaseStore::new();
+    leases
+        .acquire(AcquireLease {
+            task_id: TaskId::new("task-1").unwrap(),
+            holder_run_id: RunId::new("run-1").unwrap(),
+            expected_fencing_epoch: 0,
+            acquired_at: "2026-07-26T00:00:00Z".to_owned(),
+            expires_at: "2026-07-26T00:05:00Z".to_owned(),
+        })
+        .unwrap();
+    let use_case = PrepareTaskWorkspace::new(&workspaces, &repositories, &leases);
 
     let result = use_case
         .execute(
@@ -334,6 +344,64 @@ fn prepare_workspace_persists_and_starts_intent_before_git_create() {
             "create_worktree",
             "succeed_intent"
         ]
+    );
+}
+
+#[test]
+fn stale_worktree_create_claim_is_rejected_before_repository_effect() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let repositories = FakeRepositoryGateway {
+        calls: Arc::clone(&calls),
+    };
+    let workspaces = FakeWorkspaceStateStore {
+        calls: Arc::clone(&calls),
+    };
+    let leases = FakeLeaseStore::new();
+    let first = leases
+        .acquire(AcquireLease {
+            task_id: TaskId::new("task-1").unwrap(),
+            holder_run_id: RunId::new("run-1").unwrap(),
+            expected_fencing_epoch: 0,
+            acquired_at: "2026-07-26T00:00:00Z".to_owned(),
+            expires_at: "2026-07-26T00:05:00Z".to_owned(),
+        })
+        .unwrap();
+    leases
+        .revoke(RevokeLease {
+            claim: LeaseClaim::new(
+                first.task_id.clone(),
+                first.holder_run_id.clone(),
+                first.token,
+            ),
+            revoked_at: "2026-07-26T00:01:00Z".to_owned(),
+        })
+        .unwrap();
+
+    let result = PrepareTaskWorkspace::new(&workspaces, &repositories, &leases).execute(
+        worktree_intent(),
+        CreateWorktree {
+            repository: repository_locator(),
+            managed_path: managed_path(),
+            task_id: TaskId::new("task-1").unwrap(),
+            lease_claim: lease_claim(1),
+            expected_workspace_version: WorkspaceVersion::new(0),
+            worktree_id: WorktreeId::new("worktree-1").unwrap(),
+            branch: TaskBranch::new("codex/task-1").unwrap(),
+            base_commit: GitObjectId::new(SHA1).unwrap(),
+        },
+        "2026-07-26T00:00:01Z".to_owned(),
+    );
+
+    assert!(matches!(
+        result,
+        Err(PortError::StaleLease {
+            current,
+            supplied
+        }) if current.get() == 1 && supplied.get() == 1
+    ));
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["begin_intent", "start_intent", "fail_intent"]
     );
 }
 

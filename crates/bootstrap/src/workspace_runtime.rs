@@ -2,19 +2,26 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use local_agent_terminal_application::{
-    Clock, ExecutorLeaseStore, ExpectedPresence, InspectWorktree, IntentTransition,
-    ManagedWorktreePath, OperationIntentStatus, PortError, RecoveryCandidate, RecoveryReason,
-    RepositoryGateway, SafeErrorClassification, WorkspaceRecoveryStore, WorkspaceStateStore,
-    WorktreeObservation,
+    AcquireLease, Clock, CreateWorktree, DiscardWorktree, ExecutorLeaseStore, ExpectedPresence,
+    InspectWorktree, IntentTransition, LeaseClaim, LeaseSnapshot, ManagedWorktreePath,
+    OperationIntentStatus, PortError, RecoveryCandidate, RecoveryReason, RepositoryGateway,
+    RevokeLease, SafeErrorClassification, TaskQuery, TaskSnapshot, TimelineEntryDto,
+    WorkspaceDashboardDto, WorkspaceRecoveryStore, WorkspaceStateStore, WorkspaceWriteCoordinator,
+    WorktreeIntent, WorktreeObservation, WorktreeSnapshot,
 };
+use local_agent_terminal_application::{ProjectId, TaskId};
 use local_agent_terminal_repository_git::GitRepositoryGateway;
 use local_agent_terminal_storage_files::ContentAddressedArtifactStore;
 use local_agent_terminal_storage_sqlite::SqliteStore;
 
+use crate::workspace_monitor::WorkspaceMonitor;
+
 pub struct WorkspaceRuntime {
-    _database: SqliteStore,
-    _artifacts: ContentAddressedArtifactStore,
-    _repositories: GitRepositoryGateway,
+    database: SqliteStore,
+    artifacts: ContentAddressedArtifactStore,
+    repositories: GitRepositoryGateway,
+    writes: WorkspaceWriteCoordinator,
+    monitor: WorkspaceMonitor,
     recovery_candidates: Vec<RecoveryCandidate>,
 }
 
@@ -32,15 +39,73 @@ impl WorkspaceRuntime {
         recovery_candidates: Vec<RecoveryCandidate>,
     ) -> Self {
         Self {
-            _database: database,
-            _artifacts: artifacts,
-            _repositories: repositories,
+            database,
+            artifacts,
+            repositories,
+            writes: WorkspaceWriteCoordinator::new(),
+            monitor: WorkspaceMonitor,
             recovery_candidates,
         }
     }
 
     pub fn recovery_candidates(&self) -> &[RecoveryCandidate] {
         &self.recovery_candidates
+    }
+
+    pub fn acquire_lease(&self, request: AcquireLease) -> Result<LeaseSnapshot, PortError> {
+        self.writes.acquire_lease(&self.database, request)
+    }
+
+    pub fn revoke_lease(&self, request: RevokeLease) -> Result<(), PortError> {
+        self.writes.revoke_lease(&self.database, request)
+    }
+
+    pub fn prepare_worktree(
+        &self,
+        intent: WorktreeIntent,
+        request: CreateWorktree,
+        observed_at: String,
+    ) -> Result<WorktreeSnapshot, PortError> {
+        self.writes.prepare_worktree(
+            &self.database,
+            &self.repositories,
+            &self.database,
+            intent,
+            request,
+            observed_at,
+        )
+    }
+
+    pub fn discard_worktree(&self, request: DiscardWorktree) -> Result<(), PortError> {
+        self.writes
+            .discard_worktree(&self.database, &self.repositories, request)
+    }
+
+    pub fn poll_workspace(
+        &self,
+        task_id: &TaskId,
+        claim: LeaseClaim,
+    ) -> Result<Option<local_agent_terminal_application::WorkspaceMutationResult>, PortError> {
+        self.monitor.poll(
+            &self.database,
+            &self.artifacts,
+            &self.repositories,
+            &self.writes,
+            task_id,
+            claim,
+        )
+    }
+
+    pub fn task(&self, task_id: &TaskId) -> Result<TaskSnapshot, PortError> {
+        self.database.task(task_id)
+    }
+
+    pub fn timeline(&self, task_id: &TaskId) -> Result<Vec<TimelineEntryDto>, PortError> {
+        self.database.timeline(task_id)
+    }
+
+    pub fn dashboard(&self, project_id: &ProjectId) -> Result<WorkspaceDashboardDto, PortError> {
+        self.database.dashboard(project_id)
     }
 }
 
@@ -105,24 +170,30 @@ pub(crate) fn reconcile_startup(
 
     let mut conflicts = HashMap::new();
     for recovery in started {
-        let next = if recovery.candidate.expected_worktree.is_none() {
-            Some((OperationIntentStatus::Indeterminate, None))
+        let (next, observed_fingerprint) = if recovery.candidate.expected_worktree.is_none() {
+            (Some((OperationIntentStatus::Indeterminate, None)), None)
         } else {
             match observations.remove(&recovery.operation.id) {
                 Some(WorktreeObservation::Exact(snapshot))
                     if snapshot.expected_presence == ExpectedPresence::Present =>
                 {
-                    Some((OperationIntentStatus::Succeeded, None))
+                    (
+                        Some((OperationIntentStatus::Succeeded, None)),
+                        Some(snapshot.fingerprint),
+                    )
                 }
-                Some(WorktreeObservation::AuthoritativelyAbsent) => Some((
-                    OperationIntentStatus::Interrupted,
-                    Some(SafeErrorClassification::NotFound),
-                )),
+                Some(WorktreeObservation::AuthoritativelyAbsent) => (
+                    Some((
+                        OperationIntentStatus::Interrupted,
+                        Some(SafeErrorClassification::NotFound),
+                    )),
+                    None,
+                ),
                 Some(WorktreeObservation::Conflict(reason)) => {
                     conflicts.insert(recovery.operation.id.clone(), reason);
-                    None
+                    (None, None)
                 }
-                Some(WorktreeObservation::Exact(_)) | None => None,
+                Some(WorktreeObservation::Exact(_)) | None => (None, None),
             }
         };
         if let Some((next_status, error)) = next {
@@ -134,6 +205,7 @@ pub(crate) fn reconcile_startup(
                 attempt_count: recovery.operation.attempt_count,
                 updated_at: database.now_utc()?,
                 error,
+                observed_fingerprint,
             })?;
         }
     }

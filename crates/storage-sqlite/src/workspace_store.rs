@@ -4,7 +4,7 @@ use local_agent_terminal_application::{
     Clock, ExpectedPresence, IdempotencyClass, IntentTransition, NewProject, NewTask,
     OperationIntent, OperationIntentStatus, PortError, ProjectSnapshot, RecoveryAction,
     RecoveryCandidate, RecoveryEvidence, RecoveryReason, RepositoryInspectionRecord, Retryability,
-    SafeErrorClassification, StartedRecovery, TaskLeaseState, TaskSnapshot,
+    SafeErrorClassification, StartedRecovery, TaskLeaseState, TaskSnapshot, WorkspaceEvidenceStore,
     WorkspaceMutationRequest, WorkspaceMutationResult, WorkspaceMutationStore,
     WorkspaceRecoveryStore, WorkspaceStateStore, WorktreeIntent,
 };
@@ -306,6 +306,7 @@ impl WorkspaceStateStore for SqliteStore {
             "attemptCount": transition.attempt_count,
             "executorFencingToken": transition.executor_fencing_token.map(FencingToken::get),
             "errorClassification": transition.error.map(error_classification_name),
+            "observedFingerprint": transition.observed_fingerprint.as_ref().map(fingerprint_json),
         });
         let transition_correlation = format!("intent:{}", transition.intent_id);
         insert_task_event(
@@ -446,6 +447,56 @@ impl WorkspaceRecoveryStore for SqliteStore {
             candidates.extend(self.load_dashboard(&project.project_id)?.recovery);
         }
         Ok(candidates)
+    }
+}
+
+impl WorkspaceEvidenceStore for SqliteStore {
+    fn available_evidence(
+        &self,
+        artifact_id: &ArtifactId,
+    ) -> Result<Option<local_agent_terminal_application::CanonicalEvidenceRef>, PortError> {
+        let connection = self.connection().map_err(open_error_to_port)?;
+        let row: Option<(String, String, i64, String, Option<String>, String)> = connection
+            .query_row(
+                "SELECT content_hash, storage_key, size_bytes, project_id, task_id, availability
+                 FROM artifacts WHERE id = ?1",
+                [artifact_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?;
+        let Some((content_hash, storage_key, size_bytes, project_id, task_id, availability)) = row
+        else {
+            return Ok(None);
+        };
+        if availability != "available" {
+            return Err(integrity_failure());
+        }
+        let size_bytes = u64::try_from(size_bytes).map_err(|_| integrity_failure())?;
+        let project_id = ProjectId::new(project_id).map_err(|_| integrity_failure())?;
+        let task_id = task_id
+            .map(TaskId::new)
+            .transpose()
+            .map_err(|_| integrity_failure())?;
+        Ok(Some(
+            local_agent_terminal_application::CanonicalEvidenceRef {
+                artifact_id: artifact_id.clone(),
+                content_hash,
+                storage_key,
+                size_bytes,
+                project_id,
+                task_id,
+            },
+        ))
     }
 }
 
@@ -681,6 +732,7 @@ impl SqliteStore {
             attempt_count: operation.attempt_count,
             updated_at: self.now_utc()?,
             error: None,
+            observed_fingerprint: None,
         })
     }
 
