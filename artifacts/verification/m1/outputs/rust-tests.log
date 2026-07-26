@@ -315,4 +315,3 @@ test core_system_run_satisfies_foreign_keys_and_one_lease_contender_wins ... ok
 test lease_replacement_increments_token_and_stale_claim_cannot_write ... ok
 
 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s
-

@@ -14,4 +14,3 @@ test startup_adopts_only_the_exact_durable_worktree ... ok
 test repeated_startup_replays_recovery_projection_without_duplicate_side_effects ... ok
 
 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
-
