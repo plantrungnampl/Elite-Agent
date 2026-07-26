@@ -67,9 +67,7 @@ test("repository adapter rejects PATH lookup", () => {
   );
 });
 
-test("M1 evidence is complete and internally consistent", {
-  skip: process.env.M1_EVIDENCE_GENERATING === "1",
-}, () => {
+test("M1 evidence is complete and internally consistent", () => {
   assert.match(run("scripts/verify-m1-evidence.mjs"), /M1 evidence: ok/);
 });
 
@@ -79,7 +77,7 @@ test("Windows CI generates, verifies, and uploads fresh M1 evidence", () => {
   for (const command of [
     "pnpm install --frozen-lockfile",
     "node scripts/verify-design-contracts.mjs",
-    "node --test tests/contracts/*.test.mjs",
+    "node --test tests/contracts/architecture.test.mjs tests/contracts/design-contracts.test.mjs",
     "node scripts/check-architecture.mjs",
     "cargo test -p local-agent-terminal-repository-git --test windows_matrix --features test-seams",
     "cargo test -p local-agent-terminal-bootstrap --test recovery_matrix",
@@ -97,23 +95,27 @@ test("Windows CI generates, verifies, and uploads fresh M1 evidence", () => {
   }
   const generate = workflow.indexOf("node scripts/run-m1-evidence.mjs");
   const verify = workflow.indexOf("node scripts/verify-m1-evidence.mjs");
+  const postFinal = workflow.indexOf("node scripts/run-m1-post-final-contracts.mjs");
+  const verifyPostFinal = workflow.indexOf("node scripts/verify-m1-post-final-log.mjs");
   const upload = workflow.indexOf("actions/upload-artifact@v4");
-  assert.ok(generate >= 0 && verify > generate && upload > verify);
+  assert.ok(
+    generate >= 0
+      && verify > generate
+      && postFinal > verify
+      && verifyPostFinal > postFinal
+      && upload > verifyPostFinal,
+  );
   assert.match(workflow, /artifacts\/verification\/m1/);
 });
 
-test("M1 verifier rejects modified captured output", {
-  skip: process.env.M1_EVIDENCE_GENERATING === "1",
-}, () => {
+test("M1 verifier rejects modified captured output", () => {
   withEvidenceCopy((directory, manifest) => {
     appendFileSync(join(directory, manifest.commands[0].outputFile), "tampered\n");
     assertVerifierFails(directory, /output hash mismatch/);
   });
 });
 
-test("M1 verifier rejects a stale source commit", {
-  skip: process.env.M1_EVIDENCE_GENERATING === "1",
-}, () => {
+test("M1 verifier rejects a stale source commit", () => {
   withEvidenceCopy((directory, manifest) => {
     manifest.sourceCommit = "0".repeat(40);
     writeManifest(directory, manifest);
@@ -121,9 +123,7 @@ test("M1 verifier rejects a stale source commit", {
   });
 });
 
-test("M1 verifier rejects self-asserted fixture classifications", {
-  skip: process.env.M1_EVIDENCE_GENERATING === "1",
-}, () => {
+test("M1 verifier rejects self-asserted fixture classifications", () => {
   withEvidenceCopy((directory, manifest) => {
     manifest.fixtureClassifications.find(
       (entry) => entry.case === "long paths",
@@ -133,15 +133,36 @@ test("M1 verifier rejects self-asserted fixture classifications", {
   });
 });
 
-test("M1 verifier rejects fixture evidence absent from captured output", {
-  skip: process.env.M1_EVIDENCE_GENERATING === "1",
-}, () => {
+test("M1 verifier rejects fixture evidence absent from captured output", () => {
   withEvidenceCopy((directory, manifest) => {
     manifest.fixtureClassifications.find(
       (entry) => entry.case === "spaces\/metacharacters",
     ).evidence[0].needle = "unobserved_test_name";
     writeManifest(directory, manifest);
     assertVerifierFails(directory, /fixture evidence mismatch|test evidence not observed/);
+  });
+});
+
+test("M1 verifier rejects dirty tracked source even when HEAD matches sourceCommit", () => {
+  withDirtyTrackedSource(() => {
+    const result = spawnSync(process.execPath, ["scripts/verify-m1-evidence.mjs"], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}${result.stderr}`, /dirty tracked source/);
+  });
+});
+
+test("M1 evidence generation preflight rejects dirty tracked source", () => {
+  withDirtyTrackedSource(() => {
+    const result = spawnSync(
+      process.execPath,
+      ["scripts/check-m1-evidence-worktree.mjs"],
+      { cwd: process.cwd(), encoding: "utf8" },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}${result.stderr}`, /dirty tracked source/);
   });
 });
 
@@ -184,4 +205,15 @@ function assertVerifierFails(directory, pattern) {
   );
   assert.notEqual(result.status, 0);
   assert.match(`${result.stdout}${result.stderr}`, pattern);
+}
+
+function withDirtyTrackedSource(callback) {
+  const path = "tests/contracts/fixtures/m1/unknown-operation.json";
+  const original = readFileSync(path);
+  try {
+    appendFileSync(path, "\nround-2-dirty-source-sentinel\n");
+    callback();
+  } finally {
+    writeFileSync(path, original);
+  }
 }

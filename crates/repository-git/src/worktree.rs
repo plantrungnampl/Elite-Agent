@@ -61,19 +61,20 @@ pub(crate) fn create(
     pause_before_checkout(gateway);
     let worktree = match unsafe_checkout::add(&repository, &worktree_name, &target, &reference) {
         Ok(worktree) => worktree,
-        Err(error) => {
+        Err(_error) => {
             drop(reference);
-            pause_before_rollback(gateway);
-            rollback_failed_create(
+            return Err(preserve_failed_create(
+                gateway,
                 &repository,
-                &worktree_name,
-                &target,
-                &reference_name,
-                oid,
-                &request.repository,
-                &request.branch,
-            )?;
-            return Err(error);
+                FailedCreate {
+                    worktree_name: &worktree_name,
+                    target: &target,
+                    reference_name: &reference_name,
+                    expected_oid: oid,
+                    locator: &request.repository,
+                    branch: &request.branch,
+                },
+            ));
         }
     };
     drop(reference);
@@ -130,19 +131,20 @@ pub(crate) fn create(
             drop(worktree);
             Ok(snapshot)
         }
-        Err(error) => {
+        Err(_error) => {
             drop(worktree);
-            pause_before_rollback(gateway);
-            rollback_failed_create(
+            Err(preserve_failed_create(
+                gateway,
                 &repository,
-                &worktree_name,
-                &target,
-                &reference_name,
-                oid,
-                &request.repository,
-                &request.branch,
-            )?;
-            Err(error)
+                FailedCreate {
+                    worktree_name: &worktree_name,
+                    target: &target,
+                    reference_name: &reference_name,
+                    expected_oid: oid,
+                    locator: &request.repository,
+                    branch: &request.branch,
+                },
+            ))
         }
     }
 }
@@ -467,7 +469,37 @@ fn reject_reparse_root(path: &Path) -> Result<(), PortError> {
     Ok(())
 }
 
-fn rollback_failed_create(
+struct FailedCreate<'a> {
+    worktree_name: &'a str,
+    target: &'a Path,
+    reference_name: &'a str,
+    expected_oid: Oid,
+    locator: &'a local_agent_terminal_application::RepositoryLocator,
+    branch: &'a TaskBranch,
+}
+
+fn preserve_failed_create(
+    gateway: &GitRepositoryGateway,
+    repository: &Repository,
+    attempt: FailedCreate<'_>,
+) -> PortError {
+    let _owned_attempt_observed = failed_create_still_matches(
+        repository,
+        attempt.worktree_name,
+        attempt.target,
+        attempt.reference_name,
+        attempt.expected_oid,
+        attempt.locator,
+        attempt.branch,
+    );
+    pause_after_cleanup_ownership_check(gateway);
+    // Target paths and worktree metadata do not expose an atomic compare-and-delete
+    // operation. Preserve all attempt state so a concurrent replacement can never
+    // be deleted after a successful ownership observation.
+    paths::conflict()
+}
+
+fn failed_create_still_matches(
     repository: &Repository,
     worktree_name: &str,
     target: &Path,
@@ -475,62 +507,33 @@ fn rollback_failed_create(
     expected_oid: Oid,
     locator: &local_agent_terminal_application::RepositoryLocator,
     branch: &TaskBranch,
-) -> Result<(), PortError> {
-    let mut transaction = repository.transaction().map_err(paths::map_git_error)?;
-    transaction
-        .lock_ref(reference_name)
-        .map_err(paths::map_git_error)?;
-    let reference = repository
+) -> bool {
+    let reference_matches = repository
         .find_reference(reference_name)
-        .map_err(paths::map_git_error)?;
-    if reference.kind() != Some(ReferenceType::Direct) || reference.target() != Some(expected_oid) {
-        return Err(paths::conflict());
-    }
-    drop(reference);
-
-    let target_exists = fs::symlink_metadata(target).is_ok();
-    let worktree = match repository.find_worktree(worktree_name) {
-        Ok(worktree) => Some(worktree),
-        Err(error) if error.code() == git2::ErrorCode::NotFound => None,
-        Err(error) => return Err(paths::map_git_error(error)),
-    };
-    match (target_exists, worktree) {
-        (false, None) => {}
-        (true, Some(worktree)) => {
-            reject_reparse_root(target)?;
-            worktree.validate().map_err(|_| paths::conflict())?;
-            if paths::canonical_directory(worktree.path())? != target
-                || paths::canonical_directory(target)? != target
-            {
-                return Err(paths::conflict());
-            }
-            let target_repository =
-                paths::open_repository(target).map_err(|_| paths::conflict())?;
-            if paths::canonical_directory(target_repository.commondir())?
-                != locator.canonical_common_dir
-            {
-                return Err(paths::conflict());
-            }
-            let head = target_repository.head().map_err(|_| paths::conflict())?;
-            if head.target() != Some(expected_oid)
-                || head.name().ok() != Some(reference_name)
-                || head.shorthand().ok() != Some(branch.as_str())
-            {
-                return Err(paths::conflict());
-            }
-            fs::remove_dir_all(target).map_err(|_| paths::permission())?;
-            worktree.unlock().map_err(paths::map_git_error)?;
-            let mut prune = WorktreePruneOptions::new();
-            worktree
-                .prune(Some(&mut prune))
-                .map_err(paths::map_git_error)?;
-        }
-        _ => return Err(paths::conflict()),
-    }
-    transaction
-        .remove(reference_name)
-        .map_err(paths::map_git_error)?;
-    transaction.commit().map_err(paths::map_git_error)
+        .map(|reference| {
+            reference.kind() == Some(ReferenceType::Direct)
+                && reference.target() == Some(expected_oid)
+        })
+        .unwrap_or(false);
+    let worktree_matches = repository
+        .find_worktree(worktree_name)
+        .ok()
+        .and_then(|worktree| paths::canonical_directory(worktree.path()).ok())
+        .is_some_and(|path| path == target);
+    let target_matches = paths::canonical_directory(target)
+        .ok()
+        .filter(|path| path == target)
+        .and_then(|path| paths::open_repository(&path).ok())
+        .is_some_and(|target_repository| {
+            paths::canonical_directory(target_repository.commondir())
+                .is_ok_and(|common_dir| common_dir == locator.canonical_common_dir)
+                && target_repository.head().is_ok_and(|head| {
+                    head.target() == Some(expected_oid)
+                        && head.name().ok() == Some(reference_name)
+                        && head.shorthand().ok() == Some(branch.as_str())
+                })
+        });
+    reference_matches && worktree_matches && target_matches
 }
 
 #[derive(Clone, Copy)]
@@ -583,15 +586,15 @@ fn pause_before_checkout(gateway: &GitRepositoryGateway) {
 fn pause_before_checkout(_gateway: &GitRepositoryGateway) {}
 
 #[cfg(feature = "test-seams")]
-fn pause_before_rollback(gateway: &GitRepositoryGateway) {
-    if let Some(barrier) = &gateway.test_hooks.before_rollback {
+fn pause_after_cleanup_ownership_check(gateway: &GitRepositoryGateway) {
+    if let Some(barrier) = &gateway.test_hooks.after_cleanup_ownership_check {
         barrier.wait();
         barrier.wait();
     }
 }
 
 #[cfg(not(feature = "test-seams"))]
-fn pause_before_rollback(_gateway: &GitRepositoryGateway) {}
+fn pause_after_cleanup_ownership_check(_gateway: &GitRepositoryGateway) {}
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     paths::is_within(left, right) || paths::is_within(right, left)

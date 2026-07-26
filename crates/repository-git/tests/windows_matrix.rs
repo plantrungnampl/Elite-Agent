@@ -533,6 +533,126 @@ fn repository_hazards_are_classified_before_worktree_side_effects() {
 }
 
 #[test]
+fn hazard_scan_fails_closed_when_head_object_is_missing() {
+    let fixture = TempDir::new().expect("tempdir");
+    let source = fixture.path().join("source");
+    fs::create_dir(&source).expect("source");
+    let (repository, _commit) = commit_repository(&source);
+    let managed_root = fixture.path().join("managed");
+    fs::create_dir(&managed_root).expect("managed");
+    let gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+    let locator = locator(&gateway, &source);
+    let head_name = repository
+        .head()
+        .expect("head")
+        .name()
+        .expect("head name")
+        .to_owned();
+    let head_path = repository.path().join(&head_name);
+    fs::create_dir_all(head_path.parent().expect("head parent")).expect("head parent");
+    fs::write(head_path, format!("{}\n", "1".repeat(40))).expect("replace head");
+
+    gateway
+        .inspect(InspectRepository { locator })
+        .expect_err("missing HEAD object must fail closed");
+}
+
+#[test]
+fn hazard_scan_fails_closed_when_attributes_path_is_not_a_blob() {
+    let fixture = TempDir::new().expect("tempdir");
+    let source = fixture.path().join("source");
+    fs::create_dir(&source).expect("source");
+    let (repository, _commit) = commit_repository(&source);
+    fs::create_dir(source.join(".gitattributes")).expect("attributes directory");
+    fs::write(source.join(".gitattributes").join("nested"), b"inert\n").expect("nested");
+    commit_all(&repository, "non-blob attributes");
+    let managed_root = fixture.path().join("managed");
+    fs::create_dir(&managed_root).expect("managed");
+    let gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+
+    gateway
+        .inspect(InspectRepository {
+            locator: locator(&gateway, &source),
+        })
+        .expect_err("non-blob attributes must fail closed");
+}
+
+#[test]
+fn hazard_scan_fails_closed_when_attributes_blob_is_missing() {
+    let fixture = TempDir::new().expect("tempdir");
+    let source = fixture.path().join("source");
+    fs::create_dir(&source).expect("source");
+    let (repository, _commit) = commit_repository(&source);
+    fs::write(source.join(".gitattributes"), b"*.bin -filter\n").expect("attributes");
+    commit_all(&repository, "missing attributes blob");
+    let tree = repository
+        .head()
+        .expect("head")
+        .peel_to_tree()
+        .expect("tree");
+    let blob = tree
+        .get_path(Path::new(".gitattributes"))
+        .expect("attributes entry")
+        .id()
+        .to_string();
+    fs::remove_file(
+        repository
+            .path()
+            .join("objects")
+            .join(&blob[..2])
+            .join(&blob[2..]),
+    )
+    .expect("remove attributes blob");
+    let managed_root = fixture.path().join("managed");
+    fs::create_dir(&managed_root).expect("managed");
+    let gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+
+    gateway
+        .inspect(InspectRepository {
+            locator: locator(&gateway, &source),
+        })
+        .expect_err("missing attributes blob must fail closed");
+}
+
+#[test]
+fn hazard_scan_fails_closed_for_non_utf8_attributes() {
+    let fixture = TempDir::new().expect("tempdir");
+    let source = fixture.path().join("source");
+    fs::create_dir(&source).expect("source");
+    let (repository, _commit) = commit_repository(&source);
+    fs::write(source.join(".gitattributes"), [0xff, b'\n']).expect("attributes");
+    commit_all(&repository, "non-UTF-8 attributes");
+    let managed_root = fixture.path().join("managed");
+    fs::create_dir(&managed_root).expect("managed");
+    let gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+
+    gateway
+        .inspect(InspectRepository {
+            locator: locator(&gateway, &source),
+        })
+        .expect_err("non-UTF-8 attributes must fail closed");
+}
+
+#[test]
+fn hazard_scan_fails_closed_for_malformed_attributes() {
+    let fixture = TempDir::new().expect("tempdir");
+    let source = fixture.path().join("source");
+    fs::create_dir(&source).expect("source");
+    let (repository, _commit) = commit_repository(&source);
+    fs::write(source.join(".gitattributes"), b"*.bin\n").expect("attributes");
+    commit_all(&repository, "malformed attributes");
+    let managed_root = fixture.path().join("managed");
+    fs::create_dir(&managed_root).expect("managed");
+    let gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+
+    gateway
+        .inspect(InspectRepository {
+            locator: locator(&gateway, &source),
+        })
+        .expect_err("malformed attributes must fail closed");
+}
+
+#[test]
 fn target_inside_original_checkout_and_case_collisions_fail_closed() {
     let fixture = TempDir::new().expect("tempdir");
     let source = fixture.path().join("source");
@@ -603,6 +723,8 @@ fn successful_unicode_worktree_preserves_original_head_index_and_checkout_bytes(
 
 #[test]
 fn long_path_checkout_fails_closed_without_mutating_original_state() {
+    use local_agent_terminal_application::{PortError, SafeErrorClassification};
+
     let fixture = TempDir::new().expect("tempdir");
     let source = fixture.path().join("source");
     fs::create_dir(&source).expect("source");
@@ -614,9 +736,15 @@ fn long_path_checkout_fails_closed_without_mutating_original_state() {
     let locator = locator(&gateway, &source);
     let long_leaf = PathBuf::from(format!("task-{}", "x".repeat(230)));
 
-    assert!(gateway
-        .create_worktree(request_at(&gateway, &locator, &source, long_leaf.clone(),))
-        .is_err());
+    let result =
+        gateway.create_worktree(request_at(&gateway, &locator, &source, long_leaf.clone()));
+    assert!(matches!(
+        result,
+        Err(PortError::Failure {
+            classification: SafeErrorClassification::Conflict,
+            ..
+        })
+    ));
 
     assert_eq!(
         repository
@@ -631,10 +759,21 @@ fn long_path_checkout_fails_closed_without_mutating_original_state() {
         fs::read(repository.path().join("index")).expect("index after"),
         index_before
     );
-    assert!(!managed_root.join(long_leaf).exists());
-    assert!(repository
-        .find_reference("refs/heads/agent/task-1")
-        .is_err());
+    assert_eq!(
+        repository
+            .find_reference("refs/heads/agent/task-1")
+            .expect("preserved attempt branch")
+            .target()
+            .expect("attempt target")
+            .to_string(),
+        commit
+    );
+    if managed_root.join(long_leaf).exists() {
+        assert!(
+            repository.find_worktree("wt-task-1").is_ok(),
+            "partial target is preserved only with its worktree metadata"
+        );
+    }
 }
 
 #[test]
@@ -937,7 +1076,8 @@ fn create_directory_symlink(target: &Path, link: &Path) {
 
 #[cfg(feature = "test-seams")]
 #[test]
-fn every_post_add_failure_rolls_back_owned_state() {
+fn every_post_add_failure_preserves_owned_state_as_a_conflict() {
+    use local_agent_terminal_application::{PortError, SafeErrorClassification};
     use local_agent_terminal_repository_git::{PostAddStage, TestHooks};
 
     for stage in [
@@ -964,18 +1104,33 @@ fn every_post_add_failure_rolls_back_owned_state() {
         });
         let locator = locator(&gateway, &source);
 
-        gateway
-            .create_worktree(request(&gateway, &locator, &source))
-            .expect_err("injected post-add failure");
+        let result = gateway.create_worktree(request(&gateway, &locator, &source));
 
-        assert!(!managed_root.join("task-1").exists(), "{stage:?}");
         assert!(
-            repository
-                .find_reference("refs/heads/agent/task-1")
-                .is_err(),
+            matches!(
+                result,
+                Err(PortError::Failure {
+                    classification: SafeErrorClassification::Conflict,
+                    ..
+                })
+            ),
             "{stage:?}"
         );
-        assert!(repository.find_worktree("wt-task-1").is_err(), "{stage:?}");
+        assert!(
+            managed_root.join("task-1").join("README.md").is_file(),
+            "{stage:?}"
+        );
+        assert_eq!(
+            repository
+                .find_reference("refs/heads/agent/task-1")
+                .expect("preserved branch")
+                .target()
+                .expect("branch target")
+                .to_string(),
+            commit,
+            "{stage:?}"
+        );
+        assert!(repository.find_worktree("wt-task-1").is_ok(), "{stage:?}");
         assert_eq!(
             repository
                 .head()
@@ -996,7 +1151,7 @@ fn every_post_add_failure_rolls_back_owned_state() {
 
 #[cfg(feature = "test-seams")]
 #[test]
-fn rollback_preserves_a_concurrently_replaced_branch() {
+fn failed_create_preserves_replacements_after_ownership_observation() {
     use std::sync::{Arc, Barrier};
 
     use local_agent_terminal_application::{PortError, SafeErrorClassification};
@@ -1005,14 +1160,14 @@ fn rollback_preserves_a_concurrently_replaced_branch() {
     let fixture = TempDir::new().expect("tempdir");
     let source = fixture.path().join("source");
     fs::create_dir(&source).expect("source");
-    let (repository, _commit) = commit_repository(&source);
+    let (repository, commit) = commit_repository(&source);
     let replacement = dangling_commit(&repository, "replacement");
     let managed_root = fixture.path().join("managed");
     fs::create_dir(&managed_root).expect("managed");
     let mut gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
     let barrier = Arc::new(Barrier::new(2));
     gateway.set_test_hooks(TestHooks {
-        before_rollback: Some(barrier.clone()),
+        after_cleanup_ownership_check: Some(barrier.clone()),
         fail_at: Some(PostAddStage::AfterAdd),
         ..TestHooks::default()
     });
@@ -1028,58 +1183,19 @@ fn rollback_preserves_a_concurrently_replaced_branch() {
             "concurrent replacement",
         )
         .expect("replace branch");
-    barrier.wait();
-
-    let result = worker.join().expect("worker");
-
-    assert!(matches!(
-        result,
-        Err(PortError::Failure {
-            classification: SafeErrorClassification::Conflict,
-            ..
-        })
-    ));
-    assert_eq!(
-        repository
-            .find_reference("refs/heads/agent/task-1")
-            .expect("replacement branch")
-            .target(),
-        Some(replacement)
-    );
-    assert!(managed_root.join("task-1").join("README.md").is_file());
-    assert!(repository.find_worktree("wt-task-1").is_ok());
-}
-
-#[cfg(feature = "test-seams")]
-#[test]
-fn rollback_preserves_a_concurrently_replaced_target() {
-    use std::sync::{Arc, Barrier};
-
-    use local_agent_terminal_application::{PortError, SafeErrorClassification};
-    use local_agent_terminal_repository_git::{PostAddStage, TestHooks};
-
-    let fixture = TempDir::new().expect("tempdir");
-    let source = fixture.path().join("source");
-    fs::create_dir(&source).expect("source");
-    let (repository, commit) = commit_repository(&source);
-    let managed_root = fixture.path().join("managed");
-    fs::create_dir(&managed_root).expect("managed");
-    let mut gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
-    let barrier = Arc::new(Barrier::new(2));
-    gateway.set_test_hooks(TestHooks {
-        before_rollback: Some(barrier.clone()),
-        fail_at: Some(PostAddStage::AfterAdd),
-        ..TestHooks::default()
-    });
-    let locator = locator(&gateway, &source);
-    let create = request(&gateway, &locator, &source);
-    let worker = std::thread::spawn(move || gateway.create_worktree(create));
-    barrier.wait();
     let target = managed_root.join("task-1");
-    let displaced = managed_root.join("owned-but-displaced");
-    fs::rename(&target, &displaced).expect("displace owned target");
+    let displaced_target = managed_root.join("owned-target-displaced");
+    fs::rename(&target, &displaced_target).expect("displace owned target");
     fs::create_dir(&target).expect("replacement target");
     fs::write(target.join("FOREIGN.txt"), b"preserve").expect("foreign marker");
+    let worktree_admin = repository.path().join("worktrees").join("wt-task-1");
+    let displaced_admin = repository
+        .path()
+        .join("worktrees")
+        .join("owned-admin-displaced");
+    fs::rename(&worktree_admin, &displaced_admin).expect("displace owned worktree metadata");
+    fs::create_dir(&worktree_admin).expect("replacement worktree metadata");
+    fs::write(worktree_admin.join("FOREIGN.txt"), b"preserve").expect("admin marker");
     barrier.wait();
 
     let result = worker.join().expect("worker");
@@ -1095,17 +1211,21 @@ fn rollback_preserves_a_concurrently_replaced_target() {
         fs::read(target.join("FOREIGN.txt")).expect("foreign marker after"),
         b"preserve"
     );
-    assert!(displaced.join("README.md").is_file());
+    assert_eq!(
+        fs::read(worktree_admin.join("FOREIGN.txt")).expect("admin marker after"),
+        b"preserve"
+    );
+    assert!(displaced_target.join("README.md").is_file());
+    assert!(displaced_admin.is_dir());
     assert_eq!(
         repository
             .find_reference("refs/heads/agent/task-1")
-            .expect("owned branch preserved")
+            .expect("replacement branch preserved")
             .target()
-            .expect("branch target")
-            .to_string(),
-        commit
+            .expect("replacement target"),
+        replacement
     );
-    assert!(repository.find_worktree("wt-task-1").is_ok());
+    assert_ne!(replacement.to_string(), commit);
 }
 
 #[cfg(all(windows, feature = "test-seams"))]

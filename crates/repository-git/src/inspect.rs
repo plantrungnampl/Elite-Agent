@@ -23,7 +23,7 @@ pub(crate) fn inspect_opened(
     config: &git2::Config,
     locator: &local_agent_terminal_application::RepositoryLocator,
 ) -> Result<RepositorySnapshot, PortError> {
-    let mut hazard_list = hazards::scan(repository, config);
+    let mut hazard_list = hazards::scan(repository, config)?;
     if !hazards::config_worktree_matches(repository) {
         hazard_list.push(RepositoryHazard {
             reason: RepositoryHazardReason::UnsafeConfiguration,

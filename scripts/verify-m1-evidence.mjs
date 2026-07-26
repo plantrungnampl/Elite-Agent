@@ -5,6 +5,8 @@ import os from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { assertEvidenceOnlyChanges } from "./m1-evidence-worktree.mjs";
+
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const manifestArgument = process.argv.indexOf("--manifest");
 const manifestPath =
@@ -19,7 +21,7 @@ const requiredCommands = new Map([
   ["architecture", "node scripts/check-architecture.mjs"],
   ["repository-windows", "cargo test -p local-agent-terminal-repository-git --test windows_matrix --features test-seams"],
   ["recovery-matrix", "cargo test -p local-agent-terminal-bootstrap --test recovery_matrix"],
-  ["contract-tests", "node --test tests/contracts/*.test.mjs"],
+  ["contract-tests", "node --test tests/contracts/architecture.test.mjs tests/contracts/design-contracts.test.mjs"],
   ["rust-format", "cargo fmt --all -- --check"],
   ["rust-clippy", "cargo clippy --workspace --all-targets -- -D warnings"],
   ["rust-tests", "cargo test --workspace --all-targets"],
@@ -42,18 +44,18 @@ const requiredFixtures = new Map([
   ["static and swap-race junctions/symlinks", expected("fail-closed", [["repository-windows", "static_symlink_target_is_rejected_without_touching_its_destination"], ["repository-windows", "parent_swap_race_is_blocked_while_checkout_is_in_progress"]])],
   ["UNC/device/ADS rejection", expected("fail-closed", [["repository-windows", "invalid_windows_target_forms_are_rejected_without_git_side_effects"]])],
   ["nested/common-dir/artifact-root target rejection", expected("fail-closed", [["repository-windows", "target_inside_original_checkout_and_case_collisions_fail_closed"], ["repository-windows", "excluded_artifact_root_and_git_common_dir_targets_are_rejected"]])],
-  ["branch/path/CAS conflicts", expected("fail-closed", [["repository-windows", "branch_conflict_is_preserved_without_creating_target"], ["repository-windows", "rollback_preserves_a_concurrently_replaced_branch"], ["repository-windows", "rollback_preserves_a_concurrently_replaced_target"]])],
-  ["all post-add rollback boundaries", expected("recovered", [["repository-windows", "every_post_add_failure_rolls_back_owned_state"]])],
+  ["branch/path/CAS conflicts", expected("fail-closed", [["repository-windows", "branch_conflict_is_preserved_without_creating_target"], ["repository-windows", "failed_create_preserves_replacements_after_ownership_observation"]])],
+  ["all post-add rollback boundaries", expected("preserved", [["repository-windows", "every_post_add_failure_preserves_owned_state_as_a_conflict"]])],
   ["crash boundaries and pending/started intent recovery", expected("recovered", [["rust-tests", "crash_boundaries_reconcile_to_deterministic_states"], ["recovery-matrix", "startup_leaves_pending_intent_for_exact_command_retry_without_git_effects"], ["recovery-matrix", "startup_adopts_only_the_exact_durable_worktree"]])],
   ["stale lease replacement", expected("recovered", [["rust-tests", "stale_monitor_claim_is_rejected_before_evidence_or_repository_bytes_change"], ["rust-tests", "lease_replacement_increments_token_and_stale_claim_cannot_write"]])],
   ["projection-only replay", expected("preserved", [["recovery-matrix", "repeated_startup_replays_recovery_projection_without_duplicate_side_effects"]])],
   ["approval/candidate invalidation rollback", expected("preserved", [["rust-tests", "workspace_mutation_is_atomic_and_invalidates_candidate_approvals"], ["rust-tests", "mutation_rolls_back_event_projection_approvals_candidate_and_lease_together"]])],
   ["unknown intent handling", expected("recovered", [["recovery-matrix", "startup_marks_unknown_operations_indeterminate_without_touching_git"]])],
   ["SHA-1/SHA-256 exact IDs", expected("supported", [["repository-windows", "sha256_repository_keeps_exact_object_ids"]])],
-  ["submodule/LFS and execution-capable Git configuration", expected("fail-closed", [["repository-windows", "repository_hazards_are_classified_before_worktree_side_effects"], ["repository-windows", "every_execution_capable_git_configuration_fails_closed_and_stays_inert"]])],
+  ["submodule/LFS and execution-capable Git configuration", expected("fail-closed", [["repository-windows", "repository_hazards_are_classified_before_worktree_side_effects"], ["repository-windows", "hazard_scan_fails_closed_when_head_object_is_missing"], ["repository-windows", "hazard_scan_fails_closed_when_attributes_path_is_not_a_blob"], ["repository-windows", "hazard_scan_fails_closed_when_attributes_blob_is_missing"], ["repository-windows", "hazard_scan_fails_closed_for_non_utf8_attributes"], ["repository-windows", "hazard_scan_fails_closed_for_malformed_attributes"], ["repository-windows", "every_execution_capable_git_configuration_fails_closed_and_stays_inert"]])],
   ["shallow/sparse/detached/unborn repositories", expected("fail-closed", [["repository-windows", "shallow_and_sparse_repositories_fail_closed"], ["repository-windows", "dirty_detached_and_unborn_states_are_explicit"]])],
   ["CRLF configuration with checkout filters disabled", expected("supported", [["repository-windows", "checkout_disables_crlf_filters_and_preserves_blob_bytes"]])],
-  ["no child process spawned and executable sentinels untouched", expected("preserved", [["contract-tests", "repository adapter rejects process execution"], ["contract-tests", "architecture checker rejects grouped and aliased process imports"], ["repository-windows", "every_execution_capable_git_configuration_fails_closed_and_stays_inert"]])],
+  ["no child process spawned and executable sentinels untouched", expected("preserved", [["contract-tests", "architecture checker rejects grouped and aliased process imports"], ["contract-tests", "architecture checker rejects grouped and aliased PATH access"], ["repository-windows", "every_execution_capable_git_configuration_fails_closed_and_stays_inert"]])],
   ["browser recovery and accessibility", expected("supported", [["browser-tests", "renders authoritative workspace state and guards recovery actions"], ["browser-tests", "supports keyboard flow, reduced motion, narrow reflow, and contrast"]])],
 ]);
 
@@ -97,6 +99,9 @@ try {
     assert(/^outputs\/[a-z0-9-]+\.log$/.test(entry.outputFile), `invalid output path: ${command}`);
     const output = readFileSync(join(artifactRoot, entry.outputFile));
     assert(entry.outputSha256 === hash(output), `output hash mismatch: ${command}`);
+    if (name === "contract-tests") {
+      assert(!output.toString("utf8").includes("# SKIP"), "generation contract was skipped");
+    }
   }
 
   assert(Array.isArray(manifest.fixtureClassifications), "fixtures must be an array");
@@ -132,21 +137,23 @@ try {
 }
 
 function verifyCommitBinding(sourceCommit) {
+  assertEvidenceOnlyChanges(root);
   const head = commandOutput("git rev-parse HEAD");
-  if (head === sourceCommit) return;
-  const ancestor = spawnSync("git", ["merge-base", "--is-ancestor", sourceCommit, head], {
-    cwd: root,
-    windowsHide: true,
-  });
-  assert(ancestor.status === 0, "evidence source commit is not an ancestor of HEAD");
-  const changed = commandOutput(`git diff --name-only ${sourceCommit}..${head}`)
-    .split(/\r?\n/u)
-    .filter(Boolean);
-  assert(
-    changed.length > 0
-      && changed.every((path) => path.startsWith("artifacts/verification/m1/")),
-    "evidence source commit is stale for the current code",
-  );
+  if (head !== sourceCommit) {
+    const ancestor = spawnSync("git", ["merge-base", "--is-ancestor", sourceCommit, head], {
+      cwd: root,
+      windowsHide: true,
+    });
+    assert(ancestor.status === 0, "evidence source commit is not an ancestor of HEAD");
+    const changed = commandOutput(`git diff --name-only ${sourceCommit}..${head}`)
+      .split(/\r?\n/u)
+      .filter(Boolean);
+    assert(
+      changed.length > 0
+        && changed.every((path) => path.startsWith("artifacts/verification/m1/")),
+      "evidence source commit is stale for the current code",
+    );
+  }
 }
 
 function currentToolVersions() {

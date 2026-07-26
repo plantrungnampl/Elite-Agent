@@ -1,11 +1,15 @@
 use std::path::Path;
+use std::str;
 
-use git2::{Config, ConfigLevel, Repository};
-use local_agent_terminal_application::{RepositoryHazard, RepositoryHazardReason};
+use git2::{Config, ConfigLevel, ErrorCode, ObjectType, Repository, Tree};
+use local_agent_terminal_application::{PortError, RepositoryHazard, RepositoryHazardReason};
 
 use crate::paths;
 
-pub(crate) fn scan(repository: &Repository, config: &Config) -> Vec<RepositoryHazard> {
+pub(crate) fn scan(
+    repository: &Repository,
+    config: &Config,
+) -> Result<Vec<RepositoryHazard>, PortError> {
     let mut hazards = Vec::new();
     let mut entries = match config.entries(None) {
         Ok(entries) => entries,
@@ -14,7 +18,7 @@ pub(crate) fn scan(repository: &Repository, config: &Config) -> Vec<RepositoryHa
                 RepositoryHazardReason::UnsafeConfiguration,
                 "configuration could not be enumerated",
             ));
-            return hazards;
+            return Ok(hazards);
         }
     };
     while let Some(entry) = entries.next() {
@@ -98,29 +102,21 @@ pub(crate) fn scan(repository: &Repository, config: &Config) -> Vec<RepositoryHa
     if common_dir.join("hooks").is_dir() {
         // A default hooks directory is inert; only an explicit core.hooksPath is hazardous.
     }
-    if let Ok(tree) = repository.head().and_then(|head| head.peel_to_tree()) {
-        if tree.get_path(Path::new(".gitmodules")).is_ok() {
+    if let Some(tree) = resolved_head_tree(repository)? {
+        if head_blob(repository, &tree, Path::new(".gitmodules"))?.is_some() {
             hazards.push(hazard(
                 RepositoryHazardReason::SubmodulesPresent,
                 "gitmodules file present in HEAD",
             ));
         }
-        if tree.get_path(Path::new(".lfsconfig")).is_ok() {
+        if head_blob(repository, &tree, Path::new(".lfsconfig"))?.is_some() {
             hazards.push(hazard(
                 RepositoryHazardReason::LfsConfigured,
                 "lfs configuration file present in HEAD",
             ));
         }
-        if let Ok(entry) = tree.get_path(Path::new(".gitattributes")) {
-            if repository
-                .find_blob(entry.id())
-                .map(|blob| {
-                    blob.content()
-                        .split(|byte| byte.is_ascii_whitespace())
-                        .any(|token| token.eq_ignore_ascii_case(b"filter=lfs"))
-                })
-                .unwrap_or(false)
-            {
+        if let Some(attributes) = head_blob(repository, &tree, Path::new(".gitattributes"))? {
+            if attributes_use_lfs(&attributes)? {
                 hazards.push(hazard(
                     RepositoryHazardReason::LfsConfigured,
                     "lfs attribute present in HEAD",
@@ -141,7 +137,62 @@ pub(crate) fn scan(repository: &Repository, config: &Config) -> Vec<RepositoryHa
         ));
     }
     deduplicate(&mut hazards);
-    hazards
+    Ok(hazards)
+}
+
+fn resolved_head_tree(repository: &Repository) -> Result<Option<Tree<'_>>, PortError> {
+    let head = match repository.head() {
+        Ok(head) => head,
+        Err(error)
+            if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound)
+                && repository.is_empty().unwrap_or(false) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(paths::map_git_error(error)),
+    };
+    head.peel_to_tree().map(Some).map_err(paths::map_git_error)
+}
+
+fn head_blob(
+    repository: &Repository,
+    tree: &Tree<'_>,
+    path: &Path,
+) -> Result<Option<Vec<u8>>, PortError> {
+    let entry = match tree.get_path(path) {
+        Ok(entry) => entry,
+        Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
+        Err(error) => return Err(paths::map_git_error(error)),
+    };
+    if entry.kind() != Some(ObjectType::Blob) {
+        return Err(paths::integrity());
+    }
+    repository
+        .find_blob(entry.id())
+        .map(|blob| Some(blob.content().to_vec()))
+        .map_err(paths::map_git_error)
+}
+
+fn attributes_use_lfs(bytes: &[u8]) -> Result<bool, PortError> {
+    let source = str::from_utf8(bytes).map_err(|_| paths::integrity())?;
+    let mut uses_lfs = false;
+    for line in source.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.contains('\0') {
+            return Err(paths::integrity());
+        }
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() < 2 {
+            return Err(paths::integrity());
+        }
+        uses_lfs |= fields[1..]
+            .iter()
+            .any(|attribute| attribute.eq_ignore_ascii_case("filter=lfs"));
+    }
+    Ok(uses_lfs)
 }
 
 fn hazard(reason: RepositoryHazardReason, detail: &str) -> RepositoryHazard {

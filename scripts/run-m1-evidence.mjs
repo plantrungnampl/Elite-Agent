@@ -11,6 +11,8 @@ import os from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { assertEvidenceOnlyChanges } from "./m1-evidence-worktree.mjs";
+
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const artifactRoot = join(root, "artifacts", "verification", "m1");
 const outputRoot = join(artifactRoot, "outputs");
@@ -29,7 +31,10 @@ const commands = [
     "recovery-matrix",
     "cargo test -p local-agent-terminal-bootstrap --test recovery_matrix",
   ],
-  ["contract-tests", "node --test tests/contracts/*.test.mjs"],
+  [
+    "contract-tests",
+    "node --test tests/contracts/architecture.test.mjs tests/contracts/design-contracts.test.mjs",
+  ],
   ["rust-format", "cargo fmt --all -- --check"],
   ["rust-clippy", "cargo clippy --workspace --all-targets -- -D warnings"],
   ["rust-tests", "cargo test --workspace --all-targets"],
@@ -79,11 +84,10 @@ const fixtureClassifications = [
   ]),
   fixture("branch/path/CAS conflicts", "fail-closed", [
     evidence("repository-windows", "branch_conflict_is_preserved_without_creating_target"),
-    evidence("repository-windows", "rollback_preserves_a_concurrently_replaced_branch"),
-    evidence("repository-windows", "rollback_preserves_a_concurrently_replaced_target"),
+    evidence("repository-windows", "failed_create_preserves_replacements_after_ownership_observation"),
   ]),
-  fixture("all post-add rollback boundaries", "recovered", [
-    evidence("repository-windows", "every_post_add_failure_rolls_back_owned_state"),
+  fixture("all post-add rollback boundaries", "preserved", [
+    evidence("repository-windows", "every_post_add_failure_preserves_owned_state_as_a_conflict"),
   ]),
   fixture("crash boundaries and pending/started intent recovery", "recovered", [
     evidence("rust-tests", "crash_boundaries_reconcile_to_deterministic_states"),
@@ -109,6 +113,11 @@ const fixtureClassifications = [
   ]),
   fixture("submodule/LFS and execution-capable Git configuration", "fail-closed", [
     evidence("repository-windows", "repository_hazards_are_classified_before_worktree_side_effects"),
+    evidence("repository-windows", "hazard_scan_fails_closed_when_head_object_is_missing"),
+    evidence("repository-windows", "hazard_scan_fails_closed_when_attributes_path_is_not_a_blob"),
+    evidence("repository-windows", "hazard_scan_fails_closed_when_attributes_blob_is_missing"),
+    evidence("repository-windows", "hazard_scan_fails_closed_for_non_utf8_attributes"),
+    evidence("repository-windows", "hazard_scan_fails_closed_for_malformed_attributes"),
     evidence("repository-windows", "every_execution_capable_git_configuration_fails_closed_and_stays_inert"),
   ]),
   fixture("shallow/sparse/detached/unborn repositories", "fail-closed", [
@@ -119,8 +128,8 @@ const fixtureClassifications = [
     evidence("repository-windows", "checkout_disables_crlf_filters_and_preserves_blob_bytes"),
   ]),
   fixture("no child process spawned and executable sentinels untouched", "preserved", [
-    evidence("contract-tests", "repository adapter rejects process execution"),
     evidence("contract-tests", "architecture checker rejects grouped and aliased process imports"),
+    evidence("contract-tests", "architecture checker rejects grouped and aliased PATH access"),
     evidence("repository-windows", "every_execution_capable_git_configuration_fails_closed_and_stays_inert"),
   ]),
   fixture("browser recovery and accessibility", "supported", [
@@ -130,9 +139,11 @@ const fixtureClassifications = [
 ];
 
 try {
+  assertEvidenceOnlyChanges(root);
   mkdirSync(artifactRoot, { recursive: true });
   rmSync(outputRoot, { recursive: true, force: true });
   mkdirSync(outputRoot, { recursive: true });
+  rmSync(join(artifactRoot, "post-final-contracts.log"), { force: true });
   rmSync(manifestPath, { force: true });
   rmSync(temporaryManifestPath, { force: true });
 
@@ -183,7 +194,6 @@ async function runCommand(name, command) {
   const exitCode = await new Promise((resolveExit, reject) => {
     const child = spawn(command, {
       cwd: root,
-      env: { ...process.env, M1_EVIDENCE_GENERATING: "1" },
       shell: true,
       windowsHide: true,
     });
