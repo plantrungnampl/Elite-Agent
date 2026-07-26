@@ -20,3 +20,6 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 local-agent-terminal-bootstrap = { path = "../../../crates/bootstrap" }
 tauri = { version = "2", features = [] }
+
+[dev-dependencies]
+tempfile = "3.27"

@@ -7,9 +7,8 @@ edition = "2021"
 local-agent-terminal-application = { path = "../application" }
 local-agent-terminal-storage-files = { path = "../storage-files" }
 local-agent-terminal-storage-sqlite = { path = "../storage-sqlite" }
-serde_json = "1.0"
 
 [dev-dependencies]
-local-agent-terminal-domain = { path = "../domain" }
 rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1.0"
 tempfile = "3.27"

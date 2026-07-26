@@ -1,14 +1,12 @@
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use local_agent_terminal_application::{
-    Clock, DiagnosticSeverityDto, LocalDiagnosticDto, ObservationClassDto, PortError,
-    ReservedArtifact, StartupStateDto, TrustLabelDto,
-};
-use local_agent_terminal_bootstrap::{Bootstrap, LocalLog, StartupConfig};
+use local_agent_terminal_application::{Clock, PortError, ReservedArtifact, StartupStateDto};
+use local_agent_terminal_bootstrap::{Bootstrap, StartupConfig};
 use local_agent_terminal_storage_files::{
-    ContentAddressedArtifactStore, FaultPoint, JournaledArtifactWriter,
+    ContentAddressedArtifactStore, FaultPoint, JournaledArtifactWriter, RecoveryLock,
 };
 use local_agent_terminal_storage_sqlite::SqliteStore;
 use rusqlite::{params, Connection};
@@ -24,6 +22,7 @@ fn first_startup_creates_and_validates_required_local_state() {
     let bootstrap = Bootstrap::new(config(&app_data));
 
     assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
+    let _released_startup_lock = RecoveryLock::acquire(&app_data).unwrap();
     assert!(app_data.join("state.sqlite3").is_file());
     for relative in [
         "artifacts/objects",
@@ -47,8 +46,9 @@ fn first_startup_creates_and_validates_required_local_state() {
         codes,
         [
             "startup.app_directories.validated",
-            "startup.artifacts.validated",
+            "startup.recovery_lock.acquired",
             "startup.database.validated",
+            "startup.artifacts.validated",
             "startup.artifacts.reconciled",
             "startup.ready",
         ]
@@ -143,12 +143,127 @@ fn schema_failure_has_stable_safe_recovery_and_sanitized_diagnostics() {
 }
 
 #[test]
+fn database_failure_precedes_artifact_storage_mutation() {
+    let parent = TempDir::new().unwrap();
+    let app_data = parent.path().join("app-data");
+    fs::create_dir(&app_data).unwrap();
+    let database_path = app_data.join("state.sqlite3");
+    SqliteStore::open(&database_path).unwrap();
+    Connection::open(&database_path)
+        .unwrap()
+        .execute(
+            "UPDATE schema_migrations SET checksum = ?1",
+            [format!("sha256:{}", "a".repeat(64))],
+        )
+        .unwrap();
+
+    let bootstrap = Bootstrap::new(config(&app_data));
+
+    assert_eq!(
+        bootstrap.status().issues[0].code,
+        "startup.database_schema_invalid"
+    );
+    assert!(!app_data.join("artifacts").exists());
+    let _released_failure_lock = RecoveryLock::acquire(&app_data).unwrap();
+}
+
+#[test]
+fn recovery_lock_holder_process() {
+    let Some(root) = std::env::var_os("LOCAL_AGENT_TERMINAL_LOCK_TEST_ROOT") else {
+        return;
+    };
+    let _lock = RecoveryLock::acquire(Path::new(&root)).unwrap();
+    println!("RECOVERY_LOCK_HELD");
+    std::io::stdout().flush().unwrap();
+    let mut release = [0_u8; 1];
+    std::io::stdin().read_exact(&mut release).unwrap();
+}
+
+#[test]
+fn concurrent_startup_fails_closed_without_mutating_shared_state() {
+    let parent = TempDir::new().unwrap();
+    let app_data = parent.path().join("app-data");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "recovery_lock_holder_process",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("LOCAL_AGENT_TERMINAL_LOCK_TEST_ROOT", &app_data)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child_input = child.stdin.take().unwrap();
+    let mut child_output = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert_ne!(child_output.read_line(&mut line).unwrap(), 0);
+        if line.contains("RECOVERY_LOCK_HELD") {
+            break;
+        }
+    }
+
+    let bootstrap = Bootstrap::new(config(&app_data));
+
+    assert_ne!(bootstrap.status().state, StartupStateDto::Ready);
+    assert_eq!(
+        bootstrap.status().issues[0].code,
+        "startup.recovery_lock_unavailable"
+    );
+    assert!(!app_data.join("state.sqlite3").exists());
+    assert!(!app_data.join("artifacts").exists());
+    child_input.write_all(&[1]).unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn attacker_controlled_adapter_context_never_crosses_serialization_boundary() {
+    let parent = TempDir::new().unwrap();
+    let attacker_path = "private-repo-SELECT-secret-FROM-credentials";
+    let attacker_checksum = format!("sha256:{}", "a".repeat(64));
+    let app_data = parent.path().join(attacker_path);
+    ContentAddressedArtifactStore::open(app_data.join("artifacts")).unwrap();
+    let database_path = app_data.join("state.sqlite3");
+    SqliteStore::open(&database_path).unwrap();
+    Connection::open(&database_path)
+        .unwrap()
+        .execute(
+            "UPDATE schema_migrations SET checksum = ?1 WHERE version = 1",
+            [&attacker_checksum],
+        )
+        .unwrap();
+
+    let bootstrap = Bootstrap::new(config(&app_data));
+    let rendered = format!(
+        "{} {}",
+        serde_json::to_string(bootstrap.status()).unwrap(),
+        serde_json::to_string(bootstrap.local_diagnostics()).unwrap()
+    );
+
+    for forbidden in [
+        attacker_path,
+        "SELECT-secret",
+        "credentials",
+        attacker_checksum.as_str(),
+    ] {
+        assert!(!rendered.contains(forbidden), "leaked {forbidden}");
+    }
+}
+
+#[test]
 fn retry_revalidates_state_and_never_fabricates_ready() {
     let parent = TempDir::new().unwrap();
     let app_data = parent.path().join("app-data");
     fs::write(&app_data, b"not a directory").unwrap();
     let mut bootstrap = Bootstrap::new(config(&app_data));
     assert_ne!(bootstrap.status().state, StartupStateDto::Ready);
+    assert_eq!(
+        bootstrap.status().issues[0].code,
+        "startup.app_directories_unavailable"
+    );
 
     fs::remove_file(&app_data).unwrap();
     assert_eq!(
@@ -168,30 +283,6 @@ fn retry_revalidates_state_and_never_fabricates_ready() {
         bootstrap.retry_startup_validation().state,
         StartupStateDto::Ready
     );
-}
-
-#[test]
-fn structured_logs_redact_every_string_and_downgrade_untrusted_observations() {
-    let mut log = LocalLog::new(vec!["top-secret".to_owned()]);
-    log.push(LocalDiagnosticDto {
-        code: "code-top-secret".to_owned(),
-        component: "component-top-secret".to_owned(),
-        severity: DiagnosticSeverityDto::Error,
-        trust_label: TrustLabelDto::Untrusted,
-        observation_class: ObservationClassDto::CoreObservation,
-        error_category: Some("error-top-secret".to_owned()),
-        correlation_id: Some("correlation-top-secret".to_owned()),
-        detail: "detail top-secret".to_owned(),
-    });
-
-    let records = log.records();
-    assert_eq!(
-        records[0].observation_class,
-        ObservationClassDto::UntrustedClaim
-    );
-    assert!(!serde_json::to_string(records)
-        .unwrap()
-        .contains("top-secret"));
 }
 
 #[test]

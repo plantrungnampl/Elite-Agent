@@ -54,36 +54,9 @@ impl ContentAddressedArtifactStore {
 
     fn open_internal(
         root: &Path,
-        mut before_first_create: impl FnMut() -> std::io::Result<()>,
+        before_first_create: impl FnMut() -> std::io::Result<()>,
     ) -> Result<Self, PortError> {
-        let absolute = validated_absolute(root)?;
-        reject_existing_link_components(&absolute)?;
-        let (anchor, components) = anchored_components(&absolute)?;
-        let mut directory = Dir::open_ambient_dir(anchor, ambient_authority()).map_err(io_error)?;
-        let mut called = false;
-        for component in components {
-            directory = match directory.open_dir_nofollow(&component) {
-                Ok(child) => child,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if !called {
-                        before_first_create().map_err(io_error)?;
-                        called = true;
-                    }
-                    let created = match directory.create_dir(&component) {
-                        Ok(()) => true,
-                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-                        Err(error) => return Err(io_error(error)),
-                    };
-                    if created {
-                        sync_directory_handle(&directory)?;
-                    }
-                    directory.open_dir_nofollow(&component).map_err(io_error)?
-                }
-                Err(error) => return Err(io_error(error)),
-            };
-        }
-        reject_existing_link_components(&absolute)?;
-        let root = fs::canonicalize(&absolute).map_err(io_error)?;
+        let (root, directory) = open_root_directory(root, before_first_create)?;
         let store = Self { root, directory };
         for relative in [
             Path::new("objects"),
@@ -498,6 +471,40 @@ impl ContentAddressedArtifactStore {
             .map_err(io_error)?;
         sync_directory_handle(&directory)
     }
+}
+
+pub(crate) fn open_root_directory(
+    root: &Path,
+    mut before_first_create: impl FnMut() -> std::io::Result<()>,
+) -> Result<(PathBuf, Dir), PortError> {
+    let absolute = validated_absolute(root)?;
+    reject_existing_link_components(&absolute)?;
+    let (anchor, components) = anchored_components(&absolute)?;
+    let mut directory = Dir::open_ambient_dir(anchor, ambient_authority()).map_err(io_error)?;
+    let mut called = false;
+    for component in components {
+        directory = match directory.open_dir_nofollow(&component) {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !called {
+                    before_first_create().map_err(io_error)?;
+                    called = true;
+                }
+                let created = match directory.create_dir(&component) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    Err(error) => return Err(io_error(error)),
+                };
+                if created {
+                    sync_directory_handle(&directory)?;
+                }
+                directory.open_dir_nofollow(&component).map_err(io_error)?
+            }
+            Err(error) => return Err(io_error(error)),
+        };
+    }
+    reject_existing_link_components(&absolute)?;
+    Ok((fs::canonicalize(&absolute).map_err(io_error)?, directory))
 }
 
 impl ArtifactStore for ContentAddressedArtifactStore {

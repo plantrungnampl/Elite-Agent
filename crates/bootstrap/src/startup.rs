@@ -5,11 +5,11 @@ use local_agent_terminal_application::{
     SafeErrorClassification, StartupIssueDto, StartupStateDto, StartupStatusDto, TrustLabelDto,
 };
 use local_agent_terminal_storage_files::{
-    reconcile_artifacts, ContentAddressedArtifactStore, JournaledArtifactWriter,
+    reconcile_artifacts, ContentAddressedArtifactStore, RecoveryLock,
 };
 use local_agent_terminal_storage_sqlite::{DatabaseHealth, DatabaseIssue, OpenError, SqliteStore};
 
-use crate::LocalLog;
+use crate::logging::LocalLog;
 
 pub struct StartupConfig {
     pub app_data_dir: PathBuf,
@@ -17,7 +17,7 @@ pub struct StartupConfig {
 }
 
 pub struct Bootstrap {
-    config: StartupConfig,
+    config: Option<StartupConfig>,
     status: StartupStatusDto,
     diagnostics: Vec<LocalDiagnosticDto>,
     _runtime: Option<Runtime>,
@@ -34,12 +34,19 @@ struct StartupFailure {
     message: &'static str,
     category: &'static str,
     detail: String,
+    recovery: RecoveryMode,
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryMode {
+    Retry,
+    Restart,
 }
 
 impl Bootstrap {
     pub fn new(config: StartupConfig) -> Self {
         let mut bootstrap = Self {
-            config,
+            config: Some(config),
             status: StartupStatusDto {
                 state: StartupStateDto::RecoverableFailure,
                 issues: Vec::new(),
@@ -51,13 +58,44 @@ impl Bootstrap {
         bootstrap
     }
 
+    pub fn configuration_unavailable() -> Self {
+        Self::failed(StartupFailure {
+            state: StartupStateDto::RecoverableFailure,
+            code: "startup.app_data_resolution_failed",
+            message: "Local application storage could not be located.",
+            category: "configuration",
+            detail: "The application data directory resolver did not return a usable location."
+                .to_owned(),
+            recovery: RecoveryMode::Retry,
+        })
+    }
+
+    pub fn internal_state_unavailable() -> Self {
+        Self::failed(StartupFailure {
+            state: StartupStateDto::Indeterminate,
+            code: "startup.internal_state_unavailable",
+            message: "Startup state is unavailable and cannot be trusted.",
+            category: "internal",
+            detail: "Managed startup state was invalidated after an internal failure.".to_owned(),
+            recovery: RecoveryMode::Restart,
+        })
+    }
+
+    pub fn reconfigure(&mut self, config: StartupConfig) -> &StartupStatusDto {
+        self.config = Some(config);
+        self.retry_startup_validation()
+    }
+
     pub fn status(&self) -> &StartupStatusDto {
         &self.status
     }
 
     pub fn retry_startup_validation(&mut self) -> &StartupStatusDto {
-        let mut log = LocalLog::new(self.config.secret_values.clone());
-        match start(&self.config, &mut log) {
+        let Some(config) = self.config.as_ref() else {
+            return &self.status;
+        };
+        let mut log = LocalLog::new(config.secret_values.clone());
+        match start(config, &mut log) {
             Ok(runtime) => {
                 log.push(record(
                     "startup.ready",
@@ -85,7 +123,7 @@ impl Bootstrap {
                     issues: vec![StartupIssueDto {
                         code: failure.code.to_owned(),
                         message: failure.message.to_owned(),
-                        recovery_actions: recovery_actions(),
+                        recovery_actions: recovery_actions(failure.recovery),
                     }],
                 };
                 self._runtime = None;
@@ -98,11 +136,35 @@ impl Bootstrap {
     pub fn local_diagnostics(&self) -> &[LocalDiagnosticDto] {
         &self.diagnostics
     }
+
+    fn failed(failure: StartupFailure) -> Self {
+        let mut log = LocalLog::new(Vec::new());
+        log.push(record(
+            failure.code,
+            "bootstrap",
+            DiagnosticSeverityDto::Error,
+            Some(failure.category),
+            &failure.detail,
+        ));
+        Self {
+            config: None,
+            status: StartupStatusDto {
+                state: failure.state,
+                issues: vec![StartupIssueDto {
+                    code: failure.code.to_owned(),
+                    message: failure.message.to_owned(),
+                    recovery_actions: recovery_actions(failure.recovery),
+                }],
+            },
+            diagnostics: log.into_records(),
+            _runtime: None,
+        }
+    }
 }
 
 fn start(config: &StartupConfig, log: &mut LocalLog) -> Result<Runtime, StartupFailure> {
-    let artifacts = ContentAddressedArtifactStore::open(config.app_data_dir.join("artifacts"))
-        .map_err(|error| artifact_failure("startup.app_directories_unavailable", error))?;
+    let _recovery_lock =
+        RecoveryLock::acquire(&config.app_data_dir).map_err(recovery_lock_failure)?;
     log.push(record(
         "startup.app_directories.validated",
         "bootstrap",
@@ -110,16 +172,12 @@ fn start(config: &StartupConfig, log: &mut LocalLog) -> Result<Runtime, StartupF
         None,
         "Required application directories are available.",
     ));
-
-    artifacts
-        .validate_health()
-        .map_err(|error| artifact_failure("startup.artifact_storage_unavailable", error))?;
     log.push(record(
-        "startup.artifacts.validated",
-        "storage-files",
+        "startup.recovery_lock.acquired",
+        "bootstrap",
         DiagnosticSeverityDto::Info,
         None,
-        "Artifact storage passed capability-relative read/write validation.",
+        "Exclusive startup recovery lock acquired.",
     ));
 
     let database = SqliteStore::open(config.app_data_dir.join("state.sqlite3"))
@@ -136,6 +194,19 @@ fn start(config: &StartupConfig, log: &mut LocalLog) -> Result<Runtime, StartupF
         "Database schema and integrity checks passed.",
     ));
 
+    let artifacts = ContentAddressedArtifactStore::open(config.app_data_dir.join("artifacts"))
+        .map_err(|error| artifact_failure("startup.artifact_storage_unavailable", error))?;
+    artifacts
+        .validate_health()
+        .map_err(|error| artifact_failure("startup.artifact_storage_unavailable", error))?;
+    log.push(record(
+        "startup.artifacts.validated",
+        "storage-files",
+        DiagnosticSeverityDto::Info,
+        None,
+        "Artifact storage passed capability-relative read/write validation.",
+    ));
+
     let report =
         reconcile_artifacts(&artifacts, &database, &database).map_err(reconciliation_failure)?;
     log.push(record(
@@ -149,11 +220,25 @@ fn start(config: &StartupConfig, log: &mut LocalLog) -> Result<Runtime, StartupF
         ),
     ));
 
-    let _writer = JournaledArtifactWriter::new(&artifacts, &database, &database);
     Ok(Runtime {
         _database: database,
         _artifacts: artifacts,
     })
+}
+
+fn recovery_lock_failure(error: PortError) -> StartupFailure {
+    if error.safe_classification() == SafeErrorClassification::Unavailable {
+        StartupFailure {
+            state: StartupStateDto::RecoverableFailure,
+            code: "startup.recovery_lock_unavailable",
+            message: "Another application instance is validating local state.",
+            category: "unavailable",
+            detail: "Exclusive startup recovery lock could not be acquired.".to_owned(),
+            recovery: RecoveryMode::Retry,
+        }
+    } else {
+        artifact_failure("startup.app_directories_unavailable", error)
+    }
 }
 
 fn artifact_failure(code: &'static str, error: PortError) -> StartupFailure {
@@ -167,37 +252,57 @@ fn artifact_failure(code: &'static str, error: PortError) -> StartupFailure {
             error.safe_classification(),
             error.retryability()
         ),
+        recovery: RecoveryMode::Retry,
     }
 }
 
 fn database_open_failure(error: OpenError) -> StartupFailure {
     match error {
-        OpenError::ChecksumMismatch { .. } | OpenError::UnsupportedSchema { .. } => {
-            StartupFailure {
-                state: StartupStateDto::RecoverableFailure,
-                code: "startup.database_schema_invalid",
-                message: "The local database schema could not be validated.",
-                category: "integrity_failure",
-                detail: error.to_string(),
-            }
-        }
+        OpenError::ChecksumMismatch { .. } => StartupFailure {
+            state: StartupStateDto::RecoverableFailure,
+            code: "startup.database_schema_invalid",
+            message: "The local database schema could not be validated.",
+            category: "integrity_failure",
+            detail: "The recorded database migration checksum did not match this application."
+                .to_owned(),
+            recovery: RecoveryMode::Retry,
+        },
+        OpenError::UnsupportedSchema { .. } => StartupFailure {
+            state: StartupStateDto::RecoverableFailure,
+            code: "startup.database_schema_invalid",
+            message: "The local database schema could not be validated.",
+            category: "integrity_failure",
+            detail: "The database schema version is not supported by this application.".to_owned(),
+            recovery: RecoveryMode::Retry,
+        },
         OpenError::Database(_) => StartupFailure {
             state: StartupStateDto::RecoverableFailure,
             code: "startup.database_unavailable",
             message: "The local database could not be opened.",
             category: "unavailable",
-            detail: error.to_string(),
+            detail: "The database adapter could not open the local store.".to_owned(),
+            recovery: RecoveryMode::Retry,
         },
     }
 }
 
 fn database_health_failure(issue: DatabaseIssue) -> StartupFailure {
+    let detail = match issue {
+        DatabaseIssue::Unreadable => "The database could not be read for health validation.",
+        DatabaseIssue::IntegrityCheckFailed(_) => {
+            "The database integrity check reported a failure."
+        }
+        DatabaseIssue::ForeignKeyViolation => {
+            "The database health check found a referential integrity violation."
+        }
+    };
     StartupFailure {
         state: StartupStateDto::RecoverableFailure,
         code: "startup.database_integrity_failed",
         message: "The local database failed an integrity check.",
         category: "integrity_failure",
-        detail: format!("Database health check failed: {issue:?}."),
+        detail: detail.to_owned(),
+        recovery: RecoveryMode::Retry,
     }
 }
 
@@ -212,14 +317,23 @@ fn reconciliation_failure(error: PortError) -> StartupFailure {
             error.safe_classification(),
             error.retryability()
         ),
+        recovery: RecoveryMode::Retry,
     }
 }
 
-fn recovery_actions() -> Vec<RecoveryActionDto> {
+fn recovery_actions(recovery: RecoveryMode) -> Vec<RecoveryActionDto> {
     vec![
         RecoveryActionDto {
-            code: "retry_startup_validation".to_owned(),
-            label: "Retry startup validation".to_owned(),
+            code: match recovery {
+                RecoveryMode::Retry => "retry_startup_validation",
+                RecoveryMode::Restart => "restart_application",
+            }
+            .to_owned(),
+            label: match recovery {
+                RecoveryMode::Retry => "Retry startup validation",
+                RecoveryMode::Restart => "Restart application",
+            }
+            .to_owned(),
         },
         RecoveryActionDto {
             code: "get_local_diagnostics".to_owned(),
