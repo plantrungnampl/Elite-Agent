@@ -6,7 +6,7 @@ use local_agent_terminal_domain::{
 };
 
 use crate::{
-    NewProject, PortError, ProjectSnapshot, Retryability, SafeErrorClassification,
+    NewProject, PortError, ProjectSettings, ProjectSnapshot, Retryability, SafeErrorClassification,
     WorkspaceStateStore,
 };
 
@@ -16,12 +16,42 @@ pub enum ObjectFormat {
     Sha256,
 }
 
+impl ObjectFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha1 => "sha1",
+            Self::Sha256 => "sha256",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepositoryHealth {
     Healthy,
     Dirty,
     Unsafe,
     Unsupported,
+}
+
+impl RepositoryHealth {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Dirty => "dirty",
+            Self::Unsafe => "unsafe",
+            Self::Unsupported => "unsupported",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "healthy" => Some(Self::Healthy),
+            "dirty" => Some(Self::Dirty),
+            "unsafe" => Some(Self::Unsafe),
+            "unsupported" => Some(Self::Unsupported),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +63,29 @@ pub enum OriginalCheckoutState {
     Unavailable,
 }
 
+impl OriginalCheckoutState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Dirty => "dirty",
+            Self::Detached => "detached",
+            Self::Unborn => "unborn",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "clean" => Some(Self::Clean),
+            "dirty" => Some(Self::Dirty),
+            "detached" => Some(Self::Detached),
+            "unborn" => Some(Self::Unborn),
+            "unavailable" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepositoryHazardReason {
     HooksConfigured,
@@ -42,6 +95,33 @@ pub enum RepositoryHazardReason {
     UnsafeConfiguration,
     UnsupportedObjectFormat,
     PathConflict,
+}
+
+impl RepositoryHazardReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HooksConfigured => "hooks_configured",
+            Self::FiltersConfigured => "filters_configured",
+            Self::LfsConfigured => "lfs_configured",
+            Self::SubmodulesPresent => "submodules_present",
+            Self::UnsafeConfiguration => "unsafe_configuration",
+            Self::UnsupportedObjectFormat => "unsupported_object_format",
+            Self::PathConflict => "path_conflict",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "hooks_configured" => Some(Self::HooksConfigured),
+            "filters_configured" => Some(Self::FiltersConfigured),
+            "lfs_configured" => Some(Self::LfsConfigured),
+            "submodules_present" => Some(Self::SubmodulesPresent),
+            "unsafe_configuration" => Some(Self::UnsafeConfiguration),
+            "unsupported_object_format" => Some(Self::UnsupportedObjectFormat),
+            "path_conflict" => Some(Self::PathConflict),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,9 +247,21 @@ impl<'a> OnboardRepository<'a> {
         project_id: ProjectId,
         name: String,
         created_at: String,
+        settings: ProjectSettings,
         inspection: InspectRepository,
     ) -> Result<ProjectSnapshot, PortError> {
-        if name.trim().is_empty() || name.len() > 200 || created_at.trim().is_empty() {
+        let repository_path = inspection
+            .locator
+            .canonical_workdir
+            .to_str()
+            .ok_or_else(invalid_input)?
+            .to_owned();
+        if name.trim().is_empty()
+            || name.len() > 200
+            || created_at.trim().is_empty()
+            || settings.policy_profile_id.trim().is_empty()
+            || settings.artifact_root_path.trim().is_empty()
+        {
             return Err(invalid_input());
         }
 
@@ -178,6 +270,8 @@ impl<'a> OnboardRepository<'a> {
             project_id,
             name,
             repository,
+            repository_path,
+            settings,
             created_at,
         })
     }

@@ -34,9 +34,10 @@ pub use repository::{
     WorktreeSnapshot, WorktreeState,
 };
 pub use workspace::{
-    GetWorkspaceDashboard, IdempotencyClass, IntentTransition, NewProject, NewTask,
-    ObserveWorkspaceMutation, OperationIntent, OperationIntentStatus, PrepareTaskWorkspace,
-    ProjectSnapshot, ReconcileWorkspaces, RecoveryAction, RecoveryCandidate, RecoveryEvidence,
-    RecoveryReason, TaskLeaseState, TaskSnapshot, WorkspaceMutationRequest,
-    WorkspaceMutationResult, WorkspaceStateStore, WorktreeIntent, WorktreeMatch,
+    ArtifactRootMode, GetWorkspaceDashboard, IdempotencyClass, IntentTransition, NewProject,
+    NewTask, ObserveWorkspaceMutation, OperationIntent, OperationIntentStatus,
+    PrepareTaskWorkspace, ProjectSettings, ProjectSnapshot, ReconcileWorkspaces, RecoveryAction,
+    RecoveryCandidate, RecoveryEvidence, RecoveryReason, RepositoryInspectionRecord, RiskLevel,
+    TaskLeaseState, TaskSnapshot, WorkspaceMutationRequest, WorkspaceMutationResult,
+    WorkspaceStateStore, WorktreeIntent, WorktreeMatch,
 };

@@ -5,8 +5,31 @@ use crate::PortError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseState {
     Active,
+    Released,
+    Expired,
     Revoked,
     Stale,
+}
+
+impl LeaseState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Released => "released",
+            Self::Expired => "expired",
+            Self::Revoked | Self::Stale => "revoked",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "released" => Some(Self::Released),
+            "expired" => Some(Self::Expired),
+            "revoked" => Some(Self::Revoked),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

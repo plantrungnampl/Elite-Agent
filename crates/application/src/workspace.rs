@@ -15,7 +15,31 @@ pub struct NewProject {
     pub project_id: ProjectId,
     pub name: String,
     pub repository: RepositorySnapshot,
+    pub repository_path: String,
+    pub settings: ProjectSettings,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactRootMode {
+    ApplicationData,
+    ProjectLocal,
+}
+
+impl ArtifactRootMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApplicationData => "application_data",
+            Self::ProjectLocal => "project_local",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSettings {
+    pub policy_profile_id: String,
+    pub artifact_root_mode: ArtifactRootMode,
+    pub artifact_root_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +47,49 @@ pub struct ProjectSnapshot {
     pub project_id: ProjectId,
     pub name: String,
     pub repository: RepositorySnapshot,
+    pub repository_path: String,
+    pub settings: ProjectSettings,
+    pub repository_evidence_artifact_id: Option<ArtifactId>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryInspectionRecord {
+    pub project_id: ProjectId,
+    pub repository: RepositorySnapshot,
+    pub evidence: CanonicalEvidenceRef,
+    pub actor_id: ActorId,
+    pub correlation_id: String,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl RiskLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "critical" => Some(Self::Critical),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +98,7 @@ pub struct NewTask {
     pub project_id: ProjectId,
     pub title: String,
     pub objective: String,
+    pub risk_level: RiskLevel,
     pub base_branch: TaskBranch,
     pub base_commit: GitObjectId,
     pub created_at: String,
@@ -41,6 +108,8 @@ pub struct NewTask {
 pub enum TaskLeaseState {
     None,
     Active,
+    Released,
+    Expired,
     Revoked,
     Stale,
 }
@@ -51,6 +120,7 @@ pub struct TaskSnapshot {
     pub project_id: ProjectId,
     pub title: String,
     pub objective: String,
+    pub risk_level: RiskLevel,
     pub phase: Phase,
     pub condition: Condition,
     pub operation_state: OperationState,
@@ -72,6 +142,25 @@ pub enum IdempotencyClass {
     NonRepeatable,
 }
 
+impl IdempotencyClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idempotent => "idempotent",
+            Self::Queryable => "queryable",
+            Self::NonRepeatable => "non_repeatable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "idempotent" => Some(Self::Idempotent),
+            "queryable" => Some(Self::Queryable),
+            "non_repeatable" => Some(Self::NonRepeatable),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationIntentStatus {
     Pending,
@@ -81,8 +170,37 @@ pub enum OperationIntentStatus {
     Failed,
     Interrupted,
     Indeterminate,
+    Cancelled,
 }
 
+impl OperationIntentStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Claimed => "claimed",
+            Self::Started => "started",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+            Self::Indeterminate => "indeterminate",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "claimed" => Some(Self::Claimed),
+            "started" => Some(Self::Started),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "interrupted" => Some(Self::Interrupted),
+            "indeterminate" => Some(Self::Indeterminate),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationIntent {
     pub id: String,
@@ -200,6 +318,7 @@ pub struct RecoveryCandidate {
     pub reason: RecoveryReason,
     pub evidence: RecoveryEvidence,
     pub actions: Vec<RecoveryAction>,
+    pub expected_worktree: Option<WorktreeIntent>,
 }
 
 impl RecoveryCandidate {
@@ -227,6 +346,7 @@ impl RecoveryCandidate {
             reason,
             evidence,
             actions,
+            expected_worktree: None,
         }
     }
 
@@ -241,6 +361,10 @@ impl RecoveryCandidate {
 
 pub trait WorkspaceStateStore: Send + Sync {
     fn create_project(&self, project: NewProject) -> Result<ProjectSnapshot, PortError>;
+    fn record_repository_inspection(
+        &self,
+        inspection: RepositoryInspectionRecord,
+    ) -> Result<ProjectSnapshot, PortError>;
     fn create_task(&self, task: NewTask) -> Result<TaskSnapshot, PortError>;
     fn begin_worktree_intent(&self, intent: WorktreeIntent) -> Result<OperationIntent, PortError>;
     fn transition_worktree_intent(&self, transition: IntentTransition) -> Result<(), PortError>;

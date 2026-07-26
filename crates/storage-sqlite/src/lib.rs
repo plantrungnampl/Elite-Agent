@@ -3,7 +3,11 @@
 mod artifact_journal;
 mod event_store;
 mod health;
+mod lease_store;
 mod migrations;
+mod project_store;
+mod task_query;
+mod workspace_store;
 
 use std::path::{Path, PathBuf};
 
@@ -11,6 +15,7 @@ use local_agent_terminal_application::{Clock, PortError};
 use rusqlite::Connection;
 
 pub use health::{artifact_root_health, ArtifactRootIssue, DatabaseHealth, DatabaseIssue};
+pub use lease_store::CoreSystemRunRequest;
 pub use migrations::{migration_checksum, OpenError};
 
 #[derive(Debug, Clone)]

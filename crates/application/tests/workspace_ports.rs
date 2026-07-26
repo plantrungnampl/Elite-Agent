@@ -2,14 +2,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use local_agent_terminal_application::{
-    canonical_evidence, AcquireExecutorLease, AcquireLease, ArtifactRef, CanonicalJsonRequest,
-    CreateWorktree, DiscardWorktree, EvidenceSummaryDto, ExecutorLeaseStore, ExpectedPresence,
-    GetWorkspaceDashboard, IdempotencyClass, InspectRepository, IntentTransition, LeaseSnapshot,
-    LeaseState, ManagedWorktreePath, NewProject, NewTask, ObjectFormat, ObserveWorkspaceMutation,
-    OnboardRepository, OperationIntent, OperationIntentStatus, OriginalCheckoutState, PortError,
-    PrepareTaskWorkspace, ProjectSnapshot, RecoveryAction, RecoveryCandidate, RecoveryEvidence,
-    RecoveryReason, RepositoryGateway, RepositoryHealth, RepositoryLocator, RepositorySnapshot,
-    RevokeLease, SafeErrorClassification, TaskLeaseState, TaskQuery, TaskSnapshot,
+    canonical_evidence, AcquireExecutorLease, AcquireLease, ArtifactRef, ArtifactRootMode,
+    CanonicalJsonRequest, CreateWorktree, DiscardWorktree, EvidenceSummaryDto, ExecutorLeaseStore,
+    ExpectedPresence, GetWorkspaceDashboard, IdempotencyClass, InspectRepository, IntentTransition,
+    LeaseSnapshot, LeaseState, ManagedWorktreePath, NewProject, NewTask, ObjectFormat,
+    ObserveWorkspaceMutation, OnboardRepository, OperationIntent, OperationIntentStatus,
+    OriginalCheckoutState, PortError, PrepareTaskWorkspace, ProjectSettings, ProjectSnapshot,
+    RecoveryAction, RecoveryCandidate, RecoveryEvidence, RecoveryReason, RepositoryGateway,
+    RepositoryHealth, RepositoryInspectionRecord, RepositoryLocator, RepositorySnapshot,
+    RevokeLease, RiskLevel, SafeErrorClassification, TaskLeaseState, TaskQuery, TaskSnapshot,
     TimelineEntryDto, WorkspaceDashboardDto, WorkspaceMutationRequest, WorkspaceMutationResult,
     WorkspaceMutationStore, WorkspaceStateStore, WorktreeIntent, WorktreeMatch, WorktreeSnapshot,
     WorktreeState,
@@ -89,6 +90,7 @@ fn task_snapshot() -> TaskSnapshot {
         project_id: ProjectId::new("project-1").unwrap(),
         title: "Implement repository recovery".to_owned(),
         objective: "Keep Git effects isolated".to_owned(),
+        risk_level: RiskLevel::High,
         phase: Phase::Intake,
         condition: Condition::Active,
         operation_state: OperationState::None,
@@ -176,7 +178,33 @@ impl WorkspaceStateStore for FakeWorkspaceStateStore {
             project_id: project.project_id,
             name: project.name,
             repository: project.repository,
+            repository_path: project.repository_path,
+            settings: project.settings,
+            repository_evidence_artifact_id: None,
             created_at: project.created_at,
+        })
+    }
+
+    fn record_repository_inspection(
+        &self,
+        inspection: RepositoryInspectionRecord,
+    ) -> Result<ProjectSnapshot, PortError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push("record_repository_inspection");
+        Ok(ProjectSnapshot {
+            project_id: inspection.project_id,
+            name: "Local Agent Terminal".to_owned(),
+            repository: inspection.repository,
+            repository_path: r"D:\source\project".to_owned(),
+            settings: ProjectSettings {
+                policy_profile_id: "default".to_owned(),
+                artifact_root_mode: ArtifactRootMode::ApplicationData,
+                artifact_root_path: r"D:\application-data\artifacts".to_owned(),
+            },
+            repository_evidence_artifact_id: Some(inspection.evidence.artifact_id),
+            created_at: "2026-07-26T00:00:00Z".to_owned(),
         })
     }
 
@@ -247,6 +275,11 @@ fn repository_onboarding_returns_typed_health_without_exposing_handles() {
             ProjectId::new("project-1").unwrap(),
             "Local Agent Terminal".to_owned(),
             "2026-07-26T00:00:00Z".to_owned(),
+            ProjectSettings {
+                policy_profile_id: "default".to_owned(),
+                artifact_root_mode: ArtifactRootMode::ApplicationData,
+                artifact_root_path: r"D:\application-data\artifacts".to_owned(),
+            },
             InspectRepository {
                 locator: repository_locator(),
             },
