@@ -237,7 +237,11 @@ function commandOutput(command) {
 }
 
 function normalizeOutput(output) {
-  return Buffer.from(output.toString("utf8").replaceAll("\r\n", "\n"), "utf8");
+  const normalized = output.toString("utf8").replaceAll("\r\n", "\n");
+  return Buffer.from(
+    normalized.length === 0 ? "" : `${normalized.replace(/\n+$/u, "")}\n`,
+    "utf8",
+  );
 }
 
 function hash(value) {
