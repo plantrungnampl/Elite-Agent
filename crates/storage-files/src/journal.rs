@@ -5,7 +5,8 @@ use local_agent_terminal_application::{
     ArtifactWriteReservation, Clock, PortError,
 };
 
-use crate::content_address::ContentAddressedArtifactStore;
+use crate::content_address::{ContentAddressedArtifactStore, PublishError};
+use serde_json::json;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultPoint {
@@ -84,12 +85,24 @@ impl<'a> JournaledArtifactWriter<'a> {
         )?;
         fault(FaultPoint::AfterJournalTransition)?;
 
-        self.store.publish(
+        match self.store.publish_with_post_rename_hook(
             &staging,
             &reservation.artifact.content_hash,
             reservation.artifact.size_bytes,
-        )?;
-        fault(FaultPoint::AfterRename)?;
+            || fault(FaultPoint::AfterRename),
+        ) {
+            Ok(_) => {}
+            Err(PublishError::Quarantined) => {
+                self.transition_with_error(
+                    &reservation.operation_id,
+                    ArtifactJournalStatus::Staging,
+                    ArtifactJournalStatus::Quarantined,
+                    json!({"kind": "object_invalid_after_rename"}),
+                )?;
+                return Err(super::content_address::integrity_failure());
+            }
+            Err(error) => return Err(error.into_port_error()),
+        }
         self.transition(
             &reservation.operation_id,
             ArtifactJournalStatus::Staging,
@@ -113,6 +126,26 @@ impl<'a> JournaledArtifactWriter<'a> {
         expected_status: ArtifactJournalStatus,
         next_status: ArtifactJournalStatus,
     ) -> Result<(), PortError> {
+        self.transition_internal(operation_id, expected_status, next_status, None)
+    }
+
+    fn transition_with_error(
+        &self,
+        operation_id: &str,
+        expected_status: ArtifactJournalStatus,
+        next_status: ArtifactJournalStatus,
+        error: serde_json::Value,
+    ) -> Result<(), PortError> {
+        self.transition_internal(operation_id, expected_status, next_status, Some(error))
+    }
+
+    fn transition_internal(
+        &self,
+        operation_id: &str,
+        expected_status: ArtifactJournalStatus,
+        next_status: ArtifactJournalStatus,
+        error: Option<serde_json::Value>,
+    ) -> Result<(), PortError> {
         let updated_at = self.clock.now_utc()?;
         self.journal.transition(ArtifactJournalTransition {
             operation_id: operation_id.to_owned(),
@@ -121,7 +154,7 @@ impl<'a> JournaledArtifactWriter<'a> {
             completed_at: (next_status == ArtifactJournalStatus::Completed)
                 .then(|| updated_at.clone()),
             updated_at,
-            error: None,
+            error,
         })
     }
 }

@@ -27,6 +27,26 @@ enum InspectedFile {
     Valid(Vec<u8>),
 }
 
+pub(crate) enum PublishError {
+    Quarantined,
+    Other(PortError),
+}
+
+impl PublishError {
+    pub(crate) fn into_port_error(self) -> PortError {
+        match self {
+            Self::Quarantined => integrity_failure(),
+            Self::Other(error) => error,
+        }
+    }
+}
+
+impl From<PortError> for PublishError {
+    fn from(error: PortError) -> Self {
+        Self::Other(error)
+    }
+}
+
 impl ContentAddressedArtifactStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, PortError> {
         Self::open_internal(root.as_ref(), || Ok(()))
@@ -107,10 +127,7 @@ impl ContentAddressedArtifactStore {
         expected_hash: &str,
         expected_size: u64,
     ) -> Result<bool, PortError> {
-        Ok(matches!(
-            self.inspect(path, expected_hash, expected_size)?,
-            InspectedFile::Valid(_)
-        ))
+        self.verify_relative(self.relative(path)?, expected_hash, expected_size)
     }
 
     pub(crate) fn create_staging(&self, temp_name: &str) -> Result<File, PortError> {
@@ -133,7 +150,7 @@ impl ContentAddressedArtifactStore {
         staging: &Path,
         expected_hash: &str,
         expected_size: u64,
-    ) -> Result<PathBuf, PortError> {
+    ) -> Result<PathBuf, PublishError> {
         self.publish_internal(staging, expected_hash, expected_size, || Ok(()))
     }
 
@@ -142,17 +159,14 @@ impl ContentAddressedArtifactStore {
         staging: &Path,
         expected_hash: &str,
         expected_size: u64,
-        after_rename: impl FnOnce() -> std::io::Result<()>,
-    ) -> Result<PathBuf, PortError> {
+        after_rename: impl FnOnce() -> Result<(), PortError>,
+    ) -> Result<PathBuf, PublishError> {
         let staging_relative = self.relative(staging)?.to_owned();
         let target_relative = object_relative(expected_hash)?;
         let target_parent = target_relative.parent().ok_or_else(invalid_input)?;
         self.ensure_directory(target_parent)?;
         if self.entry_exists_relative(&target_relative)? {
-            if matches!(
-                self.inspect_relative(&target_relative, expected_hash, expected_size)?,
-                InspectedFile::Valid(_)
-            ) {
+            if self.verify_relative(&target_relative, expected_hash, expected_size)? {
                 if self.entry_exists_relative(&staging_relative)? {
                     self.discard_staging(staging)?;
                 }
@@ -165,27 +179,23 @@ impl ContentAddressedArtifactStore {
             .map_err(io_error)?;
         self.sync_relative_directory(target_parent)?;
         self.sync_relative_directory(Path::new("staging"))?;
-        after_rename().map_err(io_error)?;
-        if !matches!(
-            self.inspect_relative(&target_relative, expected_hash, expected_size)?,
-            InspectedFile::Valid(_)
-        ) {
+        after_rename()?;
+        if !self.verify_relative(&target_relative, expected_hash, expected_size)? {
             if self.entry_exists_relative(&target_relative)? {
                 self.quarantine(&self.root.join(&target_relative))?;
             }
-            return Err(integrity_failure());
+            return Err(PublishError::Quarantined);
         }
         Ok(self.root.join(target_relative))
     }
 
-    #[cfg(test)]
-    fn publish_with_post_rename_hook(
+    pub(crate) fn publish_with_post_rename_hook(
         &self,
         staging: &Path,
         expected_hash: &str,
         expected_size: u64,
-        hook: impl FnOnce() -> std::io::Result<()>,
-    ) -> Result<PathBuf, PortError> {
+        hook: impl FnOnce() -> Result<(), PortError>,
+    ) -> Result<PathBuf, PublishError> {
         self.publish_internal(staging, expected_hash, expected_size, hook)
     }
 
@@ -320,7 +330,8 @@ impl ContentAddressedArtifactStore {
             self.quarantine(&staging)?;
             return Err(integrity_failure());
         }
-        self.publish(&staging, &artifact.expected_hash, artifact.expected_size)?;
+        self.publish(&staging, &artifact.expected_hash, artifact.expected_size)
+            .map_err(PublishError::into_port_error)?;
         Ok(ArtifactRef {
             content_hash: artifact.expected_hash,
             storage_key,
@@ -360,22 +371,24 @@ impl ContentAddressedArtifactStore {
         self.read_internal(reference, hook)
     }
 
-    fn inspect(
-        &self,
-        path: &Path,
-        expected_hash: &str,
-        expected_size: u64,
-    ) -> Result<InspectedFile, PortError> {
-        self.inspect_relative(self.relative(path)?, expected_hash, expected_size)
-    }
-
-    fn inspect_relative(
+    fn verify_relative(
         &self,
         relative: &Path,
         expected_hash: &str,
         expected_size: u64,
-    ) -> Result<InspectedFile, PortError> {
-        self.inspect_relative_with_post_open_hook(relative, expected_hash, expected_size, || Ok(()))
+    ) -> Result<bool, PortError> {
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = match self.directory.open_with(relative, &options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(io_error(error)),
+        };
+        let metadata = file.metadata().map_err(io_error)?;
+        if !metadata.is_file() || metadata.len() != expected_size {
+            return Ok(false);
+        }
+        verify_stream(&mut file, expected_hash, expected_size)
     }
 
     fn inspect_relative_with_post_open_hook(
@@ -502,6 +515,30 @@ fn validate_declared_content_parts(
         return Err(integrity_failure());
     }
     Ok(())
+}
+
+fn verify_stream(
+    reader: &mut impl Read,
+    expected_hash: &str,
+    expected_size: u64,
+) -> Result<bool, PortError> {
+    let mut hash = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(io_error)?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read as u64)
+            .ok_or_else(integrity_failure)?;
+        if size > expected_size {
+            return Ok(false);
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(size == expected_size && format!("sha256:{:x}", hash.finalize()) == expected_hash)
 }
 
 fn validate_hash(hash: &str) -> Result<&str, PortError> {
@@ -776,7 +813,7 @@ mod tests {
 
         assert!(store
             .publish_with_post_rename_hook(&staging, HELLO_HASH, 5, || {
-                fs::write(&target, b"jello")
+                fs::write(&target, b"jello").map_err(io_error)
             })
             .is_err());
 
@@ -786,6 +823,30 @@ mod tests {
             .map(|entry| fs::read(entry.unwrap().path()).unwrap())
             .collect();
         assert_eq!(evidence, [b"jello".to_vec()]);
+    }
+
+    #[test]
+    fn internal_verification_reads_in_bounded_chunks() {
+        struct BoundedReader {
+            bytes: std::io::Cursor<Vec<u8>>,
+        }
+
+        impl Read for BoundedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if buffer.len() > 64 * 1024 {
+                    return Err(std::io::Error::other("unbounded read"));
+                }
+                self.bytes.read(buffer)
+            }
+        }
+
+        let bytes = vec![b'x'; 128 * 1024 + 1];
+        let expected_hash = format!("sha256:{:x}", Sha256::digest(&bytes));
+        let mut reader = BoundedReader {
+            bytes: std::io::Cursor::new(bytes),
+        };
+
+        assert!(verify_stream(&mut reader, &expected_hash, 128 * 1024 + 1).unwrap());
     }
 
     #[test]

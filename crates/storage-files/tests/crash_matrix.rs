@@ -292,7 +292,7 @@ fn artifact_reconciliation_does_not_retry_indeterminate_non_repeatable_operation
 }
 
 #[test]
-fn reconciliation_rejects_artifact_metadata_that_disagrees_with_the_write_intent() {
+fn incomplete_metadata_mismatch_quarantines_staging_once() {
     let fixture = Fixture::new();
     fixture
         .store
@@ -308,7 +308,7 @@ fn reconciliation_rejects_artifact_metadata_that_disagrees_with_the_write_intent
             reservation("operation-metadata", "artifact-metadata", "metadata.txt"),
             b"hello",
             |point| {
-                if point == FaultPoint::BeforeWrite {
+                if point == FaultPoint::AfterWrite {
                     Err(injected_crash())
                 } else {
                     Ok(())
@@ -325,12 +325,141 @@ fn reconciliation_rejects_artifact_metadata_that_disagrees_with_the_write_intent
         )
         .unwrap();
 
-    reconcile_artifacts(&fixture.store, &fixture.journal, &fixture.clock).unwrap();
+    let first = reconcile_artifacts(&fixture.store, &fixture.journal, &fixture.clock).unwrap();
 
+    assert_eq!(first.quarantined, 1);
     assert_eq!(
         fixture.state("operation-metadata"),
         ("quarantined".to_owned(), "quarantined".to_owned())
     );
+    assert_eq!(
+        operation_error_kind(&fixture, "operation-metadata"),
+        "intent_metadata_mismatch"
+    );
+    let evidence = quarantine_evidence(&fixture);
+    assert_eq!(evidence, [b"hello".to_vec()]);
+    assert_eq!(
+        reconcile_artifacts(&fixture.store, &fixture.journal, &fixture.clock).unwrap(),
+        Default::default()
+    );
+    assert_eq!(
+        fixture.state("operation-metadata"),
+        ("quarantined".to_owned(), "quarantined".to_owned())
+    );
+    assert_eq!(
+        operation_error_kind(&fixture, "operation-metadata"),
+        "intent_metadata_mismatch"
+    );
+    assert_eq!(quarantine_evidence(&fixture), evidence);
+}
+
+#[test]
+fn completed_metadata_mismatch_quarantines_staging_once() {
+    let fixture = Fixture::new();
+    fixture
+        .store
+        .put(NewArtifact {
+            expected_hash: WORLD_HASH.to_owned(),
+            expected_size: 5,
+            content: b"world".to_vec(),
+        })
+        .unwrap();
+    let reservation = reservation(
+        "operation-completed-metadata",
+        "artifact-completed-metadata",
+        "completed-metadata.txt",
+    );
+    let temp_name = reservation.temp_name.clone();
+    JournaledArtifactWriter::new(&fixture.store, &fixture.journal, &fixture.clock)
+        .write(reservation, b"hello")
+        .unwrap();
+    fs::write(
+        fixture.store.root().join("staging").join(temp_name),
+        b"staged evidence",
+    )
+    .unwrap();
+    Connection::open(&fixture.database_path)
+        .unwrap()
+        .execute(
+            "UPDATE artifacts SET content_hash = ?1, storage_key = ?2
+             WHERE id = 'artifact-completed-metadata'",
+            params![WORLD_HASH, format!("objects/48/{}", &WORLD_HASH[7..])],
+        )
+        .unwrap();
+
+    let first = reconcile_artifacts(&fixture.store, &fixture.journal, &fixture.clock).unwrap();
+
+    assert_eq!(first.invalidated, 1);
+    assert_eq!(
+        fixture.state("operation-completed-metadata"),
+        ("completed".to_owned(), "quarantined".to_owned())
+    );
+    assert_eq!(
+        operation_error_kind(&fixture, "operation-completed-metadata"),
+        "intent_metadata_mismatch"
+    );
+    let evidence = quarantine_evidence(&fixture);
+    assert_eq!(evidence, [b"staged evidence".to_vec()]);
+    assert_eq!(
+        reconcile_artifacts(&fixture.store, &fixture.journal, &fixture.clock).unwrap(),
+        Default::default()
+    );
+    assert_eq!(
+        fixture.state("operation-completed-metadata"),
+        ("completed".to_owned(), "quarantined".to_owned())
+    );
+    assert_eq!(
+        operation_error_kind(&fixture, "operation-completed-metadata"),
+        "intent_metadata_mismatch"
+    );
+    assert_eq!(quarantine_evidence(&fixture), evidence);
+}
+
+#[test]
+fn post_rename_corruption_is_recorded_as_quarantined_before_restart() {
+    let fixture = Fixture::new();
+    let reservation = reservation(
+        "operation-post-rename",
+        "artifact-post-rename",
+        "post-rename.txt",
+    );
+    let target = fixture
+        .store
+        .root()
+        .join(format!("objects/2c/{}", &HELLO_HASH[7..]));
+    let result = JournaledArtifactWriter::new(&fixture.store, &fixture.journal, &fixture.clock)
+        .write_with_fault(reservation, b"hello", |point| {
+            if point == FaultPoint::AfterRename {
+                fs::write(&target, b"jello").unwrap();
+            }
+            Ok(())
+        });
+
+    assert!(result.is_err());
+    assert_eq!(
+        fixture.state("operation-post-rename"),
+        ("quarantined".to_owned(), "quarantined".to_owned())
+    );
+    assert_eq!(
+        operation_error_kind(&fixture, "operation-post-rename"),
+        "object_invalid_after_rename"
+    );
+    assert_eq!(quarantine_evidence(&fixture), [b"jello".to_vec()]);
+
+    let restarted = SqliteStore::open(&fixture.database_path).unwrap();
+    assert_eq!(
+        reconcile_artifacts(&fixture.store, &restarted, &fixture.clock).unwrap(),
+        Default::default()
+    );
+    assert_eq!(
+        fixture.state("operation-post-rename"),
+        ("quarantined".to_owned(), "quarantined".to_owned())
+    );
+    assert_eq!(
+        operation_error_kind(&fixture, "operation-post-rename"),
+        "object_invalid_after_rename"
+    );
+    assert_eq!(quarantine_evidence(&fixture), [b"jello".to_vec()]);
 }
 
 fn quarantine_evidence(fixture: &Fixture) -> Vec<Vec<u8>> {
@@ -340,6 +469,21 @@ fn quarantine_evidence(fixture: &Fixture) -> Vec<Vec<u8>> {
         .collect();
     evidence.sort();
     evidence
+}
+
+fn operation_error_kind(fixture: &Fixture, operation_id: &str) -> String {
+    let json: String = Connection::open(&fixture.database_path)
+        .unwrap()
+        .query_row(
+            "SELECT error_json FROM artifact_operations WHERE id = ?1",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_str::<serde_json::Value>(&json).unwrap()["kind"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 fn reservation(

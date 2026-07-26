@@ -8,6 +8,7 @@ use local_agent_terminal_application::{
 use serde_json::json;
 
 use crate::content_address::ContentAddressedArtifactStore;
+use crate::content_address::PublishError;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileReport {
@@ -58,7 +59,15 @@ fn reconcile_incomplete(
     report: &mut ReconcileReport,
 ) -> Result<(), PortError> {
     if intent_disagrees_with_metadata(entry) {
-        transition(journal, clock, entry, ArtifactJournalStatus::Quarantined)?;
+        quarantine_staging(store, entry)?;
+        raw_transition_with_error(
+            journal,
+            clock,
+            &entry.reservation.operation_id,
+            entry.status,
+            ArtifactJournalStatus::Quarantined,
+            Some(json!({"kind": "intent_metadata_mismatch"})),
+        )?;
         report.quarantined += 1;
         return Ok(());
     }
@@ -126,7 +135,27 @@ fn reconcile_incomplete(
             ArtifactJournalStatus::Staging,
         )?;
     }
-    store.publish(&staging, &artifact.content_hash, artifact.size_bytes)?;
+    let publish_status = if entry.status == ArtifactJournalStatus::Renamed {
+        ArtifactJournalStatus::Renamed
+    } else {
+        ArtifactJournalStatus::Staging
+    };
+    match store.publish(&staging, &artifact.content_hash, artifact.size_bytes) {
+        Ok(_) => {}
+        Err(PublishError::Quarantined) => {
+            raw_transition_with_error(
+                journal,
+                clock,
+                &entry.reservation.operation_id,
+                publish_status,
+                ArtifactJournalStatus::Quarantined,
+                Some(json!({"kind": "object_invalid_after_rename"})),
+            )?;
+            report.quarantined += 1;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into_port_error()),
+    }
     if entry.status != ArtifactJournalStatus::Renamed {
         raw_transition(
             journal,
@@ -155,6 +184,7 @@ fn reconcile_completed(
     report: &mut ReconcileReport,
 ) -> Result<(), PortError> {
     if intent_disagrees_with_metadata(entry) {
+        quarantine_staging(store, entry)?;
         invalidate(
             journal,
             clock,
@@ -211,6 +241,17 @@ fn reconcile_completed(
 fn intent_disagrees_with_metadata(entry: &ArtifactJournalEntry) -> bool {
     entry.expected_hash != entry.reservation.artifact.content_hash
         || entry.expected_size != entry.reservation.artifact.size_bytes
+}
+
+fn quarantine_staging(
+    store: &ContentAddressedArtifactStore,
+    entry: &ArtifactJournalEntry,
+) -> Result<(), PortError> {
+    let staging = store.staging_path(&entry.reservation.temp_name)?;
+    if store.entry_exists(&staging)? {
+        store.quarantine(&staging)?;
+    }
+    Ok(())
 }
 
 fn complete(
@@ -279,6 +320,29 @@ fn raw_transition(
     expected_status: ArtifactJournalStatus,
     next_status: ArtifactJournalStatus,
 ) -> Result<(), PortError> {
+    let error = (matches!(
+        next_status,
+        ArtifactJournalStatus::Aborted | ArtifactJournalStatus::Quarantined
+    ))
+    .then(|| json!({"kind": format!("artifact_{next_status:?}").to_lowercase()}));
+    raw_transition_with_error(
+        journal,
+        clock,
+        operation_id,
+        expected_status,
+        next_status,
+        error,
+    )
+}
+
+fn raw_transition_with_error(
+    journal: &dyn ArtifactJournal,
+    clock: &dyn Clock,
+    operation_id: &str,
+    expected_status: ArtifactJournalStatus,
+    next_status: ArtifactJournalStatus,
+    error: Option<serde_json::Value>,
+) -> Result<(), PortError> {
     let updated_at = clock.now_utc()?;
     journal.transition(ArtifactJournalTransition {
         operation_id: operation_id.to_owned(),
@@ -286,11 +350,7 @@ fn raw_transition(
         next_status,
         completed_at: (next_status == ArtifactJournalStatus::Completed).then(|| updated_at.clone()),
         updated_at,
-        error: (matches!(
-            next_status,
-            ArtifactJournalStatus::Aborted | ArtifactJournalStatus::Quarantined
-        ))
-        .then(|| json!({"kind": format!("artifact_{next_status:?}").to_lowercase()})),
+        error,
     })
 }
 
