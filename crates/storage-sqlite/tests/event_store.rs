@@ -5,8 +5,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use local_agent_terminal_application::{
-    AppendOperation, ArtifactJournal, ArtifactJournalStatus, ArtifactJournalTransition,
-    ArtifactWriteReservation, EventStore, NewEvent, PortError, ProjectionChange, ReservedArtifact,
+    AppendOperation, ArtifactJournal, ArtifactJournalInvalidation, ArtifactJournalStatus,
+    ArtifactJournalTransition, ArtifactUnavailableState, ArtifactWriteReservation, EventStore,
+    NewEvent, PortError, ProjectionChange, ReservedArtifact, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     ActorId, Condition, EventId, FencingToken, OperationState, Phase, Sequence, StreamId, TaskId,
@@ -428,4 +429,86 @@ fn failed_journal_insert_rolls_back_reserved_artifact_metadata() {
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn completed_artifact_invalidation_is_atomic_and_requires_completed_state() {
+    let database = TempDatabase::new();
+    let store = SqliteStore::open(&database.path).unwrap();
+    seed_task(&database.path, "task-1");
+    store
+        .reserve(reservation("operation-1", "artifact-1"))
+        .unwrap();
+
+    let conflict = store
+        .invalidate_completed(ArtifactJournalInvalidation {
+            operation_id: "operation-1".to_owned(),
+            unavailable_state: ArtifactUnavailableState::Missing,
+            updated_at: "2026-07-26T00:00:01Z".to_owned(),
+            error: json!({"kind": "object_missing"}),
+        })
+        .unwrap_err();
+    assert_eq!(
+        conflict.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+
+    for (expected_status, next_status, completed_at) in [
+        (
+            ArtifactJournalStatus::Intent,
+            ArtifactJournalStatus::Staging,
+            None,
+        ),
+        (
+            ArtifactJournalStatus::Staging,
+            ArtifactJournalStatus::Renamed,
+            None,
+        ),
+        (
+            ArtifactJournalStatus::Renamed,
+            ArtifactJournalStatus::Completed,
+            Some("2026-07-26T00:00:04Z".to_owned()),
+        ),
+    ] {
+        store
+            .transition(ArtifactJournalTransition {
+                operation_id: "operation-1".to_owned(),
+                expected_status,
+                next_status,
+                updated_at: "2026-07-26T00:00:04Z".to_owned(),
+                completed_at,
+                error: None,
+            })
+            .unwrap();
+    }
+
+    assert_eq!(store.completed().unwrap().len(), 1);
+    store
+        .invalidate_completed(ArtifactJournalInvalidation {
+            operation_id: "operation-1".to_owned(),
+            unavailable_state: ArtifactUnavailableState::Missing,
+            updated_at: "2026-07-26T00:00:05Z".to_owned(),
+            error: json!({"kind": "object_missing"}),
+        })
+        .unwrap();
+
+    let connection = Connection::open(&database.path).unwrap();
+    let state: (String, String, String) = connection
+        .query_row(
+            "SELECT a.availability, o.status, o.error_json
+             FROM artifacts a JOIN artifact_operations o ON o.artifact_id = a.id
+             WHERE o.id = ?1",
+            ["operation-1"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        state,
+        (
+            "missing".to_owned(),
+            "completed".to_owned(),
+            r#"{"kind":"object_missing"}"#.to_owned(),
+        )
+    );
+    assert!(store.completed().unwrap().is_empty());
 }

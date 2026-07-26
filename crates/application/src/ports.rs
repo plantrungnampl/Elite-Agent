@@ -124,11 +124,31 @@ pub struct ArtifactJournalTransition {
     pub error: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactUnavailableState {
+    Missing,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactJournalInvalidation {
+    pub operation_id: String,
+    pub unavailable_state: ArtifactUnavailableState,
+    pub updated_at: String,
+    pub error: Value,
+}
+
 pub trait ArtifactJournal: Send + Sync {
     /// Atomically creates reserved artifact metadata and its write intent.
     fn reserve(&self, reservation: ArtifactWriteReservation) -> Result<(), PortError>;
     fn transition(&self, transition: ArtifactJournalTransition) -> Result<(), PortError>;
     fn incomplete(&self) -> Result<Vec<ArtifactJournalEntry>, PortError>;
+    fn completed(&self) -> Result<Vec<ArtifactJournalEntry>, PortError>;
+    /// Records failed verification without inventing a new successful transition.
+    fn invalidate_completed(
+        &self,
+        invalidation: ArtifactJournalInvalidation,
+    ) -> Result<(), PortError>;
 }
 
 pub trait Clock: Send + Sync {

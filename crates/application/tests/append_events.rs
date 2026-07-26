@@ -2,9 +2,9 @@ use std::sync::Mutex;
 
 use local_agent_terminal_application::{
     AppendEvents, AppendOperation, AppendResult, ArtifactContent, ArtifactJournal,
-    ArtifactJournalEntry, ArtifactJournalTransition, ArtifactRef, ArtifactStore,
-    ArtifactWriteReservation, Clock, EventStore, IdGenerator, NewArtifact, NewEvent, PortError,
-    ProjectionChange, ReservedArtifact, Retryability, SafeErrorClassification,
+    ArtifactJournalEntry, ArtifactJournalInvalidation, ArtifactJournalTransition, ArtifactRef,
+    ArtifactStore, ArtifactWriteReservation, Clock, EventStore, IdGenerator, NewArtifact, NewEvent,
+    PortError, ProjectionChange, ReservedArtifact, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     ActorId, EventId, FencingToken, OperationState, Phase, Sequence, StreamId, TaskId,
@@ -62,6 +62,17 @@ impl ArtifactJournal for RecordingArtifactJournal {
 
     fn incomplete(&self) -> Result<Vec<ArtifactJournalEntry>, PortError> {
         Ok(Vec::new())
+    }
+
+    fn completed(&self) -> Result<Vec<ArtifactJournalEntry>, PortError> {
+        Ok(Vec::new())
+    }
+
+    fn invalidate_completed(
+        &self,
+        _invalidation: ArtifactJournalInvalidation,
+    ) -> Result<(), PortError> {
+        Ok(())
     }
 }
 
@@ -261,12 +272,15 @@ fn artifact_port_contracts_are_object_safe(
     reference: &ArtifactRef,
     reservation: ArtifactWriteReservation,
     transition: ArtifactJournalTransition,
+    invalidation: ArtifactJournalInvalidation,
 ) {
     let _: Result<ArtifactRef, PortError> = artifact_store.put(artifact);
     let _: Result<ArtifactContent, PortError> = artifact_store.read(reference);
     let _: Result<(), PortError> = artifact_journal.reserve(reservation);
     let _: Result<(), PortError> = artifact_journal.transition(transition);
     let _: Result<Vec<ArtifactJournalEntry>, PortError> = artifact_journal.incomplete();
+    let _: Result<Vec<ArtifactJournalEntry>, PortError> = artifact_journal.completed();
+    let _: Result<(), PortError> = artifact_journal.invalidate_completed(invalidation);
 }
 
 #[allow(dead_code)]

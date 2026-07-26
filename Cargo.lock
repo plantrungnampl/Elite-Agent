@@ -1990,6 +1990,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "local-agent-terminal-storage-files"
+version = "0.1.0"
+dependencies = [
+ "local-agent-terminal-application",
+ "local-agent-terminal-domain",
+ "local-agent-terminal-storage-sqlite",
+ "rusqlite",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "local-agent-terminal-storage-sqlite"
 version = "0.1.0"
 dependencies = [

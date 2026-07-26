@@ -1,6 +1,7 @@
 use local_agent_terminal_application::{
-    ArtifactJournal, ArtifactJournalEntry, ArtifactJournalStatus, ArtifactJournalTransition,
-    ArtifactWriteReservation, PortError, Retryability, SafeErrorClassification,
+    ArtifactJournal, ArtifactJournalEntry, ArtifactJournalInvalidation, ArtifactJournalStatus,
+    ArtifactJournalTransition, ArtifactUnavailableState, ArtifactWriteReservation, PortError,
+    Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::TaskId;
 use rusqlite::{params, TransactionBehavior};
@@ -119,6 +120,57 @@ impl ArtifactJournal for SqliteStore {
     }
 
     fn incomplete(&self) -> Result<Vec<ArtifactJournalEntry>, PortError> {
+        self.journal_entries(false)
+    }
+
+    fn completed(&self) -> Result<Vec<ArtifactJournalEntry>, PortError> {
+        self.journal_entries(true)
+    }
+
+    fn invalidate_completed(
+        &self,
+        invalidation: ArtifactJournalInvalidation,
+    ) -> Result<(), PortError> {
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error_to_port)?;
+        let error_json = invalidation.error.to_string();
+        let changed = transaction
+            .execute(
+                "UPDATE artifact_operations SET updated_at = ?1, error_json = ?2
+                 WHERE id = ?3 AND status = 'completed'",
+                params![
+                    invalidation.updated_at,
+                    error_json,
+                    invalidation.operation_id
+                ],
+            )
+            .map_err(sqlite_error_to_port)?;
+        if changed != 1 {
+            return Err(conflict());
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE artifacts SET availability = ?1
+                 WHERE availability = 'available' AND id = (
+                    SELECT artifact_id FROM artifact_operations WHERE id = ?2
+                 )",
+                params![
+                    unavailable_name(invalidation.unavailable_state),
+                    invalidation.operation_id
+                ],
+            )
+            .map_err(sqlite_error_to_port)?;
+        if changed != 1 {
+            return Err(conflict());
+        }
+        transaction.commit().map_err(sqlite_error_to_port)
+    }
+}
+
+impl SqliteStore {
+    fn journal_entries(&self, completed: bool) -> Result<Vec<ArtifactJournalEntry>, PortError> {
         let connection = self.connection().map_err(open_error_to_port)?;
         let mut statement = connection
             .prepare(
@@ -129,12 +181,13 @@ impl ArtifactJournal for SqliteStore {
                     o.status, o.updated_at, o.completed_at, o.error_json
                  FROM artifact_operations o
                  JOIN artifacts a ON a.id = o.artifact_id
-                 WHERE o.status IN ('intent', 'staging', 'renamed')
+                 WHERE (?1 AND o.status = 'completed' AND a.availability = 'available')
+                    OR (NOT ?1 AND o.status IN ('intent', 'staging', 'renamed'))
                  ORDER BY o.created_at, o.id",
             )
             .map_err(sqlite_error_to_port)?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map([completed], |row| {
                 Ok(RawJournalEntry {
                     operation_id: row.get(0)?,
                     artifact_id: row.get(1)?,
@@ -301,4 +354,18 @@ fn integrity_failure() -> PortError {
         SafeErrorClassification::IntegrityFailure,
         Retryability::NonRetryable,
     )
+}
+
+fn conflict() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::Conflict,
+        Retryability::NonRetryable,
+    )
+}
+
+fn unavailable_name(state: ArtifactUnavailableState) -> &'static str {
+    match state {
+        ArtifactUnavailableState::Missing => "missing",
+        ArtifactUnavailableState::Quarantined => "quarantined",
+    }
 }

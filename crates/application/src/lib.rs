@@ -12,7 +12,7 @@ pub use dto::{
 pub use error::{PortError, Retryability, SafeErrorClassification};
 pub use ports::{
     AppendOperation, AppendResult, ArtifactContent, ArtifactJournal, ArtifactJournalEntry,
-    ArtifactJournalStatus, ArtifactJournalTransition, ArtifactRef, ArtifactStore,
-    ArtifactWriteReservation, Clock, EventStore, IdGenerator, NewArtifact, NewEvent,
-    ProjectionChange, ReservedArtifact,
+    ArtifactJournalInvalidation, ArtifactJournalStatus, ArtifactJournalTransition, ArtifactRef,
+    ArtifactStore, ArtifactUnavailableState, ArtifactWriteReservation, Clock, EventStore,
+    IdGenerator, NewArtifact, NewEvent, ProjectionChange, ReservedArtifact,
 };

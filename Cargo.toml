@@ -3,6 +3,7 @@ members = [
     "apps/desktop/src-tauri",
     "crates/application",
     "crates/domain",
+    "crates/storage-files",
     "crates/storage-sqlite",
 ]
 resolver = "2"
