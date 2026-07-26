@@ -183,8 +183,9 @@ impl ContentAddressedArtifactStore {
         if !self.verify_relative(&target_relative, expected_hash, expected_size)? {
             if self.entry_exists_relative(&target_relative)? {
                 self.quarantine(&self.root.join(&target_relative))?;
+                return Err(PublishError::Quarantined);
             }
-            return Err(PublishError::Quarantined);
+            return Err(PublishError::Other(integrity_failure()));
         }
         Ok(self.root.join(target_relative))
     }

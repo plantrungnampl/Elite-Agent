@@ -462,6 +462,59 @@ fn post_rename_corruption_is_recorded_as_quarantined_before_restart() {
     assert_eq!(quarantine_evidence(&fixture), [b"jello".to_vec()]);
 }
 
+#[test]
+fn post_rename_removal_is_not_misreported_as_quarantined() {
+    let fixture = Fixture::new();
+    let reservation = reservation(
+        "operation-post-rename-missing",
+        "artifact-post-rename-missing",
+        "post-rename-missing.txt",
+    );
+    let target = fixture
+        .store
+        .root()
+        .join(format!("objects/2c/{}", &HELLO_HASH[7..]));
+    let result = JournaledArtifactWriter::new(&fixture.store, &fixture.journal, &fixture.clock)
+        .write_with_fault(reservation, b"hello", |point| {
+            if point == FaultPoint::AfterRename {
+                fs::remove_file(&target).unwrap();
+            }
+            Ok(())
+        });
+
+    assert!(result.is_err());
+    assert_eq!(
+        fixture.state("operation-post-rename-missing"),
+        ("staging".to_owned(), "reserved".to_owned())
+    );
+    assert_eq!(
+        operation_error_kind_optional(&fixture, "operation-post-rename-missing"),
+        None
+    );
+    assert!(quarantine_evidence(&fixture).is_empty());
+
+    let restarted = SqliteStore::open(&fixture.database_path).unwrap();
+    let first = reconcile_artifacts(&fixture.store, &restarted, &fixture.clock).unwrap();
+    assert_eq!(first.aborted, 1);
+    assert_eq!(
+        fixture.state("operation-post-rename-missing"),
+        ("aborted".to_owned(), "missing".to_owned())
+    );
+    assert_eq!(
+        operation_error_kind(&fixture, "operation-post-rename-missing"),
+        "artifact_aborted"
+    );
+    assert_eq!(
+        reconcile_artifacts(&fixture.store, &restarted, &fixture.clock).unwrap(),
+        Default::default()
+    );
+    assert_eq!(
+        fixture.state("operation-post-rename-missing"),
+        ("aborted".to_owned(), "missing".to_owned())
+    );
+    assert!(quarantine_evidence(&fixture).is_empty());
+}
+
 fn quarantine_evidence(fixture: &Fixture) -> Vec<Vec<u8>> {
     let mut evidence: Vec<_> = fs::read_dir(fixture.store.root().join("quarantine"))
         .unwrap()
@@ -472,7 +525,11 @@ fn quarantine_evidence(fixture: &Fixture) -> Vec<Vec<u8>> {
 }
 
 fn operation_error_kind(fixture: &Fixture, operation_id: &str) -> String {
-    let json: String = Connection::open(&fixture.database_path)
+    operation_error_kind_optional(fixture, operation_id).unwrap()
+}
+
+fn operation_error_kind_optional(fixture: &Fixture, operation_id: &str) -> Option<String> {
+    let json: Option<String> = Connection::open(&fixture.database_path)
         .unwrap()
         .query_row(
             "SELECT error_json FROM artifact_operations WHERE id = ?1",
@@ -480,10 +537,12 @@ fn operation_error_kind(fixture: &Fixture, operation_id: &str) -> String {
             |row| row.get(0),
         )
         .unwrap();
-    serde_json::from_str::<serde_json::Value>(&json).unwrap()["kind"]
-        .as_str()
-        .unwrap()
-        .to_owned()
+    json.map(|json| {
+        serde_json::from_str::<serde_json::Value>(&json).unwrap()["kind"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    })
 }
 
 fn reservation(
