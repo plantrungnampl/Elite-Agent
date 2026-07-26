@@ -1,0 +1,4 @@
+    Checking local-agent-terminal-repository-git v0.1.0 (D:\multiagent\crates\repository-git)
+    Checking local-agent-terminal-bootstrap v0.1.0 (D:\multiagent\crates\bootstrap)
+    Checking local-agent-terminal-desktop v0.1.0 (D:\multiagent\apps\desktop\src-tauri)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.87s

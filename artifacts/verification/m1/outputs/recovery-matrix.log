@@ -1,0 +1,17 @@
+   Compiling local-agent-terminal-bootstrap v0.1.0 (D:\multiagent\crates\bootstrap)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.79s
+     Running tests\recovery_matrix.rs (target\debug\deps\recovery_matrix-e156a6b6bb71eedb.exe)
+
+running 9 tests
+test startup_exposes_workspace_runtime_only_after_ordered_recovery ... ok
+test startup_leaves_pending_intent_for_exact_command_retry_without_git_effects ... ok
+test startup_marks_unknown_operations_indeterminate_without_touching_git ... ok
+test startup_marks_retryable_only_after_authoritative_worktree_absence ... ok
+test startup_preserves_an_occupied_managed_path_without_creating_a_branch ... ok
+test startup_fences_every_preexisting_executor_lease_before_ready ... ok
+test startup_preserves_an_orphan_branch_as_a_specific_conflict ... ok
+test startup_adopts_only_the_exact_durable_worktree ... ok
+test repeated_startup_replays_recovery_projection_without_duplicate_side_effects ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+

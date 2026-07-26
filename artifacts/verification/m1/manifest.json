@@ -1,16 +1,17 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "finalized": true,
-  "generatedAtUtc": "2026-07-26T10:37:38.0155895Z",
-  "platform": "windows",
-  "outputCapture": "combined stdout/stderr, rendered as UTF-8 with LF line endings and one trailing LF when non-empty",
+  "generatedAtUtc": "2026-07-26T10:59:07.616Z",
+  "sourceCommit": "9b2ec7737aa40459ecc54afe604268261340391e",
+  "platform": "win32-x64",
+  "outputCapture": "combined stdout/stderr bytes normalized to LF",
   "toolVersions": {
-    "os": "Microsoft Windows 11 Pro 10.0.26200",
+    "os": "Windows_NT 10.0.26200 x64",
     "node": "v24.16.0",
     "pnpm": "11.7.0",
     "git": "git version 2.54.0.windows.1",
     "rustup": "rustup 1.29.0 (28d1352db 2026-03-05)",
-    "rustToolchain": "1.97.1-x86_64-pc-windows-msvc",
+    "rustToolchain": "1.97.1-x86_64-pc-windows-msvc (overridden by 'D:\\multiagent\\rust-toolchain.toml')",
     "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
     "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)"
   },
@@ -19,112 +20,153 @@
       "name": "frozen-install",
       "command": "pnpm install --frozen-lockfile",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:36:39.6410442Z",
-      "durationMs": 2049,
-      "outputSha256": "sha256:16bb5d164bb2330cee09414b18a6bd6ab7f4c0cf99c42e9c5fa78cc435df2bc7"
+      "startedAtUtc": "2026-07-26T10:58:23.001Z",
+      "durationMs": 916,
+      "outputFile": "outputs/frozen-install.log",
+      "outputSha256": "sha256:af88723cb30dffe31f08cc3f4e130d9f0867209fa057ab8cd2e7df638cb29486"
     },
     {
       "name": "design-contracts",
       "command": "node scripts/verify-design-contracts.mjs",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:36:41.7691833Z",
-      "durationMs": 50,
+      "startedAtUtc": "2026-07-26T10:58:23.919Z",
+      "durationMs": 67,
+      "outputFile": "outputs/design-contracts.log",
       "outputSha256": "sha256:b5cd721cbd79d0db596529962f463442bca6fe3f46067cf82a20b2a85d150852"
-    },
-    {
-      "name": "contract-tests",
-      "command": "node --test tests/contracts/*.test.mjs",
-      "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:36:41.8187372Z",
-      "durationMs": 537,
-      "outputSha256": "sha256:bd7509c17c870db81c9ac1b90de3a13f47271fab81d7edec24aa604fc8fee50f"
-    },
-    {
-      "name": "m1-evidence",
-      "command": "node scripts/verify-m1-evidence.mjs",
-      "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:36:42.3562206Z",
-      "durationMs": 45,
-      "outputSha256": "sha256:3d5f4123bfbe5aea55d4f1df05a831c73558a4373b8cc2f991f57ab7a1ea2bdf"
     },
     {
       "name": "architecture",
       "command": "node scripts/check-architecture.mjs",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:36:42.3965727Z",
-      "durationMs": 90,
+      "startedAtUtc": "2026-07-26T10:58:23.987Z",
+      "durationMs": 104,
+      "outputFile": "outputs/architecture.log",
       "outputSha256": "sha256:dc03b01395fd9c81198a04278ff2d04986443b2d7f71d20a6b77e1ef7f53c30f"
+    },
+    {
+      "name": "repository-windows",
+      "command": "cargo test -p local-agent-terminal-repository-git --test windows_matrix --features test-seams",
+      "exitCode": 0,
+      "startedAtUtc": "2026-07-26T10:58:24.092Z",
+      "durationMs": 1016,
+      "outputFile": "outputs/repository-windows.log",
+      "outputSha256": "sha256:190d7390760b91b30b717538f7d9c25826544b9c7cff7a6ad5b5db7261912a0e"
+    },
+    {
+      "name": "recovery-matrix",
+      "command": "cargo test -p local-agent-terminal-bootstrap --test recovery_matrix",
+      "exitCode": 0,
+      "startedAtUtc": "2026-07-26T10:58:25.108Z",
+      "durationMs": 3158,
+      "outputFile": "outputs/recovery-matrix.log",
+      "outputSha256": "sha256:db76db409520a79a1a17ad49db7185d371bea363d212679fc940b16a9269e0ee"
+    },
+    {
+      "name": "contract-tests",
+      "command": "node --test tests/contracts/*.test.mjs",
+      "exitCode": 0,
+      "startedAtUtc": "2026-07-26T10:58:28.268Z",
+      "durationMs": 677,
+      "outputFile": "outputs/contract-tests.log",
+      "outputSha256": "sha256:432585df81925ad74700998ca42722b0e679a90657691656800f10e064baa989"
     },
     {
       "name": "rust-format",
       "command": "cargo fmt --all -- --check",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:36:50.8904229Z",
-      "durationMs": 293,
+      "startedAtUtc": "2026-07-26T10:58:28.946Z",
+      "durationMs": 331,
+      "outputFile": "outputs/rust-format.log",
       "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     {
       "name": "rust-clippy",
       "command": "cargo clippy --workspace --all-targets -- -D warnings",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:36:51.2737499Z",
-      "durationMs": 536,
-      "outputSha256": "sha256:92bec25ad54c650450560360480d5f94d3d8ad203f81a2c724e0c641b330bbfb"
+      "startedAtUtc": "2026-07-26T10:58:29.277Z",
+      "durationMs": 2002,
+      "outputFile": "outputs/rust-clippy.log",
+      "outputSha256": "sha256:ae08806ca0c34a402b478b5477b45bb477227ab7b444ce4e12d742e0f4be238b"
     },
     {
       "name": "rust-tests",
       "command": "cargo test --workspace --all-targets",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:36:51.8126748Z",
-      "durationMs": 10019,
-      "outputSha256": "sha256:ae1b7ed069a5393a9fe6a1997993b963ece0b9233a0987b85d31f97a61f81e91"
+      "startedAtUtc": "2026-07-26T10:58:31.280Z",
+      "durationMs": 23301,
+      "outputFile": "outputs/rust-tests.log",
+      "outputSha256": "sha256:83ae13a8a564ae52a4790213f7f958b9d5ec4bdbda29a31887a6f4e152996d01"
     },
     {
       "name": "frontend-tests",
       "command": "pnpm --dir apps/desktop test --run",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:37:11.1393265Z",
-      "durationMs": 3237,
-      "outputSha256": "sha256:8248890fe7d7fca8f3fa967f02160b10b9880ecd86b07da561f436a780943834"
+      "startedAtUtc": "2026-07-26T10:58:54.582Z",
+      "durationMs": 3245,
+      "outputFile": "outputs/frontend-tests.log",
+      "outputSha256": "sha256:3ea940eff350e238e528ac730aa7d5f32a846cc0f7376960b2e0b2104f9c3b43"
+    },
+    {
+      "name": "playwright-install",
+      "command": "pnpm --dir apps/desktop exec playwright install chromium",
+      "exitCode": 0,
+      "startedAtUtc": "2026-07-26T10:58:57.828Z",
+      "durationMs": 1375,
+      "outputFile": "outputs/playwright-install.log",
+      "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     {
       "name": "browser-tests",
       "command": "pnpm --dir apps/desktop test:browser",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:37:14.4557900Z",
-      "durationMs": 6257,
+      "startedAtUtc": "2026-07-26T10:58:59.204Z",
+      "durationMs": 5120,
+      "outputFile": "outputs/browser-tests.log",
       "outputSha256": "sha256:33ef17e65b17398ffdf6b39da3b8c8e203b311d18fe5de2701fab95c8423526a"
     },
     {
       "name": "frontend-build",
       "command": "pnpm --dir apps/desktop build",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:37:20.7165785Z",
-      "durationMs": 2944,
-      "outputSha256": "sha256:362bf7415eb141accce4a7d3f6b238f527d01a7976ba7add9e1b75e991a0879a"
+      "startedAtUtc": "2026-07-26T10:59:04.325Z",
+      "durationMs": 2766,
+      "outputFile": "outputs/frontend-build.log",
+      "outputSha256": "sha256:d1e255a957ce74db1196b7c9d1b4470ff933b93349429fcbfa0461b78f5f1ec6"
     },
     {
       "name": "desktop-debug-build",
       "command": "cargo build -p local-agent-terminal-desktop",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:37:23.6608707Z",
-      "durationMs": 380,
-      "outputSha256": "sha256:32d47f791eadf1ea833d9f8c84fbfea5cab1f438e113e93be05bd5b908e1c2ac"
+      "startedAtUtc": "2026-07-26T10:59:07.092Z",
+      "durationMs": 364,
+      "outputFile": "outputs/desktop-debug-build.log",
+      "outputSha256": "sha256:0b53209db424367e80c52cd8cde8b75e37af110438a0efde777104a1463956de"
     },
     {
       "name": "diff-check",
       "command": "git diff --check",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:37:31.4159827Z",
-      "durationMs": 30,
+      "startedAtUtc": "2026-07-26T10:59:07.456Z",
+      "durationMs": 43,
+      "outputFile": "outputs/diff-check.log",
+      "outputSha256": "sha256:3a690a5b84be99113491ccb39d0d97152d3fa8ce378862b9cea3822c80d8a771"
+    },
+    {
+      "name": "committed-diff-check",
+      "command": "git diff --check 321734f..HEAD",
+      "exitCode": 0,
+      "startedAtUtc": "2026-07-26T10:59:07.501Z",
+      "durationMs": 61,
+      "outputFile": "outputs/committed-diff-check.log",
       "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     {
       "name": "design-docs-unchanged",
       "command": "git diff --exit-code 321734f -- docs/multi-agent-terminal-design",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:37:31.5270473Z",
-      "durationMs": 25,
+      "startedAtUtc": "2026-07-26T10:59:07.563Z",
+      "durationMs": 53,
+      "outputFile": "outputs/design-docs-unchanged.log",
       "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     }
   ],
@@ -133,162 +175,272 @@
       "case": "clean/dirty/original-index preservation",
       "classification": "preserved",
       "evidence": [
-        "crates/repository-git/tests/windows_matrix.rs::inspect_reports_clean_repository_without_exposing_handles",
-        "crates/repository-git/tests/windows_matrix.rs::worktree_creation_rejects_a_dirty_original_checkout",
-        "crates/repository-git/tests/windows_matrix.rs::successful_unicode_worktree_preserves_original_head_index_and_checkout_bytes"
+        {
+          "command": "repository-windows",
+          "needle": "successful_unicode_worktree_preserves_original_head_index_and_checkout_bytes"
+        },
+        {
+          "command": "repository-windows",
+          "needle": "worktree_creation_rejects_a_dirty_original_checkout"
+        }
       ]
     },
     {
       "case": "spaces/metacharacters",
       "classification": "supported",
       "evidence": [
-        "crates/repository-git/tests/windows_matrix.rs::successful_unicode_worktree_preserves_original_head_index_and_checkout_bytes",
-        "crates/repository-git/tests/windows_matrix.rs::invalid_windows_target_forms_are_rejected_without_git_side_effects"
+        {
+          "command": "repository-windows",
+          "needle": "valid_windows_shell_metacharacters_are_supported_in_managed_paths"
+        }
       ]
     },
     {
       "case": "Unicode",
       "classification": "supported",
       "evidence": [
-        "crates/repository-git/tests/windows_matrix.rs::successful_unicode_worktree_preserves_original_head_index_and_checkout_bytes"
+        {
+          "command": "repository-windows",
+          "needle": "successful_unicode_worktree_preserves_original_head_index_and_checkout_bytes"
+        }
       ]
     },
     {
       "case": "long paths",
       "classification": "fail-closed",
       "evidence": [
-        "crates/repository-git/tests/windows_matrix.rs::long_path_checkout_fails_closed_without_mutating_original_state"
+        {
+          "command": "repository-windows",
+          "needle": "long_path_checkout_fails_closed_without_mutating_original_state"
+        }
       ]
     },
     {
       "case": "locks",
       "classification": "fail-closed",
       "evidence": [
-        "crates/repository-git/tests/windows_matrix.rs::ref_lock_and_base_cas_conflicts_leave_branch_target_and_index_absent"
+        {
+          "command": "repository-windows",
+          "needle": "ref_lock_and_base_cas_conflicts_leave_branch_target_and_index_absent"
+        }
       ]
     },
     {
       "case": "static and swap-race junctions/symlinks",
       "classification": "fail-closed",
       "evidence": [
-        "crates/repository-git/tests/windows_matrix.rs::static_symlink_target_is_rejected_without_touching_its_destination",
-        "crates/repository-git/tests/windows_matrix.rs::parent_swap_race_is_blocked_while_checkout_is_in_progress"
+        {
+          "command": "repository-windows",
+          "needle": "static_symlink_target_is_rejected_without_touching_its_destination"
+        },
+        {
+          "command": "repository-windows",
+          "needle": "parent_swap_race_is_blocked_while_checkout_is_in_progress"
+        }
       ]
     },
     {
       "case": "UNC/device/ADS rejection",
       "classification": "fail-closed",
       "evidence": [
-        "crates/repository-git/tests/windows_matrix.rs::invalid_windows_target_forms_are_rejected_without_git_side_effects"
+        {
+          "command": "repository-windows",
+          "needle": "invalid_windows_target_forms_are_rejected_without_git_side_effects"
+        }
       ]
     },
     {
       "case": "nested/common-dir/artifact-root target rejection",
       "classification": "fail-closed",
       "evidence": [
-        "crates/repository-git/tests/windows_matrix.rs::target_inside_original_checkout_and_case_collisions_fail_closed",
-        "crates/repository-git/tests/windows_matrix.rs::excluded_artifact_root_and_git_common_dir_targets_are_rejected"
+        {
+          "command": "repository-windows",
+          "needle": "target_inside_original_checkout_and_case_collisions_fail_closed"
+        },
+        {
+          "command": "repository-windows",
+          "needle": "excluded_artifact_root_and_git_common_dir_targets_are_rejected"
+        }
       ]
     },
     {
       "case": "branch/path/CAS conflicts",
       "classification": "fail-closed",
       "evidence": [
-        "crates/repository-git/tests/windows_matrix.rs::branch_conflict_is_preserved_without_creating_target",
-        "crates/repository-git/tests/windows_matrix.rs::ref_lock_and_base_cas_conflicts_leave_branch_target_and_index_absent"
+        {
+          "command": "repository-windows",
+          "needle": "branch_conflict_is_preserved_without_creating_target"
+        },
+        {
+          "command": "repository-windows",
+          "needle": "rollback_preserves_a_concurrently_replaced_branch"
+        },
+        {
+          "command": "repository-windows",
+          "needle": "rollback_preserves_a_concurrently_replaced_target"
+        }
+      ]
+    },
+    {
+      "case": "all post-add rollback boundaries",
+      "classification": "recovered",
+      "evidence": [
+        {
+          "command": "repository-windows",
+          "needle": "every_post_add_failure_rolls_back_owned_state"
+        }
       ]
     },
     {
       "case": "crash boundaries and pending/started intent recovery",
       "classification": "recovered",
       "evidence": [
-        "crates/storage-files/tests/crash_matrix.rs::crash_boundaries_reconcile_to_deterministic_states",
-        "crates/bootstrap/tests/recovery_matrix.rs::startup_leaves_pending_intent_for_exact_command_retry_without_git_effects",
-        "crates/bootstrap/tests/recovery_matrix.rs::startup_adopts_only_the_exact_durable_worktree"
+        {
+          "command": "rust-tests",
+          "needle": "crash_boundaries_reconcile_to_deterministic_states"
+        },
+        {
+          "command": "recovery-matrix",
+          "needle": "startup_leaves_pending_intent_for_exact_command_retry_without_git_effects"
+        },
+        {
+          "command": "recovery-matrix",
+          "needle": "startup_adopts_only_the_exact_durable_worktree"
+        }
       ]
     },
     {
       "case": "stale lease replacement",
       "classification": "recovered",
       "evidence": [
-        "crates/bootstrap/tests/workspace_monitor.rs::stale_monitor_claim_is_rejected_before_evidence_or_repository_bytes_change",
-        "crates/storage-sqlite/tests/workspace_recovery.rs::lease_replacement_increments_token_and_stale_claim_cannot_write"
+        {
+          "command": "rust-tests",
+          "needle": "stale_monitor_claim_is_rejected_before_evidence_or_repository_bytes_change"
+        },
+        {
+          "command": "rust-tests",
+          "needle": "lease_replacement_increments_token_and_stale_claim_cannot_write"
+        }
       ]
     },
     {
       "case": "projection-only replay",
       "classification": "preserved",
       "evidence": [
-        "crates/bootstrap/tests/recovery_matrix.rs::repeated_startup_replays_recovery_projection_without_duplicate_side_effects"
+        {
+          "command": "recovery-matrix",
+          "needle": "repeated_startup_replays_recovery_projection_without_duplicate_side_effects"
+        }
       ]
     },
     {
       "case": "approval/candidate invalidation rollback",
       "classification": "preserved",
       "evidence": [
-        "crates/storage-sqlite/tests/workspace_recovery.rs::workspace_mutation_is_atomic_and_invalidates_candidate_approvals",
-        "crates/storage-sqlite/tests/workspace_recovery.rs::mutation_rolls_back_event_projection_approvals_candidate_and_lease_together"
+        {
+          "command": "rust-tests",
+          "needle": "workspace_mutation_is_atomic_and_invalidates_candidate_approvals"
+        },
+        {
+          "command": "rust-tests",
+          "needle": "mutation_rolls_back_event_projection_approvals_candidate_and_lease_together"
+        }
       ]
     },
     {
       "case": "unknown intent handling",
       "classification": "recovered",
       "evidence": [
-        "crates/bootstrap/tests/recovery_matrix.rs::startup_marks_unknown_operations_indeterminate_without_touching_git"
+        {
+          "command": "recovery-matrix",
+          "needle": "startup_marks_unknown_operations_indeterminate_without_touching_git"
+        }
       ]
     },
     {
       "case": "SHA-1/SHA-256 exact IDs",
       "classification": "supported",
       "evidence": [
-        "crates/repository-git/tests/windows_matrix.rs::branch_conflict_is_preserved_without_creating_target",
-        "crates/repository-git/tests/windows_matrix.rs::sha256_repository_keeps_exact_object_ids"
+        {
+          "command": "repository-windows",
+          "needle": "sha256_repository_keeps_exact_object_ids"
+        }
       ]
     },
     {
-      "case": "submodule/LFS/custom filter/hook/fsmonitor/include/credential/SSH/remote-helper fail-closed behavior",
+      "case": "submodule/LFS and execution-capable Git configuration",
       "classification": "fail-closed",
       "evidence": [
-        "crates/repository-git/tests/windows_matrix.rs::repository_hazards_are_classified_before_worktree_side_effects",
-        "crates/repository-git/tests/windows_matrix.rs::every_execution_capable_git_configuration_fails_closed_and_stays_inert"
+        {
+          "command": "repository-windows",
+          "needle": "repository_hazards_are_classified_before_worktree_side_effects"
+        },
+        {
+          "command": "repository-windows",
+          "needle": "every_execution_capable_git_configuration_fails_closed_and_stays_inert"
+        }
       ]
     },
     {
       "case": "shallow/sparse/detached/unborn repositories",
       "classification": "fail-closed",
       "evidence": [
-        "crates/repository-git/tests/windows_matrix.rs::shallow_and_sparse_repositories_fail_closed",
-        "crates/repository-git/tests/windows_matrix.rs::dirty_detached_and_unborn_states_are_explicit"
+        {
+          "command": "repository-windows",
+          "needle": "shallow_and_sparse_repositories_fail_closed"
+        },
+        {
+          "command": "repository-windows",
+          "needle": "dirty_detached_and_unborn_states_are_explicit"
+        }
       ]
     },
     {
       "case": "CRLF configuration with checkout filters disabled",
       "classification": "supported",
       "evidence": [
-        "crates/repository-git/tests/windows_matrix.rs::checkout_disables_crlf_filters_and_preserves_blob_bytes"
+        {
+          "command": "repository-windows",
+          "needle": "checkout_disables_crlf_filters_and_preserves_blob_bytes"
+        }
       ]
     },
     {
-      "case": "no child process spawned and sentinel executables untouched",
+      "case": "no child process spawned and executable sentinels untouched",
       "classification": "preserved",
       "evidence": [
-        "tests/contracts/m1-contracts.test.mjs#repository adapter rejects process execution",
-        "tests/contracts/m1-contracts.test.mjs#repository adapter rejects PATH lookup",
-        "crates/repository-git/tests/windows_matrix.rs::every_execution_capable_git_configuration_fails_closed_and_stays_inert"
+        {
+          "command": "contract-tests",
+          "needle": "repository adapter rejects process execution"
+        },
+        {
+          "command": "contract-tests",
+          "needle": "architecture checker rejects grouped and aliased process imports"
+        },
+        {
+          "command": "repository-windows",
+          "needle": "every_execution_capable_git_configuration_fails_closed_and_stays_inert"
+        }
+      ]
+    },
+    {
+      "case": "browser recovery and accessibility",
+      "classification": "supported",
+      "evidence": [
+        {
+          "command": "browser-tests",
+          "needle": "renders authoritative workspace state and guards recovery actions"
+        },
+        {
+          "command": "browser-tests",
+          "needle": "supports keyboard flow, reduced motion, narrow reflow, and contrast"
+        }
       ]
     }
   ],
-  "approvalBlockers": {
-    "filterDisabling": "verified",
-    "pathContainment": "verified",
-    "sha256ExactOids": "verified",
-    "noForceConditionalRefs": "verified",
-    "worktrees": "verified",
-    "lfsSubmoduleEvidence": "verified"
-  },
   "artifactSha256": {
-    "review.md": "sha256:e89dfc4781cb3b418ee99c0ba3d689f877522978ddf27dd35c573ca2101b7965",
-    "known-limitations.md": "sha256:901038f2555e3d15b64e0459d34ddc373d7508cd8e25b9d82f79a3e75c639c85",
-    "toolchain.txt": "sha256:89cb4c98631679595ffb404cb9f3cee34dfa440216544417f59b6220143099fa"
+    "review.md": "sha256:2dff9a4f6d55d56ac8995d1bcf9252b59fdd621a51673a9586c216176ac2c765",
+    "known-limitations.md": "sha256:6bc4bdf610b526a4884825f95241f4c27722d32e0c08bddd7144f198352c4a74",
+    "toolchain.txt": "sha256:25c26e9c10fc4e9724da9c34ea6e874e9a0cc8832a09009fe9952b91ea79d396"
   }
 }
