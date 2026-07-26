@@ -55,3 +55,15 @@ test("architecture checker allows external domain test dependencies", () => {
     /architecture contracts: ok/,
   );
 });
+
+test("architecture checker rejects a generic Tauri execution command", () => {
+  assert.throws(
+    () =>
+      run(
+        "scripts/check-architecture.mjs",
+        "--tauri-fixture",
+        "tests/contracts/fixtures/architecture/tauri-generic-command/src",
+      ),
+    /generic Tauri command is forbidden: run_command/,
+  );
+});

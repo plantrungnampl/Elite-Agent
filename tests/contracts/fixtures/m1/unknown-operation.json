@@ -1,0 +1,13 @@
+{
+  "operationKind": "unknown.external-operation",
+  "idempotencyClass": "non_repeatable",
+  "status": "started",
+  "recovery": {
+    "classification": "indeterminate",
+    "actions": [
+      "inspect",
+      "preserve",
+      "cancel"
+    ]
+  }
+}

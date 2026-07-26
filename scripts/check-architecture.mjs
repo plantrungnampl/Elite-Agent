@@ -16,6 +16,9 @@ try {
     : JSON.parse(execFileSync("cargo", ["metadata", "--no-deps", "--format-version", "1"], { cwd: root, encoding: "utf8" }));
   verifyCargo(metadata);
   verifyReact(option("--fixture") ?? join(root, "apps", "desktop"));
+  verifyTauriCommands(
+    option("--tauri-fixture") ?? join(root, "apps", "desktop", "src-tauri", "src"),
+  );
   verifyAdapterConstruction();
   console.log("architecture contracts: ok");
 } catch (error) {
@@ -36,6 +39,7 @@ function verifyCargo(metadata) {
     (packages.get(name)?.dependencies ?? []).filter((dependency) => dependency.kind !== "dev");
   const domain = "local-agent-terminal-domain";
   const application = "local-agent-terminal-application";
+  const repositoryGit = "local-agent-terminal-repository-git";
   const domainAllowed = new Set(["serde", "serde_json"]);
   if (allDependencies(domain).some((dependency) => workspace.has(dependency.name))) {
     throw new Error("domain may not depend on workspace packages");
@@ -65,7 +69,8 @@ function verifyCargo(metadata) {
   const allowed = new Map([
     ["local-agent-terminal-storage-sqlite", new Set([application, domain])],
     ["local-agent-terminal-storage-files", new Set([application, domain])],
-    ["local-agent-terminal-bootstrap", new Set([application, "local-agent-terminal-storage-sqlite", "local-agent-terminal-storage-files"])],
+    [repositoryGit, new Set([application, domain])],
+    ["local-agent-terminal-bootstrap", new Set([application, "local-agent-terminal-storage-sqlite", "local-agent-terminal-storage-files", repositoryGit])],
     ["local-agent-terminal-desktop", new Set(["local-agent-terminal-bootstrap"])],
   ]);
   for (const [name, targets] of allowed) {
@@ -98,6 +103,25 @@ function verifyReact(appRoot) {
     }
     if (!local.startsWith("api/") && /@tauri-apps\/api|\binvoke\s*\(/.test(source)) {
       throw new Error(`Tauri invoke is allowed only in src/api/: ${local}`);
+    }
+    if (
+      /@tauri-apps\/plugin-(?:fs|shell)|node:child_process|\bCommand\.create\s*\(/.test(source)
+    ) {
+      throw new Error(`React source may not invoke generic filesystem or process APIs: ${local}`);
+    }
+  }
+}
+
+function verifyTauriCommands(sourceRoot) {
+  const forbidden = new Set(["shell", "git", "filesystem", "exec", "run_command"]);
+  const command =
+    /#\s*\[\s*tauri::command(?:\([^)]*\))?\s*\]\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)/g;
+  for (const path of filesUnder(sourceRoot).filter((path) => path.endsWith(".rs"))) {
+    const source = readFileSync(path, "utf8");
+    for (const match of source.matchAll(command)) {
+      if (forbidden.has(match[1])) {
+        throw new Error(`generic Tauri command is forbidden: ${match[1]}`);
+      }
     }
   }
 }
