@@ -3,9 +3,10 @@ use std::str::FromStr;
 use local_agent_terminal_application::{
     Clock, ExpectedPresence, IdempotencyClass, IntentTransition, NewProject, NewTask,
     OperationIntent, OperationIntentStatus, PortError, ProjectSnapshot, RecoveryAction,
-    RecoveryCandidate, RecoveryEvidence, RecoveryReason, RepositoryInspectionRecord, Retryability,
-    SafeErrorClassification, StartedRecovery, TaskLeaseState, TaskSnapshot, WorkspaceEvidenceStore,
-    WorkspaceMutationRequest, WorkspaceMutationResult, WorkspaceMutationStore,
+    RecoveryCandidate, RecoveryEvidence, RecoveryOperationIntent, RecoveryReason,
+    RepositoryInspectionRecord, Retryability, SafeErrorClassification, StartedRecovery,
+    TaskLeaseState, TaskSnapshot, WorkspaceEvidenceStore, WorkspaceMutationRequest,
+    WorkspaceMutationResult, WorkspaceMutationStore, WorkspaceObservationLossRequest,
     WorkspaceRecoveryStore, WorkspaceStateStore, WorktreeIntent,
 };
 use local_agent_terminal_domain::{
@@ -113,6 +114,7 @@ impl WorkspaceStateStore for SqliteStore {
             fencing_epoch: 0,
             lease_state: TaskLeaseState::None,
             recovery_candidates: Vec::new(),
+            timeline: Vec::new(),
         })
     }
 
@@ -221,6 +223,125 @@ impl WorkspaceStateStore for SqliteStore {
                     intent.operation.updated_at,
                     intent.operation.task_id.as_str(),
                     current_sequence,
+                ],
+            )
+            .map_err(sqlite_error_to_port)?;
+        if changed != 1 {
+            return Err(conflict());
+        }
+        transaction.commit().map_err(sqlite_error_to_port)?;
+        Ok(intent.operation)
+    }
+
+    fn begin_recovery_intent(
+        &self,
+        intent: RecoveryOperationIntent,
+    ) -> Result<OperationIntent, PortError> {
+        validate_recovery_intent(&intent)?;
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error_to_port)?;
+        verify_operation_evidence(&transaction, &intent.operation)?;
+        let task: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT current_sequence, workspace_version FROM tasks WHERE id = ?1",
+                [intent.operation.task_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?;
+        let Some((current_sequence, workspace_version)) = task else {
+            return Err(not_found());
+        };
+        if u64::try_from(workspace_version).ok() != Some(intent.expected_workspace_version.get()) {
+            return Err(conflict());
+        }
+        let candidate_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM operation_intents WHERE id = ?1 AND task_id = ?2
+                 )",
+                params![intent.candidate_id, intent.operation.task_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_error_to_port)?;
+        if !candidate_exists {
+            return Err(conflict());
+        }
+        let existing: Option<RawOperationIntent> = transaction
+            .query_row(
+                "SELECT id, task_id, operation_kind, idempotency_class, idempotency_key,
+                        canonical_request_artifact_id, operation_digest, status,
+                        executor_fencing_token, attempt_count, created_at, updated_at
+                 FROM operation_intents WHERE idempotency_key = ?1",
+                [intent.operation.idempotency_key.as_str()],
+                raw_operation_intent,
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?;
+        if let Some(existing) = existing {
+            let existing = parse_operation_intent(existing)?;
+            if same_operation_intent(&existing, &intent.operation) {
+                return Ok(existing);
+            }
+            return Err(conflict());
+        }
+        let sequence = current_sequence.checked_add(1).ok_or_else(invalid_input)?;
+        let action = recovery_action_name(intent.action).ok_or_else(invalid_input)?;
+        let receipt = json!({
+            "candidateId": intent.candidate_id,
+            "action": action,
+            "expectedWorkspaceVersion": intent.expected_workspace_version.get(),
+        });
+        transaction
+            .execute(
+                "INSERT INTO operation_intents (
+                    id, task_id, run_id, operation_kind, idempotency_class, idempotency_key,
+                    canonical_request_artifact_id, operation_digest, status,
+                    executor_fencing_token, lease_owner, lease_expires_at, attempt_count,
+                    result_artifact_id, external_receipt_json, error_json, created_at, updated_at
+                 ) VALUES (
+                    ?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, 'pending',
+                    NULL, NULL, NULL, 0, NULL, ?8, NULL, ?9, ?9
+                 )",
+                params![
+                    intent.operation.id,
+                    intent.operation.task_id.as_str(),
+                    intent.operation.operation_kind,
+                    intent.operation.idempotency_class.as_str(),
+                    intent.operation.idempotency_key,
+                    intent.operation.canonical_request_artifact_id.as_str(),
+                    intent.operation.operation_digest,
+                    receipt.to_string(),
+                    intent.operation.created_at,
+                ],
+            )
+            .map_err(sqlite_error_to_port)?;
+        let event_id = format!("workspace.recovery.requested:{}", intent.operation.id);
+        insert_task_event(
+            &transaction,
+            TaskEvent {
+                task_id: intent.operation.task_id.as_str(),
+                sequence,
+                event_id: &event_id,
+                event_type: "workspace.recovery.requested",
+                payload: &receipt,
+                actor_id: "workspace-coordinator",
+                correlation_id: &intent.operation.idempotency_key,
+                created_at: &intent.operation.created_at,
+            },
+        )?;
+        let changed = transaction
+            .execute(
+                "UPDATE tasks SET current_sequence = ?1, updated_at = ?2
+                 WHERE id = ?3 AND current_sequence = ?4 AND workspace_version = ?5",
+                params![
+                    sequence,
+                    intent.operation.updated_at,
+                    intent.operation.task_id.as_str(),
+                    current_sequence,
+                    workspace_version,
                 ],
             )
             .map_err(sqlite_error_to_port)?;
@@ -700,9 +821,190 @@ impl WorkspaceMutationStore for SqliteStore {
             invalidated_approval_ids: invalidated_ids,
         })
     }
+
+    fn record_workspace_observation_loss(
+        &self,
+        request: WorkspaceObservationLossRequest,
+    ) -> Result<(), PortError> {
+        if request.task_id != request.operation.task_id
+            || request.claim.task_id() != &request.task_id
+            || request.operation.operation_kind != "worktree.create"
+            || request.operation.status != OperationIntentStatus::Succeeded
+            || !matches!(
+                request.next_status,
+                OperationIntentStatus::Interrupted | OperationIntentStatus::Indeterminate
+            )
+            || request.observed_at.trim().is_empty()
+        {
+            return Err(invalid_input());
+        }
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error_to_port)?;
+        let task: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT current_sequence, fencing_epoch FROM tasks WHERE id = ?1",
+                [request.task_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?;
+        let Some((current_sequence, fencing_epoch)) = task else {
+            return Err(not_found());
+        };
+        let expected_sequence =
+            i64::try_from(request.expected_sequence.get()).map_err(|_| invalid_input())?;
+        if current_sequence != expected_sequence {
+            return Err(PortError::version_conflict(
+                request.expected_sequence,
+                Sequence::try_from(current_sequence).map_err(|_| integrity_failure())?,
+            ));
+        }
+        let current_token =
+            FencingToken::try_from(fencing_epoch).map_err(|_| integrity_failure())?;
+        if request.claim.token() != current_token {
+            return Err(PortError::stale_lease(current_token, request.claim.token()));
+        }
+        let token = i64::try_from(request.claim.token().get()).map_err(|_| invalid_input())?;
+        let error_json = json!({
+            "classification": error_classification_name(request.error)
+        })
+        .to_string();
+        let intent_changed = transaction
+            .execute(
+                "UPDATE operation_intents
+                 SET status = ?1, executor_fencing_token = ?2,
+                     error_json = ?3, updated_at = ?4
+                 WHERE id = ?5 AND task_id = ?6 AND status = 'succeeded'",
+                params![
+                    request.next_status.as_str(),
+                    token,
+                    error_json,
+                    request.observed_at,
+                    request.operation.id,
+                    request.task_id.as_str(),
+                ],
+            )
+            .map_err(sqlite_error_to_port)?;
+        if intent_changed != 1 {
+            return Err(conflict());
+        }
+        let transition_sequence = current_sequence.checked_add(1).ok_or_else(invalid_input)?;
+        let transition_event_id = format!(
+            "intent.transition:{}:{}:{}",
+            request.operation.id,
+            request.next_status.as_str(),
+            request.operation.attempt_count
+        );
+        let transition_payload = json!({
+            "intentId": request.operation.id,
+            "from": OperationIntentStatus::Succeeded.as_str(),
+            "to": request.next_status.as_str(),
+            "attemptCount": request.operation.attempt_count,
+            "executorFencingToken": request.claim.token().get(),
+            "errorClassification": error_classification_name(request.error),
+            "observedFingerprint": Value::Null,
+        });
+        let transition_correlation = format!("intent:{}", request.operation.id);
+        insert_task_event(
+            &transaction,
+            TaskEvent {
+                task_id: request.task_id.as_str(),
+                sequence: transition_sequence,
+                event_id: &transition_event_id,
+                event_type: "operation.intent.transitioned",
+                payload: &transition_payload,
+                actor_id: "workspace-monitor",
+                correlation_id: &transition_correlation,
+                created_at: &request.observed_at,
+            },
+        )?;
+        let revoked = transaction
+            .execute(
+                "UPDATE executor_leases SET status = 'revoked', released_at = ?1
+                 WHERE task_id = ?2 AND holder_run_id = ?3
+                   AND fencing_token = ?4 AND status = 'active'",
+                params![
+                    request.observed_at,
+                    request.task_id.as_str(),
+                    request.claim.holder_run_id().as_str(),
+                    token,
+                ],
+            )
+            .map_err(sqlite_error_to_port)?;
+        if revoked != 1 {
+            return Err(PortError::stale_lease(current_token, request.claim.token()));
+        }
+        let revoke_sequence = transition_sequence
+            .checked_add(1)
+            .ok_or_else(invalid_input)?;
+        let revoke_event_id = format!(
+            "executor.lease.revoked:{}:{}",
+            request.task_id.as_str(),
+            request.claim.token().get()
+        );
+        let revoke_payload = json!({
+            "taskId": request.task_id.as_str(),
+            "holderRunId": request.claim.holder_run_id().as_str(),
+            "fencingToken": request.claim.token().get(),
+        });
+        let revoke_correlation = format!(
+            "executor-lease:revoke:{}:{}",
+            request.task_id.as_str(),
+            request.claim.token().get()
+        );
+        insert_task_event(
+            &transaction,
+            TaskEvent {
+                task_id: request.task_id.as_str(),
+                sequence: revoke_sequence,
+                event_id: &revoke_event_id,
+                event_type: "executor.lease.revoked",
+                payload: &revoke_payload,
+                actor_id: "core",
+                correlation_id: &revoke_correlation,
+                created_at: &request.observed_at,
+            },
+        )?;
+        let task_changed = transaction
+            .execute(
+                "UPDATE tasks SET current_sequence = ?1, updated_at = ?2
+                 WHERE id = ?3 AND current_sequence = ?4 AND fencing_epoch = ?5",
+                params![
+                    revoke_sequence,
+                    request.observed_at,
+                    request.task_id.as_str(),
+                    current_sequence,
+                    fencing_epoch,
+                ],
+            )
+            .map_err(sqlite_error_to_port)?;
+        if task_changed != 1 {
+            return Err(conflict());
+        }
+        transaction.commit().map_err(sqlite_error_to_port)
+    }
 }
 
 impl SqliteStore {
+    pub fn operation_intent(&self, intent_id: &str) -> Result<OperationIntent, PortError> {
+        let connection = self.connection().map_err(open_error_to_port)?;
+        connection
+            .query_row(
+                "SELECT id, task_id, operation_kind, idempotency_class, idempotency_key,
+                        canonical_request_artifact_id, operation_digest, status,
+                        executor_fencing_token, attempt_count, created_at, updated_at
+                 FROM operation_intents WHERE id = ?1",
+                [intent_id],
+                raw_operation_intent,
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?
+            .ok_or_else(not_found)
+            .and_then(parse_operation_intent)
+    }
+
     fn started_operations(&self) -> Result<Vec<OperationIntent>, PortError> {
         let connection = self.connection().map_err(open_error_to_port)?;
         let mut statement = connection
@@ -925,17 +1227,24 @@ fn verify_intent_evidence(
     transaction: &Transaction<'_>,
     intent: &WorktreeIntent,
 ) -> Result<(), PortError> {
+    verify_operation_evidence(transaction, &intent.operation)
+}
+
+fn verify_operation_evidence(
+    transaction: &Transaction<'_>,
+    operation: &OperationIntent,
+) -> Result<(), PortError> {
     let artifact: Option<(Option<String>, String)> = transaction
         .query_row(
             "SELECT task_id, availability FROM artifacts WHERE id = ?1",
-            [intent.operation.canonical_request_artifact_id.as_str()],
+            [operation.canonical_request_artifact_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(sqlite_error_to_port)?;
     if artifact
         != Some((
-            Some(intent.operation.task_id.as_str().to_owned()),
+            Some(operation.task_id.as_str().to_owned()),
             "available".to_owned(),
         ))
     {
@@ -967,6 +1276,49 @@ fn validate_worktree_intent(intent: &WorktreeIntent) -> Result<(), PortError> {
     Ok(())
 }
 
+fn validate_recovery_intent(intent: &RecoveryOperationIntent) -> Result<(), PortError> {
+    let action = recovery_action_name(intent.action).ok_or_else(invalid_input)?;
+    if intent.candidate_id.trim().is_empty()
+        || intent.operation.operation_kind != format!("workspace.recovery.{action}")
+    {
+        return Err(invalid_input());
+    }
+    validate_operation_intent(&intent.operation)
+}
+
+fn validate_operation_intent(operation: &OperationIntent) -> Result<(), PortError> {
+    if operation.status != OperationIntentStatus::Pending
+        || operation.id.trim().is_empty()
+        || operation.idempotency_key.trim().is_empty()
+        || operation.created_at.trim().is_empty()
+        || operation.updated_at.trim().is_empty()
+    {
+        return Err(invalid_input());
+    }
+    Ok(())
+}
+
+fn same_operation_intent(left: &OperationIntent, right: &OperationIntent) -> bool {
+    left.id == right.id
+        && left.task_id == right.task_id
+        && left.operation_kind == right.operation_kind
+        && left.idempotency_class == right.idempotency_class
+        && left.idempotency_key == right.idempotency_key
+        && left.canonical_request_artifact_id == right.canonical_request_artifact_id
+        && left.operation_digest == right.operation_digest
+}
+
+const fn recovery_action_name(action: RecoveryAction) -> Option<&'static str> {
+    match action {
+        RecoveryAction::AdoptExactMatch | RecoveryAction::RetryAfterAuthoritativeAbsence => {
+            Some("reconcile")
+        }
+        RecoveryAction::PreserveTask => Some("preserve"),
+        RecoveryAction::DiscardExactWorktree => Some("discard"),
+        RecoveryAction::InspectEvidence | RecoveryAction::CancelTask => None,
+    }
+}
+
 fn allowed_intent_transition(from: OperationIntentStatus, to: OperationIntentStatus) -> bool {
     matches!(
         (from, to),
@@ -987,7 +1339,18 @@ fn allowed_intent_transition(from: OperationIntentStatus, to: OperationIntentSta
             OperationIntentStatus::Pending
         ) | (
             OperationIntentStatus::Indeterminate,
-            OperationIntentStatus::Succeeded | OperationIntentStatus::Failed
+            OperationIntentStatus::Succeeded
+                | OperationIntentStatus::Failed
+                | OperationIntentStatus::Cancelled
+        ) | (
+            OperationIntentStatus::Succeeded,
+            OperationIntentStatus::Interrupted | OperationIntentStatus::Indeterminate
+        ) | (
+            OperationIntentStatus::Pending
+                | OperationIntentStatus::Claimed
+                | OperationIntentStatus::Started
+                | OperationIntentStatus::Interrupted,
+            OperationIntentStatus::Cancelled
         )
     )
 }

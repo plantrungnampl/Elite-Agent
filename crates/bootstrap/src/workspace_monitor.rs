@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 
 use local_agent_terminal_application::{
     canonical_evidence, ArtifactWriteReservation, CanonicalEvidenceRef, CanonicalJsonRequest,
-    Clock, ExpectedPresence, InspectWorktree, LeaseClaim, PortError, RepositoryGateway,
-    SafeErrorClassification, TaskQuery, WorkspaceEvidenceStore, WorkspaceFingerprint,
-    WorkspaceMutationRequest, WorkspaceMutationResult, WorkspaceMutationStore,
-    WorkspaceRecoveryStore, WorkspaceWriteCoordinator, WorktreeObservation, WorktreeState,
+    Clock, ExpectedPresence, InspectWorktree, LeaseClaim, OperationIntentStatus, PortError,
+    RepositoryGateway, SafeErrorClassification, TaskQuery, WorkspaceEvidenceStore,
+    WorkspaceFingerprint, WorkspaceMutationRequest, WorkspaceMutationResult,
+    WorkspaceMutationStore, WorkspaceObservationLossRequest, WorkspaceRecoveryStore,
+    WorkspaceWriteCoordinator, WorktreeObservation, WorktreeState,
 };
 use local_agent_terminal_application::{ActorId, ArtifactId, Phase, TaskId};
 use local_agent_terminal_repository_git::GitRepositoryGateway;
@@ -15,6 +16,12 @@ use local_agent_terminal_storage_sqlite::SqliteStore;
 use serde_json::json;
 
 pub(crate) struct WorkspaceMonitor;
+
+pub(crate) enum WorkspacePollOutcome {
+    Unchanged,
+    Mutated(WorkspaceMutationResult),
+    RecoveryRequired,
+}
 
 impl WorkspaceMonitor {
     pub(crate) fn poll(
@@ -25,29 +32,29 @@ impl WorkspaceMonitor {
         writes: &WorkspaceWriteCoordinator,
         task_id: &TaskId,
         claim: LeaseClaim,
-    ) -> Result<Option<WorkspaceMutationResult>, PortError> {
+    ) -> Result<WorkspacePollOutcome, PortError> {
         if claim.task_id() != task_id {
             return Err(failure(SafeErrorClassification::InvalidInput));
         }
         let _permit = writes.monitor_permit(database, claim.clone())?;
         let task = database.task(task_id)?;
         if !monitorable_phase(task.phase) {
-            return Ok(None);
+            return Ok(WorkspacePollOutcome::Unchanged);
         }
         let Some(worktree) = task.worktree.as_ref() else {
-            return Ok(None);
+            return Ok(WorkspacePollOutcome::Unchanged);
         };
         if worktree.state != WorktreeState::Present
             || worktree.expected_presence != ExpectedPresence::Present
         {
-            return Ok(None);
+            return Ok(WorkspacePollOutcome::Unchanged);
         }
         let project = database
             .recovery_projects()?
             .into_iter()
             .find(|project| project.project_id == task.project_id)
             .ok_or_else(|| failure(SafeErrorClassification::NotFound))?;
-        let locator = repositories.locate(Path::new(&project.repository_path))?;
+        let locator = repositories.locate_persisted(Path::new(&project.repository_path))?;
         if locator.repository_id != worktree.repository_id
             || locator.stable_identity != worktree.repository_identity
         {
@@ -67,12 +74,29 @@ impl WorkspaceMonitor {
         })?;
         let observed = match observation {
             WorktreeObservation::Exact(snapshot) => *snapshot,
-            WorktreeObservation::AuthoritativelyAbsent | WorktreeObservation::Conflict(_) => {
-                return Err(failure(SafeErrorClassification::Conflict));
+            WorktreeObservation::AuthoritativelyAbsent => {
+                return record_observation_loss(
+                    database,
+                    &task,
+                    worktree.worktree_id.as_str(),
+                    claim,
+                    OperationIntentStatus::Interrupted,
+                    SafeErrorClassification::NotFound,
+                );
+            }
+            WorktreeObservation::Conflict(_) => {
+                return record_observation_loss(
+                    database,
+                    &task,
+                    worktree.worktree_id.as_str(),
+                    claim,
+                    OperationIntentStatus::Indeterminate,
+                    SafeErrorClassification::Conflict,
+                );
             }
         };
         if observed.fingerprint == worktree.fingerprint {
-            return Ok(None);
+            return Ok(WorkspacePollOutcome::Unchanged);
         }
 
         let pre_evidence =
@@ -95,11 +119,41 @@ impl WorkspaceMonitor {
                 task.current_sequence.get()
             ),
         })?;
-        Ok(Some(result))
+        Ok(WorkspacePollOutcome::Mutated(result))
     }
 }
 
-fn monitorable_phase(phase: Phase) -> bool {
+fn record_observation_loss(
+    database: &SqliteStore,
+    task: &local_agent_terminal_application::TaskSnapshot,
+    worktree_id: &str,
+    claim: LeaseClaim,
+    next_status: OperationIntentStatus,
+    error: SafeErrorClassification,
+) -> Result<WorkspacePollOutcome, PortError> {
+    let operation = task
+        .recovery_candidates
+        .iter()
+        .filter_map(|candidate| candidate.expected_worktree.as_ref())
+        .find(|intent| {
+            intent.worktree_id.as_str() == worktree_id
+                && intent.operation.status == OperationIntentStatus::Succeeded
+        })
+        .map(|intent| intent.operation.clone())
+        .ok_or_else(|| failure(SafeErrorClassification::Conflict))?;
+    database.record_workspace_observation_loss(WorkspaceObservationLossRequest {
+        task_id: task.task_id.clone(),
+        expected_sequence: task.current_sequence,
+        claim,
+        operation,
+        next_status,
+        observed_at: database.now_utc()?,
+        error,
+    })?;
+    Ok(WorkspacePollOutcome::RecoveryRequired)
+}
+
+pub(crate) fn monitorable_phase(phase: Phase) -> bool {
     matches!(
         phase,
         Phase::Implementation
@@ -155,6 +209,14 @@ fn publish_fingerprint(
             &fingerprint_key[..24]
         ),
     )?;
+    publish_canonical_json(database, artifacts, request)
+}
+
+pub(crate) fn publish_canonical_json(
+    database: &SqliteStore,
+    artifacts: &ContentAddressedArtifactStore,
+    request: CanonicalJsonRequest,
+) -> Result<CanonicalEvidenceRef, PortError> {
     if let Some(existing) = database.available_evidence(&request.artifact_id)? {
         if existing.project_id != request.project_id
             || existing.task_id.as_ref() != request.task_id.as_ref()

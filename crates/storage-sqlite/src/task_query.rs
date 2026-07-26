@@ -39,6 +39,7 @@ impl TaskQuery for SqliteStore {
         let mut task = row.ok_or_else(not_found).and_then(parse_task)?;
         task.worktree = self.load_worktree_snapshot(&task.task_id)?;
         task.recovery_candidates = self.recovery_for_task(&task.task_id)?;
+        task.timeline = self.timeline(&task.task_id)?;
         Ok(task)
     }
 
@@ -135,7 +136,19 @@ impl SqliteStore {
         let repository = parse_repository_snapshot(
             &serde_json::from_str(&repository_payload).map_err(|_| integrity_failure())?,
         )?;
-        let state = match operation.status {
+        let discard_status: Option<String> = connection
+            .query_row(
+                "SELECT status FROM operation_intents
+                 WHERE task_id = ?1
+                   AND operation_kind = 'workspace.recovery.discard'
+                   AND json_extract(external_receipt_json, '$.candidateId') = ?2
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                [task_id.as_str(), operation.id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?;
+        let undiscarded_state = match operation.status {
             OperationIntentStatus::Succeeded => {
                 local_agent_terminal_application::WorktreeState::Present
             }
@@ -144,7 +157,15 @@ impl SqliteStore {
             | OperationIntentStatus::Cancelled => {
                 local_agent_terminal_application::WorktreeState::Missing
             }
+            OperationIntentStatus::Indeterminate => {
+                local_agent_terminal_application::WorktreeState::Conflict
+            }
             _ => local_agent_terminal_application::WorktreeState::Planned,
+        };
+        let state = match discard_status.as_deref() {
+            Some("succeeded") => local_agent_terminal_application::WorktreeState::Discarded,
+            Some("failed" | "cancelled") | None => undiscarded_state,
+            Some(_) => local_agent_terminal_application::WorktreeState::Conflict,
         };
         let observed_fingerprint = connection
             .query_row(
@@ -171,7 +192,13 @@ impl SqliteStore {
             base_commit: intent.base_commit,
             target_path_display: intent.target_path_display,
             state,
-            expected_presence: intent.expected_presence,
+            expected_presence: if state
+                == local_agent_terminal_application::WorktreeState::Discarded
+            {
+                local_agent_terminal_application::ExpectedPresence::Absent
+            } else {
+                intent.expected_presence
+            },
             fingerprint: observed_fingerprint,
         }))
     }
@@ -183,9 +210,28 @@ impl SqliteStore {
                 "SELECT id, task_id, operation_kind, idempotency_class, idempotency_key,
                         canonical_request_artifact_id, operation_digest, status,
                         executor_fencing_token, attempt_count, created_at, updated_at
-                 FROM operation_intents
-                 WHERE task_id = ?1 AND status IN ('started', 'interrupted', 'indeterminate')
-                 ORDER BY created_at, id",
+                 FROM operation_intents oi
+                 WHERE oi.task_id = ?1 AND (
+                    (
+                        oi.operation_kind LIKE 'workspace.recovery.%'
+                        AND oi.status IN ('pending', 'started', 'interrupted', 'indeterminate')
+                    )
+                    OR (
+                        oi.operation_kind NOT LIKE 'workspace.recovery.%'
+                        AND oi.status IN ('started', 'interrupted', 'indeterminate')
+                        AND NOT EXISTS (
+                            SELECT 1 FROM operation_intents recovery
+                            WHERE recovery.task_id = oi.task_id
+                              AND recovery.operation_kind LIKE 'workspace.recovery.%'
+                              AND json_extract(
+                                    recovery.external_receipt_json,
+                                    '$.candidateId'
+                                  ) = oi.id
+                              AND recovery.status NOT IN ('failed', 'cancelled')
+                        )
+                    )
+                 )
+                 ORDER BY oi.created_at, oi.id",
             )
             .map_err(sqlite_error_to_port)?;
         let rows = statement
@@ -197,15 +243,57 @@ impl SqliteStore {
                     .and_then(parse_operation_intent)
             })
             .collect::<Result<Vec<_>, PortError>>()?;
+        let discardable = connection
+            .query_row(
+                "SELECT id, task_id, operation_kind, idempotency_class, idempotency_key,
+                        canonical_request_artifact_id, operation_digest, status,
+                        executor_fencing_token, attempt_count, created_at, updated_at
+                 FROM operation_intents created
+                 WHERE created.task_id = ?1
+                   AND created.operation_kind = 'worktree.create'
+                   AND created.status = 'succeeded'
+                   AND NOT EXISTS (
+                        SELECT 1 FROM operation_intents recovery
+                        WHERE recovery.task_id = created.task_id
+                          AND recovery.operation_kind = 'workspace.recovery.discard'
+                          AND json_extract(
+                                recovery.external_receipt_json,
+                                '$.candidateId'
+                              ) = created.id
+                          AND recovery.status NOT IN ('failed', 'cancelled')
+                   )
+                 ORDER BY created.created_at DESC, created.id DESC LIMIT 1",
+                [task_id.as_str()],
+                raw_operation_intent,
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?
+            .map(parse_operation_intent)
+            .transpose()?;
         drop(statement);
         drop(connection);
 
-        let mut candidates = Vec::with_capacity(operations.len());
+        let mut candidates =
+            Vec::with_capacity(operations.len() + usize::from(discardable.is_some()));
         for operation in operations {
             let evidence = RecoveryEvidence {
                 summary: "Persisted operation requires recovery review".to_owned(),
                 artifact_id: Some(operation.canonical_request_artifact_id.clone()),
             };
+            if operation.operation_kind.starts_with("workspace.recovery.") {
+                candidates.push(RecoveryCandidate {
+                    intent_id: Some(operation.id),
+                    worktree_id: None,
+                    reason: RecoveryReason::OutcomeIndeterminate,
+                    evidence,
+                    actions: vec![
+                        RecoveryAction::InspectEvidence,
+                        RecoveryAction::PreserveTask,
+                    ],
+                    expected_worktree: None,
+                });
+                continue;
+            }
             if operation.status == OperationIntentStatus::Interrupted {
                 let expected = self.load_worktree_intent(&operation)?;
                 candidates.push(RecoveryCandidate {
@@ -271,6 +359,23 @@ impl SqliteStore {
                 actions: vec![
                     RecoveryAction::InspectEvidence,
                     RecoveryAction::PreserveTask,
+                ],
+                expected_worktree: Some(expected),
+            });
+        }
+        if let Some(operation) = discardable {
+            let expected = self.load_worktree_intent(&operation)?;
+            candidates.push(RecoveryCandidate {
+                intent_id: Some(operation.id),
+                worktree_id: Some(expected.worktree_id.clone()),
+                reason: RecoveryReason::ExactMatch,
+                evidence: RecoveryEvidence {
+                    summary: "Exact managed worktree may be explicitly discarded".to_owned(),
+                    artifact_id: Some(operation.canonical_request_artifact_id.clone()),
+                },
+                actions: vec![
+                    RecoveryAction::InspectEvidence,
+                    RecoveryAction::DiscardExactWorktree,
                 ],
                 expected_worktree: Some(expected),
             });
@@ -433,6 +538,7 @@ fn parse_task(raw: RawTask) -> Result<TaskSnapshot, PortError> {
             Some(_) => return Err(integrity_failure()),
         },
         recovery_candidates: Vec::new(),
+        timeline: Vec::new(),
     })
 }
 

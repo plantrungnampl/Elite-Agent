@@ -20,6 +20,42 @@ test("first Tab reaches the skip link and activation moves focus to main", async
   await expect(summary.locator("..")).toHaveJSProperty("open", true);
 });
 
+test("workspace stays behind the authoritative startup gate", async ({ page }) => {
+  await page.addInitScript(() => {
+    (
+      window as typeof window & {
+        __TAURI_INTERNALS__: {
+          invoke: (command: string) => Promise<unknown>;
+        };
+      }
+    ).__TAURI_INTERNALS__ = {
+      invoke: (command) =>
+        Promise.resolve(
+          command === "get_startup_status"
+            ? {
+                state: "recoverableFailure",
+                issues: [
+                  {
+                    code: "startup.database_unavailable",
+                    message: "The local database could not be opened.",
+                    recoveryActions: [],
+                  },
+                ],
+              }
+            : [],
+        ),
+    };
+  });
+  await page.goto("/");
+
+  await expect(
+    page.getByRole("heading", { name: "Startup needs attention" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Workspace recovery" }),
+  ).toHaveCount(0);
+});
+
 test("reduced motion and narrow reflow stay usable", async ({ browser }) => {
   const context = await browser.newContext({
     reducedMotion: "reduce",

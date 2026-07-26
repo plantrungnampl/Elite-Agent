@@ -4,6 +4,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -201,6 +202,27 @@ describe("StartupScreen", () => {
     expect(
       screen.queryByRole("button", { name: "Retry startup validation" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("opens the workspace only after authoritative Ready", async () => {
+    const onReady = vi.fn();
+    startupApi.getStartupStatus.mockResolvedValue(recoverableStatus);
+    const { unmount } = render(<StartupScreen onReady={onReady} />);
+
+    await screen.findByRole("heading", {
+      level: 2,
+      name: "Startup needs attention",
+    });
+    expect(onReady).not.toHaveBeenCalled();
+
+    unmount();
+    startupApi.getStartupStatus.mockResolvedValue(readyStatus);
+    render(<StartupScreen onReady={onReady} />);
+    await screen.findByRole("heading", {
+      level: 2,
+      name: "Local services are ready",
+    });
+    await waitFor(() => expect(onReady).toHaveBeenCalledTimes(1));
   });
 
   it("shows deduplicated authoritative restart guidance without fabricating retry", async () => {

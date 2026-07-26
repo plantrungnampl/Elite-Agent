@@ -8,7 +8,7 @@ use local_agent_terminal_application::{
     IntentTransition, ManagedWorktreePath, NewProject, NewTask, OperationIntent,
     OperationIntentStatus, PortError, ProjectSettings, RecoveryAction, RecoveryReason,
     RepositoryGateway, RepositoryInspectionRecord, ReservedArtifact, RiskLevel, StartupStateDto,
-    TaskQuery, WorkspaceStateStore, WorktreeIntent, WorktreeState,
+    TaskQuery, WorkspaceDashboardRequestDto, WorkspaceStateStore, WorktreeIntent, WorktreeState,
 };
 use local_agent_terminal_bootstrap::{Bootstrap, StartupConfig};
 use local_agent_terminal_domain::{
@@ -148,6 +148,17 @@ fn startup_preserves_an_orphan_branch_as_a_specific_conflict() {
     assert!(!candidates[0]
         .actions
         .contains(&RecoveryAction::RetryAfterAuthoritativeAbsence));
+    let dashboard = bootstrap
+        .workspace_runtime()
+        .expect("runtime")
+        .get_workspace_dashboard(WorkspaceDashboardRequestDto {
+            project_id: PROJECT_ID.to_owned(),
+        })
+        .expect("dashboard");
+    assert_eq!(
+        dashboard.tasks[0].recovery_candidates[0].reason,
+        RecoveryReason::PresenceMismatch
+    );
     assert_eq!(fixture.intent_status(), "started");
     assert_eq!(fixture.branch_target(), branch_target);
     assert!(!fixture.workspace_root.join(WORKTREE_ID).exists());
@@ -274,7 +285,7 @@ impl WorkspaceFixture {
                 project_id: project_id.clone(),
                 name: "Workspace recovery fixture".to_owned(),
                 repository: repository.clone(),
-                repository_path: source.to_string_lossy().into_owned(),
+                repository_path: locator.canonical_workdir.to_string_lossy().into_owned(),
                 settings: ProjectSettings {
                     policy_profile_id: "default".to_owned(),
                     artifact_root_mode: ArtifactRootMode::ApplicationData,

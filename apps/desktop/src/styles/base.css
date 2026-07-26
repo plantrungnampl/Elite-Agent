@@ -17,18 +17,50 @@ body {
 }
 
 button,
+input,
+select,
+textarea,
 summary {
   font: inherit;
 }
 
-button {
+button,
+input,
+select,
+textarea {
   min-block-size: 2.75rem;
+}
+
+button {
   padding: var(--space-2) var(--space-4);
   border: 0.125rem solid var(--color-strong);
   border-radius: var(--radius);
   background: var(--color-strong);
   color: var(--color-inverse);
   font-weight: 700;
+  cursor: pointer;
+}
+
+input,
+select,
+textarea {
+  inline-size: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 0.125rem solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+textarea {
+  min-block-size: 7rem;
+  resize: vertical;
+}
+
+summary {
+  display: flex;
+  align-items: center;
+  min-block-size: 2.75rem;
   cursor: pointer;
 }
 
@@ -90,7 +122,8 @@ button:disabled {
   font-size: var(--font-size-sm);
 }
 
-.startup-layout {
+.startup-layout,
+.workspace-layout {
   padding-block: var(--space-7);
 }
 
@@ -129,7 +162,8 @@ code {
 }
 
 .status-panel,
-.diagnostics {
+.diagnostics,
+.panel {
   max-inline-size: 75ch;
   border: 0.0625rem solid var(--color-border);
   border-radius: var(--radius);
@@ -240,23 +274,163 @@ code {
   margin: 0;
 }
 
+.workspace-status,
+.workspace-section,
+.onboarding-panel {
+  margin-block-start: var(--space-5);
+}
+
+.workspace-section,
+.onboarding-panel {
+  padding: var(--space-4) var(--space-5);
+}
+
+.compact-form,
+.stacked-form {
+  display: grid;
+  gap: var(--space-2);
+  margin-block-start: var(--space-4);
+}
+
+.compact-form {
+  grid-template-columns: minmax(7rem, 0.35fr) minmax(10rem, 1fr) auto;
+  align-items: center;
+}
+
+.stacked-form {
+  max-inline-size: 42rem;
+}
+
+.stacked-form button {
+  justify-self: start;
+  margin-block-start: var(--space-2);
+}
+
+.error-message,
+.dirty-warning {
+  padding: var(--space-3);
+  border-inline-start: 0.35rem solid var(--color-danger);
+  background: var(--color-danger-surface);
+  font-weight: 700;
+}
+
+.state-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-weight: 750;
+}
+
+.summary-list {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.summary-list div {
+  display: grid;
+  grid-template-columns: minmax(9rem, 0.35fr) minmax(0, 1fr);
+  gap: var(--space-3);
+}
+
+.summary-list dt {
+  color: var(--color-muted);
+  font-weight: 700;
+}
+
+.summary-list dd {
+  margin: 0;
+}
+
+.task-list,
+.timeline {
+  padding-inline-start: var(--space-5);
+}
+
+.task-list {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.task-card,
+.recovery-panel {
+  padding: var(--space-4);
+  border: 0.0625rem solid var(--color-border);
+  background: var(--color-raised);
+}
+
+.task-card > * + * {
+  margin-block-start: var(--space-3);
+}
+
+.recovery-panel {
+  border-inline-start: 0.35rem solid var(--color-strong);
+  background: var(--color-surface);
+}
+
+.recovery-panel h4 {
+  margin: 0;
+  font-size: var(--font-size-body);
+}
+
+.recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-block-start: var(--space-3);
+}
+
+.destructive-action {
+  display: grid;
+  gap: var(--space-2);
+  inline-size: 100%;
+}
+
+.destructive-action label {
+  display: flex;
+  align-items: center;
+  min-block-size: 2.75rem;
+}
+
+.destructive-action input {
+  flex: 0 0 auto;
+  inline-size: 1.25rem;
+  min-block-size: 1.25rem;
+  margin-inline-end: var(--space-2);
+}
+
+.danger-button {
+  justify-self: start;
+  border-color: var(--color-danger);
+  background: var(--color-danger);
+}
+
 @media (max-width: 36rem) {
   .shell {
     inline-size: min(calc(100% - 2 * var(--space-4)), 72rem);
   }
 
-  .startup-layout {
+  .startup-layout,
+  .workspace-layout {
     padding-block: var(--space-6);
   }
 
   .status-panel,
-  .diagnostics {
+  .diagnostics,
+  .panel {
     padding: var(--space-4);
   }
 
-  .diagnostic dl div {
+  .diagnostic dl div,
+  .summary-list div,
+  .compact-form {
     grid-template-columns: 1fr;
     gap: 0;
+  }
+
+  .compact-form button,
+  .stacked-form button,
+  .danger-button {
+    inline-size: 100%;
   }
 }
 

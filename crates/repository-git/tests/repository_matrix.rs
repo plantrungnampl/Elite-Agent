@@ -109,6 +109,26 @@ fn inspect_reports_clean_repository_without_exposing_handles() {
 }
 
 #[test]
+fn persisted_canonical_repository_path_can_be_reopened() {
+    let fixture = TempDir::new().expect("tempdir");
+    let source = fixture.path().join("source");
+    fs::create_dir(&source).expect("source");
+    let (_repository, _commit) = commit_repository(&source);
+    let managed_root = fixture.path().join("managed");
+    fs::create_dir(&managed_root).expect("managed");
+    let gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+    let located = locator(&gateway, &source);
+
+    let reopened = gateway
+        .locate_persisted(&located.canonical_workdir)
+        .expect("persisted locator");
+
+    assert_eq!(reopened, located);
+    #[cfg(windows)]
+    assert!(gateway.locate(&located.canonical_workdir).is_err());
+}
+
+#[test]
 fn worktree_creation_preserves_original_and_disables_checkout_filters() {
     let fixture = TempDir::new().expect("tempdir");
     let source = fixture.path().join("source");
@@ -131,6 +151,28 @@ fn worktree_creation_preserves_original_and_disables_checkout_filters() {
         source_before
     );
     assert!(managed_root.join("task-1").join("README.md").is_file());
+}
+
+#[test]
+fn worktree_creation_rejects_a_dirty_original_checkout() {
+    let fixture = TempDir::new().expect("tempdir");
+    let source = fixture.path().join("source");
+    fs::create_dir(&source).expect("source");
+    let (repository, _commit) = commit_repository(&source);
+    let managed_root = fixture.path().join("managed");
+    fs::create_dir(&managed_root).expect("managed");
+    let gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+    let locator = locator(&gateway, &source);
+    fs::write(source.join("README.md"), b"dirty\n").expect("dirty source");
+
+    gateway
+        .create_worktree(request(&gateway, &locator, &source))
+        .expect_err("dirty original checkout must not create a worktree");
+
+    assert!(!managed_root.join("task-1").exists());
+    assert!(repository
+        .find_reference("refs/heads/agent/task-1")
+        .is_err());
 }
 
 #[test]

@@ -22,12 +22,7 @@ pub(crate) fn create(
         return Err(paths::conflict());
     }
     let before = inspect::inspect_opened(&repository, &config, &request.repository)?;
-    if !before.hazards.is_empty()
-        || matches!(
-            before.original_checkout,
-            OriginalCheckoutState::Detached | OriginalCheckoutState::Unborn
-        )
-    {
+    if !before.hazards.is_empty() || before.original_checkout != OriginalCheckoutState::Clean {
         return Err(paths::conflict());
     }
     let expected_base = before.base_commit.clone().ok_or_else(paths::conflict)?;

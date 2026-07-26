@@ -2,7 +2,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use local_agent_terminal_bootstrap::{
-    Bootstrap, LocalDiagnosticDto, StartupConfig, StartupStatusDto,
+    Bootstrap, CommandErrorDto, ConfirmDiscardWorkspaceRequestDto, CreateTaskWorkspaceRequestDto,
+    LocalDiagnosticDto, OnboardRepositoryRequestDto, ProjectSnapshot, RecoveryCandidateRequestDto,
+    StartupConfig, StartupStatusDto, TaskSnapshot, WorkspaceDashboardDto,
+    WorkspaceDashboardRequestDto, WorkspaceRuntime,
 };
 use tauri::Manager;
 
@@ -45,6 +48,20 @@ impl ManagedBootstrap {
                 .to_vec(),
         }
     }
+
+    fn with_runtime<T>(
+        &self,
+        operation: impl FnOnce(&WorkspaceRuntime) -> Result<T, CommandErrorDto>,
+    ) -> Result<T, CommandErrorDto> {
+        let bootstrap = self
+            .0
+            .lock()
+            .map_err(|_| CommandErrorDto::internal_state_unavailable())?;
+        let runtime = bootstrap
+            .workspace_runtime()
+            .ok_or_else(CommandErrorDto::startup_not_ready)?;
+        operation(runtime)
+    }
 }
 
 #[tauri::command]
@@ -63,6 +80,78 @@ fn retry_startup_validation(
 #[tauri::command]
 fn get_local_diagnostics(state: tauri::State<'_, ManagedBootstrap>) -> Vec<LocalDiagnosticDto> {
     state.diagnostics()
+}
+
+#[tauri::command]
+fn get_workspace_dashboard(
+    request: WorkspaceDashboardRequestDto,
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<WorkspaceDashboardDto, CommandErrorDto> {
+    state.with_runtime(|runtime| {
+        runtime
+            .get_workspace_dashboard(request)
+            .map_err(CommandErrorDto::from)
+    })
+}
+
+#[tauri::command]
+fn onboard_repository(
+    request: OnboardRepositoryRequestDto,
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<ProjectSnapshot, CommandErrorDto> {
+    state.with_runtime(|runtime| {
+        runtime
+            .onboard_repository(request)
+            .map_err(CommandErrorDto::from)
+    })
+}
+
+#[tauri::command]
+fn create_task_workspace(
+    request: CreateTaskWorkspaceRequestDto,
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<TaskSnapshot, CommandErrorDto> {
+    state.with_runtime(|runtime| {
+        runtime
+            .create_task_workspace(request)
+            .map_err(CommandErrorDto::from)
+    })
+}
+
+#[tauri::command]
+fn reconcile_workspace(
+    request: RecoveryCandidateRequestDto,
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<WorkspaceDashboardDto, CommandErrorDto> {
+    state.with_runtime(|runtime| {
+        runtime
+            .reconcile_workspace(request)
+            .map_err(CommandErrorDto::from)
+    })
+}
+
+#[tauri::command]
+fn preserve_workspace(
+    request: RecoveryCandidateRequestDto,
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<WorkspaceDashboardDto, CommandErrorDto> {
+    state.with_runtime(|runtime| {
+        runtime
+            .preserve_workspace(request)
+            .map_err(CommandErrorDto::from)
+    })
+}
+
+#[tauri::command]
+fn discard_workspace(
+    request: ConfirmDiscardWorkspaceRequestDto,
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<WorkspaceDashboardDto, CommandErrorDto> {
+    state.with_runtime(|runtime| {
+        runtime
+            .discard_workspace(request)
+            .map_err(CommandErrorDto::from)
+    })
 }
 
 fn config(app_data_dir: PathBuf) -> StartupConfig {
@@ -85,7 +174,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_startup_status,
             retry_startup_validation,
-            get_local_diagnostics
+            get_local_diagnostics,
+            get_workspace_dashboard,
+            onboard_repository,
+            create_task_workspace,
+            reconcile_workspace,
+            preserve_workspace,
+            discard_workspace
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

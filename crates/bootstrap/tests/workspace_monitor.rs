@@ -2,12 +2,117 @@ mod support;
 
 use std::fs;
 
-use local_agent_terminal_application::{AcquireLease, PortError, RevokeLease, StartupStateDto};
+use local_agent_terminal_application::{
+    AcquireLease, PortError, RevokeLease, StartupStateDto, TaskLeaseState,
+    WorkspaceDashboardRequestDto,
+};
 use local_agent_terminal_domain::{LeaseClaim, RunId, TaskId};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 
 use support::{WorkspaceFixture, TASK_ID};
+
+#[test]
+fn startup_reconciles_a_completed_worktree_before_exposing_ready() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let moved = fixture.root.path().join("moved-before-startup");
+    fs::rename(fixture.managed_worktree(), &moved).expect("move worktree");
+
+    let bootstrap = fixture.start();
+    let runtime = bootstrap.workspace_runtime().expect("runtime");
+
+    assert!(!runtime.recovery_candidates().is_empty());
+    let task = runtime.task(&task_id()).expect("task");
+    assert_eq!(
+        task.worktree.as_ref().expect("worktree").state,
+        local_agent_terminal_application::WorktreeState::Conflict
+    );
+    assert!(!task.recovery_candidates.is_empty());
+}
+
+#[test]
+fn failed_dashboard_inspection_revokes_new_monitor_authority() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let bootstrap = fixture.start();
+    let runtime = bootstrap.workspace_runtime().expect("runtime");
+    let moved_source = fixture.root.path().join("source-moved");
+    fs::rename(&fixture.source, &moved_source).expect("move source");
+
+    runtime
+        .get_workspace_dashboard(WorkspaceDashboardRequestDto {
+            project_id: "project-1".to_owned(),
+        })
+        .expect_err("inspection must fail closed");
+
+    let lease_status: String = fixture
+        .database()
+        .query_row(
+            "SELECT status FROM executor_leases WHERE task_id = ?1",
+            [TASK_ID],
+            |row| row.get(0),
+        )
+        .expect("lease");
+    assert_eq!(lease_status, "revoked");
+}
+
+#[test]
+fn dashboard_reestablishes_monitor_authority_after_restart() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let bootstrap = fixture.start();
+    let runtime = bootstrap.workspace_runtime().expect("runtime");
+    fs::write(
+        fixture.managed_worktree().join("README.md"),
+        b"changed after restart\n",
+    )
+    .expect("mutation");
+
+    let dashboard = runtime
+        .get_workspace_dashboard(WorkspaceDashboardRequestDto {
+            project_id: "project-1".to_owned(),
+        })
+        .expect("dashboard");
+
+    assert_eq!(dashboard.tasks[0].phase.as_str(), "WorkspaceDirty");
+    assert_eq!(dashboard.tasks[0].workspace_version.get(), 1);
+    assert_eq!(dashboard.tasks[0].lease_state, TaskLeaseState::Revoked);
+}
+
+#[test]
+fn missing_worktree_enters_durable_recovery_without_stranding_the_monitor_lease() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let bootstrap = fixture.start();
+    let runtime = bootstrap.workspace_runtime().expect("runtime");
+    let moved = fixture.root.path().join("moved-worktree");
+    fs::rename(fixture.managed_worktree(), &moved).expect("move worktree");
+
+    let dashboard = runtime
+        .get_workspace_dashboard(WorkspaceDashboardRequestDto {
+            project_id: "project-1".to_owned(),
+        })
+        .expect("recovery dashboard");
+
+    assert_eq!(dashboard.tasks[0].lease_state, TaskLeaseState::Revoked);
+    assert!(!dashboard.tasks[0].recovery_candidates.is_empty());
+    assert_eq!(
+        dashboard.tasks[0]
+            .worktree
+            .as_ref()
+            .expect("worktree")
+            .state,
+        local_agent_terminal_application::WorktreeState::Conflict
+    );
+    let repeated = runtime
+        .get_workspace_dashboard(WorkspaceDashboardRequestDto {
+            project_id: "project-1".to_owned(),
+        })
+        .expect("dashboard remains available");
+    assert_eq!(repeated.tasks[0].lease_state, TaskLeaseState::Revoked);
+    assert!(!repeated.tasks[0].recovery_candidates.is_empty());
+}
 
 #[test]
 fn unchanged_authoritative_fingerprint_is_a_no_op() {

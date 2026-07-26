@@ -41,6 +41,24 @@ pub(crate) fn locate(
 ) -> Result<RepositoryLocator, PortError> {
     validate_external_path(workdir)?;
     let workdir = canonical_directory(workdir)?;
+    locate_canonical(gateway, workdir)
+}
+
+pub(crate) fn locate_persisted(
+    gateway: &GitRepositoryGateway,
+    workdir: &Path,
+) -> Result<RepositoryLocator, PortError> {
+    let canonical = canonical_directory(workdir)?;
+    if canonical != workdir {
+        return Err(conflict());
+    }
+    locate_canonical(gateway, canonical)
+}
+
+fn locate_canonical(
+    gateway: &GitRepositoryGateway,
+    workdir: PathBuf,
+) -> Result<RepositoryLocator, PortError> {
     let repository = open_repository(&workdir)?;
     let common_dir = canonical_directory(repository.commondir())?;
     let actual_workdir = repository.workdir().ok_or_else(|| {

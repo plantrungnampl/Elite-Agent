@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::{
     CanonicalEvidenceRef, PortError, TaskSnapshot, TimelineEntryDto, WorkspaceMutationRequest,
-    WorkspaceMutationResult,
+    WorkspaceMutationResult, WorkspaceObservationLossRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +54,11 @@ pub trait WorkspaceMutationStore: Send + Sync {
         &self,
         request: WorkspaceMutationRequest,
     ) -> Result<WorkspaceMutationResult, PortError>;
+
+    fn record_workspace_observation_loss(
+        &self,
+        request: WorkspaceObservationLossRequest,
+    ) -> Result<(), PortError>;
 }
 
 pub trait WorkspaceEvidenceStore: Send + Sync {

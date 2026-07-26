@@ -8,8 +8,8 @@ use local_agent_terminal_domain::{
 
 use crate::{
     AcquireLease, CanonicalEvidenceRef, CreateWorktree, DiscardWorktree, ExecutorLeaseStore,
-    ExpectedPresence, LeaseSnapshot, PortError, RecoveryActionDto, RepositoryGateway,
-    RepositorySnapshot, Retryability, RevokeLease, SafeErrorClassification, WorkspaceDashboardDto,
+    ExpectedPresence, LeaseSnapshot, PortError, RepositoryGateway, RepositorySnapshot,
+    Retryability, RevokeLease, SafeErrorClassification, TimelineEntryDto, WorkspaceDashboardDto,
     WorkspaceMutationStore, WorktreeSnapshot,
 };
 
@@ -136,6 +136,7 @@ pub struct TaskSnapshot {
     pub fencing_epoch: u64,
     pub lease_state: TaskLeaseState,
     pub recovery_candidates: Vec<RecoveryCandidate>,
+    pub timeline: Vec<TimelineEntryDto>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +231,14 @@ pub struct WorktreeIntent {
     pub base_commit: GitObjectId,
     pub target_path_display: String,
     pub expected_presence: ExpectedPresence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryOperationIntent {
+    pub operation: OperationIntent,
+    pub candidate_id: String,
+    pub action: RecoveryAction,
+    pub expected_workspace_version: WorkspaceVersion,
 }
 
 impl WorktreeIntent {
@@ -372,14 +381,6 @@ impl RecoveryCandidate {
             expected_worktree: None,
         }
     }
-
-    pub fn action_dtos(&self) -> Vec<RecoveryActionDto> {
-        self.actions
-            .iter()
-            .copied()
-            .map(RecoveryActionDto::from)
-            .collect()
-    }
 }
 
 pub trait WorkspaceStateStore: Send + Sync {
@@ -390,6 +391,10 @@ pub trait WorkspaceStateStore: Send + Sync {
     ) -> Result<ProjectSnapshot, PortError>;
     fn create_task(&self, task: NewTask) -> Result<TaskSnapshot, PortError>;
     fn begin_worktree_intent(&self, intent: WorktreeIntent) -> Result<OperationIntent, PortError>;
+    fn begin_recovery_intent(
+        &self,
+        intent: RecoveryOperationIntent,
+    ) -> Result<OperationIntent, PortError>;
     fn transition_worktree_intent(&self, transition: IntentTransition) -> Result<(), PortError>;
     fn reconcile_intents(&self) -> Result<Vec<RecoveryCandidate>, PortError>;
     fn dashboard(&self, project: &ProjectId) -> Result<WorkspaceDashboardDto, PortError>;
@@ -415,6 +420,17 @@ pub struct WorkspaceMutationResult {
     pub task_state: WorkflowState,
     pub resume_target: Option<Phase>,
     pub invalidated_approval_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceObservationLossRequest {
+    pub task_id: TaskId,
+    pub expected_sequence: Sequence,
+    pub claim: LeaseClaim,
+    pub operation: OperationIntent,
+    pub next_status: OperationIntentStatus,
+    pub observed_at: String,
+    pub error: SafeErrorClassification,
 }
 
 pub struct PrepareTaskWorkspace<'a> {
@@ -488,7 +504,7 @@ impl<'a> PrepareTaskWorkspace<'a> {
                     .transition_worktree_intent(IntentTransition {
                         intent_id: operation.id,
                         expected_status: OperationIntentStatus::Started,
-                        next_status: OperationIntentStatus::Failed,
+                        next_status: OperationIntentStatus::Indeterminate,
                         executor_fencing_token: Some(fencing_token),
                         attempt_count,
                         updated_at: observed_at,

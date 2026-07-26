@@ -35,6 +35,11 @@ impl GitRepositoryGateway {
         paths::locate(self, workdir)
     }
 
+    pub fn locate_persisted(&self, workdir: &Path) -> Result<RepositoryLocator, PortError> {
+        let _guard = self.calls.lock().map_err(|_| paths::internal())?;
+        paths::locate_persisted(self, workdir)
+    }
+
     pub fn trusted_root_id(&self) -> &str {
         &self.trusted_root_id
     }

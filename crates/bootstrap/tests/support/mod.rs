@@ -6,8 +6,8 @@ use local_agent_terminal_application::{
     ArtifactRootMode, ArtifactWriteReservation, CanonicalEvidenceRef, Clock, CreateWorktree,
     ExpectedPresence, IdempotencyClass, InspectRepository, IntentTransition, ManagedWorktreePath,
     NewProject, NewTask, OperationIntent, OperationIntentStatus, PortError, ProjectSettings,
-    RepositoryGateway, RepositoryInspectionRecord, ReservedArtifact, RiskLevel,
-    WorkspaceStateStore, WorktreeIntent,
+    RecoveryAction, RecoveryOperationIntent, RepositoryGateway, RepositoryInspectionRecord,
+    ReservedArtifact, RiskLevel, TaskQuery, WorkspaceStateStore, WorktreeIntent,
 };
 use local_agent_terminal_bootstrap::{Bootstrap, StartupConfig};
 use local_agent_terminal_domain::{
@@ -66,7 +66,7 @@ impl WorkspaceFixture {
                 project_id: project_id.clone(),
                 name: "Workspace recovery fixture".to_owned(),
                 repository: repository.clone(),
-                repository_path: source.to_string_lossy().into_owned(),
+                repository_path: locator.canonical_workdir.to_string_lossy().into_owned(),
                 settings: ProjectSettings {
                     policy_profile_id: "default".to_owned(),
                     artifact_root_mode: ArtifactRootMode::ApplicationData,
@@ -180,6 +180,77 @@ impl WorkspaceFixture {
             .expect("succeeded intent");
         self.seed_core_run(&database, &artifacts);
         self.seed_implementation_projection();
+    }
+
+    #[allow(dead_code)]
+    pub fn seed_interrupted_workspace(&self) {
+        let database = SqliteStore::open(&self.database_path).expect("database");
+        let artifacts = ContentAddressedArtifactStore::open(self.app_data.join("artifacts"))
+            .expect("artifact store");
+        let intent = self.worktree_intent(&database, &artifacts);
+        database
+            .begin_worktree_intent(intent.clone())
+            .expect("worktree intent");
+        database
+            .transition_worktree_intent(IntentTransition {
+                intent_id: intent.operation.id.clone(),
+                expected_status: OperationIntentStatus::Pending,
+                next_status: OperationIntentStatus::Started,
+                executor_fencing_token: Some(FencingToken::new(1).expect("token")),
+                attempt_count: 1,
+                updated_at: "2026-07-26T00:00:04Z".to_owned(),
+                error: None,
+                observed_fingerprint: None,
+            })
+            .expect("started intent");
+        database
+            .transition_worktree_intent(IntentTransition {
+                intent_id: intent.operation.id,
+                expected_status: OperationIntentStatus::Started,
+                next_status: OperationIntentStatus::Interrupted,
+                executor_fencing_token: Some(FencingToken::new(1).expect("token")),
+                attempt_count: 1,
+                updated_at: "2026-07-26T00:00:05Z".to_owned(),
+                error: None,
+                observed_fingerprint: None,
+            })
+            .expect("interrupted intent");
+    }
+
+    #[allow(dead_code)]
+    pub fn seed_pending_discard_recovery(&self) {
+        let database = SqliteStore::open(&self.database_path).expect("database");
+        let artifacts = ContentAddressedArtifactStore::open(self.app_data.join("artifacts"))
+            .expect("artifact store");
+        let task_id = TaskId::new(TASK_ID).expect("task id");
+        let task = database.task(&task_id).expect("task");
+        let candidate_id = "intent-worktree-1".to_owned();
+        let request_sequence = task.current_sequence.get();
+        let artifact_id = format!("recovery-request-discard-{candidate_id}-{request_sequence}");
+        let evidence = publish_artifact(&database, &artifacts, &artifact_id, Some(task_id.clone()));
+        database
+            .begin_recovery_intent(RecoveryOperationIntent {
+                operation: OperationIntent {
+                    id: format!("recovery-discard-{candidate_id}-{request_sequence}"),
+                    task_id,
+                    operation_kind: "workspace.recovery.discard".to_owned(),
+                    idempotency_class: IdempotencyClass::Queryable,
+                    idempotency_key: format!(
+                        "workspace-recovery:discard:{candidate_id}:{request_sequence}"
+                    ),
+                    canonical_request_artifact_id: evidence.artifact_id,
+                    operation_digest: evidence.content_hash,
+                    status: OperationIntentStatus::Pending,
+                    executor_fencing_token: None,
+                    attempt_count: 0,
+                    created_at: "2026-07-26T00:00:06Z".to_owned(),
+                    updated_at: "2026-07-26T00:00:06Z".to_owned(),
+                },
+                candidate_id,
+                action: RecoveryAction::DiscardExactWorktree,
+                expected_workspace_version: WorkspaceVersion::new(0),
+            })
+            .expect("pending discard recovery");
     }
 
     pub fn managed_worktree(&self) -> PathBuf {

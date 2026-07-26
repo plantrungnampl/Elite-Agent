@@ -17,9 +17,12 @@ mod workspace;
 pub use append_events::AppendEvents;
 pub use canonical_json::{canonical_evidence, CanonicalEvidenceRef, CanonicalJsonRequest};
 pub use dto::{
+    CommandErrorDto, ConfirmDiscardWorkspaceRequestDto, CreateTaskWorkspaceRequestDto,
     DiagnosticSeverityDto, EvidenceSummaryDto, LocalDiagnosticDto, ObservationClassDto,
-    RecoveryActionDto, StartupIssueDto, StartupStateDto, StartupStatusDto, TimelineEntryDto,
-    TrustLabelDto, WorkspaceDashboardDto,
+    OnboardRepositoryRequestDto, RecoveryActionCodeDto, RecoveryActionDto,
+    RecoveryCandidateRequestDto, StartupIssueDto, StartupRecoveryActionDto, StartupStateDto,
+    StartupStatusDto, TimelineEntryDto, TrustLabelDto, WorkspaceDashboardDto,
+    WorkspaceDashboardRequestDto,
 };
 pub use error::{PortError, Retryability, SafeErrorClassification};
 pub use lease::{
@@ -42,8 +45,9 @@ pub use workspace::{
     ArtifactRootMode, GetWorkspaceDashboard, IdempotencyClass, IntentTransition, NewProject,
     NewTask, ObserveWorkspaceMutation, OperationIntent, OperationIntentStatus,
     PrepareTaskWorkspace, ProjectSettings, ProjectSnapshot, ReconcileWorkspaces, RecoveryAction,
-    RecoveryCandidate, RecoveryEvidence, RecoveryProject, RecoveryReason,
+    RecoveryCandidate, RecoveryEvidence, RecoveryOperationIntent, RecoveryProject, RecoveryReason,
     RepositoryInspectionRecord, RiskLevel, StartedRecovery, TaskLeaseState, TaskSnapshot,
-    WorkspaceMutationRequest, WorkspaceMutationResult, WorkspaceRecoveryStore, WorkspaceStateStore,
-    WorkspaceWriteCoordinator, WorkspaceWritePermit, WorktreeIntent, WorktreeMatch,
+    WorkspaceMutationRequest, WorkspaceMutationResult, WorkspaceObservationLossRequest,
+    WorkspaceRecoveryStore, WorkspaceStateStore, WorkspaceWriteCoordinator, WorkspaceWritePermit,
+    WorktreeIntent, WorktreeMatch,
 };

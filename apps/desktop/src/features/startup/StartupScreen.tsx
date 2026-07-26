@@ -11,7 +11,11 @@ import type {
 } from "../../api/startup";
 import { startupViewModel } from "./startup-model";
 
-export function StartupScreen() {
+interface StartupScreenProps {
+  onReady?: () => void;
+}
+
+export function StartupScreen({ onReady }: StartupScreenProps) {
   const [status, setStatus] = useState<StartupStatusDto | null>(null);
   const [diagnostics, setDiagnostics] = useState<LocalDiagnosticDto[]>([]);
   const [ipcFailed, setIpcFailed] = useState(false);
@@ -19,6 +23,7 @@ export function StartupScreen() {
   const mainContent = useRef<HTMLElement>(null);
   const statusHeading = useRef<HTMLHeadingElement>(null);
   const retryInFlight = useRef(false);
+  const readyNotified = useRef(false);
 
   useEffect(() => {
     let active = true;
@@ -42,6 +47,17 @@ export function StartupScreen() {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (
+      status?.state === "ready" &&
+      !readyNotified.current &&
+      onReady !== undefined
+    ) {
+      readyNotified.current = true;
+      onReady();
+    }
+  }, [onReady, status]);
 
   const view = startupViewModel(status, ipcFailed, retrying);
 

@@ -5,6 +5,11 @@ mod startup;
 mod workspace_monitor;
 mod workspace_runtime;
 
-pub use local_agent_terminal_application::{LocalDiagnosticDto, StartupStateDto, StartupStatusDto};
+pub use local_agent_terminal_application::{
+    CommandErrorDto, ConfirmDiscardWorkspaceRequestDto, CreateTaskWorkspaceRequestDto,
+    LocalDiagnosticDto, OnboardRepositoryRequestDto, ProjectSnapshot, RecoveryCandidateRequestDto,
+    StartupStateDto, StartupStatusDto, TaskSnapshot, WorkspaceDashboardDto,
+    WorkspaceDashboardRequestDto,
+};
 pub use startup::{Bootstrap, StartupConfig};
 pub use workspace_runtime::WorkspaceRuntime;

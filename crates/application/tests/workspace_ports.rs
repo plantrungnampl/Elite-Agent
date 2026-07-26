@@ -103,6 +103,7 @@ fn task_snapshot() -> TaskSnapshot {
         fencing_epoch: 1,
         lease_state: TaskLeaseState::Active,
         recovery_candidates: Vec::new(),
+        timeline: Vec::new(),
     }
 }
 
@@ -139,6 +140,7 @@ fn worktree_intent() -> WorktreeIntent {
 #[derive(Clone)]
 struct FakeRepositoryGateway {
     calls: Arc<Mutex<Vec<&'static str>>>,
+    fail_create: bool,
 }
 
 impl RepositoryGateway for FakeRepositoryGateway {
@@ -149,6 +151,12 @@ impl RepositoryGateway for FakeRepositoryGateway {
 
     fn create_worktree(&self, _request: CreateWorktree) -> Result<WorktreeSnapshot, PortError> {
         self.calls.lock().unwrap().push("create_worktree");
+        if self.fail_create {
+            return Err(PortError::failure(
+                SafeErrorClassification::Unavailable,
+                local_agent_terminal_application::Retryability::Retryable,
+            ));
+        }
         Ok(worktree_snapshot())
     }
 
@@ -218,12 +226,21 @@ impl WorkspaceStateStore for FakeWorkspaceStateStore {
         Ok(intent.operation)
     }
 
+    fn begin_recovery_intent(
+        &self,
+        intent: local_agent_terminal_application::RecoveryOperationIntent,
+    ) -> Result<OperationIntent, PortError> {
+        self.calls.lock().unwrap().push("begin_recovery_intent");
+        Ok(intent.operation)
+    }
+
     fn transition_worktree_intent(&self, transition: IntentTransition) -> Result<(), PortError> {
         if matches!(
             transition.next_status,
             OperationIntentStatus::Started
                 | OperationIntentStatus::Succeeded
                 | OperationIntentStatus::Failed
+                | OperationIntentStatus::Indeterminate
         ) {
             assert_eq!(
                 transition.executor_fencing_token.unwrap().get(),
@@ -238,6 +255,7 @@ impl WorkspaceStateStore for FakeWorkspaceStateStore {
                 OperationIntentStatus::Started => "start_intent",
                 OperationIntentStatus::Succeeded => "succeed_intent",
                 OperationIntentStatus::Failed => "fail_intent",
+                OperationIntentStatus::Indeterminate => "indeterminate_intent",
                 _ => "other_intent_transition",
             });
         Ok(())
@@ -264,6 +282,7 @@ fn repository_onboarding_returns_typed_health_without_exposing_handles() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let repositories = FakeRepositoryGateway {
         calls: Arc::clone(&calls),
+        fail_create: false,
     };
     let workspaces = FakeWorkspaceStateStore {
         calls: Arc::clone(&calls),
@@ -302,6 +321,7 @@ fn prepare_workspace_persists_and_starts_intent_before_git_create() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let repositories = FakeRepositoryGateway {
         calls: Arc::clone(&calls),
+        fail_create: false,
     };
     let workspaces = FakeWorkspaceStateStore {
         calls: Arc::clone(&calls),
@@ -348,10 +368,59 @@ fn prepare_workspace_persists_and_starts_intent_before_git_create() {
 }
 
 #[test]
+fn repository_error_leaves_the_worktree_intent_indeterminate() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let repositories = FakeRepositoryGateway {
+        calls: Arc::clone(&calls),
+        fail_create: true,
+    };
+    let workspaces = FakeWorkspaceStateStore {
+        calls: Arc::clone(&calls),
+    };
+    let leases = FakeLeaseStore::new();
+    leases
+        .acquire(AcquireLease {
+            task_id: TaskId::new("task-1").unwrap(),
+            holder_run_id: RunId::new("run-1").unwrap(),
+            expected_fencing_epoch: 0,
+            acquired_at: "2026-07-26T00:00:00Z".to_owned(),
+            expires_at: "2026-07-26T00:05:00Z".to_owned(),
+        })
+        .unwrap();
+
+    let result = PrepareTaskWorkspace::new(&workspaces, &repositories, &leases).execute(
+        worktree_intent(),
+        CreateWorktree {
+            repository: repository_locator(),
+            managed_path: managed_path(),
+            task_id: TaskId::new("task-1").unwrap(),
+            lease_claim: lease_claim(1),
+            expected_workspace_version: WorkspaceVersion::new(0),
+            worktree_id: WorktreeId::new("worktree-1").unwrap(),
+            branch: TaskBranch::new("codex/task-1").unwrap(),
+            base_commit: GitObjectId::new(SHA1).unwrap(),
+        },
+        "2026-07-26T00:00:01Z".to_owned(),
+    );
+
+    assert!(result.is_err());
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            "begin_intent",
+            "start_intent",
+            "create_worktree",
+            "indeterminate_intent"
+        ]
+    );
+}
+
+#[test]
 fn stale_worktree_create_claim_is_rejected_before_repository_effect() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let repositories = FakeRepositoryGateway {
         calls: Arc::clone(&calls),
+        fail_create: false,
     };
     let workspaces = FakeWorkspaceStateStore {
         calls: Arc::clone(&calls),
@@ -401,7 +470,7 @@ fn stale_worktree_create_claim_is_rejected_before_repository_effect() {
     ));
     assert_eq!(
         *calls.lock().unwrap(),
-        ["begin_intent", "start_intent", "fail_intent"]
+        ["begin_intent", "start_intent", "indeterminate_intent"]
     );
 }
 
@@ -601,6 +670,14 @@ impl WorkspaceMutationStore for FakeMutationStore {
             resume_target: Some(Phase::Implementation),
             invalidated_approval_ids: vec!["approval-1".to_owned()],
         })
+    }
+
+    fn record_workspace_observation_loss(
+        &self,
+        _request: local_agent_terminal_application::WorkspaceObservationLossRequest,
+    ) -> Result<(), PortError> {
+        *self.calls.lock().unwrap() += 1;
+        Ok(())
     }
 }
 

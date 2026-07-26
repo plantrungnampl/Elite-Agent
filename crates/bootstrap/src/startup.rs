@@ -2,8 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use local_agent_terminal_application::{
-    DiagnosticSeverityDto, LocalDiagnosticDto, ObservationClassDto, PortError, RecoveryActionDto,
-    SafeErrorClassification, StartupIssueDto, StartupStateDto, StartupStatusDto, TrustLabelDto,
+    DiagnosticSeverityDto, LocalDiagnosticDto, ObservationClassDto, PortError,
+    SafeErrorClassification, StartupIssueDto, StartupRecoveryActionDto, StartupStateDto,
+    StartupStatusDto, TrustLabelDto,
 };
 use local_agent_terminal_repository_git::GitRepositoryGateway;
 use local_agent_terminal_storage_files::{
@@ -386,9 +387,9 @@ fn reconciliation_failure(error: PortError) -> StartupFailure {
     }
 }
 
-fn recovery_actions(recovery: RecoveryMode) -> Vec<RecoveryActionDto> {
+fn recovery_actions(recovery: RecoveryMode) -> Vec<StartupRecoveryActionDto> {
     vec![
-        RecoveryActionDto {
+        StartupRecoveryActionDto {
             code: match recovery {
                 RecoveryMode::Retry => "retry_startup_validation",
                 RecoveryMode::Restart => "restart_application",
@@ -400,7 +401,7 @@ fn recovery_actions(recovery: RecoveryMode) -> Vec<RecoveryActionDto> {
             }
             .to_owned(),
         },
-        RecoveryActionDto {
+        StartupRecoveryActionDto {
             code: "get_local_diagnostics".to_owned(),
             label: "View local diagnostics".to_owned(),
         },
