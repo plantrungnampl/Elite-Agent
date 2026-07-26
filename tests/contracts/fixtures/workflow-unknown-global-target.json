@@ -1,0 +1,14 @@
+{
+  "phases": ["Intake"],
+  "conditions": ["Active"],
+  "operationStates": ["None"],
+  "phaseTransitions": [],
+  "conditionTransitions": [],
+  "operationTransitions": [],
+  "workspaceDirtySources": [],
+  "workspaceDirtyTransition": { "to": "Intake" },
+  "globalEvents": {
+    "task.cancelled": { "to": "Unknown" },
+    "task.failed": { "to": "Unknown" }
+  }
+}

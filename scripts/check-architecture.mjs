@@ -31,14 +31,18 @@ function verifyCargo(metadata) {
       return metadata.packages.find((pkg) => pkg.id === member)?.name ?? member;
     }),
   );
+  const allDependencies = (name) => packages.get(name)?.dependencies ?? [];
   const dependencies = (name) =>
     (packages.get(name)?.dependencies ?? []).filter((dependency) => dependency.kind !== "dev");
   const names = (name) => dependencies(name).map((dependency) => dependency.name);
   const domain = "local-agent-terminal-domain";
   const application = "local-agent-terminal-application";
-  const forbiddenDomain = new Set(["tauri", "tokio", "rusqlite", "cap-std", "cap-fs-ext"]);
-  if (names(domain).some((name) => forbiddenDomain.has(name))) {
-    throw new Error("domain has a forbidden framework or IO dependency");
+  const domainAllowed = new Set(["serde", "serde_json"]);
+  if (allDependencies(domain).some((dependency) => workspace.has(dependency.name))) {
+    throw new Error("domain may not depend on workspace packages");
+  }
+  if (allDependencies(domain).some((dependency) => !domainAllowed.has(dependency.name))) {
+    throw new Error("domain may depend only on justified general-purpose libraries");
   }
   const applicationAllowed = new Set([domain, "serde", "serde_json", "thiserror"]);
   if (names(application).some((name) => !applicationAllowed.has(name))) {

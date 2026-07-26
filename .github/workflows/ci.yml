@@ -10,9 +10,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
         with:
-          version: 11.9.0
+          version: 11.7.0
       - uses: actions/setup-node@v4
         with:
           node-version: 24.16.0
@@ -32,3 +34,6 @@ jobs:
       - run: pnpm --dir apps/desktop test:browser
       - run: pnpm --dir apps/desktop build
       - run: cargo build -p local-agent-terminal-desktop
+      - run: git diff --check
+      - run: git diff --check 321734f..HEAD
+      - run: git diff --exit-code 321734f -- docs/multi-agent-terminal-design

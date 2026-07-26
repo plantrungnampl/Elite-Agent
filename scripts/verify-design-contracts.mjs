@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const designRoot = join(root, "docs", "multi-agent-terminal-design");
 const argument = process.argv.indexOf("--manifest");
+const workflowArgument = process.argv.indexOf("--workflow");
 const manifestPath = resolve(
   root,
   argument === -1
@@ -17,7 +18,11 @@ const manifestPath = resolve(
 try {
   verifyManifest(manifestPath);
   verifyJsonArtifacts();
-  verifyWorkflow();
+  verifyWorkflow(
+    workflowArgument === -1
+      ? join(designRoot, "schemas", "workflow-transitions.v1.json")
+      : resolve(root, process.argv[workflowArgument + 1]),
+  );
   verifySqliteDdl();
   console.log("design contracts: ok");
 } catch (error) {
@@ -63,10 +68,8 @@ function verifyJsonArtifacts() {
   }
 }
 
-function verifyWorkflow() {
-  const workflow = JSON.parse(
-    readFileSync(join(designRoot, "schemas", "workflow-transitions.v1.json"), "utf8"),
-  );
+function verifyWorkflow(path) {
+  const workflow = JSON.parse(readFileSync(path, "utf8"));
   const phases = new Set(workflow.phases);
   const conditions = new Set(workflow.conditions);
   const operations = new Set(workflow.operationStates);
@@ -99,6 +102,19 @@ function verifyWorkflow() {
   }
   if (!phases.has(workflow.workspaceDirtyTransition.to)) {
     throw new Error("workspace dirty target is not a phase");
+  }
+  const globalSources = new Set([
+    ...phases,
+    "any_nonterminal_phase",
+    "any_nonterminal_phase_after_resolution",
+  ]);
+  for (const event of Object.values(workflow.globalEvents)) {
+    if (event.to && !phases.has(event.to)) {
+      throw new Error("workflow global event target is not a phase");
+    }
+    if (event.allowedFrom && !globalSources.has(event.allowedFrom)) {
+      throw new Error("workflow global event source is not closed");
+    }
   }
 }
 

@@ -20,3 +20,15 @@ test("design verifier rejects incomplete checksum manifests", () => {
     /checksum manifest is not exact/,
   );
 });
+
+test("design verifier rejects global events with an unknown target phase", () => {
+  assert.throws(
+    () =>
+      run(
+        "scripts/verify-design-contracts.mjs",
+        "--workflow",
+        "tests/contracts/fixtures/workflow-unknown-global-target.json",
+      ),
+    /workflow global event target is not a phase/,
+  );
+});

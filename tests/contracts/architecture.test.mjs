@@ -32,3 +32,15 @@ test("architecture checker rejects an outward application dependency", () => {
     /application may depend only on domain or general-purpose libraries/,
   );
 });
+
+test("architecture checker rejects even dev-only domain dependencies on adapters", () => {
+  assert.throws(
+    () =>
+      run(
+        "scripts/check-architecture.mjs",
+        "--metadata",
+        "tests/contracts/fixtures/architecture/domain-adapter-dev-metadata.json",
+      ),
+    /domain may not depend on workspace packages/,
+  );
+});

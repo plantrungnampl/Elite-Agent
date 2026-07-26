@@ -6,7 +6,48 @@ use local_agent_terminal_storage_sqlite::{
     artifact_root_health, migration_checksum, ArtifactRootIssue, DatabaseHealth, OpenError,
     SqliteStore,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
+use sha2::{Digest, Sha256};
+
+const NORMATIVE_SQL: &str =
+    include_str!("../../../docs/multi-agent-terminal-design/schemas/sqlite-v1.sql");
+const PRIOR_V1_CHECKSUM: &str =
+    "sha256:016173b278c07b241c61d9a0e93533803b787861b945d4393ca26ee24d165f62";
+const PRIOR_V1_HARDENING: &str = r#"
+CREATE TRIGGER events_update_forbidden
+BEFORE UPDATE ON events
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'events are immutable');
+END;
+
+CREATE TRIGGER events_delete_forbidden
+BEFORE DELETE ON events
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'events are immutable');
+END;
+
+CREATE TRIGGER artifact_operation_status_forward_only
+BEFORE UPDATE OF status ON artifact_operations
+FOR EACH ROW
+WHEN NOT (
+    (OLD.status = 'intent' AND NEW.status IN ('staging', 'aborted', 'quarantined'))
+    OR (OLD.status = 'staging' AND NEW.status IN ('renamed', 'aborted', 'quarantined'))
+    OR (OLD.status = 'renamed' AND NEW.status IN ('completed', 'quarantined'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'artifact operation status must move forward');
+END;
+
+CREATE TRIGGER artifact_operation_completion_required
+BEFORE UPDATE OF status, completed_at ON artifact_operations
+FOR EACH ROW
+WHEN NEW.status = 'completed' AND NEW.completed_at IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'completed artifact operation requires completed_at');
+END;
+"#;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -38,15 +79,22 @@ fn first_startup_applies_schema_and_records_checksum() {
     SqliteStore::open(&path).unwrap();
 
     let connection = Connection::open(path).unwrap();
-    let migration: (i64, String) = connection
+    let latest: (i64, String) = connection
         .query_row(
-            "SELECT version, checksum FROM schema_migrations",
+            "SELECT version, checksum FROM schema_migrations ORDER BY version DESC LIMIT 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(migration, (1, migration_checksum()));
-    assert_eq!(migration.1.len(), 71);
+    assert_eq!(latest, (2, migration_checksum()));
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        2
+    );
     assert_eq!(
         connection
             .query_row(
@@ -57,6 +105,50 @@ fn first_startup_applies_schema_and_records_checksum() {
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn exact_prior_v1_database_upgrades_to_v2_without_losing_data() {
+    let directory = TempDirectory::new();
+    let path = directory.0.join("state.sqlite3");
+    let mut connection = Connection::open(&path).unwrap();
+    install_prior_v1(&mut connection);
+    seed_project_and_task(&connection);
+    drop(connection);
+
+    SqliteStore::open(&path).unwrap();
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT name FROM projects WHERE id = 'project-1'",
+                [],
+                |row| { row.get::<_, String>(0) }
+            )
+            .unwrap(),
+        "Project"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        2
+    );
+    assert!(connection
+        .execute("UPDATE tasks SET fencing_epoch = 0 WHERE id = 'task-1'", [])
+        .is_err());
+    assert!(connection
+        .execute(
+            "INSERT INTO agent_descriptors (
+                id, display_name, transport_type, trust_tier, manifest_json, manifest_digest,
+                executable_digest, enabled, containment_verified, last_health_status, updated_at
+             ) VALUES ('brokered', 'agent', 'local', 'brokered_process', '{}', ?1, NULL, 1, 0, NULL, '2026-07-26T00:00:00Z')",
+            [format!("sha256:{}", "a".repeat(64))],
+        )
+        .is_err());
 }
 
 #[test]
@@ -75,6 +167,17 @@ fn later_startup_rejects_changed_or_unsupported_schema() {
         SqliteStore::open(&mismatch_path),
         Err(OpenError::ChecksumMismatch { .. })
     ));
+    assert_eq!(
+        Connection::open(&mismatch_path)
+            .unwrap()
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        format!("sha256:{}", "0".repeat(64))
+    );
 
     let unsupported_directory = TempDirectory::new();
     let unsupported_path = unsupported_directory.0.join("state.sqlite3");
@@ -86,7 +189,7 @@ fn later_startup_rejects_changed_or_unsupported_schema() {
              (version, name, applied_at, application_version, checksum)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                2,
+                3,
                 "future",
                 "2026-07-26T00:00:00Z",
                 "9.0.0",
@@ -97,8 +200,8 @@ fn later_startup_rejects_changed_or_unsupported_schema() {
     assert!(matches!(
         SqliteStore::open(&unsupported_path),
         Err(OpenError::UnsupportedSchema {
-            found: 2,
-            supported: 1
+            found: 3,
+            supported: 2
         })
     ));
 }
@@ -173,6 +276,29 @@ fn seed_project_and_task(connection: &Connection) {
         .unwrap();
 }
 
+fn install_prior_v1(connection: &mut Connection) {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    let (_, body) = NORMATIVE_SQL.split_once("BEGIN IMMEDIATE;").unwrap();
+    let (body, _) = body.rsplit_once("COMMIT;").unwrap();
+    let migration = format!("{body}\n{PRIOR_V1_HARDENING}");
+    assert_eq!(
+        format!("sha256:{:x}", Sha256::digest(migration.as_bytes())),
+        PRIOR_V1_CHECKSUM
+    );
+    transaction.execute_batch(&migration).unwrap();
+    transaction
+        .execute(
+            "INSERT INTO schema_migrations (
+                version, name, applied_at, application_version, checksum
+             ) VALUES (1, 'initial', '2026-07-26T00:00:00Z', '0.1.0', ?1)",
+            [PRIOR_V1_CHECKSUM],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+}
+
 #[test]
 fn startup_rejects_unknown_nonempty_database_without_mutating_it() {
     let directory = TempDirectory::new();
@@ -191,7 +317,7 @@ fn startup_rejects_unknown_nonempty_database_without_mutating_it() {
         SqliteStore::open(&path),
         Err(OpenError::UnsupportedSchema {
             found: 0,
-            supported: 1
+            supported: 2
         })
     ));
 
