@@ -104,6 +104,76 @@ fn later_startup_rejects_changed_or_unsupported_schema() {
 }
 
 #[test]
+fn task_fencing_epoch_must_increase_when_changed() {
+    let directory = TempDirectory::new();
+    let path = directory.0.join("state.sqlite3");
+    SqliteStore::open(&path).unwrap();
+    let connection = Connection::open(path).unwrap();
+    seed_project_and_task(&connection);
+
+    connection
+        .execute("UPDATE tasks SET fencing_epoch = 1 WHERE id = 'task-1'", [])
+        .unwrap();
+    assert!(connection
+        .execute("UPDATE tasks SET fencing_epoch = 1 WHERE id = 'task-1'", [])
+        .is_err());
+    assert!(connection
+        .execute("UPDATE tasks SET fencing_epoch = 0 WHERE id = 'task-1'", [])
+        .is_err());
+}
+
+#[test]
+fn enabled_brokered_and_isolated_agents_require_verified_containment() {
+    let directory = TempDirectory::new();
+    let path = directory.0.join("state.sqlite3");
+    SqliteStore::open(&path).unwrap();
+    let connection = Connection::open(path).unwrap();
+
+    for trust_tier in ["brokered_process", "isolated_worker"] {
+        assert!(connection
+            .execute(
+                "INSERT INTO agent_descriptors (
+                    id, display_name, transport_type, trust_tier, manifest_json, manifest_digest,
+                    executable_digest, enabled, containment_verified, last_health_status, updated_at
+                 ) VALUES (?1, 'agent', 'local', ?2, '{}', ?3, NULL, 1, 0, NULL, '2026-07-26T00:00:00Z')",
+                params![
+                    format!("{trust_tier}-agent"),
+                    trust_tier,
+                    format!("sha256:{}", "a".repeat(64))
+                ],
+            )
+            .is_err());
+    }
+}
+
+fn seed_project_and_task(connection: &Connection) {
+    connection
+        .execute(
+            "INSERT INTO projects (
+                id, name, repository_path, repository_identity, created_at, updated_at,
+                policy_profile_id, artifact_root_mode, artifact_root_path
+             ) VALUES (
+                'project-1', 'Project', 'C:/repo', 'repo-1', '2026-07-26T00:00:00Z',
+                '2026-07-26T00:00:00Z', 'policy-1', 'application_data', 'C:/artifacts'
+             )",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tasks (
+                id, project_id, title, objective, phase, condition, operation_state, risk_level,
+                base_branch, base_commit, created_at, updated_at
+             ) VALUES (
+                'task-1', 'project-1', 'Task', 'Objective', 'Intake', 'Active', 'None', 'low',
+                'main', ?1, '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z'
+             )",
+            ["a".repeat(40)],
+        )
+        .unwrap();
+}
+
+#[test]
 fn startup_rejects_unknown_nonempty_database_without_mutating_it() {
     let directory = TempDirectory::new();
     let path = directory.0.join("state.sqlite3");

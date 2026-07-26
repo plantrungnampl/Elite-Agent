@@ -100,8 +100,33 @@ impl EventStore for SqliteStore {
                 state,
                 updated_at,
             } = change;
-            let changed = transaction
-                .execute(
+            let current_fencing_epoch: i64 = transaction
+                .query_row(
+                    "SELECT fencing_epoch FROM tasks WHERE id = ?1",
+                    [task_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_error_to_port)?;
+            let next_fencing_epoch =
+                i64::try_from(state.fencing_token().get()).map_err(|_| invalid_input())?;
+            let changed = if current_fencing_epoch == next_fencing_epoch {
+                transaction.execute(
+                    "UPDATE tasks SET
+                        phase = ?1, condition = ?2, operation_state = ?3,
+                        workspace_version = ?4, updated_at = ?5
+                     WHERE id = ?6",
+                    params![
+                        state.phase().as_str(),
+                        state.condition().as_str(),
+                        state.operation().as_str(),
+                        i64::try_from(state.workspace_version().get())
+                            .map_err(|_| invalid_input())?,
+                        updated_at,
+                        task_id.as_str(),
+                    ],
+                )
+            } else {
+                transaction.execute(
                     "UPDATE tasks SET
                         phase = ?1, condition = ?2, operation_state = ?3,
                         workspace_version = ?4, fencing_epoch = ?5, updated_at = ?6
@@ -112,12 +137,13 @@ impl EventStore for SqliteStore {
                         state.operation().as_str(),
                         i64::try_from(state.workspace_version().get())
                             .map_err(|_| invalid_input())?,
-                        i64::try_from(state.fencing_token().get()).map_err(|_| invalid_input())?,
+                        next_fencing_epoch,
                         updated_at,
                         task_id.as_str(),
                     ],
                 )
-                .map_err(sqlite_error_to_port)?;
+            }
+            .map_err(sqlite_error_to_port)?;
             if changed != 1 {
                 return Err(PortError::failure(
                     SafeErrorClassification::NotFound,

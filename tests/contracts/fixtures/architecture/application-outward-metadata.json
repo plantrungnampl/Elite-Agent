@@ -1,0 +1,17 @@
+{
+  "packages": [
+    { "name": "local-agent-terminal-domain", "dependencies": [] },
+    {
+      "name": "local-agent-terminal-application",
+      "dependencies": [
+        { "name": "local-agent-terminal-storage-sqlite" }
+      ]
+    },
+    { "name": "local-agent-terminal-storage-sqlite", "dependencies": [] }
+  ],
+  "workspace_members": [
+    "local-agent-terminal-domain",
+    "local-agent-terminal-application",
+    "local-agent-terminal-storage-sqlite"
+  ]
+}

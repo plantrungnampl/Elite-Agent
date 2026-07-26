@@ -21,6 +21,34 @@ BEGIN
     SELECT RAISE(ABORT, 'events are immutable');
 END;
 
+CREATE TRIGGER task_fencing_epoch_monotonic
+BEFORE UPDATE OF fencing_epoch ON tasks
+FOR EACH ROW
+WHEN NEW.fencing_epoch <= OLD.fencing_epoch
+BEGIN
+    SELECT RAISE(ABORT, 'task fencing epoch must increase');
+END;
+
+CREATE TRIGGER enabled_agent_requires_containment_insert
+BEFORE INSERT ON agent_descriptors
+FOR EACH ROW
+WHEN NEW.enabled = 1
+    AND NEW.trust_tier IN ('brokered_process', 'isolated_worker')
+    AND NEW.containment_verified <> 1
+BEGIN
+    SELECT RAISE(ABORT, 'enabled agent requires verified containment');
+END;
+
+CREATE TRIGGER enabled_agent_requires_containment_update
+BEFORE UPDATE OF enabled, trust_tier, containment_verified ON agent_descriptors
+FOR EACH ROW
+WHEN NEW.enabled = 1
+    AND NEW.trust_tier IN ('brokered_process', 'isolated_worker')
+    AND NEW.containment_verified <> 1
+BEGIN
+    SELECT RAISE(ABORT, 'enabled agent requires verified containment');
+END;
+
 CREATE TRIGGER artifact_operation_status_forward_only
 BEFORE UPDATE OF status ON artifact_operations
 FOR EACH ROW
