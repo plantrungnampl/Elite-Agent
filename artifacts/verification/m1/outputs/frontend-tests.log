@@ -5,5 +5,5 @@ $ vitest "--run"
 
  Test Files  4 passed (4)
       Tests  18 passed (18)
-   Start at  17:58:55
-   Duration  1.81s (transform 306ms, setup 810ms, import 435ms, tests 989ms, environment 2.79s)
+   Start at  18:01:08
+   Duration  1.91s (transform 313ms, setup 851ms, import 549ms, tests 1.19s, environment 2.60s)

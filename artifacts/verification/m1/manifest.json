@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
   "finalized": true,
-  "generatedAtUtc": "2026-07-26T10:59:07.616Z",
-  "sourceCommit": "9b2ec7737aa40459ecc54afe604268261340391e",
+  "generatedAtUtc": "2026-07-26T11:01:20.021Z",
+  "sourceCommit": "2bf3f4d32ccd88a364ecca8157291a9896d73bd8",
   "platform": "win32-x64",
   "outputCapture": "combined stdout/stderr bytes normalized to LF",
   "toolVersions": {
@@ -20,17 +20,17 @@
       "name": "frozen-install",
       "command": "pnpm install --frozen-lockfile",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:58:23.001Z",
-      "durationMs": 916,
+      "startedAtUtc": "2026-07-26T11:00:53.671Z",
+      "durationMs": 917,
       "outputFile": "outputs/frozen-install.log",
-      "outputSha256": "sha256:af88723cb30dffe31f08cc3f4e130d9f0867209fa057ab8cd2e7df638cb29486"
+      "outputSha256": "sha256:16bb5d164bb2330cee09414b18a6bd6ab7f4c0cf99c42e9c5fa78cc435df2bc7"
     },
     {
       "name": "design-contracts",
       "command": "node scripts/verify-design-contracts.mjs",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:58:23.919Z",
-      "durationMs": 67,
+      "startedAtUtc": "2026-07-26T11:00:54.591Z",
+      "durationMs": 78,
       "outputFile": "outputs/design-contracts.log",
       "outputSha256": "sha256:b5cd721cbd79d0db596529962f463442bca6fe3f46067cf82a20b2a85d150852"
     },
@@ -38,8 +38,8 @@
       "name": "architecture",
       "command": "node scripts/check-architecture.mjs",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:58:23.987Z",
-      "durationMs": 104,
+      "startedAtUtc": "2026-07-26T11:00:54.669Z",
+      "durationMs": 117,
       "outputFile": "outputs/architecture.log",
       "outputSha256": "sha256:dc03b01395fd9c81198a04278ff2d04986443b2d7f71d20a6b77e1ef7f53c30f"
     },
@@ -47,35 +47,35 @@
       "name": "repository-windows",
       "command": "cargo test -p local-agent-terminal-repository-git --test windows_matrix --features test-seams",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:58:24.092Z",
-      "durationMs": 1016,
+      "startedAtUtc": "2026-07-26T11:00:54.787Z",
+      "durationMs": 1086,
       "outputFile": "outputs/repository-windows.log",
-      "outputSha256": "sha256:1c46af279fc07cbf667a6c994ea40c184bf6b19193a1bfdd357d6805e3f99734"
+      "outputSha256": "sha256:371f2acc6f6f7fd75a4012d088ef537b9f9299e5f487fd1abf369f381969597f"
     },
     {
       "name": "recovery-matrix",
       "command": "cargo test -p local-agent-terminal-bootstrap --test recovery_matrix",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:58:25.108Z",
-      "durationMs": 3158,
+      "startedAtUtc": "2026-07-26T11:00:55.875Z",
+      "durationMs": 1070,
       "outputFile": "outputs/recovery-matrix.log",
-      "outputSha256": "sha256:a930528354c3bc90fc7bd65b49dc105313000eefddaf7fe3e098966e0935f2b0"
+      "outputSha256": "sha256:a5782f679ab911e2540a1d2dd555d223002231b01a0387bd62edbc4c789697ee"
     },
     {
       "name": "contract-tests",
       "command": "node --test tests/contracts/*.test.mjs",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:58:28.268Z",
-      "durationMs": 677,
+      "startedAtUtc": "2026-07-26T11:00:56.946Z",
+      "durationMs": 741,
       "outputFile": "outputs/contract-tests.log",
-      "outputSha256": "sha256:432585df81925ad74700998ca42722b0e679a90657691656800f10e064baa989"
+      "outputSha256": "sha256:054ec359e0e4592760124ad04af70a0396c072e8a778ffd329b0eb1fce894300"
     },
     {
       "name": "rust-format",
       "command": "cargo fmt --all -- --check",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:58:28.946Z",
-      "durationMs": 331,
+      "startedAtUtc": "2026-07-26T11:00:57.688Z",
+      "durationMs": 308,
       "outputFile": "outputs/rust-format.log",
       "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
@@ -83,35 +83,35 @@
       "name": "rust-clippy",
       "command": "cargo clippy --workspace --all-targets -- -D warnings",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:58:29.277Z",
-      "durationMs": 2002,
+      "startedAtUtc": "2026-07-26T11:00:57.997Z",
+      "durationMs": 552,
       "outputFile": "outputs/rust-clippy.log",
-      "outputSha256": "sha256:ae08806ca0c34a402b478b5477b45bb477227ab7b444ce4e12d742e0f4be238b"
+      "outputSha256": "sha256:29162d76fb109d9c6005d8544d63a4a438d15235d4f9b8e73d51adc9ba6e95d7"
     },
     {
       "name": "rust-tests",
       "command": "cargo test --workspace --all-targets",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:58:31.280Z",
-      "durationMs": 23301,
+      "startedAtUtc": "2026-07-26T11:00:58.550Z",
+      "durationMs": 8300,
       "outputFile": "outputs/rust-tests.log",
-      "outputSha256": "sha256:f7d547bae6c510dcd6f87e67b5be590fd3481cecd7a47d36591ab198b85f1814"
+      "outputSha256": "sha256:282d6c5a496890e53969ebd97cf168d44bc65890e8e4d45e184efb9c12f3d7c7"
     },
     {
       "name": "frontend-tests",
       "command": "pnpm --dir apps/desktop test --run",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:58:54.582Z",
-      "durationMs": 3245,
+      "startedAtUtc": "2026-07-26T11:01:06.851Z",
+      "durationMs": 3236,
       "outputFile": "outputs/frontend-tests.log",
-      "outputSha256": "sha256:f7f82e28c397543c37025e6449de41d03cd3051d60b489bf11caa826abd667f9"
+      "outputSha256": "sha256:d14c1c0c179649a87cf2983e66673481c4d3487933d3dd0d4946591b1d798550"
     },
     {
       "name": "playwright-install",
       "command": "pnpm --dir apps/desktop exec playwright install chromium",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:58:57.828Z",
-      "durationMs": 1375,
+      "startedAtUtc": "2026-07-26T11:01:10.088Z",
+      "durationMs": 1372,
       "outputFile": "outputs/playwright-install.log",
       "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
@@ -119,26 +119,26 @@
       "name": "browser-tests",
       "command": "pnpm --dir apps/desktop test:browser",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:58:59.204Z",
-      "durationMs": 5120,
+      "startedAtUtc": "2026-07-26T11:01:11.461Z",
+      "durationMs": 5225,
       "outputFile": "outputs/browser-tests.log",
-      "outputSha256": "sha256:33ef17e65b17398ffdf6b39da3b8c8e203b311d18fe5de2701fab95c8423526a"
+      "outputSha256": "sha256:049783d4ecf238d0fb5640e70ce260aa7e72d9694177be750a70121cc7ebc0bc"
     },
     {
       "name": "frontend-build",
       "command": "pnpm --dir apps/desktop build",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:59:04.325Z",
-      "durationMs": 2766,
+      "startedAtUtc": "2026-07-26T11:01:16.687Z",
+      "durationMs": 2804,
       "outputFile": "outputs/frontend-build.log",
-      "outputSha256": "sha256:d1e255a957ce74db1196b7c9d1b4470ff933b93349429fcbfa0461b78f5f1ec6"
+      "outputSha256": "sha256:c82c2cdca5456b627c6eaaf20b6c133c6dd5b13cc73830afa4e448b14cee746a"
     },
     {
       "name": "desktop-debug-build",
       "command": "cargo build -p local-agent-terminal-desktop",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:59:07.092Z",
-      "durationMs": 364,
+      "startedAtUtc": "2026-07-26T11:01:19.492Z",
+      "durationMs": 361,
       "outputFile": "outputs/desktop-debug-build.log",
       "outputSha256": "sha256:0b53209db424367e80c52cd8cde8b75e37af110438a0efde777104a1463956de"
     },
@@ -146,16 +146,16 @@
       "name": "diff-check",
       "command": "git diff --check",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:59:07.456Z",
-      "durationMs": 43,
+      "startedAtUtc": "2026-07-26T11:01:19.854Z",
+      "durationMs": 51,
       "outputFile": "outputs/diff-check.log",
-      "outputSha256": "sha256:3a690a5b84be99113491ccb39d0d97152d3fa8ce378862b9cea3822c80d8a771"
+      "outputSha256": "sha256:10f0a4a294696b7ef714db6f7a8e35e060561c161dca440052b405c38f2fd704"
     },
     {
       "name": "committed-diff-check",
       "command": "git diff --check 321734f..HEAD",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:59:07.501Z",
+      "startedAtUtc": "2026-07-26T11:01:19.905Z",
       "durationMs": 61,
       "outputFile": "outputs/committed-diff-check.log",
       "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -164,7 +164,7 @@
       "name": "design-docs-unchanged",
       "command": "git diff --exit-code 321734f -- docs/multi-agent-terminal-design",
       "exitCode": 0,
-      "startedAtUtc": "2026-07-26T10:59:07.563Z",
+      "startedAtUtc": "2026-07-26T11:01:19.967Z",
       "durationMs": 53,
       "outputFile": "outputs/design-docs-unchanged.log",
       "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
