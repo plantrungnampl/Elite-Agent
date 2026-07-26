@@ -2,6 +2,7 @@
 members = [
     "apps/desktop/src-tauri",
     "crates/application",
+    "crates/bootstrap",
     "crates/domain",
     "crates/storage-files",
     "crates/storage-sqlite",

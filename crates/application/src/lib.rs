@@ -7,7 +7,8 @@ mod ports;
 
 pub use append_events::AppendEvents;
 pub use dto::{
-    LocalDiagnosticDto, RecoveryActionDto, StartupIssueDto, StartupStateDto, StartupStatusDto,
+    DiagnosticSeverityDto, LocalDiagnosticDto, ObservationClassDto, RecoveryActionDto,
+    StartupIssueDto, StartupStateDto, StartupStatusDto, TrustLabelDto,
 };
 pub use error::{PortError, Retryability, SafeErrorClassification};
 pub use ports::{

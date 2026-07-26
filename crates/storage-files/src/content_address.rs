@@ -108,6 +108,31 @@ impl ContentAddressedArtifactStore {
         &self.root
     }
 
+    pub fn validate_health(&self) -> Result<(), PortError> {
+        let temp_name = format!(
+            "health-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        );
+        let staging = self.staging_path(&temp_name)?;
+        let expected_hash = format!("sha256:{:x}", Sha256::digest(b"health"));
+        let result = (|| {
+            let mut file = self.create_staging(&temp_name)?;
+            file.write_all(b"health").map_err(io_error)?;
+            file.flush().map_err(io_error)?;
+            file.sync_all().map_err(io_error)?;
+            drop(file);
+            if !self.verify(&staging, &expected_hash, 6)? {
+                return Err(integrity_failure());
+            }
+            self.discard_staging(&staging)
+        })();
+        if result.is_err() && self.entry_exists(&staging).unwrap_or(false) {
+            let _ = self.discard_staging(&staging);
+        }
+        result
+    }
+
     pub(crate) fn staging_path(&self, temp_name: &str) -> Result<PathBuf, PortError> {
         Ok(self.root.join(staging_relative(temp_name)?))
     }

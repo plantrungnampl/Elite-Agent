@@ -7,6 +7,7 @@ mod migrations;
 
 use std::path::{Path, PathBuf};
 
+use local_agent_terminal_application::{Clock, PortError};
 use rusqlite::Connection;
 
 pub use health::{artifact_root_health, ArtifactRootIssue, DatabaseHealth, DatabaseIssue};
@@ -56,6 +57,17 @@ impl SqliteStore {
         let connection = Connection::open(&self.path)?;
         initialize_connection(&connection)?;
         Ok(connection)
+    }
+}
+
+impl Clock for SqliteStore {
+    fn now_utc(&self) -> Result<String, PortError> {
+        let connection = self.connection().map_err(event_store::open_error_to_port)?;
+        connection
+            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+                row.get(0)
+            })
+            .map_err(event_store::sqlite_error_to_port)
     }
 }
 

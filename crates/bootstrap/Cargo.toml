@@ -1,0 +1,15 @@
+[package]
+name = "local-agent-terminal-bootstrap"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+local-agent-terminal-application = { path = "../application" }
+local-agent-terminal-storage-files = { path = "../storage-files" }
+local-agent-terminal-storage-sqlite = { path = "../storage-sqlite" }
+serde_json = "1.0"
+
+[dev-dependencies]
+local-agent-terminal-domain = { path = "../domain" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3.27"
