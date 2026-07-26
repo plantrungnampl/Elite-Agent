@@ -34,18 +34,32 @@ function verifyCargo(metadata) {
   const allDependencies = (name) => packages.get(name)?.dependencies ?? [];
   const dependencies = (name) =>
     (packages.get(name)?.dependencies ?? []).filter((dependency) => dependency.kind !== "dev");
-  const names = (name) => dependencies(name).map((dependency) => dependency.name);
   const domain = "local-agent-terminal-domain";
   const application = "local-agent-terminal-application";
   const domainAllowed = new Set(["serde", "serde_json"]);
   if (allDependencies(domain).some((dependency) => workspace.has(dependency.name))) {
     throw new Error("domain may not depend on workspace packages");
   }
-  if (allDependencies(domain).some((dependency) => !domainAllowed.has(dependency.name))) {
+  if (
+    dependencies(domain).some(
+      (dependency) => !workspace.has(dependency.name) && !domainAllowed.has(dependency.name),
+    )
+  ) {
     throw new Error("domain may depend only on justified general-purpose libraries");
   }
   const applicationAllowed = new Set([domain, "serde", "serde_json", "thiserror"]);
-  if (names(application).some((name) => !applicationAllowed.has(name))) {
+  if (
+    allDependencies(application).some(
+      (dependency) => workspace.has(dependency.name) && dependency.name !== domain,
+    )
+  ) {
+    throw new Error(`${application} has an outward internal dependency`);
+  }
+  if (
+    dependencies(application).some(
+      (dependency) => !workspace.has(dependency.name) && !applicationAllowed.has(dependency.name),
+    )
+  ) {
     throw new Error("application may depend only on domain or general-purpose libraries");
   }
   const allowed = new Map([

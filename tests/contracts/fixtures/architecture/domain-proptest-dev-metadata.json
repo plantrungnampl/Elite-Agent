@@ -1,0 +1,13 @@
+{
+  "packages": [
+    {
+      "name": "local-agent-terminal-domain",
+      "dependencies": [
+        { "name": "serde" },
+        { "name": "serde_json" },
+        { "name": "proptest", "kind": "dev" }
+      ]
+    }
+  ],
+  "workspace_members": ["local-agent-terminal-domain"]
+}

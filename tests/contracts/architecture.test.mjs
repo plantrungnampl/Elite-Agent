@@ -29,7 +29,7 @@ test("architecture checker rejects an outward application dependency", () => {
         "--metadata",
         "tests/contracts/fixtures/architecture/application-outward-metadata.json",
       ),
-    /application may depend only on domain or general-purpose libraries/,
+    /local-agent-terminal-application has an outward internal dependency/,
   );
 });
 
@@ -42,5 +42,16 @@ test("architecture checker rejects even dev-only domain dependencies on adapters
         "tests/contracts/fixtures/architecture/domain-adapter-dev-metadata.json",
       ),
     /domain may not depend on workspace packages/,
+  );
+});
+
+test("architecture checker allows external domain test dependencies", () => {
+  assert.match(
+    run(
+      "scripts/check-architecture.mjs",
+      "--metadata",
+      "tests/contracts/fixtures/architecture/domain-proptest-dev-metadata.json",
+    ),
+    /architecture contracts: ok/,
   );
 });
