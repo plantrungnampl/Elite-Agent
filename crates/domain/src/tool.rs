@@ -44,8 +44,9 @@ impl CapabilityRef {
         Ok(Self::Source(SourceCapability { revision, path }))
     }
 
-    pub fn artifact(artifact_id: ArtifactId) -> Self {
-        Self::Artifact(ArtifactCapability { artifact_id })
+    pub fn artifact(artifact_id: ArtifactId) -> Result<Self, ToolError> {
+        validate_binding_id(artifact_id.as_str())?;
+        Ok(Self::Artifact(ArtifactCapability { artifact_id }))
     }
 
     pub fn worktree(task_id: TaskId, path: impl Into<String>) -> Result<Self, ToolError> {

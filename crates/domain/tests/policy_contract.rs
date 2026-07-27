@@ -295,8 +295,8 @@ fn policy_combination_sorts_and_deduplicates_rule_ids_while_retaining_redactions
         request(10),
         PolicyVersion::new(1).unwrap(),
         vec![
-            rule("z-rule", PolicyEffect::Allow, "secret-pattern"),
             rule("a-rule", PolicyEffect::AllowWithRedaction, "token-mask"),
+            rule("z-rule", PolicyEffect::Allow, "secret-pattern"),
         ],
         None,
     )

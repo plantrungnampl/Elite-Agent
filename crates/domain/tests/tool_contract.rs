@@ -1,6 +1,6 @@
 use local_agent_terminal_domain::{
-    CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken, NetworkProfile, Phase,
-    PlanStepId, ProcessBinding, ProcessInvocation, ProcessToolRequest, ProcessTrustTier,
+    ArtifactId, CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken, NetworkProfile,
+    Phase, PlanStepId, ProcessBinding, ProcessInvocation, ProcessToolRequest, ProcessTrustTier,
     RawShellRequest, RunId, Sha256Digest, StructuredToolName, TaskId, ToolError, WorkspaceVersion,
 };
 
@@ -68,6 +68,9 @@ fn capability_references_reject_paths_that_can_escape_the_broker() {
             "{invalid:?}"
         );
     }
+
+    assert!(CapabilityRef::artifact(ArtifactId::new("x".repeat(257)).unwrap()).is_err());
+    assert!(CapabilityRef::artifact(ArtifactId::new("artifact\0id").unwrap()).is_err());
 }
 
 #[test]
