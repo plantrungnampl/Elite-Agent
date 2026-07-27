@@ -1,15 +1,25 @@
-# M1 review
+# M1 independent review
 
-## Spec compliance: pass
+## Independent approval: PASS
 
-The Windows acceptance matrix covers the repository, path, Git-configuration, object-format, recovery, fencing, projection, approval invalidation, browser, and crash-boundary cases listed in the M1 Task 9 brief. Mandatory approval evidence is available for checkout filter disabling, path containment, exact SHA-256 object IDs, non-forcing conditional references, managed worktrees, and LFS/submodule fail-closed handling.
+M1 is independently approved at source commit `a7c604a` with evidence commit `33de728`; the broad review baseline was `ed5a66f`. The first independent review found two Critical and two Important findings. Fix round 1 addressed the stale-poll overwrite, but re-review still found two Critical and two Important findings, including the newly identified `project.created` v1 compatibility regression. Fix round 2 closed the target-child checkout race, exact-discard tombstone race, changed-evidence onboarding recovery gap, and v1 compatibility regression. The final reviewer found every carried finding addressed and no new Critical or Important breakage.
 
-All hostile fixtures are local and inert. Each execution-capable fixture has its own marker-producing sentinel, and the matrix proves every marker remains absent. The production repository adapter uses typed in-process `git2`/libgit2 calls only; the architecture gate rejects direct, grouped, and aliased process/PATH access. Original checkout bytes, HEAD, and index are asserted unchanged across success and failure cases.
+One deferred Minor remains: a referenced Git object that is missing is classified as `NotFound` rather than `IntegrityFailure`. The path fails closed without fallback or side effect, so this diagnostic inconsistency does not block M1.
 
-## Code quality: pass
+## Spec compliance: PASS
 
-The focused Windows matrices, complete Rust workspace, clippy, formatting, Node contracts, frontend unit tests, real-browser accessibility/recovery tests, frontend build, and Windows desktop debug build pass. Every post-add validation boundary is fault-injected. Because target paths and worktree metadata have no atomic compare-and-delete operation, failed creation preserves the complete attempt and surfaces a conflict. Startup retains the canonical worktree intent, re-inspects the preserved attempt, and offers adopt/discard only for an exact repository identity, base, branch, path, and Git-metadata match; replacement state remains preserved without either action. A deterministic post-observation race proves simultaneous target, worktree-admin, and ref replacements remain untouched.
+The Windows acceptance matrix covers repository identity and health, path and Git hazards, exact SHA-1/SHA-256 object IDs, worktree recovery, fencing, projections, approval invalidation, crash boundaries, browser recovery, and accessibility. Checkout materializes the exact commit tree through retained handle-relative Windows operations, rejects special entries and reparse escapes, and never delegates checkout to repository-controlled hooks, filters, helpers, LFS, submodules, PATH, or a shell. Exact discard renames and removes the verified tombstone through retained handles without reopening an attacker-replaceable pathname.
 
-## Evidence review: pass
+All hostile fixtures are local and inert, and their execution sentinels remain absent. Success and failure paths preserve the original checkout bytes, HEAD, and index. Startup recovery is idempotent across repository-evidence changes, preserves the stable v1 `project.created` payload contract, and never silently retries an unknown operation.
 
-The manifest is generated only after the gates run. Generation and verification independently reject tracked source changes outside the exact evidence-output allowlist, including when `HEAD` equals `sourceCommit`. It binds the source commit, platform, toolchain, UTC start times, durations, exit codes, and independently re-hashed captured output files to each fixture classification. The verifier is intentionally outside the manifest, rejects tampered logs and stale commits, and derives approval blockers from observed test names. After finalization, CI runs every evidence-verifier contract without skip and saves that output separately to avoid self-reference. The immutable design directory has no diff from `321734f`.
+## Code quality: PASS
+
+The final verification set passes formatting, clippy, all workspace targets, doctests, the frontend build, the Windows desktop build, architecture contracts, design contracts, and evidence gates. Focused counts are Windows matrix 33/33, SQLite recovery 14/14, bootstrap recovery 16/16, frontend 19, browser 5, post-final verifier contracts 14, and Node contracts 25. The React dashboard rejects stale polling responses with a monotonic generation guard, so mutation responses remain authoritative.
+
+The implementation preserves clean-architecture direction: domain rules remain pure, application owns ports and DTOs, adapters implement those ports, Tauri stays narrow, and bootstrap remains the composition root.
+
+## Evidence review: PASS
+
+The finalized manifest binds source commit `a7c604a`, platform and toolchain versions, UTC timing, exit codes, captured output hashes, fixture classifications, and review artifacts. Independent verification rejects tampered output, stale source binding, unapproved tracked changes, and skipped post-final verifier contracts. The immutable design directory has no diff from `321734f`.
+
+The existing limitations in `known-limitations.md` remain accurate and accepted for M1.
