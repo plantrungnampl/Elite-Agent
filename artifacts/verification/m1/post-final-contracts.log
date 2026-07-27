@@ -2,20 +2,20 @@ architecture contracts: local-agent-terminal-repository-git has an outward inter
 architecture contracts: generic Tauri command is forbidden: run_command
 architecture contracts: repository adapter may not spawn a process: lib.rs
 architecture contracts: repository adapter may not inspect PATH: lib.rs
-✔ immutable design checks still pass (45.3177ms)
-✔ repository adapter cannot depend on an outer desktop adapter (35.9365ms)
-✔ generic Tauri execution commands are rejected (74.4304ms)
-✔ repository adapter rejects process execution (81.0467ms)
-✔ repository adapter rejects PATH lookup (76.0766ms)
-✔ M1 evidence is complete and internally consistent (1340.0166ms)
-✔ Windows CI generates, verifies, and uploads fresh M1 evidence (0.6615ms)
-✔ M1 verifier rejects modified captured output (1350.4096ms)
-✔ M1 verifier rejects a stale source commit (218.1515ms)
-✔ M1 verifier rejects self-asserted fixture classifications (1303.4378ms)
-✔ M1 verifier rejects fixture evidence absent from captured output (1338.977ms)
-✔ M1 verifier rejects dirty tracked source even when HEAD matches sourceCommit (123.8355ms)
-✔ M1 evidence generation preflight rejects dirty tracked source (127.3442ms)
-✔ unknown non-repeatable operations are indeterminate and non-replayable (0.5204ms)
+✔ immutable design checks still pass (49.4475ms)
+✔ repository adapter cannot depend on an outer desktop adapter (38.2854ms)
+✔ generic Tauri execution commands are rejected (72.4341ms)
+✔ repository adapter rejects process execution (75.4844ms)
+✔ repository adapter rejects PATH lookup (78.3284ms)
+✔ M1 evidence is complete and internally consistent (1368.0996ms)
+✔ Windows CI generates, verifies, and uploads fresh M1 evidence (0.9397ms)
+✔ M1 verifier rejects modified captured output (1362.9215ms)
+✔ M1 verifier rejects a stale source commit (229.1477ms)
+✔ M1 verifier rejects self-asserted fixture classifications (1414.8491ms)
+✔ M1 verifier rejects fixture evidence absent from captured output (1321.363ms)
+✔ M1 verifier rejects dirty tracked source even when HEAD matches sourceCommit (128.4851ms)
+✔ M1 evidence generation preflight rejects dirty tracked source (127.8046ms)
+✔ unknown non-repeatable operations are indeterminate and non-replayable (0.7051ms)
 ℹ tests 14
 ℹ suites 0
 ℹ pass 14
@@ -23,4 +23,4 @@ architecture contracts: repository adapter may not inspect PATH: lib.rs
 ℹ cancelled 0
 ℹ skipped 0
 ℹ todo 0
-ℹ duration_ms 6173.4767
+ℹ duration_ms 6330.1096

@@ -1,4 +1,7 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.33s
+   Compiling local-agent-terminal-bootstrap v0.1.0 (D:\multiagent\crates\bootstrap)
+   Compiling local-agent-terminal-repository-git v0.1.0 (D:\multiagent\crates\repository-git)
+   Compiling local-agent-terminal-desktop v0.1.0 (D:\multiagent\apps\desktop\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.69s
      Running unittests src\lib.rs (target\debug\deps\local_agent_terminal_application-61b1b62893f60cb0.exe)
 
 running 0 tests
@@ -29,18 +32,18 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
      Running tests\workspace_ports.rs (target\debug\deps\workspace_ports-d28f05bbabb520c7.exe)
 
 running 13 tests
-test indeterminate_known_worktree_candidate_retains_exact_linkage ... ok
-test exact_worktree_observation_matches_but_each_identity_mismatch_conflicts ... ok
-test indeterminate_unknown_candidate_has_no_worktree_linkage ... ok
-test dashboard_use_case_reads_one_application_owned_projection ... ok
 test indeterminate_non_repeatable_candidate_never_exposes_retry ... ok
-test prepare_workspace_persists_and_starts_intent_before_git_create ... ok
-test workspace_mutation_is_one_atomic_application_port_call ... ok
-test stale_worktree_create_claim_is_rejected_before_repository_effect ... ok
-test task_timeline_contract_preserves_persisted_sequence_order ... ok
-test repository_onboarding_returns_typed_health_without_exposing_handles ... ok
+test dashboard_use_case_reads_one_application_owned_projection ... ok
+test indeterminate_unknown_candidate_has_no_worktree_linkage ... ok
 test repository_error_leaves_the_worktree_intent_indeterminate ... ok
+test indeterminate_known_worktree_candidate_retains_exact_linkage ... ok
+test prepare_workspace_persists_and_starts_intent_before_git_create ... ok
+test repository_onboarding_returns_typed_health_without_exposing_handles ... ok
+test task_timeline_contract_preserves_persisted_sequence_order ... ok
+test workspace_mutation_is_one_atomic_application_port_call ... ok
+test exact_worktree_observation_matches_but_each_identity_mismatch_conflicts ... ok
 test lease_has_one_winner_increasing_replacement_tokens_and_typed_stale_rejection ... ok
+test stale_worktree_create_claim_is_rejected_before_repository_effect ... ok
 test rfc8785_vectors_have_stable_canonical_bytes_and_sha256_digest ... ok
 
 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
@@ -54,40 +57,41 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
      Running tests\recovery_matrix.rs (target\debug\deps\recovery_matrix-32bdb5cad739a0f3.exe)
 
-running 15 tests
+running 16 tests
 test startup_exposes_workspace_runtime_only_after_ordered_recovery ... ok
 test startup_preserves_incomplete_onboarding_when_repository_identity_changed ... ok
-test exact_onboarding_command_retry_reuses_the_completed_project ... ok
 test startup_resumes_onboarding_after_the_artifact_publish_boundary ... ok
-test startup_leaves_pending_intent_for_exact_command_retry_without_git_effects ... ok
-test startup_resumes_onboarding_after_the_durable_intent_boundary ... ok
+test exact_onboarding_command_retry_reuses_the_completed_project ... ok
 test startup_marks_unknown_operations_indeterminate_without_touching_git ... ok
+test startup_leaves_pending_intent_for_exact_command_retry_without_git_effects ... ok
+test startup_preserves_an_occupied_managed_path_without_creating_a_branch ... ok
+test startup_resumes_onboarding_after_the_durable_intent_boundary ... ok
 test startup_marks_retryable_only_after_authoritative_worktree_absence ... ok
 test startup_fences_every_preexisting_executor_lease_before_ready ... ok
-test startup_preserves_an_occupied_managed_path_without_creating_a_branch ... ok
 test startup_preserves_an_orphan_branch_as_a_specific_conflict ... ok
 test startup_adopts_only_the_exact_durable_worktree ... ok
 test repeated_startup_replays_recovery_projection_without_duplicate_side_effects ... ok
+test startup_preserves_and_supersedes_published_onboarding_evidence_after_status_change ... ok
 test discard_rejects_repository_replacement_after_exact_startup_observation ... ok
 test startup_inspects_preserved_indeterminate_create_without_adopting_or_discarding_it ... ok
 
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.86s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.29s
 
      Running tests\startup.rs (target\debug\deps\startup-dd62f94894045243.exe)
 
 running 10 tests
 test recovery_lock_holder_process ... ok
-test desktop_depends_on_bootstrap_instead_of_concrete_storage_adapters ... ok
 test concurrent_startup_fails_closed_without_mutating_shared_state ... ok
+test desktop_depends_on_bootstrap_instead_of_concrete_storage_adapters ... ok
 test database_failure_precedes_artifact_storage_mutation ... ok
 test attacker_controlled_adapter_context_never_crosses_serialization_boundary ... ok
 test schema_failure_has_stable_safe_recovery_and_sanitized_diagnostics ... ok
 test tauri_facing_values_are_serializable_data_without_resource_capabilities ... ok
-test first_startup_creates_and_validates_required_local_state ... ok
 test retry_revalidates_state_and_never_fabricates_ready ... ok
+test first_startup_creates_and_validates_required_local_state ... ok
 test startup_reconciles_a_durable_renamed_artifact_before_ready ... ok
 
-test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
 
      Running tests\workspace_commands.rs (target\debug\deps\workspace_commands-d445f0cde413b9d1.exe)
 
@@ -98,21 +102,21 @@ test typed_workspace_commands_create_an_isolated_worktree_without_serializing_pa
 test exact_retry_resumes_after_the_task_record_but_before_the_worktree_intent ... ok
 test dashboard_poll_detects_a_real_out_of_band_workspace_mutation ... ok
 
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
 
      Running tests\workspace_monitor.rs (target\debug\deps\workspace_monitor-5a3a56a665cf40f4.exe)
 
 running 8 tests
+test unchanged_authoritative_fingerprint_is_a_no_op ... ok
 test startup_reconciles_a_completed_worktree_before_exposing_ready ... ok
 test stale_monitor_claim_is_rejected_before_evidence_or_repository_bytes_change ... ok
-test unchanged_authoritative_fingerprint_is_a_no_op ... ok
 test retry_and_drop_leave_no_monitor_thread_holding_workspace_adapters ... ok
 test out_of_band_change_enters_workspace_dirty_once_with_atomic_evidence ... ok
 test failed_dashboard_inspection_revokes_new_monitor_authority ... ok
 test missing_worktree_enters_durable_recovery_without_stranding_the_monitor_lease ... ok
 test dashboard_reestablishes_monitor_authority_after_restart ... ok
 
-test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.15s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.91s
 
      Running tests\workspace_recovery_commands.rs (target\debug\deps\workspace_recovery_commands-56b9d9c8cbfbd62d.exe)
 
@@ -122,13 +126,13 @@ test reconcile_reloads_authorization_and_records_a_durable_recovery_operation ..
 test discard_requires_confirmation_and_records_intent_before_the_exact_effect ... ok
 test cancelling_an_interrupted_discard_restores_an_actionable_exact_worktree ... ok
 
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.41s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.32s
 
      Running unittests src\lib.rs (target\debug\deps\local_agent_terminal_desktop_lib-75212e47ad1de424.exe)
 
 running 2 tests
-test tests::poisoned_managed_state_never_serves_stale_ready ... ok
 test tests::resolver_failure_is_typed_and_retry_re_resolves_before_ready ... ok
+test tests::poisoned_managed_state_never_serves_stale_ready ... ok
 
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
 
@@ -142,9 +146,9 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 running 10 tests
 test workflow::specification_tests::specification_rejects_duplicate_raw_global_event_keys ... ok
+test workflow::specification_tests::specification_pins_the_observed_workspace_mutation_rule ... ok
 test workflow::specification_tests::specification_rejects_phase_condition_selector_overlap ... ok
 test workflow::specification_tests::specification_rejects_condition_operation_selector_overlap ... ok
-test workflow::specification_tests::specification_pins_the_observed_workspace_mutation_rule ... ok
 test workflow::specification_tests::specification_rejects_wrong_missing_and_unknown_state_shape_fields ... ok
 test workflow::specification_tests::specification_rejects_unknown_fields_in_nested_rules ... ok
 test workflow::specification_tests::specification_allows_disjoint_phase_workspace_event_reuse ... ok
@@ -157,26 +161,26 @@ test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
      Running tests\workflow_contract.rs (target\debug\deps\workflow_contract-7994490980bb8310.exe)
 
 running 22 tests
-test generated_terminal_states_never_leave_terminality_without_a_declared_recovery ... ok
 test parses_every_normative_phase_condition_and_operation_state ... ok
+test generated_terminal_states_never_leave_terminality_without_a_declared_recovery ... ok
 test typed_ids_and_numeric_values_reject_invalid_boundaries ... ok
 test domain_crate_declares_only_pure_data_dependencies ... ok
-test task_failed_excludes_exactly_running_and_indeterminate_operations ... ok
+test task_cancelled_still_requires_a_fully_resolved_operation ... ok
 test rejects_undeclared_transitions_and_paused_phase_advancement ... ok
 test preserves_approval_and_verification_repair_semantics ... ok
 test observed_workspace_mutation_increments_version_outside_json_effects ... ok
-test task_cancelled_still_requires_a_fully_resolved_operation ... ok
-test numeric_values_cover_the_normative_u64_range_and_reject_overflow ... ok
 test preserves_workspace_dirty_recovery_and_fencing_semantics ... ok
+test numeric_values_cover_the_normative_u64_range_and_reject_overflow ... ok
+test task_failed_excludes_exactly_running_and_indeterminate_operations ... ok
 test condition_changes_inside_workspace_dirty_do_not_invent_new_mutations ... ok
-test approval_granted_requires_an_active_condition ... ok
-test accepts_every_declared_phase_transition_and_exact_effects ... ok
 test cancellation_and_failure_require_resolved_external_operations ... ok
-test accepts_every_declared_operation_transition_without_changing_phase ... ok
 test rejects_each_named_guard_when_false_or_missing ... ok
+test accepts_every_declared_phase_transition_and_exact_effects ... ok
+test accepts_every_declared_operation_transition_without_changing_phase ... ok
 test accepts_every_declared_condition_transition_without_changing_phase ... ok
-test generated_rejections_leave_state_unchanged ... ok
+test approval_granted_requires_an_active_condition ... ok
 test accepts_workspace_dirty_and_global_transitions_from_their_declared_sources ... ok
+test generated_rejections_leave_state_unchanged ... ok
 test terminal_states_are_normalized_and_cannot_transition ... ok
 test generated_accepted_transitions_are_normative_and_versions_never_decrease ... ok
 
@@ -188,8 +192,8 @@ running 5 tests
 test git_object_ids_support_exact_sha1_and_sha256_values ... ok
 test task_branches_reject_git_ref_hazards ... ok
 test repository_workspace_identifiers_reject_empty_values ... ok
-test workspace_fingerprint_validates_each_digest ... ok
 test only_the_current_active_lease_claim_is_authorized ... ok
+test workspace_fingerprint_validates_each_digest ... ok
 
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
@@ -204,40 +208,40 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 running 26 tests
 test hazard_scan_fails_closed_when_head_object_is_missing ... ok
-Junction created for C:\Users\clone\AppData\Local\Temp\.tmpKDuMU0\managed\task-1 <<===>> C:\Users\clone\AppData\Local\Temp\.tmpKDuMU0\outside
-test persisted_canonical_repository_path_can_be_reopened ... ok
+Junction created for C:\Users\clone\AppData\Local\Temp\.tmpSUC9UI\managed\task-1 <<===>> C:\Users\clone\AppData\Local\Temp\.tmpSUC9UI\outside
 test inspect_reports_clean_repository_without_exposing_handles ... ok
-test ref_lock_and_base_cas_conflicts_leave_branch_target_and_index_absent ... ok
 test invalid_windows_target_forms_are_rejected_without_git_side_effects ... ok
+test ref_lock_and_base_cas_conflicts_leave_branch_target_and_index_absent ... ok
 test branch_conflict_is_preserved_without_creating_target ... ok
+test persisted_canonical_repository_path_can_be_reopened ... ok
+test hazard_scan_fails_closed_when_attributes_blob_is_missing ... ok
 test static_symlink_target_is_rejected_without_touching_its_destination ... ok
+test hazard_scan_fails_closed_for_non_utf8_attributes ... ok
 test hazard_scan_fails_closed_when_attributes_path_is_not_a_blob ... ok
 test excluded_artifact_root_and_git_common_dir_targets_are_rejected ... ok
-test hazard_scan_fails_closed_when_attributes_blob_is_missing ... ok
-test hazard_scan_fails_closed_for_non_utf8_attributes ... ok
 test long_path_checkout_fails_closed_without_mutating_original_state ... ok
 test hazard_scan_fails_closed_for_malformed_attributes ... ok
 test repository_hazards_are_classified_before_worktree_side_effects ... ok
-test every_execution_capable_git_configuration_fails_closed_and_stays_inert ... ok
 test sha256_repository_keeps_exact_object_ids ... ok
 test checkout_disables_crlf_filters_and_preserves_blob_bytes ... ok
+test every_execution_capable_git_configuration_fails_closed_and_stays_inert ... ok
 test target_inside_original_checkout_and_case_collisions_fail_closed ... ok
-test exact_worktree_can_be_listed_and_discarded ... ok
 test shallow_and_sparse_repositories_fail_closed ... ok
 test unsafe_filter_configuration_is_rejected_before_checkout ... ok
+test exact_worktree_can_be_listed_and_discarded ... ok
 test worktree_creation_rejects_a_dirty_original_checkout ... ok
 test successful_unicode_worktree_preserves_original_head_index_and_checkout_bytes ... ok
 test dirty_detached_and_unborn_states_are_explicit ... ok
 test valid_windows_shell_metacharacters_are_supported_in_managed_paths ... ok
 test worktree_creation_preserves_original_and_disables_checkout_filters ... ok
 
-test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
 
      Running unittests src\lib.rs (target\debug\deps\local_agent_terminal_storage_files-6062d48bae7cd99b.exe)
 
 running 7 tests
-test content_address::tests::windows_verbatim_device_roots_are_rejected ... ok
 test content_address::tests::transient_lock_errors_are_retryable ... ok
+test content_address::tests::windows_verbatim_device_roots_are_rejected ... ok
 test content_address::tests::capability_relative_creation_cannot_escape_after_parent_replacement ... ok
 test content_address::tests::internal_verification_reads_in_bounded_chunks ... ok
 test content_address::tests::windows_directory_sync_is_not_a_silent_noop ... ok
@@ -263,15 +267,15 @@ running 10 tests
 test staging_bytes_without_an_intent_are_quarantined_not_deleted ... ok
 test invalid_staging_bytes_are_quarantined_and_preserved ... ok
 test post_rename_corruption_is_recorded_as_quarantined_before_restart ... ok
-test artifact_reconciliation_does_not_retry_indeterminate_non_repeatable_operations ... ok
-test post_rename_removal_is_not_misreported_as_quarantined ... ok
 test incomplete_metadata_mismatch_quarantines_staging_once ... ok
+test artifact_reconciliation_does_not_retry_indeterminate_non_repeatable_operations ... ok
 test logical_metadata_is_separate_from_deduplicated_content ... ok
+test post_rename_removal_is_not_misreported_as_quarantined ... ok
 test completed_metadata_mismatch_quarantines_staging_once ... ok
 test completed_missing_and_corrupt_objects_are_invalidated ... ok
 test crash_boundaries_reconcile_to_deterministic_states ... ok
 
-test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
 
      Running unittests src\lib.rs (target\debug\deps\local_agent_terminal_storage_sqlite-af89d7732e41ff88.exe)
 
@@ -283,10 +287,10 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 running 8 tests
 test failed_projection_rolls_back_inserted_events ... ok
-test competing_writers_yield_one_success_and_one_version_conflict ... ok
 test append_advances_stream_head_without_a_projection_payload ... ok
 test append_updates_event_and_projection_atomically ... ok
 test persisted_events_are_immutable ... ok
+test competing_writers_yield_one_success_and_one_version_conflict ... ok
 test failed_journal_insert_rolls_back_reserved_artifact_metadata ... ok
 test artifact_reservation_is_atomic_and_transitions_only_move_forward ... ok
 test completed_artifact_invalidation_is_atomic_and_requires_completed_state ... ok
@@ -299,11 +303,11 @@ running 10 tests
 test startup_rejects_unknown_nonempty_database_without_mutating_it ... ok
 test artifact_root_symlink_is_rejected_without_touching_target ... ok
 test artifact_root_probe_collision_preserves_preexisting_paths ... ok
-test first_startup_applies_schema_and_records_checksum ... ok
-test enabled_brokered_and_isolated_agents_require_verified_containment ... ok
-test every_initialized_connection_enables_required_pragmas ... ok
-test task_fencing_epoch_must_increase_when_changed ... ok
 test database_and_artifact_root_health_are_typed ... ok
+test enabled_brokered_and_isolated_agents_require_verified_containment ... ok
+test task_fencing_epoch_must_increase_when_changed ... ok
+test every_initialized_connection_enables_required_pragmas ... ok
+test first_startup_applies_schema_and_records_checksum ... ok
 test exact_prior_v1_database_upgrades_to_v2_without_losing_data ... ok
 test later_startup_rejects_changed_or_unsupported_schema ... ok
 
@@ -311,8 +315,9 @@ test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 
      Running tests\workspace_recovery.rs (target\debug\deps\workspace_recovery-14536e90a0ad358f.exe)
 
-running 13 tests
+running 14 tests
 test pending_onboarding_is_queryable_and_exact_project_retry_is_idempotent ... ok
+test legacy_v1_project_created_payload_is_queryable_and_exactly_retryable ... ok
 test exact_repository_inspection_retry_reuses_one_completion_event ... ok
 test project_onboarding_persists_identity_health_and_canonical_evidence ... ok
 test task_intent_requires_available_evidence_and_is_durable_before_git ... ok
@@ -323,7 +328,7 @@ test fencing_stale_leases_preserves_row_history_and_advances_epoch ... ok
 test stale_mutation_claim_is_rejected_before_projection_changes ... ok
 test workspace_mutation_is_atomic_and_invalidates_candidate_approvals ... ok
 test mutation_rolls_back_event_projection_approvals_candidate_and_lease_together ... ok
-test core_system_run_satisfies_foreign_keys_and_one_lease_contender_wins ... ok
 test lease_replacement_increments_token_and_stale_claim_cannot_write ... ok
+test core_system_run_satisfies_foreign_keys_and_one_lease_contender_wins ... ok
 
-test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
