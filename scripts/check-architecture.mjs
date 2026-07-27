@@ -332,6 +332,7 @@ function filesUnderIfExists(directory) {
 
 function withoutInlineTestModules(source) {
   const mask = rustCodeMask(source);
+  if (mask === null) return source;
   const testModule = /#\[cfg\(test\)\]\s*mod\s+\w+\s*\{/g;
   let output = "";
   let start = 0;
@@ -378,6 +379,8 @@ function rustCodeMask(source) {
       if (depth === 0) {
         maskRange(mask, index, end);
         index = end - 1;
+      } else {
+        return null;
       }
       continue;
     }
@@ -388,6 +391,8 @@ function rustCodeMask(source) {
       if (end !== -1) {
         maskRange(mask, index, end + terminator.length);
         index = end + terminator.length - 1;
+      } else {
+        return null;
       }
       continue;
     }
@@ -400,6 +405,8 @@ function rustCodeMask(source) {
       if (end < source.length) {
         maskRange(mask, index, end + 1);
         index = end;
+      } else {
+        return null;
       }
     }
   }
