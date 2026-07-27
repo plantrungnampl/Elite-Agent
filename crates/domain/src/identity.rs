@@ -97,6 +97,52 @@ macro_rules! nonnegative_value {
 nonnegative_value!(Sequence, "sequence");
 nonnegative_value!(WorkspaceVersion, "workspace version");
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Sha256Digest(String);
+
+impl Sha256Digest {
+    pub fn new(value: impl Into<String>) -> Result<Self, ValueError> {
+        let value = value.into();
+        if !valid_sha256_digest(&value) {
+            return Err(ValueError::Invalid {
+                kind: "SHA-256 digest",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Sha256Digest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+pub(crate) fn valid_sha256_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timestamp(i64);
+
+impl Timestamp {
+    pub const fn from_unix_seconds(value: i64) -> Self {
+        Self(value)
+    }
+
+    pub const fn unix_seconds(self) -> i64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FencingToken(NonZeroU64);
 

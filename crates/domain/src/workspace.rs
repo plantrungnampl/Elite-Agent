@@ -1,5 +1,6 @@
 use std::fmt;
 
+use crate::identity::valid_sha256_digest;
 use crate::{FencingToken, RunId, TaskId, ValueError};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -115,14 +116,6 @@ impl WorkspaceFingerprint {
     pub fn status_digest(&self) -> &str {
         &self.status_digest
     }
-}
-
-fn valid_sha256_digest(value: &str) -> bool {
-    value.len() == 71
-        && value.starts_with("sha256:")
-        && value[7..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
