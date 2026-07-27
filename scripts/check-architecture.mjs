@@ -87,7 +87,7 @@ function verifyCargo(metadata) {
     ["local-agent-terminal-storage-sqlite", new Set([application, domain])],
     ["local-agent-terminal-storage-files", new Set([application, domain])],
     [repositoryGit, new Set([application, domain])],
-    ["local-agent-terminal-bootstrap", new Set([application, "local-agent-terminal-storage-sqlite", "local-agent-terminal-storage-files", repositoryGit])],
+    ["local-agent-terminal-bootstrap", new Set([application, "local-agent-terminal-storage-sqlite", "local-agent-terminal-storage-files", repositoryGit, ...m2Adapters.keys()])],
     ["local-agent-terminal-desktop", new Set(["local-agent-terminal-bootstrap"])],
     ...m2Adapters,
   ]);
@@ -185,13 +185,13 @@ function verifyReact(appRoot) {
 
 function verifyTauriCommands(sourceRoot) {
   if (!existsSync(sourceRoot)) return;
-  const forbidden = new Set(["shell", "git", "filesystem", "exec", "run_command", "commit", "finalize"]);
+  const forbidden = new Set(["shell", "git", "filesystem", "exec", "run_command"]);
   const command =
     /#\s*\[\s*tauri::command(?:\([^)]*\))?\s*\]\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)/g;
   for (const path of filesUnder(sourceRoot).filter((path) => path.endsWith(".rs"))) {
     const source = readFileSync(path, "utf8");
     for (const match of source.matchAll(command)) {
-      if (forbidden.has(match[1])) {
+      if (forbidden.has(match[1]) || /(?:^|_)(?:commit|finali[sz]e|finalization)(?:_|$)/.test(match[1])) {
         throw new Error(`generic Tauri command is forbidden: ${match[1]}`);
       }
     }
@@ -229,22 +229,36 @@ function verifyM2Sources(sourceRoot) {
     }
   }
 
-  for (const crate of ["policy-engine", "tool-runtime", "platform-core"]) {
-    for (const path of filesUnderIfExists(join(crates, crate, "src")).filter((path) => path.endsWith(".rs"))) {
-      const source = readFileSync(path, "utf8");
+  const productionRoots = [
+    ...(existsSync(crates)
+      ? readdirSync(crates, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => join(crates, entry.name, "src"))
+      : []),
+    join(sourceRoot, "apps", "desktop", "src-tauri", "src"),
+  ];
+  for (const directory of productionRoots) {
+    if (directory === join(crates, "platform-windows", "src") || directory === join(crates, "repository-git", "src")) continue;
+    for (const path of filesUnderIfExists(directory).filter((path) => path.endsWith(".rs"))) {
+      const source = readFileSync(path, "utf8").replace(/#\[cfg\(test\)\]\s*mod\s+\w+\s*\{[\s\S]*$/u, "");
       if (
-        /\b(?:windows_sys|windows)::Win32::(?:System::Threading|Security|Storage::FileSystem)\b|\b(?:CreateJobObject|OpenProcessToken|JobObject)\b|\bstd::os::windows::fs\b/.test(
+        /\bstd::process::(?:Command|Stdio|Child)\b|\b(?:Command|Stdio)::(?:new|piped|inherit|null)\b|\b(?:powershell|pwsh|cmd\.exe)\b/i.test(
+          source,
+        )
+      ) {
+        throw new Error("process construction is allowed only in platform-windows");
+      }
+      if (
+        /\b(?:windows_sys|windows)::Win32::(?:System::Threading|Security|Storage::FileSystem)\b|\b(?:CreateJobObject|OpenProcessToken|JobObject)\b|\bstd::os::windows::fs::(?:OpenOptionsExt|FileExt)\b/.test(
           source,
         )
       ) {
         throw new Error("Windows process and filesystem APIs are allowed only in platform-windows");
       }
-    }
-  }
-
-  for (const crate of ["domain", "application", "policy-engine", "tool-runtime", "platform-core", "platform-windows"]) {
-    for (const path of filesUnderIfExists(join(crates, crate, "src")).filter((path) => path.endsWith(".rs"))) {
-      if (/\b(?:PolicyEngine|ToolRuntime|PlatformCore|PlatformWindows)\s*::\s*(?:new|default|build)\s*\(/.test(readFileSync(path, "utf8"))) {
+      if (
+        directory !== join(crates, "bootstrap", "src")
+        && /\b(?:PolicyEngine|ToolRuntime|PlatformCore|PlatformWindows)\s*::\s*(?:new|default|build)\s*\(/.test(source)
+      ) {
         throw new Error("concrete M2 adapters must be constructed only in bootstrap");
       }
     }

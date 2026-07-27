@@ -71,18 +71,20 @@ test("architecture checker rejects a generic Tauri execution command", () => {
   );
 });
 
-test("architecture checker rejects M5 commit commands before M5 exists", () => {
-  const directory = mkdtempSync(join(tmpdir(), "m2-commit-command-"));
-  try {
-    const source = join(directory, "apps", "desktop", "src-tauri", "src", "lib.rs");
-    mkdirSync(dirname(source), { recursive: true });
-    writeFileSync(source, "#[tauri::command]\nfn commit() {}\n", "utf8");
-    assert.throws(
-      () => run("scripts/check-architecture.mjs", "--m2-source-fixture", directory),
-      /generic Tauri command is forbidden: commit/,
-    );
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
+test("architecture checker rejects M5 commit and finalization command variants", () => {
+  for (const name of ["commit", "create_commit", "finalize_commit"]) {
+    const directory = mkdtempSync(join(tmpdir(), "m2-commit-command-"));
+    try {
+      const source = join(directory, "apps", "desktop", "src-tauri", "src", "lib.rs");
+      mkdirSync(dirname(source), { recursive: true });
+      writeFileSync(source, `#[tauri::command]\nfn ${name}() {}\n`, "utf8");
+      assert.throws(
+        () => run("scripts/check-architecture.mjs", "--m2-source-fixture", directory),
+        new RegExp(`generic Tauri command is forbidden: ${name}`),
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   }
 });
 
