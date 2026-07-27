@@ -159,14 +159,12 @@ impl PolicyDecisionDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyError {
-    InvalidBinding,
     UnsupportedVersion(u16),
 }
 
 impl fmt::Display for PolicyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidBinding => formatter.write_str("policy binding is invalid"),
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported policy version {version}")
             }
@@ -182,10 +180,6 @@ pub fn combine_policy_rules(
     matches: Vec<MatchedPolicyRule>,
     expires_at: Option<Timestamp>,
 ) -> Result<PolicyDecisionDraft, PolicyError> {
-    if policy_version.get() != 1 || !request_is_valid(&request) {
-        return Err(PolicyError::InvalidBinding);
-    }
-
     let mut rule_ids = BTreeSet::new();
     let mut redactions = BTreeSet::new();
     let mut effect = PolicyEffect::Allow;
@@ -195,7 +189,8 @@ pub fn combine_policy_rules(
         redactions.extend(matched.redactions);
     }
 
-    if rule_ids.is_empty()
+    if !request_is_valid(&request)
+        || rule_ids.is_empty()
         || expires_at.is_some_and(|expires_at| expires_at <= request.evaluated_at)
     {
         effect = PolicyEffect::Deny;
@@ -220,11 +215,20 @@ fn request_is_valid(request: &PolicyRequest) -> bool {
         && valid_identifier(&request.actor.connection_id)
         && valid_identifier(&request.actor.agent_id)
         && valid_identifier(request.action.as_str())
-        && request.resource.capability.validate().is_ok()
+        && resource_is_valid(request)
         && valid_identifier(&request.workflow_phase)
         && !request.purpose.trim().is_empty()
         && request.purpose.len() <= 65_536
         && !request.purpose.contains('\0')
+}
+
+fn resource_is_valid(request: &PolicyRequest) -> bool {
+    request.resource.capability.validate().is_ok()
+        && request
+            .resource
+            .capability
+            .worktree_task_id()
+            .is_none_or(|task_id| task_id == &request.task_id)
 }
 
 fn more_restrictive(current: PolicyEffect, candidate: PolicyEffect) -> PolicyEffect {

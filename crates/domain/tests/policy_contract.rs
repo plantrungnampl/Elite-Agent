@@ -29,11 +29,11 @@ fn request(evaluated_at: i64) -> PolicyRequest {
     }
 }
 
-fn rule(id: &str, effect: PolicyEffect) -> MatchedPolicyRule {
+fn rule(id: &str, effect: PolicyEffect, redaction: &str) -> MatchedPolicyRule {
     MatchedPolicyRule {
         rule_id: PolicyRuleId::new(id).unwrap(),
         effect,
-        redactions: vec![RedactionDirective::new("secret-pattern").unwrap()],
+        redactions: vec![RedactionDirective::new(redaction).unwrap()],
     }
 }
 
@@ -62,22 +62,50 @@ fn policy_combination_denies_no_match_invalid_binding_and_expiry() {
 
     let mut incomplete = request(10);
     incomplete.actor.agent_id.clear();
-    assert!(combine_policy_rules(
+    let incomplete = combine_policy_rules(
         incomplete,
         version,
-        vec![rule("allow", PolicyEffect::Allow)],
-        None
+        vec![
+            rule("z-rule", PolicyEffect::Allow, "secret-pattern"),
+            rule("a-rule", PolicyEffect::AllowWithRedaction, "token-mask"),
+        ],
+        None,
     )
-    .is_err());
+    .unwrap();
+    assert_eq!(incomplete.effect(), PolicyEffect::Deny);
+    assert_eq!(incomplete.request().actor.agent_id, "");
+    assert_eq!(incomplete.policy_version(), version);
+    assert_eq!(incomplete.rule_ids(), ["a-rule", "z-rule"]);
+    assert_eq!(incomplete.redactions(), ["secret-pattern", "token-mask"]);
+
+    let mut malformed_resource = request(10);
+    malformed_resource.resource.capability =
+        CapabilityRef::worktree(TaskId::new("other-task").unwrap(), "src/lib.rs").unwrap();
+    let malformed_resource = combine_policy_rules(
+        malformed_resource,
+        version,
+        vec![rule("allow", PolicyEffect::Allow, "secret-pattern")],
+        None,
+    )
+    .unwrap();
+    assert_eq!(malformed_resource.effect(), PolicyEffect::Deny);
+    assert_eq!(malformed_resource.request().task_id.as_str(), "task-1");
 
     let expired = combine_policy_rules(
         request(10),
         version,
-        vec![rule("allow", PolicyEffect::Allow)],
+        vec![
+            rule("z-rule", PolicyEffect::Allow, "secret-pattern"),
+            rule("a-rule", PolicyEffect::AllowWithRedaction, "token-mask"),
+        ],
         Some(Timestamp::from_unix_seconds(10)),
     )
     .unwrap();
     assert_eq!(expired.effect(), PolicyEffect::Deny);
+    assert_eq!(expired.request().task_id.as_str(), "task-1");
+    assert_eq!(expired.policy_version(), version);
+    assert_eq!(expired.rule_ids(), ["a-rule", "z-rule"]);
+    assert_eq!(expired.redactions(), ["secret-pattern", "token-mask"]);
 }
 
 #[test]
@@ -168,13 +196,13 @@ fn policy_combination_is_deterministic_and_uses_deny_overrides() {
         let forward = effects
             .iter()
             .enumerate()
-            .map(|(index, effect)| rule(&format!("rule-{index}"), *effect))
+            .map(|(index, effect)| rule(&format!("rule-{index}"), *effect, "secret-pattern"))
             .collect();
         let reverse = effects
             .iter()
             .enumerate()
             .rev()
-            .map(|(index, effect)| rule(&format!("rule-{index}"), *effect))
+            .map(|(index, effect)| rule(&format!("rule-{index}"), *effect, "secret-pattern"))
             .collect();
 
         let forward = combine_policy_rules(request(10), version, forward, None).unwrap();
@@ -183,6 +211,67 @@ fn policy_combination_is_deterministic_and_uses_deny_overrides() {
         assert_eq!(forward.effect(), expected);
         assert_eq!(forward, reverse);
     }
+
+    let effects = [
+        PolicyEffect::Allow,
+        PolicyEffect::AllowWithRedaction,
+        PolicyEffect::RequireApproval,
+    ];
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let rules = order
+            .iter()
+            .map(|index| rule(&format!("rule-{index}"), effects[*index], "secret-pattern"))
+            .collect();
+        assert_eq!(
+            combine_policy_rules(request(10), version, rules, None)
+                .unwrap()
+                .effect(),
+            PolicyEffect::RequireApproval,
+        );
+    }
+
+    let effects = [
+        PolicyEffect::Allow,
+        PolicyEffect::AllowWithRedaction,
+        PolicyEffect::RequireApproval,
+        PolicyEffect::Deny,
+    ];
+    let mut order = [0, 1, 2, 3];
+    loop {
+        let rules = order
+            .iter()
+            .map(|index| rule(&format!("rule-{index}"), effects[*index], "secret-pattern"))
+            .collect();
+        assert_eq!(
+            combine_policy_rules(request(10), version, rules, None)
+                .unwrap()
+                .effect(),
+            PolicyEffect::Deny,
+        );
+        if !next_permutation(&mut order) {
+            break;
+        }
+    }
+}
+
+fn next_permutation(values: &mut [usize]) -> bool {
+    let Some(pivot) = (0..values.len() - 1).rfind(|&index| values[index] < values[index + 1])
+    else {
+        return false;
+    };
+    let successor = (pivot + 1..values.len())
+        .rfind(|&index| values[pivot] < values[index])
+        .unwrap();
+    values.swap(pivot, successor);
+    values[pivot + 1..].reverse();
+    true
 }
 
 #[test]
@@ -191,14 +280,26 @@ fn policy_combination_sorts_and_deduplicates_rule_ids_while_retaining_redactions
         request(10),
         PolicyVersion::new(1).unwrap(),
         vec![
-            rule("z-rule", PolicyEffect::Allow),
-            rule("a-rule", PolicyEffect::AllowWithRedaction),
-            rule("z-rule", PolicyEffect::Allow),
+            rule("z-rule", PolicyEffect::Allow, "secret-pattern"),
+            rule("a-rule", PolicyEffect::AllowWithRedaction, "token-mask"),
+            rule("z-rule", PolicyEffect::Allow, "secret-pattern"),
         ],
         None,
     )
     .unwrap();
 
     assert_eq!(decision.rule_ids(), ["a-rule", "z-rule"]);
-    assert_eq!(decision.redactions(), ["secret-pattern"]);
+    assert_eq!(decision.redactions(), ["secret-pattern", "token-mask"]);
+
+    let reordered = combine_policy_rules(
+        request(10),
+        PolicyVersion::new(1).unwrap(),
+        vec![
+            rule("z-rule", PolicyEffect::Allow, "secret-pattern"),
+            rule("a-rule", PolicyEffect::AllowWithRedaction, "token-mask"),
+        ],
+        None,
+    )
+    .unwrap();
+    assert_eq!(decision, reordered);
 }

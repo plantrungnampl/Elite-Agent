@@ -1,60 +1,118 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use crate::{ArtifactId, FencingToken, Sha256Digest, TaskId};
+use crate::{ArtifactId, FencingToken, Phase, RunId, Sha256Digest, TaskId, WorkspaceVersion};
 
-const MAX_CAPABILITY_COMPONENT_LENGTH: usize = 256;
+const MAX_IDENTIFIER_LENGTH: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CapabilityRef {
-    Source { revision: String, path: String },
-    Artifact { artifact_id: ArtifactId },
-    Worktree { task_id: TaskId, path: String },
-    Toolchain { name: String },
+    Source(SourceCapability),
+    Artifact(ArtifactCapability),
+    Worktree(WorktreeCapability),
+    Toolchain(ToolchainCapability),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SourceCapability {
+    revision: String,
+    path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ArtifactCapability {
+    artifact_id: ArtifactId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorktreeCapability {
+    task_id: TaskId,
+    path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ToolchainCapability {
+    name: String,
 }
 
 impl CapabilityRef {
     pub fn source(revision: impl Into<String>, path: impl Into<String>) -> Result<Self, ToolError> {
-        let capability = Self::Source {
-            revision: revision.into(),
-            path: path.into(),
-        };
-        capability.validate()?;
-        Ok(capability)
+        let revision = revision.into();
+        let path = path.into();
+        validate_component(&revision)?;
+        validate_relative_path(&path)?;
+        Ok(Self::Source(SourceCapability { revision, path }))
     }
 
     pub fn artifact(artifact_id: ArtifactId) -> Self {
-        Self::Artifact { artifact_id }
+        Self::Artifact(ArtifactCapability { artifact_id })
     }
 
     pub fn worktree(task_id: TaskId, path: impl Into<String>) -> Result<Self, ToolError> {
-        let capability = Self::Worktree {
-            task_id,
-            path: path.into(),
-        };
-        capability.validate()?;
-        Ok(capability)
+        let path = path.into();
+        validate_binding_id(task_id.as_str())?;
+        validate_relative_path(&path)?;
+        Ok(Self::Worktree(WorktreeCapability { task_id, path }))
     }
 
     pub fn toolchain(name: impl Into<String>) -> Result<Self, ToolError> {
-        let capability = Self::Toolchain { name: name.into() };
-        capability.validate()?;
-        Ok(capability)
+        let name = name.into();
+        validate_component(&name)?;
+        Ok(Self::Toolchain(ToolchainCapability { name }))
     }
 
     pub fn validate(&self) -> Result<(), ToolError> {
         match self {
-            Self::Source { revision, path } => {
-                validate_component(revision)?;
-                validate_relative_path(path)
+            Self::Source(capability) => {
+                validate_component(&capability.revision)?;
+                validate_relative_path(&capability.path)
             }
-            Self::Artifact { artifact_id } => validate_component(artifact_id.as_str()),
-            Self::Worktree { task_id, path } => {
-                validate_component(task_id.as_str())?;
-                validate_relative_path(path)
+            Self::Artifact(capability) => validate_binding_id(capability.artifact_id.as_str()),
+            Self::Worktree(capability) => {
+                validate_binding_id(capability.task_id.as_str())?;
+                validate_relative_path(&capability.path)
             }
-            Self::Toolchain { name } => validate_component(name),
+            Self::Toolchain(capability) => validate_component(&capability.name),
         }
+    }
+
+    pub fn worktree_task_id(&self) -> Option<&TaskId> {
+        match self {
+            Self::Worktree(capability) => Some(&capability.task_id),
+            _ => None,
+        }
+    }
+}
+
+impl SourceCapability {
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl ArtifactCapability {
+    pub const fn artifact_id(&self) -> &ArtifactId {
+        &self.artifact_id
+    }
+}
+
+impl WorktreeCapability {
+    pub const fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl ToolchainCapability {
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -81,11 +139,114 @@ pub enum NetworkProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlanStepId(String);
+
+impl PlanStepId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ToolError> {
+        let value = value.into();
+        validate_binding_id(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentProfile {
+    name: String,
+    digest: Sha256Digest,
+}
+
+impl EnvironmentProfile {
+    pub fn new(name: impl Into<String>, digest: Sha256Digest) -> Result<Self, ToolError> {
+        let name = name.into();
+        validate_component(&name)?;
+        Ok(Self { name, digest })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessBinding {
+    task_id: TaskId,
+    run_id: RunId,
+    plan_step_id: PlanStepId,
+    workflow_phase: Phase,
+    workspace_version: WorkspaceVersion,
+    environment_profile: EnvironmentProfile,
+    timeout_ms: u64,
+}
+
+impl ProcessBinding {
+    pub fn new(
+        task_id: TaskId,
+        run_id: RunId,
+        plan_step_id: PlanStepId,
+        workflow_phase: Phase,
+        workspace_version: WorkspaceVersion,
+        environment_profile: EnvironmentProfile,
+        timeout_ms: u64,
+    ) -> Result<Self, ToolError> {
+        validate_binding_id(task_id.as_str())?;
+        validate_binding_id(run_id.as_str())?;
+        if timeout_ms == 0 {
+            return Err(ToolError::InvalidTimeout);
+        }
+        Ok(Self {
+            task_id,
+            run_id,
+            plan_step_id,
+            workflow_phase,
+            workspace_version,
+            environment_profile,
+            timeout_ms,
+        })
+    }
+
+    pub const fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    pub const fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    pub const fn plan_step_id(&self) -> &PlanStepId {
+        &self.plan_step_id
+    }
+
+    pub const fn workflow_phase(&self) -> Phase {
+        self.workflow_phase
+    }
+
+    pub const fn workspace_version(&self) -> WorkspaceVersion {
+        self.workspace_version
+    }
+
+    pub const fn environment_profile(&self) -> &EnvironmentProfile {
+        &self.environment_profile
+    }
+
+    pub const fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExpectedWrite(CapabilityRef);
 
 impl ExpectedWrite {
     pub fn new(capability: CapabilityRef) -> Result<Self, ToolError> {
-        if !matches!(capability, CapabilityRef::Worktree { .. }) {
+        if capability.worktree_task_id().is_none() {
             return Err(ToolError::InvalidExpectedWrite);
         }
         capability.validate()?;
@@ -98,7 +259,7 @@ impl ExpectedWrite {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProcessToolRequest {
+pub struct ProcessInvocation {
     executable: CapabilityRef,
     argv: Vec<String>,
     cwd: CapabilityRef,
@@ -108,7 +269,7 @@ pub struct ProcessToolRequest {
     executor_fencing_token: Option<FencingToken>,
 }
 
-impl ProcessToolRequest {
+impl ProcessInvocation {
     pub fn new(
         executable: CapabilityRef,
         argv: Vec<String>,
@@ -118,7 +279,7 @@ impl ProcessToolRequest {
         expected_writes: Vec<ExpectedWrite>,
         executor_fencing_token: Option<FencingToken>,
     ) -> Result<Self, ToolError> {
-        if !matches!(executable, CapabilityRef::Toolchain { .. }) {
+        if !matches!(executable, CapabilityRef::Toolchain(_)) {
             return Err(ToolError::RegisteredExecutableRequired);
         }
         executable.validate()?;
@@ -129,7 +290,7 @@ impl ProcessToolRequest {
         {
             return Err(ToolError::InvalidArgv);
         }
-        if !matches!(cwd, CapabilityRef::Worktree { .. }) {
+        if cwd.worktree_task_id().is_none() {
             return Err(ToolError::WorktreeCapabilityRequired);
         }
         cwd.validate()?;
@@ -140,7 +301,6 @@ impl ProcessToolRequest {
         if unique_writes.len() != expected_writes.len() {
             return Err(ToolError::DuplicateExpectedWrite);
         }
-
         Ok(Self {
             executable,
             argv,
@@ -151,37 +311,67 @@ impl ProcessToolRequest {
             executor_fencing_token,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessToolRequest {
+    binding: ProcessBinding,
+    invocation: ProcessInvocation,
+}
+
+impl ProcessToolRequest {
+    pub fn new(binding: ProcessBinding, invocation: ProcessInvocation) -> Result<Self, ToolError> {
+        if invocation.cwd.worktree_task_id() != Some(binding.task_id()) {
+            return Err(ToolError::MismatchedTaskScope);
+        }
+        if invocation
+            .expected_writes
+            .iter()
+            .any(|write| write.capability().worktree_task_id() != Some(binding.task_id()))
+        {
+            return Err(ToolError::MismatchedTaskScope);
+        }
+
+        Ok(Self {
+            binding,
+            invocation,
+        })
+    }
 
     pub const fn tool(&self) -> StructuredToolName {
         StructuredToolName::ProcessExec
     }
 
+    pub const fn binding(&self) -> &ProcessBinding {
+        &self.binding
+    }
+
     pub const fn executable(&self) -> &CapabilityRef {
-        &self.executable
+        &self.invocation.executable
     }
 
     pub fn argv(&self) -> &[String] {
-        &self.argv
+        &self.invocation.argv
     }
 
     pub const fn cwd(&self) -> &CapabilityRef {
-        &self.cwd
+        &self.invocation.cwd
     }
 
     pub const fn trust_tier(&self) -> ProcessTrustTier {
-        self.trust_tier
+        self.invocation.trust_tier
     }
 
     pub const fn network(&self) -> NetworkProfile {
-        self.network
+        self.invocation.network
     }
 
     pub fn expected_writes(&self) -> &[ExpectedWrite] {
-        &self.expected_writes
+        &self.invocation.expected_writes
     }
 
     pub const fn executor_fencing_token(&self) -> Option<FencingToken> {
-        self.executor_fencing_token
+        self.invocation.executor_fencing_token
     }
 }
 
@@ -198,10 +388,10 @@ impl RawShellRequest {
         script_digest: Sha256Digest,
         cwd: CapabilityRef,
     ) -> Result<Self, ToolError> {
-        if !matches!(shell, CapabilityRef::Toolchain { .. }) {
+        if !matches!(shell, CapabilityRef::Toolchain(_)) {
             return Err(ToolError::RegisteredExecutableRequired);
         }
-        if !matches!(cwd, CapabilityRef::Worktree { .. }) {
+        if cwd.worktree_task_id().is_none() {
             return Err(ToolError::WorktreeCapabilityRequired);
         }
         shell.validate()?;
@@ -223,8 +413,11 @@ impl RawShellRequest {
 pub enum ToolError {
     InvalidCapability,
     PathEscapesCapability,
+    InvalidBinding,
+    InvalidTimeout,
     RegisteredExecutableRequired,
     WorktreeCapabilityRequired,
+    MismatchedTaskScope,
     InvalidArgv,
     InvalidExpectedWrite,
     DuplicateExpectedWrite,
@@ -237,8 +430,11 @@ impl fmt::Display for ToolError {
         formatter.write_str(match self {
             Self::InvalidCapability => "capability is invalid",
             Self::PathEscapesCapability => "capability path escapes its root",
+            Self::InvalidBinding => "process binding is invalid",
+            Self::InvalidTimeout => "timeout must be positive",
             Self::RegisteredExecutableRequired => "registered executable capability is required",
             Self::WorktreeCapabilityRequired => "worktree capability is required",
+            Self::MismatchedTaskScope => "capability task does not match process binding",
             Self::InvalidArgv => "argv is invalid",
             Self::InvalidExpectedWrite => "expected write is invalid",
             Self::DuplicateExpectedWrite => "expected writes must be unique",
@@ -250,9 +446,16 @@ impl fmt::Display for ToolError {
 
 impl std::error::Error for ToolError {}
 
+fn validate_binding_id(value: &str) -> Result<(), ToolError> {
+    if value.trim().is_empty() || value.len() > MAX_IDENTIFIER_LENGTH || value.contains('\0') {
+        return Err(ToolError::InvalidBinding);
+    }
+    Ok(())
+}
+
 fn validate_component(value: &str) -> Result<(), ToolError> {
     if value.trim().is_empty()
-        || value.len() > MAX_CAPABILITY_COMPONENT_LENGTH
+        || value.len() > MAX_IDENTIFIER_LENGTH
         || value.contains('\0')
         || value.contains(['/', '\\', ':'])
     {

@@ -18,8 +18,10 @@ pub use policy::{
     PolicyVersion, RedactionDirective, ResourceClass, TaskRisk, TrustTier,
 };
 pub use tool::{
-    CapabilityRef, ExpectedWrite, NetworkProfile, ProcessToolRequest, ProcessTrustTier,
-    RawShellRequest, StructuredToolName, ToolError,
+    ArtifactCapability, CapabilityRef, EnvironmentProfile, ExpectedWrite, NetworkProfile,
+    PlanStepId, ProcessBinding, ProcessInvocation, ProcessToolRequest, ProcessTrustTier,
+    RawShellRequest, SourceCapability, StructuredToolName, ToolError, ToolchainCapability,
+    WorktreeCapability,
 };
 pub use workflow::{
     reduce, Condition, OperationState, ParseWorkflowValueError, Phase, Transition, WorkflowError,
