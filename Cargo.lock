@@ -1899,12 +1899,14 @@ dependencies = [
 name = "local-agent-terminal-repository-git"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.3.4",
  "git2",
  "libgit2-sys",
  "local-agent-terminal-application",
  "local-agent-terminal-domain",
  "sha2",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

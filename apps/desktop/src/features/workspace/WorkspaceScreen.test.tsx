@@ -132,6 +132,50 @@ describe("WorkspaceScreen", () => {
     expect(screen.getByText("revoked")).toBeVisible();
   });
 
+  it("does not let an older poll overwrite a completed mutation", async () => {
+    vi.useFakeTimers();
+    const initial = dashboardFixture();
+    const stalePoll = deferred<WorkspaceDashboardDto>();
+    const mutationResult = dashboardFixture();
+    mutationResult.tasks[0].title = "Fresh mutation result";
+    const staleResult = dashboardFixture();
+    staleResult.tasks[0].title = "Stale poll result";
+    workspaceApi.getWorkspaceDashboard
+      .mockResolvedValueOnce(initial)
+      .mockReturnValueOnce(stalePoll.promise);
+    workspaceApi.preserveWorkspace.mockResolvedValueOnce(mutationResult);
+    render(<WorkspaceScreen initialProjectId="project-1" />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+      await Promise.resolve();
+    });
+    expect(workspaceApi.getWorkspaceDashboard).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      screen.getByRole("button", { name: "Preserve workspace" }).click();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getAllByText("Fresh mutation result").length).toBeGreaterThan(
+      0,
+    );
+
+    await act(async () => {
+      stalePoll.resolve(staleResult);
+      await stalePoll.promise;
+    });
+
+    expect(screen.queryByText("Stale poll result")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Fresh mutation result").length).toBeGreaterThan(
+      0,
+    );
+  });
+
   it("renders only core recovery actions, guards double submit, confirms discard, and restores focus", async () => {
     const preserve = deferred<WorkspaceDashboardDto>();
     workspaceApi.preserveWorkspace.mockReturnValue(preserve.promise);

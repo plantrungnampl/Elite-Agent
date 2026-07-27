@@ -236,8 +236,8 @@ fn start(config: &StartupConfig, log: &mut LocalLog) -> Result<WorkspaceRuntime,
     let artifact_root = config.app_data_dir.join("artifacts");
     let repositories = GitRepositoryGateway::open(&config.trusted_workspace_root, &[artifact_root])
         .map_err(workspace_reconciliation_failure)?;
-    let workspace_report =
-        reconcile_startup(&database, &repositories).map_err(workspace_reconciliation_failure)?;
+    let workspace_report = reconcile_startup(&database, &artifacts, &repositories)
+        .map_err(workspace_reconciliation_failure)?;
     log.push(record(
         "startup.leases.fenced",
         "storage-sqlite",

@@ -1,15 +1,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use git2::{IndexAddOption, Repository, Signature};
+use git2::{IndexAddOption, Repository, RepositoryInitOptions, Signature};
 use local_agent_terminal_application::{
-    AcquireLease, ArtifactRootMode, ArtifactWriteReservation, CanonicalEvidenceRef, Clock,
-    ConfirmDiscardWorkspaceRequestDto, CreateWorktree, DiscardWorktree, ExecutorLeaseStore,
-    ExpectedPresence, IdempotencyClass, InspectRepository, IntentTransition, ManagedWorktreePath,
-    NewProject, NewTask, OperationIntent, OperationIntentStatus, PortError, ProjectSettings,
-    RecoveryAction, RecoveryCandidateRequestDto, RecoveryReason, RepositoryGateway,
-    RepositoryInspectionRecord, ReservedArtifact, RiskLevel, SafeErrorClassification,
-    StartupStateDto, TaskQuery, WorkspaceDashboardRequestDto, WorkspaceStateStore, WorktreeIntent,
+    AcquireLease, ArtifactRootMode, ArtifactWriteReservation, CanonicalEvidenceRef,
+    CanonicalJsonRequest, Clock, ConfirmDiscardWorkspaceRequestDto, CreateWorktree,
+    DiscardWorktree, ExecutorLeaseStore, ExpectedPresence, IdempotencyClass, InspectRepository,
+    IntentTransition, ManagedWorktreePath, NewProject, NewTask, OnboardRepositoryRequestDto,
+    OperationIntent, OperationIntentStatus, PortError, ProjectSettings, RecoveryAction,
+    RecoveryCandidateRequestDto, RecoveryReason, RepositoryGateway, RepositoryInspectionRecord,
+    ReservedArtifact, RiskLevel, SafeErrorClassification, StartupStateDto, TaskQuery,
+    WorkspaceDashboardRequestDto, WorkspaceRecoveryStore, WorkspaceStateStore, WorktreeIntent,
     WorktreeState,
 };
 use local_agent_terminal_bootstrap::{Bootstrap, StartupConfig};
@@ -69,6 +70,101 @@ fn startup_exposes_workspace_runtime_only_after_ordered_recovery() {
             "startup.ready",
         ]
     );
+}
+
+#[test]
+fn startup_resumes_onboarding_after_the_durable_intent_boundary() {
+    let fixture = OnboardingFixture::new();
+    fixture.seed_intent();
+    fs::write(
+        fixture.source.join("AFTER-INTENT.txt"),
+        b"repository changed after the durable intent",
+    )
+    .expect("post-intent repository change");
+
+    let first = fixture.start();
+
+    assert_eq!(first.status().state, StartupStateDto::Ready);
+    let store = SqliteStore::open(&fixture.database_path).expect("database");
+    let recovered = store.recovery_projects().expect("recovery projects");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        recovered[0].repository.stable_identity,
+        fixture.project.repository.stable_identity
+    );
+    assert_ne!(
+        recovered[0].repository.fingerprint,
+        fixture.project.repository.fingerprint
+    );
+    assert!(recovered[0].repository_evidence_artifact_id.is_some());
+    assert_eq!(fixture.completion_count(), 1);
+    drop(first);
+
+    let second = fixture.start();
+    assert_eq!(second.status().state, StartupStateDto::Ready);
+    assert_eq!(fixture.completion_count(), 1);
+}
+
+#[test]
+fn startup_resumes_onboarding_after_the_artifact_publish_boundary() {
+    let fixture = OnboardingFixture::new();
+    fixture.seed_intent();
+    let evidence = fixture.publish_inspection_artifact();
+
+    let bootstrap = fixture.start();
+
+    assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
+    let store = SqliteStore::open(&fixture.database_path).expect("database");
+    let recovered = store.recovery_projects().expect("recovery projects");
+    assert_eq!(
+        recovered[0].repository_evidence_artifact_id.as_ref(),
+        Some(&evidence.artifact_id)
+    );
+    assert_eq!(fixture.completion_count(), 1);
+    assert_eq!(fixture.inspection_artifact_count(), 1);
+}
+
+#[test]
+fn startup_preserves_incomplete_onboarding_when_repository_identity_changed() {
+    let fixture = OnboardingFixture::new();
+    fixture.seed_intent();
+    let displaced = fixture.replace_repository();
+
+    let bootstrap = fixture.start();
+
+    assert_eq!(bootstrap.status().state, StartupStateDto::Indeterminate);
+    assert!(bootstrap
+        .status()
+        .issues
+        .iter()
+        .any(|issue| issue.code == "startup.workspace_reconciliation_failed"));
+    assert_eq!(fixture.completion_count(), 0);
+    assert!(fixture.source.join("README.md").is_file());
+    assert!(displaced.join("README.md").is_file());
+}
+
+#[test]
+fn exact_onboarding_command_retry_reuses_the_completed_project() {
+    let fixture = OnboardingFixture::new();
+    let bootstrap = fixture.start();
+    assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
+    let runtime = bootstrap.workspace_runtime().expect("runtime");
+    let request = OnboardRepositoryRequestDto {
+        project_id: PROJECT_ID.to_owned(),
+        name: "Onboarding recovery fixture".to_owned(),
+        repository_path: fixture.source.to_string_lossy().into_owned(),
+    };
+
+    let first = runtime
+        .onboard_repository(request.clone())
+        .expect("first onboarding");
+    let second = runtime
+        .onboard_repository(request)
+        .expect("exact onboarding retry");
+
+    assert_eq!(second, first);
+    assert_eq!(fixture.completion_count(), 1);
+    assert_eq!(fixture.inspection_artifact_count(), 1);
 }
 
 #[test]
@@ -569,6 +665,169 @@ struct WorkspaceFixture {
     repository: local_agent_terminal_application::RepositorySnapshot,
 }
 
+struct OnboardingFixture {
+    _root: TempDir,
+    app_data: PathBuf,
+    database_path: PathBuf,
+    workspace_root: PathBuf,
+    source: PathBuf,
+    project: NewProject,
+}
+
+impl OnboardingFixture {
+    fn new() -> Self {
+        let root = TempDir::new().expect("tempdir");
+        let app_data = root.path().join("app-data");
+        let database_path = app_data.join("state.sqlite3");
+        let workspace_root = root.path().join("managed-workspaces");
+        let source = root.path().join("source");
+        fs::create_dir(&app_data).expect("app data");
+        fs::create_dir(&workspace_root).expect("workspace root");
+        fs::create_dir(&source).expect("source");
+        commit_repository(&source);
+
+        let database = SqliteStore::open(&database_path).expect("database");
+        let artifacts = ContentAddressedArtifactStore::open(app_data.join("artifacts"))
+            .expect("artifact store");
+        let gateway = GitRepositoryGateway::open(&workspace_root, &[app_data.join("artifacts")])
+            .expect("gateway");
+        let locator = gateway.locate(&source).expect("locator");
+        let repository = gateway
+            .inspect(InspectRepository {
+                locator: locator.clone(),
+            })
+            .expect("repository inspection");
+        let project = NewProject {
+            project_id: ProjectId::new(PROJECT_ID).expect("project id"),
+            name: "Onboarding recovery fixture".to_owned(),
+            repository,
+            repository_path: locator.canonical_workdir.to_string_lossy().into_owned(),
+            settings: ProjectSettings {
+                policy_profile_id: "default".to_owned(),
+                artifact_root_mode: ArtifactRootMode::ApplicationData,
+                artifact_root_path: artifacts.root().to_string_lossy().into_owned(),
+            },
+            created_at: "2026-07-26T00:00:00Z".to_owned(),
+        };
+        drop(gateway);
+        drop(artifacts);
+        drop(database);
+
+        Self {
+            _root: root,
+            app_data,
+            database_path,
+            workspace_root,
+            source,
+            project,
+        }
+    }
+
+    fn seed_intent(&self) {
+        SqliteStore::open(&self.database_path)
+            .expect("database")
+            .create_project(self.project.clone())
+            .expect("pending onboarding");
+    }
+
+    fn publish_inspection_artifact(&self) -> CanonicalEvidenceRef {
+        let database = SqliteStore::open(&self.database_path).expect("database");
+        let artifacts = ContentAddressedArtifactStore::open(self.app_data.join("artifacts"))
+            .expect("artifact store");
+        let request = CanonicalJsonRequest::new(
+            ArtifactId::new(format!("repository-inspection-{PROJECT_ID}")).expect("artifact id"),
+            ProjectId::new(PROJECT_ID).expect("project id"),
+            None,
+            "repository_inspection",
+            format!("repository/{PROJECT_ID}/inspection.json"),
+            "core",
+            "workspace-coordinator",
+            &repository_evidence_value(&self.project.repository),
+            format!("repository-inspection:{PROJECT_ID}"),
+        )
+        .expect("canonical request");
+        let storage_key = format!(
+            "objects/{}/{}",
+            &request.expected_hash[7..9],
+            &request.expected_hash[7..]
+        );
+        let reference = JournaledArtifactWriter::new(&artifacts, &database, &FixedClock)
+            .write(
+                ArtifactWriteReservation {
+                    operation_id: request.idempotency_key.clone(),
+                    artifact: ReservedArtifact {
+                        artifact_id: request.artifact_id.as_str().to_owned(),
+                        task_id: None,
+                        project_id: PROJECT_ID.to_owned(),
+                        artifact_type: request.artifact_type.clone(),
+                        logical_path: request.logical_path.clone(),
+                        content_hash: request.expected_hash.clone(),
+                        storage_key,
+                        size_bytes: request.expected_size,
+                        mime_type: Some("application/json".to_owned()),
+                        created_by_type: request.created_by_type.clone(),
+                        created_by_id: request.created_by_id.clone(),
+                        created_at: "2026-07-26T00:00:00Z".to_owned(),
+                        supersedes: None,
+                    },
+                    temp_name: format!("{}.tmp", request.artifact_id.as_str()),
+                    created_at: "2026-07-26T00:00:00Z".to_owned(),
+                },
+                &request.canonical_bytes,
+            )
+            .expect("inspection artifact");
+        CanonicalEvidenceRef {
+            artifact_id: request.artifact_id,
+            content_hash: reference.content_hash,
+            storage_key: reference.storage_key,
+            size_bytes: reference.size_bytes,
+            project_id: request.project_id,
+            task_id: None,
+        }
+    }
+
+    fn start(&self) -> Bootstrap {
+        Bootstrap::new(StartupConfig {
+            app_data_dir: self.app_data.clone(),
+            trusted_workspace_root: self.workspace_root.clone(),
+            secret_values: Vec::new(),
+        })
+    }
+
+    fn replace_repository(&self) -> PathBuf {
+        let displaced = self.source.with_file_name("displaced-source");
+        fs::rename(&self.source, &displaced).expect("displace repository");
+        fs::create_dir(&self.source).expect("replacement source");
+        commit_repository_with_format(&self.source, git2::ObjectFormat::Sha256);
+        displaced
+    }
+
+    fn completion_count(&self) -> i64 {
+        Connection::open(&self.database_path)
+            .expect("database")
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE stream_id = 'project:project-1'
+                   AND event_type = 'repository.inspected'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("completion count")
+    }
+
+    fn inspection_artifact_count(&self) -> i64 {
+        Connection::open(&self.database_path)
+            .expect("database")
+            .query_row(
+                "SELECT COUNT(*) FROM artifacts
+                 WHERE id = 'repository-inspection-project-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("artifact count")
+    }
+}
+
 impl WorkspaceFixture {
     fn new() -> Self {
         let root = TempDir::new().expect("tempdir");
@@ -865,7 +1124,13 @@ impl WorkspaceFixture {
 }
 
 fn commit_repository(root: &Path) {
-    let repository = Repository::init(root).expect("init repository");
+    commit_repository_with_format(root, git2::ObjectFormat::Sha1);
+}
+
+fn commit_repository_with_format(root: &Path, object_format: git2::ObjectFormat) {
+    let mut options = RepositoryInitOptions::new();
+    options.object_format(object_format);
+    let repository = Repository::init_opts(root, &options).expect("init repository");
     fs::write(root.join("README.md"), b"original\n").expect("write fixture");
     let mut index = repository.index().expect("index");
     index
@@ -878,6 +1143,28 @@ fn commit_repository(root: &Path) {
     repository
         .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
         .expect("commit");
+}
+
+fn repository_evidence_value(
+    repository: &local_agent_terminal_application::RepositorySnapshot,
+) -> serde_json::Value {
+    serde_json::json!({
+        "repositoryId": repository.repository_id.as_str(),
+        "health": repository.health.as_str(),
+        "stableIdentity": repository.stable_identity,
+        "defaultBranch": repository.default_branch.as_ref().map(TaskBranch::as_str),
+        "baseCommit": repository.base_commit.as_ref().map(|commit| commit.as_str()),
+        "originalCheckout": repository.original_checkout.as_str(),
+        "hazards": repository.hazards.iter().map(|hazard| serde_json::json!({
+            "reason": hazard.reason.as_str(),
+            "detail": hazard.detail,
+        })).collect::<Vec<_>>(),
+        "fingerprint": {
+            "head": repository.fingerprint.head().as_str(),
+            "indexDigest": repository.fingerprint.index_digest(),
+            "statusDigest": repository.fingerprint.status_digest(),
+        },
+    })
 }
 
 fn publish_artifact(

@@ -44,26 +44,28 @@ export function WorkspaceScreen({
   const statusHeading = useRef<HTMLHeadingElement>(null);
   const mutationInFlight = useRef(false);
   const refreshInFlight = useRef(false);
+  const dashboardGeneration = useRef(0);
 
   useEffect(() => {
     if (initialProjectId === "") {
       return;
     }
+    const generation = ++dashboardGeneration.current;
     let active = true;
     getWorkspaceDashboard({ projectId: initialProjectId })
       .then((nextDashboard) => {
-        if (active) {
+        if (active && generation === dashboardGeneration.current) {
           setDashboard(nextDashboard);
           setError(null);
         }
       })
       .catch((cause: unknown) => {
-        if (active) {
+        if (active && generation === dashboardGeneration.current) {
           setError(commandErrorMessage(cause));
         }
       })
       .finally(() => {
-        if (active) {
+        if (active && generation === dashboardGeneration.current) {
           setLoading(false);
         }
       });
@@ -83,15 +85,20 @@ export function WorkspaceScreen({
         return;
       }
       refreshInFlight.current = true;
+      const generation = dashboardGeneration.current;
       void getWorkspaceDashboard({ projectId: activeProjectId })
         .then((nextDashboard) => {
-          if (active && !mutationInFlight.current) {
+          if (
+            active &&
+            !mutationInFlight.current &&
+            generation === dashboardGeneration.current
+          ) {
             setDashboard(nextDashboard);
             setError(null);
           }
         })
         .catch((cause: unknown) => {
-          if (active) {
+          if (active && generation === dashboardGeneration.current) {
             setError(commandErrorMessage(cause));
           }
         })
@@ -110,6 +117,7 @@ export function WorkspaceScreen({
       return;
     }
     mutationInFlight.current = true;
+    dashboardGeneration.current += 1;
     setLoading(true);
     setError(null);
     try {
@@ -146,6 +154,7 @@ export function WorkspaceScreen({
       repositoryPath: String(data.get("repositoryPath") ?? "").trim(),
     };
     mutationInFlight.current = true;
+    dashboardGeneration.current += 1;
     setBusyKey("onboard");
     setError(null);
     try {
@@ -176,6 +185,7 @@ export function WorkspaceScreen({
     const form = event.currentTarget;
     const data = new FormData(form);
     mutationInFlight.current = true;
+    dashboardGeneration.current += 1;
     setBusyKey("create-task");
     setError(null);
     try {
@@ -212,6 +222,7 @@ export function WorkspaceScreen({
       return;
     }
     mutationInFlight.current = true;
+    dashboardGeneration.current += 1;
     setBusyKey(`${candidate.candidateId}:${action.code}`);
     setError(null);
     const request = recoveryRequest(dashboard.projectId, candidate);

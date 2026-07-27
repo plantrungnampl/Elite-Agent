@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 
@@ -59,7 +60,15 @@ pub(crate) fn create(
     validate_worktree_name(&worktree_name)?;
     let parent_guard = paths::DirectoryGuard::open(target.parent().ok_or_else(paths::invalid)?)?;
     pause_before_checkout(gateway);
-    let worktree = match unsafe_checkout::add(&repository, &worktree_name, &target, &reference) {
+    let added = match unsafe_checkout::add(
+        &repository,
+        &worktree_name,
+        &target,
+        &reference,
+        &parent_guard,
+        #[cfg(feature = "test-seams")]
+        gateway,
+    ) {
         Ok(worktree) => worktree,
         Err(_error) => {
             drop(reference);
@@ -77,10 +86,15 @@ pub(crate) fn create(
             ));
         }
     };
+    let unsafe_checkout::AddedWorktree {
+        worktree,
+        target_guard,
+    } = added;
     drop(reference);
     let result = (|| {
         fail_after(gateway, PostAddPoint::Add)?;
         parent_guard.verify()?;
+        target_guard.verify()?;
         fail_after(gateway, PostAddPoint::ParentVerify)?;
         let target_path = paths::validate_existing_target(gateway, &target)?;
         if target_path != target {
@@ -129,10 +143,12 @@ pub(crate) fn create(
     match result {
         Ok(snapshot) => {
             drop(worktree);
+            drop(target_guard);
             Ok(snapshot)
         }
         Err(_error) => {
             drop(worktree);
+            drop(target_guard);
             Err(preserve_failed_create(
                 gateway,
                 &repository,
@@ -318,19 +334,88 @@ pub(crate) fn discard(
         return Err(paths::conflict());
     }
     reject_reparse_root(&target)?;
-    fs::remove_dir_all(&target).map_err(|_| paths::permission())?;
+    pause_after_discard_validation(gateway);
+    let parent_guard = paths::DirectoryGuard::open(target.parent().ok_or_else(paths::invalid)?)?;
+    let mut target_guard = paths::DirectoryGuard::open_child_for_rename(&parent_guard, &target)?;
+    revalidate_discard_target(
+        &repository,
+        &request,
+        &target,
+        expected_oid,
+        &reference_name,
+    )?;
+    target_guard.verify()?;
+    let mut reference_transaction = repository.transaction().map_err(paths::map_git_error)?;
+    reference_transaction
+        .lock_ref(&reference_name)
+        .map_err(paths::map_git_error)?;
+    let locked_reference = repository
+        .find_reference(&reference_name)
+        .map_err(paths::map_git_error)?;
+    if locked_reference.kind() != Some(ReferenceType::Direct)
+        || locked_reference.target() != Some(expected_oid)
+    {
+        return Err(paths::conflict());
+    }
+    drop(locked_reference);
+    reference_transaction
+        .remove(&reference_name)
+        .map_err(paths::map_git_error)?;
+    drop(head);
+    drop(target_repository);
+    drop(reference);
+    let tombstone_leaf = discard_tombstone(&request.worktree_id)?;
+    let tombstone = target_guard.rename_to(&parent_guard, &tombstone_leaf)?;
+    drop(target_guard);
+    fs::remove_dir_all(&tombstone).map_err(|_| paths::conflict())?;
     worktree.unlock().map_err(paths::map_git_error)?;
     let mut prune = WorktreePruneOptions::new();
     worktree
         .prune(Some(&mut prune))
         .map_err(paths::map_git_error)?;
-    let mut reference = repository
-        .find_reference(&reference_name)
+    reference_transaction
+        .commit()
         .map_err(paths::map_git_error)?;
-    if reference.target() == Some(expected_oid) {
-        reference.delete().map_err(paths::map_git_error)?;
+    Ok(())
+}
+
+fn revalidate_discard_target(
+    repository: &Repository,
+    request: &DiscardWorktree,
+    target: &Path,
+    expected_oid: Oid,
+    reference_name: &str,
+) -> Result<(), PortError> {
+    let worktree = repository
+        .find_worktree(request.worktree_id.as_str())
+        .map_err(|_| paths::conflict())?;
+    if paths::canonical_directory(worktree.path()).map_err(|_| paths::conflict())? != target {
+        return Err(paths::conflict());
+    }
+    let target_repository = paths::open_repository(target).map_err(|_| paths::conflict())?;
+    if paths::canonical_directory(target_repository.commondir()).map_err(|_| paths::conflict())?
+        != request.repository.canonical_common_dir
+    {
+        return Err(paths::conflict());
+    }
+    let head = target_repository.head().map_err(|_| paths::conflict())?;
+    if head.target() != Some(expected_oid)
+        || head.name().ok() != Some(reference_name)
+        || head.shorthand().ok() != Some(request.branch.as_str())
+    {
+        return Err(paths::conflict());
     }
     Ok(())
+}
+
+fn discard_tombstone(worktree_id: &WorktreeId) -> Result<OsString, PortError> {
+    let mut nonce = [0_u8; 16];
+    getrandom::fill(&mut nonce).map_err(|_| paths::unavailable())?;
+    Ok(OsString::from(format!(
+        ".local-agent-terminal-discard-{}-{}",
+        worktree_id.as_str(),
+        paths::hex_digest(&nonce)
+    )))
 }
 
 pub(crate) fn inspect_expected(
@@ -595,6 +680,17 @@ fn pause_after_cleanup_ownership_check(gateway: &GitRepositoryGateway) {
 
 #[cfg(not(feature = "test-seams"))]
 fn pause_after_cleanup_ownership_check(_gateway: &GitRepositoryGateway) {}
+
+#[cfg(feature = "test-seams")]
+fn pause_after_discard_validation(gateway: &GitRepositoryGateway) {
+    if let Some(barrier) = &gateway.test_hooks.after_discard_validation {
+        barrier.wait();
+        barrier.wait();
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+fn pause_after_discard_validation(_gateway: &GitRepositoryGateway) {}
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     paths::is_within(left, right) || paths::is_within(right, left)

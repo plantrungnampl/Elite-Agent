@@ -6,7 +6,7 @@ use local_agent_terminal_application::{
 use local_agent_terminal_domain::{
     ArtifactId, GitObjectId, ProjectId, RepositoryId, TaskBranch, WorkspaceFingerprint,
 };
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
 
 use crate::event_store::{open_error_to_port, sqlite_error_to_port};
@@ -18,7 +18,8 @@ impl SqliteStore {
         let projects = {
             let mut statement = connection
                 .prepare(
-                    "SELECT id, repository_path, repository_identity
+                    "SELECT id, name, repository_path, repository_identity, created_at,
+                            policy_profile_id, artifact_root_mode, artifact_root_path
                      FROM projects ORDER BY created_at, id",
                 )
                 .map_err(sqlite_error_to_port)?;
@@ -26,8 +27,15 @@ impl SqliteStore {
                 .query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
+                        ProjectRow {
+                            name: row.get(1)?,
+                            repository_path: row.get(2)?,
+                            repository_identity: row.get(3)?,
+                            created_at: row.get(4)?,
+                            policy_profile_id: row.get(5)?,
+                            artifact_root_mode: row.get(6)?,
+                            artifact_root_path: row.get(7)?,
+                        },
                     ))
                 })
                 .map_err(sqlite_error_to_port)?
@@ -36,9 +44,38 @@ impl SqliteStore {
             rows
         };
         let mut recovery = Vec::with_capacity(projects.len());
-        for (project_id, repository_path, repository_identity) in projects {
+        for (project_id, project) in projects {
             let project_id = ProjectId::new(project_id).map_err(|_| integrity_failure())?;
-            let payload: Option<String> = connection
+            let intent_payload: String = connection
+                .query_row(
+                    "SELECT payload_json FROM events
+                     WHERE stream_id = ?1 AND event_type = 'project.created'
+                     ORDER BY sequence LIMIT 1",
+                    [project_stream_id(&project_id)],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_error_to_port)?;
+            let intent_payload: Value =
+                serde_json::from_str(&intent_payload).map_err(|_| integrity_failure())?;
+            let repository = parse_repository_snapshot(
+                intent_payload
+                    .get("repository")
+                    .ok_or_else(integrity_failure)?,
+            )?;
+            let persisted = NewProject {
+                project_id: project_id.clone(),
+                name: project.name.clone(),
+                repository: repository.clone(),
+                repository_path: project.repository_path.clone(),
+                settings: project.settings()?,
+                created_at: project.created_at.clone(),
+            };
+            if intent_payload != project_intent_json(&persisted)
+                || repository.stable_identity != project.repository_identity
+            {
+                return Err(conflict());
+            }
+            let completion_payload: Option<String> = connection
                 .query_row(
                     "SELECT payload_json FROM events
                      WHERE stream_id = ?1 AND event_type = 'repository.inspected'
@@ -48,19 +85,27 @@ impl SqliteStore {
                 )
                 .optional()
                 .map_err(sqlite_error_to_port)?;
-            let Some(payload) = payload else {
-                continue;
+            let (repository, repository_evidence_artifact_id) = match completion_payload {
+                Some(payload) => {
+                    let payload: Value =
+                        serde_json::from_str(&payload).map_err(|_| integrity_failure())?;
+                    let repository = parse_repository_snapshot(&payload)?;
+                    if repository.repository_id != persisted.repository.repository_id
+                        || repository.stable_identity != persisted.repository.stable_identity
+                    {
+                        return Err(integrity_failure());
+                    }
+                    let evidence = evidence_artifact_id(&payload)?.ok_or_else(integrity_failure)?;
+                    verify_recovery_evidence(&connection, &project_id, &evidence)?;
+                    (repository, Some(evidence))
+                }
+                None => (repository, None),
             };
-            let repository = parse_repository_snapshot(
-                &serde_json::from_str(&payload).map_err(|_| integrity_failure())?,
-            )?;
-            if repository.stable_identity != repository_identity {
-                return Err(integrity_failure());
-            }
             recovery.push(RecoveryProject {
                 project_id,
-                repository_path,
+                repository_path: project.repository_path,
                 repository,
+                repository_evidence_artifact_id,
             });
         }
         Ok(recovery)
@@ -72,6 +117,84 @@ impl SqliteStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
+        if let Some(existing) = project_row_optional(&transaction, &project.project_id)? {
+            if !same_project(&existing, &project) {
+                return Err(conflict());
+            }
+            let requested_repository = project.repository.clone();
+            let mut persisted_project = project;
+            persisted_project
+                .created_at
+                .clone_from(&existing.created_at);
+            let payload: String = transaction
+                .query_row(
+                    "SELECT payload_json FROM events
+                     WHERE stream_id = ?1 AND event_type = 'project.created'
+                     ORDER BY sequence LIMIT 1",
+                    [project_stream_id(&persisted_project.project_id)],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_error_to_port)?;
+            let payload: Value = serde_json::from_str(&payload).map_err(|_| integrity_failure())?;
+            let intent_repository = parse_repository_snapshot(
+                payload.get("repository").ok_or_else(integrity_failure)?,
+            )?;
+            if intent_repository.repository_id != requested_repository.repository_id
+                || intent_repository.stable_identity != requested_repository.stable_identity
+            {
+                return Err(conflict());
+            }
+            let mut intent_project = persisted_project.clone();
+            intent_project.repository = intent_repository;
+            if payload != project_intent_json(&intent_project) {
+                return Err(conflict());
+            }
+            let completion: Option<String> = transaction
+                .query_row(
+                    "SELECT payload_json FROM events
+                     WHERE stream_id = ?1 AND event_type = 'repository.inspected'
+                     ORDER BY sequence DESC LIMIT 1",
+                    [project_stream_id(&persisted_project.project_id)],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error_to_port)?;
+            let completion = completion
+                .map(|payload| {
+                    let payload: Value =
+                        serde_json::from_str(&payload).map_err(|_| integrity_failure())?;
+                    let repository = parse_repository_snapshot(&payload)?;
+                    if repository.repository_id != requested_repository.repository_id
+                        || repository.stable_identity != requested_repository.stable_identity
+                    {
+                        return Err(conflict());
+                    }
+                    let evidence = evidence_artifact_id(&payload)?.ok_or_else(integrity_failure)?;
+                    Ok((repository, evidence))
+                })
+                .transpose()?;
+            let repository_evidence_artifact_id =
+                completion.as_ref().map(|(_, evidence)| evidence.clone());
+            persisted_project.repository = completion
+                .map(|(repository, _)| repository)
+                .unwrap_or(requested_repository);
+            transaction.rollback().map_err(sqlite_error_to_port)?;
+            return Ok(project_snapshot(
+                persisted_project,
+                repository_evidence_artifact_id,
+            ));
+        }
+        let conflicting_identity: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM projects WHERE repository_identity = ?1",
+                [&project.repository.stable_identity],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?;
+        if conflicting_identity.is_some() {
+            return Err(conflict());
+        }
         transaction
             .execute(
                 "INSERT INTO projects (
@@ -102,12 +225,7 @@ impl SqliteStore {
                 params![
                     format!("project.created:{}", project.project_id.as_str()),
                     stream_id,
-                    json!({
-                        "projectId": project.project_id.as_str(),
-                        "repositoryId": project.repository.repository_id.as_str(),
-                        "repositoryIdentity": project.repository.stable_identity,
-                    })
-                    .to_string(),
+                    project_intent_json(&project).to_string(),
                     format!("project:create:{}", project.project_id.as_str()),
                     project.created_at,
                 ],
@@ -115,15 +233,7 @@ impl SqliteStore {
             .map_err(sqlite_error_to_port)?;
         transaction.commit().map_err(sqlite_error_to_port)?;
 
-        Ok(ProjectSnapshot {
-            project_id: project.project_id,
-            name: project.name,
-            repository: project.repository,
-            repository_path: project.repository_path,
-            settings: project.settings,
-            repository_evidence_artifact_id: None,
-            created_at: project.created_at,
-        })
+        Ok(project_snapshot(project, None))
     }
 
     pub(crate) fn insert_repository_inspection(
@@ -142,6 +252,42 @@ impl SqliteStore {
         verify_available_evidence(&transaction, &inspection)?;
 
         let stream_id = project_stream_id(&inspection.project_id);
+        let payload = repository_snapshot_json(
+            &inspection.repository,
+            Some(&inspection.evidence.artifact_id),
+        );
+        let existing: Option<(String, String, String, String)> = transaction
+            .query_row(
+                "SELECT payload_json, actor_id, correlation_id, created_at FROM events
+                 WHERE stream_id = ?1 AND event_type = 'repository.inspected'
+                 ORDER BY sequence DESC LIMIT 1",
+                [&stream_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?;
+        if let Some((existing_payload, actor_id, correlation_id, created_at)) = existing {
+            let existing_payload: Value =
+                serde_json::from_str(&existing_payload).map_err(|_| integrity_failure())?;
+            if existing_payload != payload
+                || actor_id != inspection.actor_id.as_str()
+                || correlation_id != inspection.correlation_id
+                || created_at != inspection.observed_at
+            {
+                return Err(conflict());
+            }
+            transaction.rollback().map_err(sqlite_error_to_port)?;
+            let settings = project.settings()?;
+            return Ok(ProjectSnapshot {
+                project_id: inspection.project_id,
+                name: project.name,
+                repository: inspection.repository,
+                repository_path: project.repository_path,
+                settings,
+                repository_evidence_artifact_id: Some(inspection.evidence.artifact_id),
+                created_at: project.created_at,
+            });
+        }
         let sequence: i64 = transaction
             .query_row(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE stream_id = ?1",
@@ -149,10 +295,6 @@ impl SqliteStore {
                 |row| row.get(0),
             )
             .map_err(sqlite_error_to_port)?;
-        let payload = repository_snapshot_json(
-            &inspection.repository,
-            Some(&inspection.evidence.artifact_id),
-        );
         transaction
             .execute(
                 "INSERT INTO events (
@@ -177,17 +319,13 @@ impl SqliteStore {
             .map_err(sqlite_error_to_port)?;
         transaction.commit().map_err(sqlite_error_to_port)?;
 
+        let settings = project.settings()?;
         Ok(ProjectSnapshot {
             project_id: inspection.project_id,
             name: project.name,
             repository: inspection.repository,
             repository_path: project.repository_path,
-            settings: ProjectSettings {
-                policy_profile_id: project.policy_profile_id,
-                artifact_root_mode: parse_artifact_root_mode(&project.artifact_root_mode)
-                    .ok_or_else(integrity_failure)?,
-                artifact_root_path: project.artifact_root_path,
-            },
+            settings,
             repository_evidence_artifact_id: Some(inspection.evidence.artifact_id),
             created_at: project.created_at,
         })
@@ -307,10 +445,28 @@ struct ProjectRow {
     artifact_root_path: String,
 }
 
+impl ProjectRow {
+    fn settings(&self) -> Result<ProjectSettings, PortError> {
+        Ok(ProjectSettings {
+            policy_profile_id: self.policy_profile_id.clone(),
+            artifact_root_mode: parse_artifact_root_mode(&self.artifact_root_mode)
+                .ok_or_else(integrity_failure)?,
+            artifact_root_path: self.artifact_root_path.clone(),
+        })
+    }
+}
+
 fn project_row(
     transaction: &Transaction<'_>,
     project_id: &ProjectId,
 ) -> Result<ProjectRow, PortError> {
+    project_row_optional(transaction, project_id)?.ok_or_else(not_found)
+}
+
+fn project_row_optional(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+) -> Result<Option<ProjectRow>, PortError> {
     transaction
         .query_row(
             "SELECT name, repository_path, repository_identity, created_at, policy_profile_id,
@@ -330,8 +486,76 @@ fn project_row(
             },
         )
         .optional()
-        .map_err(sqlite_error_to_port)?
-        .ok_or_else(not_found)
+        .map_err(sqlite_error_to_port)
+}
+
+fn project_intent_json(project: &NewProject) -> Value {
+    json!({
+        "onboardingStatus": "pending",
+        "projectId": project.project_id.as_str(),
+        "name": project.name,
+        "repositoryPath": project.repository_path,
+        "settings": {
+            "policyProfileId": project.settings.policy_profile_id,
+            "artifactRootMode": project.settings.artifact_root_mode.as_str(),
+            "artifactRootPath": project.settings.artifact_root_path,
+        },
+        "createdAt": project.created_at,
+        "repository": repository_snapshot_json(&project.repository, None),
+    })
+}
+
+fn same_project(existing: &ProjectRow, requested: &NewProject) -> bool {
+    existing.name == requested.name
+        && existing.repository_path == requested.repository_path
+        && existing.repository_identity == requested.repository.stable_identity
+        && existing.policy_profile_id == requested.settings.policy_profile_id
+        && existing.artifact_root_mode == requested.settings.artifact_root_mode.as_str()
+        && existing.artifact_root_path == requested.settings.artifact_root_path
+}
+
+fn project_snapshot(
+    project: NewProject,
+    repository_evidence_artifact_id: Option<ArtifactId>,
+) -> ProjectSnapshot {
+    ProjectSnapshot {
+        project_id: project.project_id,
+        name: project.name,
+        repository: project.repository,
+        repository_path: project.repository_path,
+        settings: project.settings,
+        repository_evidence_artifact_id,
+        created_at: project.created_at,
+    }
+}
+
+fn evidence_artifact_id(payload: &Value) -> Result<Option<ArtifactId>, PortError> {
+    payload
+        .get("evidenceArtifactId")
+        .ok_or_else(integrity_failure)?
+        .as_str()
+        .map(ArtifactId::new)
+        .transpose()
+        .map_err(|_| integrity_failure())
+}
+
+fn verify_recovery_evidence(
+    connection: &Connection,
+    project_id: &ProjectId,
+    artifact_id: &ArtifactId,
+) -> Result<(), PortError> {
+    let evidence: Option<(String, Option<String>, String)> = connection
+        .query_row(
+            "SELECT project_id, task_id, availability FROM artifacts WHERE id = ?1",
+            [artifact_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_error_to_port)?;
+    if evidence != Some((project_id.as_str().to_owned(), None, "available".to_owned())) {
+        return Err(integrity_failure());
+    }
+    Ok(())
 }
 
 fn verify_available_evidence(

@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 #[cfg(windows)]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
@@ -192,25 +193,91 @@ pub(crate) fn recovery_path(
 
 pub(crate) struct DirectoryGuard {
     path: PathBuf,
-    _handle: File,
+    handle: File,
+    #[cfg(windows)]
+    identity: crate::unsafe_checkout::windows_directory::DirectoryIdentity,
 }
 
 impl DirectoryGuard {
     pub(crate) fn open(path: &Path) -> Result<Self, PortError> {
         let handle = open_directory_without_delete_sharing(path)?;
+        Self::from_handle(path, handle)
+    }
+
+    pub(crate) fn create_child(parent: &Self, path: &Path) -> Result<Self, PortError> {
+        let leaf = child_leaf(parent, path)?;
+        #[cfg(windows)]
+        let handle = crate::unsafe_checkout::windows_directory::create(&parent.handle, leaf)?;
+        #[cfg(not(windows))]
+        let handle = {
+            fs::create_dir(path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    conflict()
+                } else {
+                    permission()
+                }
+            })?;
+            open_directory_without_delete_sharing(path)?
+        };
+        Self::from_handle(path, handle)
+    }
+
+    pub(crate) fn open_child_for_rename(parent: &Self, path: &Path) -> Result<Self, PortError> {
+        let leaf = child_leaf(parent, path)?;
+        #[cfg(windows)]
+        let handle =
+            crate::unsafe_checkout::windows_directory::open_for_rename(&parent.handle, leaf)?;
+        #[cfg(not(windows))]
+        let handle = open_directory_without_delete_sharing(path)?;
+        Self::from_handle(path, handle).map_err(|_| conflict())
+    }
+
+    fn from_handle(path: &Path, handle: File) -> Result<Self, PortError> {
         let canonical = canonical_directory(path)?;
-        Ok(Self {
+        let guard = Self {
             path: canonical,
-            _handle: handle,
-        })
+            #[cfg(windows)]
+            identity: crate::unsafe_checkout::windows_directory::identity(&handle)?,
+            handle,
+        };
+        guard.verify()?;
+        Ok(guard)
     }
 
     pub(crate) fn verify(&self) -> Result<(), PortError> {
         if canonical_directory(&self.path)? != self.path {
             return Err(conflict());
         }
+        #[cfg(windows)]
+        crate::unsafe_checkout::windows_directory::verify(&self.handle, &self.path, self.identity)?;
         Ok(())
     }
+
+    pub(crate) fn rename_to(
+        &mut self,
+        parent: &Self,
+        new_leaf: &OsStr,
+    ) -> Result<PathBuf, PortError> {
+        let destination = parent.path.join(new_leaf);
+        #[cfg(windows)]
+        crate::unsafe_checkout::windows_directory::rename(&self.handle, &destination)?;
+        #[cfg(not(windows))]
+        fs::rename(&self.path, &destination).map_err(|_| conflict())?;
+        self.path = destination;
+        #[cfg(windows)]
+        crate::unsafe_checkout::windows_directory::verify(&self.handle, &self.path, self.identity)?;
+        #[cfg(not(windows))]
+        self.verify()?;
+        Ok(self.path.clone())
+    }
+}
+
+fn child_leaf<'a>(parent: &DirectoryGuard, path: &'a Path) -> Result<&'a OsStr, PortError> {
+    let requested_parent = path.parent().ok_or_else(invalid)?;
+    if canonical_directory(requested_parent)? != parent.path {
+        return Err(conflict());
+    }
+    path.file_name().ok_or_else(invalid)
 }
 
 #[cfg(windows)]

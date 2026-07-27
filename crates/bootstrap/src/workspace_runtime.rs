@@ -234,35 +234,16 @@ impl WorkspaceRuntime {
             },
             InspectRepository { locator },
         )?;
-        let artifact_id = ArtifactId::new(format!(
-            "repository-inspection-{}",
-            project.project_id.as_str()
-        ))
-        .map_err(|_| invalid_input())?;
-        let evidence = publish_canonical_json(
+        if project.repository_evidence_artifact_id.is_some() {
+            return Ok(project);
+        }
+        complete_repository_onboarding(
             &self.database,
             &self.artifacts,
-            CanonicalJsonRequest::new(
-                artifact_id,
-                project.project_id.clone(),
-                None,
-                "repository_inspection",
-                format!("repository/{}/inspection.json", project.project_id.as_str()),
-                "core",
-                "workspace-coordinator",
-                &repository_evidence(&project.repository),
-                format!("repository-inspection:{}", project.project_id.as_str()),
-            )?,
-        )?;
-        self.database
-            .record_repository_inspection(RepositoryInspectionRecord {
-                project_id: project.project_id,
-                repository: project.repository,
-                evidence,
-                actor_id: ActorId::new("workspace-coordinator").map_err(|_| invalid_input())?,
-                correlation_id: format!("repository-inspection:{}", project_id.as_str()),
-                observed_at,
-            })
+            project.project_id,
+            project.repository,
+            observed_at,
+        )
     }
 
     pub fn create_task_workspace(
@@ -1049,8 +1030,10 @@ impl WorkspaceRuntime {
 
 pub(crate) fn reconcile_startup(
     database: &SqliteStore,
+    artifacts: &ContentAddressedArtifactStore,
     repositories: &GitRepositoryGateway,
 ) -> Result<WorkspaceRecoveryReport, PortError> {
+    reconcile_pending_onboarding(database, artifacts, repositories)?;
     let fenced_leases = database.fence_stale()?.len();
     let started = database.started_recoveries()?;
     let projects = database
@@ -1228,6 +1211,72 @@ pub(crate) fn reconcile_startup(
         fenced_leases,
         repositories_scanned: scanned.len(),
         recovery_candidates,
+    })
+}
+
+fn reconcile_pending_onboarding(
+    database: &SqliteStore,
+    artifacts: &ContentAddressedArtifactStore,
+    repositories: &GitRepositoryGateway,
+) -> Result<(), PortError> {
+    for project in database.recovery_projects()? {
+        if project.repository_evidence_artifact_id.is_some() {
+            continue;
+        }
+        let locator = repositories.locate_persisted(Path::new(&project.repository_path))?;
+        if locator.repository_id != project.repository.repository_id
+            || locator.stable_identity != project.repository.stable_identity
+        {
+            return Err(conflict());
+        }
+        let repository = repositories.inspect(InspectRepository { locator })?;
+        if repository.repository_id != project.repository.repository_id
+            || repository.stable_identity != project.repository.stable_identity
+        {
+            return Err(conflict());
+        }
+        complete_repository_onboarding(
+            database,
+            artifacts,
+            project.project_id,
+            repository,
+            database.now_utc()?,
+        )?;
+    }
+    Ok(())
+}
+
+fn complete_repository_onboarding(
+    database: &SqliteStore,
+    artifacts: &ContentAddressedArtifactStore,
+    project_id: ProjectId,
+    repository: local_agent_terminal_application::RepositorySnapshot,
+    observed_at: String,
+) -> Result<ProjectSnapshot, PortError> {
+    let artifact_id = ArtifactId::new(format!("repository-inspection-{}", project_id.as_str()))
+        .map_err(|_| invalid_input())?;
+    let evidence = publish_canonical_json(
+        database,
+        artifacts,
+        CanonicalJsonRequest::new(
+            artifact_id,
+            project_id.clone(),
+            None,
+            "repository_inspection",
+            format!("repository/{}/inspection.json", project_id.as_str()),
+            "core",
+            "workspace-coordinator",
+            &repository_evidence(&repository),
+            format!("repository-inspection:{}", project_id.as_str()),
+        )?,
+    )?;
+    database.record_repository_inspection(RepositoryInspectionRecord {
+        project_id: project_id.clone(),
+        repository,
+        evidence,
+        actor_id: ActorId::new("workspace-coordinator").map_err(|_| invalid_input())?,
+        correlation_id: format!("repository-inspection:{}", project_id.as_str()),
+        observed_at,
     })
 }
 

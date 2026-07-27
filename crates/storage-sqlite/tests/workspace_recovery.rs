@@ -10,8 +10,8 @@ use local_agent_terminal_application::{
     ExpectedPresence, IdempotencyClass, LeaseState, NewProject, NewTask, OperationIntent,
     OperationIntentStatus, ProjectSettings, RepositoryHealth, RepositoryInspectionRecord,
     RepositorySnapshot, RevokeLease, RiskLevel, SafeErrorClassification, TaskQuery,
-    WorkspaceMutationRequest, WorkspaceMutationStore, WorkspaceStateStore, WorktreeIntent,
-    WorktreeSnapshot, WorktreeState,
+    WorkspaceMutationRequest, WorkspaceMutationStore, WorkspaceRecoveryStore, WorkspaceStateStore,
+    WorktreeIntent, WorktreeSnapshot, WorktreeState,
 };
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, FencingToken, GitObjectId, LeaseClaim, ProjectId, RepositoryId, RunId,
@@ -274,6 +274,94 @@ fn project_onboarding_persists_identity_health_and_canonical_evidence() {
     assert!(event
         .1
         .contains("\"evidenceArtifactId\":\"artifact-repository\""));
+}
+
+#[test]
+fn pending_onboarding_is_queryable_and_exact_project_retry_is_idempotent() {
+    let database = TempDatabase::new();
+    let store = SqliteStore::open(&database.path).unwrap();
+    let request = new_project();
+
+    let first = store.create_project(request.clone()).unwrap();
+    let pending = store.recovery_projects().unwrap();
+
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].project_id, request.project_id);
+    assert_eq!(pending[0].repository_path, request.repository_path);
+    assert_eq!(pending[0].repository, request.repository);
+    assert_eq!(store.create_project(request.clone()).unwrap(), first);
+
+    let mut conflicting = request;
+    conflicting.name = "A different project".to_owned();
+    assert_eq!(
+        store
+            .create_project(conflicting)
+            .unwrap_err()
+            .safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+
+    let connection = Connection::open(&database.path).unwrap();
+    let (count, payload): (i64, String) = connection
+        .query_row(
+            "SELECT COUNT(*), payload_json FROM events
+             WHERE stream_id = 'project:project-1' AND event_type = 'project.created'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(payload["onboardingStatus"], "pending");
+    assert_eq!(payload["projectId"], "project-1");
+    assert_eq!(payload["name"], "Local Agent Terminal");
+    assert_eq!(payload["repositoryPath"], "D:/source/project");
+    assert_eq!(
+        payload["repository"]["stableIdentity"],
+        "repository-identity-1"
+    );
+    assert_eq!(payload["settings"]["policyProfileId"], "default");
+}
+
+#[test]
+fn exact_repository_inspection_retry_reuses_one_completion_event() {
+    let database = TempDatabase::new();
+    let store = SqliteStore::open(&database.path).unwrap();
+    store.create_project(new_project()).unwrap();
+    let evidence = publish_artifact(
+        &store,
+        "artifact-operation-repository",
+        "artifact-repository",
+        None,
+    );
+    let inspection = RepositoryInspectionRecord {
+        project_id: ProjectId::new("project-1").unwrap(),
+        repository: repository_snapshot(),
+        evidence,
+        actor_id: ActorId::new("workspace-coordinator").unwrap(),
+        correlation_id: "correlation-repository".to_owned(),
+        observed_at: "2026-07-26T00:00:04Z".to_owned(),
+    };
+
+    let first = store
+        .record_repository_inspection(inspection.clone())
+        .unwrap();
+    assert_eq!(
+        store.record_repository_inspection(inspection).unwrap(),
+        first
+    );
+
+    let connection = Connection::open(&database.path).unwrap();
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE stream_id = 'project:project-1'
+               AND event_type = 'repository.inspected'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 #[test]

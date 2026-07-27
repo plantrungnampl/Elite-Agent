@@ -138,6 +138,20 @@ fn repository_base(
     oid.to_string()
 }
 
+fn libgit2_directory(path: &Path) -> String {
+    let mut path = fs::canonicalize(path)
+        .expect("canonical path")
+        .to_string_lossy()
+        .replace('\\', "/");
+    if let Some(without_prefix) = path.strip_prefix("//?/") {
+        path = without_prefix.to_owned();
+    }
+    if !path.ends_with('/') {
+        path.push('/');
+    }
+    path
+}
+
 #[test]
 fn inspect_reports_clean_repository_without_exposing_handles() {
     let fixture = TempDir::new().expect("tempdir");
@@ -204,7 +218,29 @@ fn worktree_creation_preserves_original_and_disables_checkout_filters() {
         fs::read(source.join("README.md")).expect("after"),
         source_before
     );
-    assert!(managed_root.join("task-1").join("README.md").is_file());
+    let target = managed_root.join("task-1");
+    assert!(target.join("README.md").is_file());
+    let metadata = source.join(".git").join("worktrees").join("wt-task-1");
+    assert_eq!(
+        fs::read_to_string(target.join(".git")).expect("worktree gitfile"),
+        format!("gitdir: {}\n", libgit2_directory(&metadata))
+    );
+    assert_eq!(
+        fs::read_to_string(metadata.join("commondir")).expect("commondir"),
+        format!("{}\n", libgit2_directory(&source.join(".git")))
+    );
+    assert_eq!(
+        fs::read_to_string(metadata.join("gitdir")).expect("gitdir"),
+        format!("{}.git\n", libgit2_directory(&target))
+    );
+    assert_eq!(
+        fs::read_to_string(metadata.join("HEAD")).expect("worktree HEAD"),
+        "ref: refs/heads/agent/task-1\n"
+    );
+    assert_eq!(
+        fs::read(metadata.join("locked")).expect("worktree lock"),
+        b""
+    );
 }
 
 #[test]
@@ -376,6 +412,77 @@ fn exact_worktree_can_be_listed_and_discarded() {
     };
     gateway.discard_worktree(discard).expect("discard");
     assert!(!managed_root.join("task-1").exists());
+}
+
+#[cfg(all(windows, feature = "test-seams"))]
+#[test]
+fn discard_preserves_a_target_replaced_after_validation() {
+    use std::sync::{Arc, Barrier};
+
+    use local_agent_terminal_application::{DiscardWorktree, PortError, SafeErrorClassification};
+    use local_agent_terminal_repository_git::TestHooks;
+
+    let fixture = TempDir::new().expect("tempdir");
+    let source = fixture.path().join("source");
+    fs::create_dir(&source).expect("source");
+    let (repository, commit) = commit_repository(&source);
+    let managed_root = fixture.path().join("managed");
+    fs::create_dir(&managed_root).expect("managed");
+    let mut gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+    let locator = locator(&gateway, &source);
+    let create = request(&gateway, &locator, &source);
+    gateway
+        .create_worktree(create.clone())
+        .expect("create worktree");
+
+    let barrier = Arc::new(Barrier::new(2));
+    gateway.set_test_hooks(TestHooks {
+        after_discard_validation: Some(barrier.clone()),
+        ..TestHooks::default()
+    });
+    let discard = DiscardWorktree {
+        repository: locator,
+        managed_path: create.managed_path,
+        task_id: create.task_id,
+        lease_claim: create.lease_claim,
+        expected_workspace_version: create.expected_workspace_version,
+        worktree_id: create.worktree_id,
+        branch: create.branch,
+        base_commit: create.base_commit,
+    };
+    let worker = std::thread::spawn(move || gateway.discard_worktree(discard));
+
+    barrier.wait();
+    let target = managed_root.join("task-1");
+    let displaced = managed_root.join("owned-target-displaced");
+    fs::rename(&target, &displaced).expect("displace validated target");
+    fs::create_dir(&target).expect("replacement target");
+    fs::write(target.join("KEEP.txt"), b"keep").expect("replacement sentinel");
+    barrier.wait();
+
+    let result = worker.join().expect("worker");
+    assert!(matches!(
+        result,
+        Err(PortError::Failure {
+            classification: SafeErrorClassification::Conflict,
+            ..
+        })
+    ));
+    assert_eq!(
+        fs::read(target.join("KEEP.txt")).expect("replacement survives"),
+        b"keep"
+    );
+    assert!(displaced.join("README.md").is_file());
+    assert_eq!(
+        repository
+            .find_reference("refs/heads/agent/task-1")
+            .expect("branch preserved")
+            .target()
+            .expect("branch target")
+            .to_string(),
+        commit
+    );
+    assert!(repository.find_worktree("wt-task-1").is_ok());
 }
 
 #[test]
@@ -1261,4 +1368,57 @@ fn parent_swap_race_is_blocked_while_checkout_is_in_progress() {
     assert_eq!(created.state, WorktreeState::Present);
     assert!(managed_root.join("task-1").join("README.md").is_file());
     assert!(!moved_root.exists());
+}
+
+#[cfg(all(windows, feature = "test-seams"))]
+#[test]
+fn target_swap_race_is_blocked_during_checkout_without_touching_outside_bytes() {
+    use std::sync::{Arc, Barrier};
+
+    use local_agent_terminal_repository_git::TestHooks;
+
+    let fixture = TempDir::new().expect("tempdir");
+    let source = fixture.path().join("source");
+    fs::create_dir(&source).expect("source");
+    let (_repository, _commit) = commit_repository(&source);
+
+    let managed_root = fixture.path().join("managed");
+    let outside = fixture.path().join("outside");
+    fs::create_dir(&managed_root).expect("managed");
+    fs::create_dir(&outside).expect("outside");
+    fs::write(outside.join("KEEP.txt"), b"keep").expect("sentinel");
+    let replacement = fixture.path().join("replacement");
+    create_directory_symlink(&outside, &replacement);
+
+    let mut gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+    let barrier = Arc::new(Barrier::new(2));
+    gateway.set_test_hooks(TestHooks {
+        during_checkout: Some(barrier.clone()),
+        ..TestHooks::default()
+    });
+    let locator = locator(&gateway, &source);
+    let create = request(&gateway, &locator, &source);
+    let worker = std::thread::spawn(move || gateway.create_worktree(create));
+
+    barrier.wait();
+    let target = managed_root.join("task-1");
+    let displaced = managed_root.join("task-1-displaced");
+    let swap = fs::rename(&target, &displaced);
+    if swap.is_ok() {
+        fs::rename(&replacement, &target).expect("install replacement");
+    }
+    barrier.wait();
+
+    let created = worker.join().expect("worker").expect("create");
+
+    assert!(swap.is_err(), "target directory swap must be denied");
+    assert_eq!(created.state, WorktreeState::Present);
+    assert!(target.join("README.md").is_file());
+    assert!(fs::symlink_metadata(&replacement).is_ok());
+    assert_eq!(
+        fs::read(outside.join("KEEP.txt")).expect("sentinel after"),
+        b"keep"
+    );
+    assert!(!outside.join("README.md").exists());
+    assert!(!displaced.exists());
 }

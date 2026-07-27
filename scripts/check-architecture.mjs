@@ -92,7 +92,13 @@ function verifyCargo(metadata) {
   }
   const repositoryPackage = packages.get(repositoryGit);
   if (repositoryPackage) {
-    const repositoryExternalAllowed = new Set(["git2", "libgit2-sys", "sha2"]);
+    const repositoryExternalAllowed = new Set([
+      "getrandom",
+      "git2",
+      "libgit2-sys",
+      "sha2",
+      "windows-sys",
+    ]);
     for (const dependency of dependencies(repositoryGit)) {
       if (
         !workspace.has(dependency.name)

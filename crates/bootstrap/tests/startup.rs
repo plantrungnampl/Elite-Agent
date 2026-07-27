@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod support;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -9,7 +12,8 @@ use local_agent_terminal_storage_files::{
     ContentAddressedArtifactStore, FaultPoint, JournaledArtifactWriter, RecoveryLock,
 };
 use local_agent_terminal_storage_sqlite::SqliteStore;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
+use support::WorkspaceFixture;
 use tempfile::TempDir;
 
 const HELLO_HASH: &str = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
@@ -60,12 +64,10 @@ fn first_startup_creates_and_validates_required_local_state() {
 
 #[test]
 fn startup_reconciles_a_durable_renamed_artifact_before_ready() {
-    let parent = TempDir::new().unwrap();
-    let app_data = parent.path().join("app-data");
-    let artifacts = ContentAddressedArtifactStore::open(app_data.join("artifacts")).unwrap();
-    let database_path = app_data.join("state.sqlite3");
-    let database = SqliteStore::open(&database_path).unwrap();
-    seed_project(&database_path);
+    let fixture = WorkspaceFixture::new();
+    let artifacts =
+        ContentAddressedArtifactStore::open(fixture.app_data.join("artifacts")).unwrap();
+    let database = SqliteStore::open(&fixture.database_path).unwrap();
     let reservation = reservation();
     let result = JournaledArtifactWriter::new(&artifacts, &database, &FixedClock).write_with_fault(
         reservation,
@@ -85,10 +87,10 @@ fn startup_reconciles_a_durable_renamed_artifact_before_ready() {
     drop(database);
     drop(artifacts);
 
-    let bootstrap = Bootstrap::new(config(&app_data));
+    let bootstrap = fixture.start();
 
     assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
-    let status: String = Connection::open(database_path)
+    let status: String = Connection::open(&fixture.database_path)
         .unwrap()
         .query_row(
             "SELECT status FROM artifact_operations WHERE id = 'operation-1'",
@@ -372,20 +374,6 @@ impl Clock for FixedClock {
     fn now_utc(&self) -> Result<String, PortError> {
         Ok("2026-07-26T00:00:00Z".to_owned())
     }
-}
-
-fn seed_project(path: &Path) {
-    Connection::open(path)
-        .unwrap()
-        .execute(
-            "INSERT INTO projects (
-                id, name, repository_path, repository_identity, created_at, updated_at,
-                policy_profile_id, artifact_root_mode, artifact_root_path
-             ) VALUES (?1, 'Project', 'C:/repo', 'repo-identity', ?2, ?2,
-                'default', 'application_data', 'C:/artifacts')",
-            params!["project-1", "2026-07-26T00:00:00Z"],
-        )
-        .unwrap();
 }
 
 fn reservation() -> local_agent_terminal_application::ArtifactWriteReservation {

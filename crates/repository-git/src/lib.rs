@@ -43,7 +43,9 @@ pub enum PostAddStage {
 #[derive(Clone, Default)]
 pub struct TestHooks {
     pub before_checkout: Option<Arc<Barrier>>,
+    pub during_checkout: Option<Arc<Barrier>>,
     pub after_cleanup_ownership_check: Option<Arc<Barrier>>,
+    pub after_discard_validation: Option<Arc<Barrier>>,
     pub fail_at: Option<PostAddStage>,
 }
 

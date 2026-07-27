@@ -339,6 +339,7 @@ pub struct RecoveryProject {
     pub project_id: ProjectId,
     pub repository_path: String,
     pub repository: RepositorySnapshot,
+    pub repository_evidence_artifact_id: Option<ArtifactId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
