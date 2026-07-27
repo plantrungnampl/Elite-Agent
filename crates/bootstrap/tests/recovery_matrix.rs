@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 use git2::{IndexAddOption, Repository, Signature};
 use local_agent_terminal_application::{
     AcquireLease, ArtifactRootMode, ArtifactWriteReservation, CanonicalEvidenceRef, Clock,
-    CreateWorktree, ExecutorLeaseStore, ExpectedPresence, IdempotencyClass, InspectRepository,
-    IntentTransition, ManagedWorktreePath, NewProject, NewTask, OperationIntent,
-    OperationIntentStatus, PortError, ProjectSettings, RecoveryAction, RecoveryCandidateRequestDto,
-    RecoveryReason, RepositoryGateway, RepositoryInspectionRecord, ReservedArtifact, RiskLevel,
+    ConfirmDiscardWorkspaceRequestDto, CreateWorktree, DiscardWorktree, ExecutorLeaseStore,
+    ExpectedPresence, IdempotencyClass, InspectRepository, IntentTransition, ManagedWorktreePath,
+    NewProject, NewTask, OperationIntent, OperationIntentStatus, PortError, ProjectSettings,
+    RecoveryAction, RecoveryCandidateRequestDto, RecoveryReason, RepositoryGateway,
+    RepositoryInspectionRecord, ReservedArtifact, RiskLevel, SafeErrorClassification,
     StartupStateDto, TaskQuery, WorkspaceDashboardRequestDto, WorkspaceStateStore, WorktreeIntent,
     WorktreeState,
 };
@@ -335,6 +336,170 @@ fn startup_inspects_preserved_indeterminate_create_without_adopting_or_discardin
         fs::read(occupied.join("FOREIGN.txt")).expect("foreign marker"),
         b"preserve"
     );
+}
+
+#[test]
+fn discard_rejects_repository_replacement_after_exact_startup_observation() {
+    let fixture = WorkspaceFixture::new();
+    let intent = fixture.seed_started_intent("worktree.create", IdempotencyClass::Queryable);
+    fixture.create_git_worktree(&intent);
+    fixture.mark_intent_indeterminate();
+    let bootstrap = fixture.start();
+    let runtime = bootstrap.workspace_runtime().expect("runtime");
+    let dashboard = runtime
+        .get_workspace_dashboard(WorkspaceDashboardRequestDto {
+            project_id: PROJECT_ID.to_owned(),
+        })
+        .expect("dashboard");
+    let candidate = dashboard.tasks[0].recovery_candidates[0].clone();
+    assert_eq!(candidate.reason, RecoveryReason::ExactMatch);
+    assert!(candidate
+        .actions
+        .contains(&RecoveryAction::DiscardExactWorktree));
+
+    let gateway = GitRepositoryGateway::open(
+        &fixture.workspace_root,
+        &[fixture.app_data.join("artifacts")],
+    )
+    .expect("gateway");
+    gateway
+        .discard_worktree(DiscardWorktree {
+            repository: fixture.locator.clone(),
+            managed_path: ManagedWorktreePath {
+                trusted_root_id: gateway.trusted_root_id().to_owned(),
+                relative_leaf: PathBuf::from(WORKTREE_ID),
+                redacted_display: intent.target_path_display.clone(),
+            },
+            task_id: intent.operation.task_id.clone(),
+            lease_claim: LeaseClaim::new(
+                intent.operation.task_id.clone(),
+                RunId::new("replace-original-worktree").expect("run id"),
+                FencingToken::new(1).expect("token"),
+            ),
+            expected_workspace_version: WorkspaceVersion::new(0),
+            worktree_id: intent.worktree_id.clone(),
+            branch: intent.branch.clone(),
+            base_commit: intent.base_commit.clone(),
+        })
+        .expect("remove original worktree");
+
+    let replacement_source = fixture.root.path().join("replacement-source");
+    let replacement = Repository::clone(
+        fixture.source.to_str().expect("source path"),
+        &replacement_source,
+    )
+    .expect("clone replacement");
+    replacement
+        .config()
+        .expect("replacement config")
+        .set_bool("core.autocrlf", false)
+        .expect("disable checkout conversion");
+    replacement.remote_delete("origin").expect("remove remote");
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.force();
+    replacement
+        .checkout_head(Some(&mut checkout))
+        .expect("refresh replacement checkout");
+    drop(replacement);
+    let replacement_locator = gateway
+        .locate(&replacement_source)
+        .expect("replacement locator");
+    assert_ne!(
+        replacement_locator.repository_id,
+        fixture.locator.repository_id
+    );
+    gateway
+        .create_worktree(CreateWorktree {
+            repository: replacement_locator.clone(),
+            managed_path: ManagedWorktreePath {
+                trusted_root_id: gateway.trusted_root_id().to_owned(),
+                relative_leaf: PathBuf::from(WORKTREE_ID),
+                redacted_display: intent.target_path_display.clone(),
+            },
+            task_id: intent.operation.task_id.clone(),
+            lease_claim: LeaseClaim::new(
+                intent.operation.task_id.clone(),
+                RunId::new("replacement-worktree").expect("run id"),
+                FencingToken::new(1).expect("token"),
+            ),
+            expected_workspace_version: WorkspaceVersion::new(0),
+            worktree_id: intent.worktree_id.clone(),
+            branch: intent.branch.clone(),
+            base_commit: intent.base_commit.clone(),
+        })
+        .expect("replacement worktree");
+    let replacement_marker = fixture.workspace_root.join(WORKTREE_ID).join("REPLACEMENT");
+    fs::write(&replacement_marker, b"preserve replacement").expect("replacement marker");
+    Connection::open(&fixture.database_path)
+        .expect("database")
+        .execute(
+            "UPDATE projects SET repository_path = ?1 WHERE id = ?2",
+            rusqlite::params![
+                replacement_locator
+                    .canonical_workdir
+                    .to_string_lossy()
+                    .into_owned(),
+                PROJECT_ID
+            ],
+        )
+        .expect("replace repository locator");
+
+    let error = runtime
+        .discard_workspace(ConfirmDiscardWorkspaceRequestDto {
+            candidate_id: candidate.intent_id.expect("candidate id"),
+            project_id: PROJECT_ID.to_owned(),
+            task_id: TASK_ID.to_owned(),
+            expected_workspace_version: dashboard.tasks[0].workspace_version.get(),
+            confirmed: true,
+        })
+        .expect_err("replacement repository must not be discarded");
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(fixture.intent_status(), "indeterminate");
+    assert_eq!(
+        fs::read(&replacement_marker).expect("replacement marker"),
+        b"preserve replacement"
+    );
+    let replacement = Repository::open(&replacement_source).expect("replacement repository");
+    assert!(replacement.find_worktree(WORKTREE_ID).is_ok());
+    assert_eq!(
+        replacement
+            .find_reference(&format!("refs/heads/{WORKTREE_BRANCH}"))
+            .expect("replacement branch")
+            .target()
+            .expect("replacement target")
+            .to_string(),
+        intent.base_commit.as_str()
+    );
+    assert_eq!(
+        Connection::open(&fixture.database_path)
+            .expect("database")
+            .query_row(
+                "SELECT COUNT(*) FROM operation_intents
+                 WHERE operation_kind = 'workspace.recovery.discard'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("discard recovery count"),
+        0
+    );
+    assert!(runtime
+        .get_workspace_dashboard(WorkspaceDashboardRequestDto {
+            project_id: PROJECT_ID.to_owned(),
+        })
+        .expect("preserved dashboard")
+        .tasks[0]
+        .recovery_candidates
+        .iter()
+        .any(|candidate| {
+            candidate.intent_id.as_deref() == Some("intent-worktree-1")
+                && candidate
+                    .actions
+                    .contains(&RecoveryAction::DiscardExactWorktree)
+        }));
 }
 
 #[test]

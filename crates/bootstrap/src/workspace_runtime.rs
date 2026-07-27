@@ -10,9 +10,9 @@ use local_agent_terminal_application::{
     OnboardRepository, OnboardRepositoryRequestDto, OperationIntent, OperationIntentStatus,
     PortError, ProjectSettings, ProjectSnapshot, RecoveryAction, RecoveryCandidate,
     RecoveryCandidateRequestDto, RecoveryOperationIntent, RecoveryProject, RecoveryReason,
-    RepositoryGateway, RepositoryHealth, RepositoryInspectionRecord, RevokeLease, RiskLevel, RunId,
-    SafeErrorClassification, TaskBranch, TaskQuery, TaskSnapshot, TimelineEntryDto,
-    WorkspaceDashboardDto, WorkspaceDashboardRequestDto, WorkspaceRecoveryStore,
+    RepositoryGateway, RepositoryHealth, RepositoryInspectionRecord, RepositoryLocator,
+    RevokeLease, RiskLevel, RunId, SafeErrorClassification, TaskBranch, TaskQuery, TaskSnapshot,
+    TimelineEntryDto, WorkspaceDashboardDto, WorkspaceDashboardRequestDto, WorkspaceRecoveryStore,
     WorkspaceStateStore, WorkspaceWriteCoordinator, WorktreeId, WorktreeIntent,
     WorktreeObservation, WorktreeSnapshot, WorktreeState,
 };
@@ -555,16 +555,7 @@ impl WorkspaceRuntime {
         }
         let observed_at = self.database.now_utc()?;
         let project = self.recovery_project(&project_id)?;
-        let locator = self
-            .repositories
-            .locate_persisted(Path::new(&project.repository_path))?;
-        if locator.repository_id != expected.repository_id
-            || locator.stable_identity != expected.repository_identity
-            || locator.repository_id != project.repository.repository_id
-            || locator.stable_identity != project.repository.stable_identity
-        {
-            return Err(conflict());
-        }
+        let locator = locate_expected_repository(&self.repositories, &project, &expected)?;
         let claim = self.lease_claim_for_task(&project_id, &task, &observed_at)?;
         let result = (|| {
             let recovery = self.begin_recovery_operation(
@@ -743,9 +734,7 @@ impl WorkspaceRuntime {
         let expected = candidate.expected_worktree.ok_or_else(invalid_input)?;
         let observed_at = self.database.now_utc()?;
         let project = self.recovery_project(&project_id)?;
-        let locator = self
-            .repositories
-            .locate_persisted(Path::new(&project.repository_path))?;
+        let locator = locate_expected_repository(&self.repositories, &project, &expected)?;
         let claim = self.lease_claim_for_task(&project_id, &task, &observed_at)?;
         let result = (|| {
             let recovery_operation = self.begin_recovery_operation(
@@ -1251,16 +1240,7 @@ fn observe_expected_worktree(
     projects
         .get(expected.repository_id.as_str())
         .and_then(|project| {
-            let locator = repositories
-                .locate_persisted(Path::new(&project.repository_path))
-                .ok()?;
-            if locator.repository_id != project.repository.repository_id
-                || locator.stable_identity != project.repository.stable_identity
-            {
-                return Some(WorktreeObservation::Conflict(
-                    RecoveryReason::RepositoryMismatch,
-                ));
-            }
+            let locator = locate_expected_repository(repositories, project, expected).ok()?;
             scanned.insert(locator.repository_id.as_str().to_owned());
             repositories
                 .inspect_worktree(InspectWorktree {
@@ -1280,6 +1260,22 @@ fn observe_expected_worktree(
         .unwrap_or(WorktreeObservation::Conflict(
             RecoveryReason::RepositoryMismatch,
         ))
+}
+
+fn locate_expected_repository(
+    repositories: &GitRepositoryGateway,
+    project: &RecoveryProject,
+    expected: &WorktreeIntent,
+) -> Result<RepositoryLocator, PortError> {
+    let locator = repositories.locate_persisted(Path::new(&project.repository_path))?;
+    if locator.repository_id != expected.repository_id
+        || locator.stable_identity != expected.repository_identity
+        || locator.repository_id != project.repository.repository_id
+        || locator.stable_identity != project.repository.stable_identity
+    {
+        return Err(conflict());
+    }
+    Ok(locator)
 }
 
 fn repository_evidence(
