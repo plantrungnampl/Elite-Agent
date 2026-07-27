@@ -80,6 +80,28 @@ test("architecture checker rejects process and Windows APIs outside platform-win
   }
 });
 
+test("architecture checker scans production code after an inline test module", () => {
+  withM2Source({
+    "crates/domain/src/lib.rs": "#[cfg(test)]\nmod tests {\n    fn helper() { assert!(true); }\n}\nuse std::process::Command;\n",
+  }, (directory) => {
+    assert.throws(
+      () => run("scripts/check-architecture.mjs", "--m2-source-fixture", directory),
+      /process construction is allowed only in platform-windows/,
+    );
+  });
+});
+
+test("architecture checker ignores process construction inside an inline test module", () => {
+  withM2Source({
+    "crates/domain/src/lib.rs": "#[cfg(test)]\nmod tests {\n    fn helper() { let _command = std::process::Command::new(\"cmd.exe\"); }\n}\n",
+  }, (directory) => {
+    assert.match(
+      run("scripts/check-architecture.mjs", "--m2-source-fixture", directory),
+      /architecture contracts: ok/,
+    );
+  });
+});
+
 test("architecture checker allows platform-windows process and Windows APIs", () => {
   withM2Source({
     "crates/platform-windows/src/lib.rs": "use std::process::Command;\nuse windows_sys::Win32::System::Threading::CreateJobObjectW;\n",
@@ -105,6 +127,17 @@ test("architecture checker reserves concrete M2 adapter construction for bootstr
 test("architecture checker rejects Tauri construction of concrete M2 adapters", () => {
   withM2Source({
     "apps/desktop/src-tauri/src/lib.rs": "let _runtime = ToolRuntime::new();\n",
+  }, (directory) => {
+    assert.throws(
+      () => run("scripts/check-architecture.mjs", "--m2-source-fixture", directory),
+      /concrete M2 adapters must be constructed only in bootstrap/,
+    );
+  });
+});
+
+test("architecture checker scans Tauri construction after an inline test module", () => {
+  withM2Source({
+    "apps/desktop/src-tauri/src/lib.rs": "#[cfg(test)]\nmod tests {\n    fn helper() { assert!(true); }\n}\nlet _runtime = ToolRuntime::new();\n",
   }, (directory) => {
     assert.throws(
       () => run("scripts/check-architecture.mjs", "--m2-source-fixture", directory),

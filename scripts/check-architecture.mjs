@@ -240,7 +240,7 @@ function verifyM2Sources(sourceRoot) {
   for (const directory of productionRoots) {
     if (directory === join(crates, "platform-windows", "src") || directory === join(crates, "repository-git", "src")) continue;
     for (const path of filesUnderIfExists(directory).filter((path) => path.endsWith(".rs"))) {
-      const source = readFileSync(path, "utf8").replace(/#\[cfg\(test\)\]\s*mod\s+\w+\s*\{[\s\S]*$/u, "");
+      const source = withoutInlineTestModules(readFileSync(path, "utf8"));
       if (
         /\bstd::process::(?:Command|Stdio|Child)\b|\b(?:Command|Stdio)::(?:new|piped|inherit|null)\b|\b(?:powershell|pwsh|cmd\.exe)\b/i.test(
           source,
@@ -328,4 +328,58 @@ function filesUnder(directory) {
 
 function filesUnderIfExists(directory) {
   return existsSync(directory) ? filesUnder(directory) : [];
+}
+
+function withoutInlineTestModules(source) {
+  const testModule = /#\[cfg\(test\)\]\s*mod\s+\w+\s*\{/g;
+  let output = "";
+  let start = 0;
+  for (const match of source.matchAll(testModule)) {
+    const openingBrace = match.index + match[0].lastIndexOf("{");
+    const closingBrace = matchingBrace(source, openingBrace);
+    if (closingBrace === -1) return source;
+    output += source.slice(start, match.index);
+    start = closingBrace + 1;
+  }
+  return output + source.slice(start);
+}
+
+function matchingBrace(source, openingBrace) {
+  let depth = 0;
+  for (let index = openingBrace; index < source.length; index += 1) {
+    if (source.startsWith("//", index)) {
+      index = source.indexOf("\n", index);
+      if (index === -1) return -1;
+      continue;
+    }
+    if (source.startsWith("/*", index)) {
+      index = source.indexOf("*/", index + 2);
+      if (index === -1) return -1;
+      index += 1;
+      continue;
+    }
+    if (
+      source[index] === '"'
+      || (
+        source[index] === "'"
+        && (
+          source[index - 1] === "b"
+          || source[index + 1] === "\\"
+          || source[index + 2] === "'"
+          || !/[A-Za-z_]/.test(source[index + 1] ?? "")
+        )
+      )
+    ) {
+      const quote = source[index];
+      do {
+        index += 1;
+        if (source[index] === "\\") index += 1;
+      } while (index < source.length && source[index] !== quote);
+      if (index === source.length) return -1;
+      continue;
+    }
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}" && --depth === 0) return index;
+  }
+  return -1;
 }
