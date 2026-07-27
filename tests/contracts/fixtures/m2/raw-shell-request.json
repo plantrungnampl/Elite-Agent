@@ -1,0 +1,7 @@
+{
+  "tool": "shell.raw",
+  "shell": "powershell.exe",
+  "script": "Get-ChildItem",
+  "cwd": "worktree:task-1",
+  "executorFencingToken": 19
+}

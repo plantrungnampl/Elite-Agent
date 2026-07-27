@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -23,6 +23,7 @@ try {
   verifyRepositoryAdapter(
     option("--repository-fixture") ?? join(root, "crates", "repository-git", "src"),
   );
+  verifyM2Sources(option("--m2-source-fixture") ?? root);
   console.log("architecture contracts: ok");
 } catch (error) {
   console.error(`architecture contracts: ${error.message}`);
@@ -43,6 +44,12 @@ function verifyCargo(metadata) {
   const domain = "local-agent-terminal-domain";
   const application = "local-agent-terminal-application";
   const repositoryGit = "local-agent-terminal-repository-git";
+  const m2Adapters = new Map([
+    ["local-agent-terminal-policy-engine", new Set([application, domain])],
+    ["local-agent-terminal-tool-runtime", new Set([application, domain])],
+    ["local-agent-terminal-platform-core", new Set([application, domain])],
+    ["local-agent-terminal-platform-windows", new Set([application, domain])],
+  ]);
   const domainAllowed = new Set(["serde", "serde_json"]);
   if (allDependencies(domain).some((dependency) => workspace.has(dependency.name))) {
     throw new Error("domain may not depend on workspace packages");
@@ -82,6 +89,7 @@ function verifyCargo(metadata) {
     [repositoryGit, new Set([application, domain])],
     ["local-agent-terminal-bootstrap", new Set([application, "local-agent-terminal-storage-sqlite", "local-agent-terminal-storage-files", repositoryGit])],
     ["local-agent-terminal-desktop", new Set(["local-agent-terminal-bootstrap"])],
+    ...m2Adapters,
   ]);
   for (const [name, targets] of allowed) {
     for (const dependency of dependencies(name)) {
@@ -89,6 +97,20 @@ function verifyCargo(metadata) {
         throw new Error(`${name} has an outward internal dependency on ${dependency.name}`);
       }
     }
+  }
+  for (const [name] of m2Adapters) {
+    if (
+      dependencies(name).some((dependency) => /^(?:tauri|react)(?:-|$)/.test(dependency.name))
+    ) {
+      throw new Error(`${name} may not depend on Tauri or React`);
+    }
+  }
+  if (
+    [...workspace].some((name) =>
+      /local-agent-terminal-(?:agent-protocol|agent-runtime|.*provider.*)/.test(name),
+    )
+  ) {
+    throw new Error("M3 protocol or provider packages are out of scope for M2");
   }
   const repositoryPackage = packages.get(repositoryGit);
   if (repositoryPackage) {
@@ -162,7 +184,8 @@ function verifyReact(appRoot) {
 }
 
 function verifyTauriCommands(sourceRoot) {
-  const forbidden = new Set(["shell", "git", "filesystem", "exec", "run_command"]);
+  if (!existsSync(sourceRoot)) return;
+  const forbidden = new Set(["shell", "git", "filesystem", "exec", "run_command", "commit", "finalize"]);
   const command =
     /#\s*\[\s*tauri::command(?:\([^)]*\))?\s*\]\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)/g;
   for (const path of filesUnder(sourceRoot).filter((path) => path.endsWith(".rs"))) {
@@ -173,6 +196,67 @@ function verifyTauriCommands(sourceRoot) {
       }
     }
   }
+}
+
+function verifyM2Sources(sourceRoot) {
+  const crates = join(sourceRoot, "crates");
+  if (existsSync(crates)) {
+    for (const entry of readdirSync(crates, { withFileTypes: true })) {
+      if (
+        entry.isDirectory()
+        && /^(?:agent-protocol|agent-runtime|.*provider.*)$/.test(entry.name)
+      ) {
+        throw new Error("M3 protocol or provider packages are out of scope for M2");
+      }
+    }
+  }
+
+  const toolRuntime = join(crates, "tool-runtime", "src");
+  const toolRuntimeFiles = filesUnderIfExists(toolRuntime).filter((path) => path.endsWith(".rs"));
+  if (toolRuntimeFiles.length > 0) {
+    const source = toolRuntimeFiles.map((path) => readFileSync(path, "utf8")).join("\n");
+    if (
+      /\bstd::process\b|\bCommand\b|\b(?:powershell|pwsh|cmd\.exe|shell\.raw)\b|\b(?:std::)?env::(?:var|var_os|vars|vars_os)\b|\bPATH\b|\bwindows(?:_sys)?::Win32::(?:System::Threading|Security|Storage::FileSystem)\b|\blocal_agent_terminal_repository_git\b/.test(
+        source,
+      )
+    ) {
+      throw new Error("tool-runtime may not construct or discover processes");
+    }
+    for (const port of ["ProcessLauncher", "CapabilityFilesystem", "StructuredGit"]) {
+      if (!source.includes(port)) {
+        throw new Error(`tool-runtime must receive the ${port} application port`);
+      }
+    }
+  }
+
+  for (const crate of ["policy-engine", "tool-runtime", "platform-core"]) {
+    for (const path of filesUnderIfExists(join(crates, crate, "src")).filter((path) => path.endsWith(".rs"))) {
+      const source = readFileSync(path, "utf8");
+      if (
+        /\b(?:windows_sys|windows)::Win32::(?:System::Threading|Security|Storage::FileSystem)\b|\b(?:CreateJobObject|OpenProcessToken|JobObject)\b|\bstd::os::windows::fs\b/.test(
+          source,
+        )
+      ) {
+        throw new Error("Windows process and filesystem APIs are allowed only in platform-windows");
+      }
+    }
+  }
+
+  for (const crate of ["domain", "application", "policy-engine", "tool-runtime", "platform-core", "platform-windows"]) {
+    for (const path of filesUnderIfExists(join(crates, crate, "src")).filter((path) => path.endsWith(".rs"))) {
+      if (/\b(?:PolicyEngine|ToolRuntime|PlatformCore|PlatformWindows)\s*::\s*(?:new|default|build)\s*\(/.test(readFileSync(path, "utf8"))) {
+        throw new Error("concrete M2 adapters must be constructed only in bootstrap");
+      }
+    }
+  }
+
+  const frontend = join(sourceRoot, "apps", "desktop", "src");
+  for (const path of filesUnderIfExists(frontend).filter((path) => /\.[tj]sx?$/.test(path))) {
+    if (/\b(?:raw|absolute|os|filesystem)Path\s*[:?]\s*string\b/.test(readFileSync(path, "utf8"))) {
+      throw new Error("raw path-bearing frontend DTOs are forbidden");
+    }
+  }
+  verifyTauriCommands(join(sourceRoot, "apps", "desktop", "src-tauri", "src"));
 }
 
 function verifyAdapterConstruction() {
@@ -226,4 +310,8 @@ function filesUnder(directory) {
     const path = join(directory, entry.name);
     return entry.isDirectory() ? filesUnder(path) : [path];
   });
+}
+
+function filesUnderIfExists(directory) {
+  return existsSync(directory) ? filesUnder(directory) : [];
 }

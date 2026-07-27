@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 const run = (...args) =>
@@ -66,6 +69,21 @@ test("architecture checker rejects a generic Tauri execution command", () => {
       ),
     /generic Tauri command is forbidden: run_command/,
   );
+});
+
+test("architecture checker rejects M5 commit commands before M5 exists", () => {
+  const directory = mkdtempSync(join(tmpdir(), "m2-commit-command-"));
+  try {
+    const source = join(directory, "apps", "desktop", "src-tauri", "src", "lib.rs");
+    mkdirSync(dirname(source), { recursive: true });
+    writeFileSync(source, "#[tauri::command]\nfn commit() {}\n", "utf8");
+    assert.throws(
+      () => run("scripts/check-architecture.mjs", "--m2-source-fixture", directory),
+      /generic Tauri command is forbidden: commit/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("architecture checker rejects grouped and aliased process imports", () => {

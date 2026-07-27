@@ -1,0 +1,20 @@
+{
+  "packages": [
+    { "name": "local-agent-terminal-domain", "dependencies": [] },
+    {
+      "name": "local-agent-terminal-application",
+      "dependencies": [{ "name": "local-agent-terminal-domain" }]
+    },
+    {
+      "name": "local-agent-terminal-policy-engine",
+      "dependencies": [{ "name": "local-agent-terminal-platform-windows" }]
+    },
+    { "name": "local-agent-terminal-platform-windows", "dependencies": [] }
+  ],
+  "workspace_members": [
+    "local-agent-terminal-domain",
+    "local-agent-terminal-application",
+    "local-agent-terminal-policy-engine",
+    "local-agent-terminal-platform-windows"
+  ]
+}

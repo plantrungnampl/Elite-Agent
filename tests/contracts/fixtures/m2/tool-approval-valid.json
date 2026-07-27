@@ -1,0 +1,22 @@
+{
+  "schema": "approval-digest.v1",
+  "approvalType": "tool",
+  "taskId": "task-1",
+  "operation": {
+    "runId": "run-1",
+    "planStepId": "step-1",
+    "tool": "process.exec",
+    "executableDigest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "argumentsDigest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "cwdCapability": "worktree:task-1",
+    "environmentProfileDigest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "networkProfile": "denied",
+    "expectedWrites": ["target/**"],
+    "executorFencingToken": 19
+  },
+  "policySnapshotDigest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "workspaceVersion": 4,
+  "requestedAt": "2026-07-23T12:00:00Z",
+  "expiresAt": "2026-07-23T12:15:00Z",
+  "nonce": "0123456789abcdef0123456789abcdef"
+}
