@@ -91,6 +91,31 @@ test("architecture checker scans production code after an inline test module", (
   });
 });
 
+test("architecture checker ignores fake test-module markers in comments and raw strings", () => {
+  for (const source of [
+    "fn f() { // #[cfg(test)] mod fake {\n    use std::process::Command;\n}\n",
+    "fn f() { let _fake = r#\"#[cfg(test)] mod fake {\"#; use std::process::Command; }\n",
+  ]) {
+    withM2Source({ "crates/domain/src/lib.rs": source }, (directory) => {
+      assert.throws(
+        () => run("scripts/check-architecture.mjs", "--m2-source-fixture", directory),
+        /process construction is allowed only in platform-windows/,
+      );
+    });
+  }
+});
+
+test("architecture checker balances raw strings and nested comments in inline test modules", () => {
+  withM2Source({
+    "crates/domain/src/lib.rs": "#[cfg(test)]\nmod tests {\n    /* outer /* nested */ comment */\n    fn helper() { let _ignored = std::process::Command::new(\"cmd.exe\"); let _quote = r#\"embedded \\\" quote\"#; }\n}\nlet _later = r#\"}\"#;\nuse std::process::Command;\n",
+  }, (directory) => {
+    assert.throws(
+      () => run("scripts/check-architecture.mjs", "--m2-source-fixture", directory),
+      /process construction is allowed only in platform-windows/,
+    );
+  });
+});
+
 test("architecture checker ignores process construction inside an inline test module", () => {
   withM2Source({
     "crates/domain/src/lib.rs": "#[cfg(test)]\nmod tests {\n    fn helper() { let _command = std::process::Command::new(\"cmd.exe\"); }\n}\n",

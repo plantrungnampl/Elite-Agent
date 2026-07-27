@@ -331,12 +331,13 @@ function filesUnderIfExists(directory) {
 }
 
 function withoutInlineTestModules(source) {
+  const mask = rustCodeMask(source);
   const testModule = /#\[cfg\(test\)\]\s*mod\s+\w+\s*\{/g;
   let output = "";
   let start = 0;
-  for (const match of source.matchAll(testModule)) {
+  for (const match of mask.matchAll(testModule)) {
     const openingBrace = match.index + match[0].lastIndexOf("{");
-    const closingBrace = matchingBrace(source, openingBrace);
+    const closingBrace = matchingBrace(mask, openingBrace);
     if (closingBrace === -1) return source;
     output += source.slice(start, match.index);
     start = closingBrace + 1;
@@ -347,39 +348,75 @@ function withoutInlineTestModules(source) {
 function matchingBrace(source, openingBrace) {
   let depth = 0;
   for (let index = openingBrace; index < source.length; index += 1) {
-    if (source.startsWith("//", index)) {
-      index = source.indexOf("\n", index);
-      if (index === -1) return -1;
-      continue;
-    }
-    if (source.startsWith("/*", index)) {
-      index = source.indexOf("*/", index + 2);
-      if (index === -1) return -1;
-      index += 1;
-      continue;
-    }
-    if (
-      source[index] === '"'
-      || (
-        source[index] === "'"
-        && (
-          source[index - 1] === "b"
-          || source[index + 1] === "\\"
-          || source[index + 2] === "'"
-          || !/[A-Za-z_]/.test(source[index + 1] ?? "")
-        )
-      )
-    ) {
-      const quote = source[index];
-      do {
-        index += 1;
-        if (source[index] === "\\") index += 1;
-      } while (index < source.length && source[index] !== quote);
-      if (index === source.length) return -1;
-      continue;
-    }
     if (source[index] === "{") depth += 1;
     if (source[index] === "}" && --depth === 0) return index;
   }
   return -1;
+}
+
+function rustCodeMask(source) {
+  const mask = source.split("");
+  for (let index = 0; index < source.length; index += 1) {
+    if (source.startsWith("//", index)) {
+      const end = source.indexOf("\n", index);
+      maskRange(mask, index, end === -1 ? source.length : end);
+      index = end === -1 ? source.length : end;
+      continue;
+    }
+    if (source.startsWith("/*", index)) {
+      let depth = 1;
+      let end = index + 2;
+      for (; end < source.length && depth > 0; end += 1) {
+        if (source.startsWith("/*", end)) {
+          depth += 1;
+          end += 1;
+        } else if (source.startsWith("*/", end)) {
+          depth -= 1;
+          end += 1;
+        }
+      }
+      if (depth === 0) {
+        maskRange(mask, index, end);
+        index = end - 1;
+      }
+      continue;
+    }
+    const raw = source.slice(index).match(/^(?:b)?r(#+)?"/);
+    if (raw && !/[A-Za-z0-9_]/.test(source[index - 1] ?? "")) {
+      const terminator = `"${raw[1] ?? ""}`;
+      const end = source.indexOf(terminator, index + raw[0].length);
+      if (end !== -1) {
+        maskRange(mask, index, end + terminator.length);
+        index = end + terminator.length - 1;
+      }
+      continue;
+    }
+    if (source[index] === '"' || isRustCharLiteral(source, index)) {
+      const quote = source[index];
+      let end = index + 1;
+      for (; end < source.length && source[end] !== quote; end += 1) {
+        if (source[end] === "\\") end += 1;
+      }
+      if (end < source.length) {
+        maskRange(mask, index, end + 1);
+        index = end;
+      }
+    }
+  }
+  return mask.join("");
+}
+
+function isRustCharLiteral(source, index) {
+  return source[index] === "'" && (
+    source[index - 1] === "b"
+    || source[index + 1] === "\\"
+    || source[index + 2] === "'"
+    || !/[A-Za-z_]/.test(source[index + 1] ?? "")
+  );
+}
+
+function maskRange(mask, start, end) {
+  for (let index = start; index < end; index += 1) {
+    if (mask[index] !== "\n" && mask[index] !== "\r") mask[index] = " ";
+  }
 }
