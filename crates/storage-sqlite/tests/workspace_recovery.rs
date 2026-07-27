@@ -277,6 +277,58 @@ fn project_onboarding_persists_identity_health_and_canonical_evidence() {
 }
 
 #[test]
+fn legacy_v1_project_created_payload_is_queryable_and_exactly_retryable() {
+    let database = TempDatabase::new();
+    let store = SqliteStore::open(&database.path).unwrap();
+    let connection = Connection::open(&database.path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO projects (
+                id, name, repository_path, repository_identity, created_at, updated_at,
+                policy_profile_id, artifact_root_mode, artifact_root_path
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8)",
+            params![
+                "project-1",
+                "Local Agent Terminal",
+                "D:/source/project",
+                "repository-identity-1",
+                "2026-07-26T00:00:00Z",
+                "default",
+                "application_data",
+                "D:/application-data/artifacts",
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO events (
+                event_id, stream_id, sequence, event_type, schema_version, actor_type,
+                actor_id, observation_class, payload_json, metadata_json, causation_id,
+                correlation_id, created_at
+             ) VALUES (
+                'project.created:project-1', 'project:project-1', 1, 'project.created', 1,
+                'core', 'workspace-coordinator', 'core_observed', ?1, '{}', NULL,
+                'project:create:project-1', '2026-07-26T00:00:00Z'
+             )",
+            [serde_json::json!({
+                "projectId": "project-1",
+                "repositoryId": "repository-1",
+                "repositoryIdentity": "repository-identity-1",
+            })
+            .to_string()],
+        )
+        .unwrap();
+
+    let pending = store.recovery_projects().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].project_id.as_str(), "project-1");
+    assert_eq!(pending[0].repository_path, "D:/source/project");
+
+    let retried = store.create_project(new_project()).unwrap();
+    assert_eq!(retried.repository, repository_snapshot());
+}
+
+#[test]
 fn pending_onboarding_is_queryable_and_exact_project_retry_is_idempotent() {
     let database = TempDatabase::new();
     let store = SqliteStore::open(&database.path).unwrap();
@@ -288,7 +340,12 @@ fn pending_onboarding_is_queryable_and_exact_project_retry_is_idempotent() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].project_id, request.project_id);
     assert_eq!(pending[0].repository_path, request.repository_path);
-    assert_eq!(pending[0].repository, request.repository);
+    assert_eq!(pending[0].repository_id, request.repository.repository_id);
+    assert_eq!(
+        pending[0].repository_identity,
+        request.repository.stable_identity
+    );
+    assert!(pending[0].repository.is_none());
     assert_eq!(store.create_project(request.clone()).unwrap(), first);
 
     let mut conflicting = request;
@@ -302,25 +359,25 @@ fn pending_onboarding_is_queryable_and_exact_project_retry_is_idempotent() {
     );
 
     let connection = Connection::open(&database.path).unwrap();
-    let (count, payload): (i64, String) = connection
+    let (count, schema_version, payload): (i64, i64, String) = connection
         .query_row(
-            "SELECT COUNT(*), payload_json FROM events
+            "SELECT COUNT(*), schema_version, payload_json FROM events
              WHERE stream_id = 'project:project-1' AND event_type = 'project.created'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
     let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(count, 1);
-    assert_eq!(payload["onboardingStatus"], "pending");
-    assert_eq!(payload["projectId"], "project-1");
-    assert_eq!(payload["name"], "Local Agent Terminal");
-    assert_eq!(payload["repositoryPath"], "D:/source/project");
+    assert_eq!(schema_version, 1);
     assert_eq!(
-        payload["repository"]["stableIdentity"],
-        "repository-identity-1"
+        payload,
+        serde_json::json!({
+            "projectId": "project-1",
+            "repositoryId": "repository-1",
+            "repositoryIdentity": "repository-identity-1",
+        })
     );
-    assert_eq!(payload["settings"]["policyProfileId"], "default");
 }
 
 #[test]

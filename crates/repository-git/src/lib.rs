@@ -46,6 +46,7 @@ pub struct TestHooks {
     pub during_checkout: Option<Arc<Barrier>>,
     pub after_cleanup_ownership_check: Option<Arc<Barrier>>,
     pub after_discard_validation: Option<Arc<Barrier>>,
+    pub after_discard_rename: Option<Arc<Barrier>>,
     pub fail_at: Option<PostAddStage>,
 }
 

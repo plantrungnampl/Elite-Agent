@@ -1,7 +1,6 @@
 use std::ffi::OsStr;
-#[cfg(windows)]
-use std::fs::OpenOptions;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use git2::{Config, ErrorCode, Repository, RepositoryOpenFlags};
@@ -232,6 +231,33 @@ impl DirectoryGuard {
         Self::from_handle(path, handle).map_err(|_| conflict())
     }
 
+    pub(crate) fn write_child(&self, path: &Path, bytes: &[u8]) -> Result<(), PortError> {
+        let leaf = child_leaf(self, path)?;
+        #[cfg(windows)]
+        let mut handle =
+            crate::unsafe_checkout::windows_directory::create_file(&self.handle, leaf)?;
+        #[cfg(not(windows))]
+        let mut handle = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    conflict()
+                } else {
+                    permission()
+                }
+            })?;
+        #[cfg(windows)]
+        let identity = crate::unsafe_checkout::windows_directory::identity(&handle)?;
+        #[cfg(windows)]
+        crate::unsafe_checkout::windows_directory::verify(&handle, path, identity)?;
+        handle.write_all(bytes).map_err(|_| permission())?;
+        #[cfg(windows)]
+        crate::unsafe_checkout::windows_directory::verify(&handle, path, identity)?;
+        Ok(())
+    }
+
     fn from_handle(path: &Path, handle: File) -> Result<Self, PortError> {
         let canonical = canonical_directory(path)?;
         let guard = Self {
@@ -269,6 +295,14 @@ impl DirectoryGuard {
         #[cfg(not(windows))]
         self.verify()?;
         Ok(self.path.clone())
+    }
+
+    pub(crate) fn remove_tree(&self) -> Result<(), PortError> {
+        #[cfg(windows)]
+        crate::unsafe_checkout::windows_directory::remove_tree(&self.handle)?;
+        #[cfg(not(windows))]
+        fs::remove_dir_all(&self.path).map_err(|_| conflict())?;
+        Ok(())
     }
 }
 
@@ -424,7 +458,7 @@ fn validate_external_path(path: &Path) -> Result<(), PortError> {
     Ok(())
 }
 
-fn valid_component(value: &str) -> bool {
+pub(crate) fn valid_component(value: &str) -> bool {
     if value.is_empty()
         || value.ends_with(['.', ' '])
         || value

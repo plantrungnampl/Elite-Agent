@@ -338,7 +338,9 @@ pub struct RecoveryCandidate {
 pub struct RecoveryProject {
     pub project_id: ProjectId,
     pub repository_path: String,
-    pub repository: RepositorySnapshot,
+    pub repository_id: RepositoryId,
+    pub repository_identity: String,
+    pub repository: Option<RepositorySnapshot>,
     pub repository_evidence_artifact_id: Option<ArtifactId>,
 }
 

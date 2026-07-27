@@ -2,10 +2,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use git2::build::CheckoutBuilder;
 #[cfg(test)]
 use git2::WorktreeAddOptions;
-use git2::{Reference, Repository, Worktree};
+use git2::{Reference, Repository, Tree, Worktree};
 use local_agent_terminal_application::PortError;
 
 use crate::paths;
@@ -39,7 +38,7 @@ pub(crate) fn add(
     let common = pretty_directory(repository.commondir())?;
 
     write_new(&metadata.join("locked"), b"")?;
-    write_new(
+    target_guard.write_child(
         &path.join(".git"),
         format!("gitdir: {}\n", display_directory(&metadata)?).as_bytes(),
     )?;
@@ -56,19 +55,14 @@ pub(crate) fn add(
         format!("ref: {reference_name}\n").as_bytes(),
     )?;
 
-    let target_repository = paths::open_repository(path)?;
-    let config =
-        git2::Config::open(&repository.path().join("config")).map_err(|_| paths::unavailable())?;
-    target_repository
-        .set_config(&config)
-        .map_err(|_| paths::unavailable())?;
-    let mut checkout = CheckoutBuilder::new();
-    checkout.disable_filters(true);
-    #[cfg(feature = "test-seams")]
-    install_checkout_barrier(&mut checkout, gateway);
-    target_repository
-        .checkout_head(Some(&mut checkout))
+    let tree = reference.peel_to_tree().map_err(paths::map_git_error)?;
+    let mut index = git2::Index::open_ext(&metadata.join("index"), repository.object_format())
         .map_err(paths::map_git_error)?;
+    index.read_tree(&tree).map_err(paths::map_git_error)?;
+    index.write().map_err(paths::map_git_error)?;
+    #[cfg(feature = "test-seams")]
+    pause_during_checkout(gateway);
+    materialize_tree(repository, &tree, &target_guard, path)?;
     target_guard.verify()?;
     let worktree = repository
         .find_worktree(name)
@@ -80,19 +74,44 @@ pub(crate) fn add(
 }
 
 #[cfg(feature = "test-seams")]
-fn install_checkout_barrier(checkout: &mut CheckoutBuilder<'_>, gateway: &GitRepositoryGateway) {
-    let Some(barrier) = &gateway.test_hooks.during_checkout else {
-        return;
-    };
-    let barrier = barrier.clone();
-    let mut waiting = true;
-    checkout.progress(move |path, completed, _total| {
-        if waiting && path.is_none() && completed == 0 {
-            waiting = false;
-            barrier.wait();
-            barrier.wait();
+fn pause_during_checkout(gateway: &GitRepositoryGateway) {
+    if let Some(barrier) = &gateway.test_hooks.during_checkout {
+        barrier.wait();
+        barrier.wait();
+    }
+}
+
+fn materialize_tree(
+    repository: &Repository,
+    tree: &Tree<'_>,
+    parent_guard: &paths::DirectoryGuard,
+    parent_path: &Path,
+) -> Result<(), PortError> {
+    for entry in tree {
+        let name = entry.name().map_err(|_| paths::unavailable())?;
+        if !paths::valid_component(name) || name.eq_ignore_ascii_case(".git") {
+            return Err(paths::unavailable());
         }
-    });
+        let path = parent_path.join(name);
+        match entry.filemode() {
+            0o040000 => {
+                let child_tree = repository
+                    .find_tree(entry.id())
+                    .map_err(paths::map_git_error)?;
+                let child_guard = paths::DirectoryGuard::create_child(parent_guard, &path)?;
+                materialize_tree(repository, &child_tree, &child_guard, &path)?;
+                child_guard.verify()?;
+            }
+            0o100644 | 0o100755 => {
+                let blob = repository
+                    .find_blob(entry.id())
+                    .map_err(paths::map_git_error)?;
+                parent_guard.write_child(&path, blob.content())?;
+            }
+            _ => return Err(paths::unavailable()),
+        }
+    }
+    Ok(())
 }
 
 fn create_metadata_parent(path: &Path) -> Result<(), PortError> {
@@ -158,18 +177,21 @@ pub(crate) mod windows_directory {
     use local_agent_terminal_application::PortError;
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-        FILE_SYNCHRONOUS_IO_NONALERT,
+        FileDirectoryInformation, NtCreateFile, NtQueryDirectoryFile, FILE_CREATE,
+        FILE_DIRECTORY_FILE, FILE_DIRECTORY_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
     };
     use windows_sys::Win32::Foundation::{
-        HANDLE, OBJ_CASE_INSENSITIVE, STATUS_SUCCESS, UNICODE_STRING,
+        HANDLE, OBJ_CASE_INSENSITIVE, STATUS_BUFFER_OVERFLOW, STATUS_NO_MORE_FILES, STATUS_SUCCESS,
+        UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FileAttributeTagInfo, FileIdInfo, FileRenameInfo, GetFileInformationByHandleEx,
-        GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_NORMAL,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, SYNCHRONIZE,
+        FileAttributeTagInfo, FileDispositionInfo, FileIdInfo, FileRenameInfo,
+        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, SetFileInformationByHandle,
+        DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        SYNCHRONIZE,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -182,11 +204,27 @@ pub(crate) mod windows_directory {
     }
 
     pub(crate) fn create(parent: &File, leaf: &OsStr) -> Result<File, PortError> {
-        open_relative(parent, leaf, FILE_CREATE, false)
+        open_relative(parent, leaf, FILE_CREATE, false, FILE_DIRECTORY_FILE)
+    }
+
+    pub(crate) fn create_file(parent: &File, leaf: &OsStr) -> Result<File, PortError> {
+        open_relative(parent, leaf, FILE_CREATE, false, FILE_NON_DIRECTORY_FILE)
     }
 
     pub(crate) fn open_for_rename(parent: &File, leaf: &OsStr) -> Result<File, PortError> {
-        open_relative(parent, leaf, FILE_OPEN, true)
+        open_relative(parent, leaf, FILE_OPEN, true, FILE_DIRECTORY_FILE)
+    }
+
+    pub(crate) fn remove_tree(root: &File) -> Result<(), PortError> {
+        if has_reparse_tag(root)? {
+            return Err(paths::conflict());
+        }
+        // ponytail: restart-scans after each deletion (O(n²)); retain a native
+        // enumeration cursor if managed worktrees become large enough to matter.
+        while let Some(entry) = next_directory_entry(root)? {
+            remove_child(root, entry)?;
+        }
+        mark_for_deletion(root)
     }
 
     fn open_relative(
@@ -194,6 +232,7 @@ pub(crate) mod windows_directory {
         leaf: &OsStr,
         disposition: u32,
         delete_access: bool,
+        kind: u32,
     ) -> Result<File, PortError> {
         let mut name = leaf.encode_wide().collect::<Vec<_>>();
         let byte_length = name
@@ -236,7 +275,7 @@ pub(crate) mod windows_directory {
                 FILE_ATTRIBUTE_NORMAL,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 disposition,
-                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
                 ptr::null(),
                 0,
             )
@@ -297,6 +336,130 @@ pub(crate) mod windows_directory {
             return Err(paths::permission());
         }
         Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+    }
+
+    struct DirectoryEntry {
+        leaf: OsString,
+        is_directory: bool,
+    }
+
+    fn next_directory_entry(root: &File) -> Result<Option<DirectoryEntry>, PortError> {
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let mut io_status = IO_STATUS_BLOCK::default();
+        // SAFETY: `root` is an open directory handle, `io_status` and `buffer`
+        // are initialized writable storage for this synchronous call, and null
+        // callback/filter pointers request the documented default enumeration.
+        let status = unsafe {
+            NtQueryDirectoryFile(
+                root.as_raw_handle() as HANDLE,
+                ptr::null_mut(),
+                None,
+                ptr::null(),
+                &mut io_status,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                FileDirectoryInformation,
+                false,
+                ptr::null(),
+                true,
+            )
+        };
+        if status == STATUS_NO_MORE_FILES {
+            return Ok(None);
+        }
+        if status != STATUS_SUCCESS && status != STATUS_BUFFER_OVERFLOW {
+            return Err(paths::conflict());
+        }
+        let name_offset = std::mem::offset_of!(FILE_DIRECTORY_INFORMATION, FileName);
+        if io_status.Information < name_offset {
+            return Err(paths::conflict());
+        }
+        let returned = io_status.Information.min(buffer.len());
+        let mut offset = 0;
+        while offset < returned {
+            if returned - offset < name_offset {
+                return Err(paths::conflict());
+            }
+            // SAFETY: `offset` was bounded by the byte count returned for this
+            // buffer and the fixed header length was checked immediately above.
+            let entry = unsafe {
+                buffer
+                    .as_ptr()
+                    .add(offset)
+                    .cast::<FILE_DIRECTORY_INFORMATION>()
+                    .as_ref()
+            }
+            .ok_or_else(paths::conflict)?;
+            let name_bytes =
+                usize::try_from(entry.FileNameLength).map_err(|_| paths::conflict())?;
+            if name_bytes == 0
+                || name_bytes % size_of::<u16>() != 0
+                || name_bytes > returned - offset - name_offset
+            {
+                return Err(paths::conflict());
+            }
+            let name_length = name_bytes / size_of::<u16>();
+            // SAFETY: `FileNameLength` was checked against the returned byte
+            // count, so this slice stays within the directory-query buffer.
+            let name = unsafe {
+                std::slice::from_raw_parts(ptr::addr_of!(entry.FileName).cast::<u16>(), name_length)
+            };
+            let leaf = OsString::from_wide(name);
+            let leaf_text = leaf.to_str().ok_or_else(paths::conflict)?;
+            if leaf_text != "." && leaf_text != ".." {
+                if !paths::valid_component(leaf_text) {
+                    return Err(paths::conflict());
+                }
+                return Ok(Some(DirectoryEntry {
+                    leaf,
+                    is_directory: entry.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                }));
+            }
+            let next = usize::try_from(entry.NextEntryOffset).map_err(|_| paths::conflict())?;
+            if next == 0 {
+                return Ok(None);
+            }
+            if next < name_offset || next > returned - offset {
+                return Err(paths::conflict());
+            }
+            offset += next;
+        }
+        Ok(None)
+    }
+
+    fn remove_child(parent: &File, entry: DirectoryEntry) -> Result<(), PortError> {
+        let kind = if entry.is_directory {
+            FILE_DIRECTORY_FILE
+        } else {
+            FILE_NON_DIRECTORY_FILE
+        };
+        let child = open_relative(parent, &entry.leaf, FILE_OPEN, true, kind)?;
+        if has_reparse_tag(&child)? {
+            return Err(paths::conflict());
+        }
+        if entry.is_directory {
+            remove_tree(&child)
+        } else {
+            mark_for_deletion(&child)
+        }
+    }
+
+    fn mark_for_deletion(handle: &File) -> Result<(), PortError> {
+        let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: `disposition` is the exact buffer required by the API and the
+        // handle was opened with DELETE access.
+        let success = unsafe {
+            SetFileInformationByHandle(
+                handle.as_raw_handle() as HANDLE,
+                FileDispositionInfo,
+                ptr::from_mut(&mut disposition).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if success == 0 {
+            return Err(paths::conflict());
+        }
+        Ok(())
     }
 
     fn final_path(handle: &File) -> Result<PathBuf, PortError> {

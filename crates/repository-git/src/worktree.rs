@@ -365,9 +365,10 @@ pub(crate) fn discard(
     drop(target_repository);
     drop(reference);
     let tombstone_leaf = discard_tombstone(&request.worktree_id)?;
-    let tombstone = target_guard.rename_to(&parent_guard, &tombstone_leaf)?;
+    target_guard.rename_to(&parent_guard, &tombstone_leaf)?;
+    pause_after_discard_rename(gateway);
+    target_guard.remove_tree()?;
     drop(target_guard);
-    fs::remove_dir_all(&tombstone).map_err(|_| paths::conflict())?;
     worktree.unlock().map_err(paths::map_git_error)?;
     let mut prune = WorktreePruneOptions::new();
     worktree
@@ -691,6 +692,17 @@ fn pause_after_discard_validation(gateway: &GitRepositoryGateway) {
 
 #[cfg(not(feature = "test-seams"))]
 fn pause_after_discard_validation(_gateway: &GitRepositoryGateway) {}
+
+#[cfg(feature = "test-seams")]
+fn pause_after_discard_rename(gateway: &GitRepositoryGateway) {
+    if let Some(barrier) = &gateway.test_hooks.after_discard_rename {
+        barrier.wait();
+        barrier.wait();
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+fn pause_after_discard_rename(_gateway: &GitRepositoryGateway) {}
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     paths::is_within(left, right) || paths::is_within(right, left)

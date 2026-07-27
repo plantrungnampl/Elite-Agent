@@ -89,11 +89,19 @@ fn startup_resumes_onboarding_after_the_durable_intent_boundary() {
     let recovered = store.recovery_projects().expect("recovery projects");
     assert_eq!(recovered.len(), 1);
     assert_eq!(
-        recovered[0].repository.stable_identity,
+        recovered[0]
+            .repository
+            .as_ref()
+            .expect("completed recovery")
+            .stable_identity,
         fixture.project.repository.stable_identity
     );
     assert_ne!(
-        recovered[0].repository.fingerprint,
+        recovered[0]
+            .repository
+            .as_ref()
+            .expect("completed recovery")
+            .fingerprint,
         fixture.project.repository.fingerprint
     );
     assert!(recovered[0].repository_evidence_artifact_id.is_some());
@@ -122,6 +130,55 @@ fn startup_resumes_onboarding_after_the_artifact_publish_boundary() {
     );
     assert_eq!(fixture.completion_count(), 1);
     assert_eq!(fixture.inspection_artifact_count(), 1);
+}
+
+#[test]
+fn startup_preserves_and_supersedes_published_onboarding_evidence_after_status_change() {
+    let fixture = OnboardingFixture::new();
+    let bootstrap = fixture.start();
+    assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
+    fixture.install_inspection_event_failure();
+    let result = bootstrap
+        .workspace_runtime()
+        .expect("runtime")
+        .onboard_repository(OnboardRepositoryRequestDto {
+            project_id: PROJECT_ID.to_owned(),
+            name: "Onboarding recovery fixture".to_owned(),
+            repository_path: fixture.source.to_string_lossy().into_owned(),
+        });
+    assert!(result.is_err(), "event boundary must interrupt onboarding");
+    fixture.remove_inspection_event_failure();
+    drop(bootstrap);
+    assert_eq!(fixture.completion_count(), 0);
+    assert_eq!(fixture.inspection_artifact_count(), 1);
+
+    fs::write(
+        fixture.source.join("AFTER-ARTIFACT.txt"),
+        b"repository status changed after artifact publication",
+    )
+    .expect("post-artifact repository change");
+
+    let first = fixture.start();
+    assert_eq!(first.status().state, StartupStateDto::Ready);
+    let store = SqliteStore::open(&fixture.database_path).expect("database");
+    let recovered = store.recovery_projects().expect("recovery projects");
+    assert_ne!(
+        recovered[0]
+            .repository
+            .as_ref()
+            .expect("completed recovery")
+            .fingerprint,
+        fixture.project.repository.fingerprint
+    );
+    assert_eq!(fixture.completion_count(), 1);
+    assert_eq!(fixture.inspection_artifact_count(), 2);
+    assert_eq!(fixture.distinct_inspection_hash_count(), 2);
+    drop(first);
+
+    let second = fixture.start();
+    assert_eq!(second.status().state, StartupStateDto::Ready);
+    assert_eq!(fixture.completion_count(), 1);
+    assert_eq!(fixture.inspection_artifact_count(), 2);
 }
 
 #[test]
@@ -794,6 +851,27 @@ impl OnboardingFixture {
         })
     }
 
+    fn install_inspection_event_failure(&self) {
+        Connection::open(&self.database_path)
+            .expect("database")
+            .execute_batch(
+                "CREATE TRIGGER fail_repository_inspection
+                 BEFORE INSERT ON events
+                 WHEN NEW.event_type = 'repository.inspected'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'fixture interruption after artifact publication');
+                 END;",
+            )
+            .expect("failure trigger");
+    }
+
+    fn remove_inspection_event_failure(&self) {
+        Connection::open(&self.database_path)
+            .expect("database")
+            .execute_batch("DROP TRIGGER fail_repository_inspection;")
+            .expect("remove failure trigger");
+    }
+
     fn replace_repository(&self) -> PathBuf {
         let displaced = self.source.with_file_name("displaced-source");
         fs::rename(&self.source, &displaced).expect("displace repository");
@@ -820,11 +898,23 @@ impl OnboardingFixture {
             .expect("database")
             .query_row(
                 "SELECT COUNT(*) FROM artifacts
-                 WHERE id = 'repository-inspection-project-1'",
+                 WHERE artifact_type = 'repository_inspection'",
                 [],
                 |row| row.get(0),
             )
             .expect("artifact count")
+    }
+
+    fn distinct_inspection_hash_count(&self) -> i64 {
+        Connection::open(&self.database_path)
+            .expect("database")
+            .query_row(
+                "SELECT COUNT(DISTINCT content_hash) FROM artifacts
+                 WHERE artifact_type = 'repository_inspection'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("distinct artifact hashes")
     }
 }
 

@@ -12,9 +12,9 @@ use local_agent_terminal_application::{
     RecoveryCandidateRequestDto, RecoveryOperationIntent, RecoveryProject, RecoveryReason,
     RepositoryGateway, RepositoryHealth, RepositoryInspectionRecord, RepositoryLocator,
     RevokeLease, RiskLevel, RunId, SafeErrorClassification, TaskBranch, TaskQuery, TaskSnapshot,
-    TimelineEntryDto, WorkspaceDashboardDto, WorkspaceDashboardRequestDto, WorkspaceRecoveryStore,
-    WorkspaceStateStore, WorkspaceWriteCoordinator, WorktreeId, WorktreeIntent,
-    WorktreeObservation, WorktreeSnapshot, WorktreeState,
+    TimelineEntryDto, WorkspaceDashboardDto, WorkspaceDashboardRequestDto, WorkspaceEvidenceStore,
+    WorkspaceRecoveryStore, WorkspaceStateStore, WorkspaceWriteCoordinator, WorktreeId,
+    WorktreeIntent, WorktreeObservation, WorktreeSnapshot, WorktreeState,
 };
 use local_agent_terminal_application::{ProjectId, TaskId};
 use local_agent_terminal_repository_git::GitRepositoryGateway;
@@ -1039,12 +1039,7 @@ pub(crate) fn reconcile_startup(
     let projects = database
         .recovery_projects()?
         .into_iter()
-        .map(|project| {
-            (
-                project.repository.repository_id.as_str().to_owned(),
-                project,
-            )
-        })
+        .map(|project| (project.repository_id.as_str().to_owned(), project))
         .collect::<HashMap<_, _>>();
     let mut observations = HashMap::new();
     let mut scanned = HashSet::new();
@@ -1224,14 +1219,14 @@ fn reconcile_pending_onboarding(
             continue;
         }
         let locator = repositories.locate_persisted(Path::new(&project.repository_path))?;
-        if locator.repository_id != project.repository.repository_id
-            || locator.stable_identity != project.repository.stable_identity
+        if locator.repository_id != project.repository_id
+            || locator.stable_identity != project.repository_identity
         {
             return Err(conflict());
         }
         let repository = repositories.inspect(InspectRepository { locator })?;
-        if repository.repository_id != project.repository.repository_id
-            || repository.stable_identity != project.repository.stable_identity
+        if repository.repository_id != project.repository_id
+            || repository.stable_identity != project.repository_identity
         {
             return Err(conflict());
         }
@@ -1253,22 +1248,10 @@ fn complete_repository_onboarding(
     repository: local_agent_terminal_application::RepositorySnapshot,
     observed_at: String,
 ) -> Result<ProjectSnapshot, PortError> {
-    let artifact_id = ArtifactId::new(format!("repository-inspection-{}", project_id.as_str()))
-        .map_err(|_| invalid_input())?;
     let evidence = publish_canonical_json(
         database,
         artifacts,
-        CanonicalJsonRequest::new(
-            artifact_id,
-            project_id.clone(),
-            None,
-            "repository_inspection",
-            format!("repository/{}/inspection.json", project_id.as_str()),
-            "core",
-            "workspace-coordinator",
-            &repository_evidence(&repository),
-            format!("repository-inspection:{}", project_id.as_str()),
-        )?,
+        repository_inspection_request(database, &project_id, &repository)?,
     )?;
     database.record_repository_inspection(RepositoryInspectionRecord {
         project_id: project_id.clone(),
@@ -1278,6 +1261,61 @@ fn complete_repository_onboarding(
         correlation_id: format!("repository-inspection:{}", project_id.as_str()),
         observed_at,
     })
+}
+
+fn repository_inspection_request(
+    database: &SqliteStore,
+    project_id: &ProjectId,
+    repository: &local_agent_terminal_application::RepositorySnapshot,
+) -> Result<CanonicalJsonRequest, PortError> {
+    let value = repository_evidence(repository);
+    let legacy_artifact_id =
+        ArtifactId::new(format!("repository-inspection-{}", project_id.as_str()))
+            .map_err(|_| invalid_input())?;
+    let legacy = CanonicalJsonRequest::new(
+        legacy_artifact_id,
+        project_id.clone(),
+        None,
+        "repository_inspection",
+        format!("repository/{}/inspection.json", project_id.as_str()),
+        "core",
+        "workspace-coordinator",
+        &value,
+        format!("repository-inspection:{}", project_id.as_str()),
+    )?;
+    if database
+        .available_evidence(&legacy.artifact_id)?
+        .is_some_and(|existing| {
+            existing.project_id == legacy.project_id
+                && existing.task_id == legacy.task_id
+                && existing.content_hash == legacy.expected_hash
+                && existing.size_bytes == legacy.expected_size
+        })
+    {
+        return Ok(legacy);
+    }
+    let evidence_hash = legacy
+        .expected_hash
+        .strip_prefix("sha256:")
+        .ok_or_else(invalid_input)?;
+    CanonicalJsonRequest::new(
+        ArtifactId::new(format!(
+            "repository-inspection-{}-{evidence_hash}",
+            project_id.as_str()
+        ))
+        .map_err(|_| invalid_input())?,
+        project_id.clone(),
+        None,
+        "repository_inspection",
+        format!("repository/{}/inspection.json", project_id.as_str()),
+        "core",
+        "workspace-coordinator",
+        &value,
+        format!(
+            "repository-inspection:{}:{evidence_hash}",
+            project_id.as_str()
+        ),
+    )
 }
 
 fn observe_expected_worktree(
@@ -1319,8 +1357,8 @@ fn locate_expected_repository(
     let locator = repositories.locate_persisted(Path::new(&project.repository_path))?;
     if locator.repository_id != expected.repository_id
         || locator.stable_identity != expected.repository_identity
-        || locator.repository_id != project.repository.repository_id
-        || locator.stable_identity != project.repository.stable_identity
+        || locator.repository_id != project.repository_id
+        || locator.stable_identity != project.repository_identity
     {
         return Err(conflict());
     }

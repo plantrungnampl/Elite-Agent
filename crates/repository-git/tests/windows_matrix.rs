@@ -1422,3 +1422,136 @@ fn target_swap_race_is_blocked_during_checkout_without_touching_outside_bytes() 
     assert!(!outside.join("README.md").exists());
     assert!(!displaced.exists());
 }
+
+#[cfg(all(windows, feature = "test-seams"))]
+#[test]
+fn nested_tracked_directory_swap_is_blocked_without_writing_outside() {
+    use std::sync::{Arc, Barrier};
+
+    use local_agent_terminal_application::{PortError, SafeErrorClassification};
+    use local_agent_terminal_repository_git::TestHooks;
+
+    let fixture = TempDir::new().expect("tempdir");
+    let source = fixture.path().join("source");
+    fs::create_dir_all(source.join("nested")).expect("nested source");
+    fs::write(
+        source.join("nested").join("PAYLOAD.txt"),
+        b"tracked payload",
+    )
+    .expect("tracked payload");
+    let (repository, _commit) = commit_repository(&source);
+    let _nested_commit = commit_all(&repository, "track nested payload");
+
+    let managed_root = fixture.path().join("managed");
+    let outside = fixture.path().join("outside");
+    fs::create_dir(&managed_root).expect("managed");
+    fs::create_dir(&outside).expect("outside");
+    fs::write(outside.join("KEEP.txt"), b"keep").expect("outside sentinel");
+
+    let mut gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+    let barrier = Arc::new(Barrier::new(2));
+    gateway.set_test_hooks(TestHooks {
+        during_checkout: Some(barrier.clone()),
+        ..TestHooks::default()
+    });
+    let locator = locator(&gateway, &source);
+    let create = request(&gateway, &locator, &source);
+    let worker = std::thread::spawn(move || gateway.create_worktree(create));
+
+    barrier.wait();
+    let target = managed_root.join("task-1");
+    assert!(target.is_dir(), "retained target root must exist");
+    create_directory_symlink(&outside, &target.join("nested"));
+    barrier.wait();
+
+    let result = worker.join().expect("worker");
+    assert!(matches!(
+        result,
+        Err(PortError::Failure {
+            classification: SafeErrorClassification::Conflict,
+            ..
+        })
+    ));
+    assert_eq!(
+        fs::read(outside.join("KEEP.txt")).expect("outside sentinel after"),
+        b"keep"
+    );
+    assert!(
+        !outside.join("PAYLOAD.txt").exists(),
+        "checkout must not traverse the nested replacement"
+    );
+}
+
+#[cfg(all(windows, feature = "test-seams"))]
+#[test]
+fn tombstone_swap_is_blocked_before_identity_bound_discard_deletion() {
+    use std::sync::{Arc, Barrier};
+
+    use local_agent_terminal_application::DiscardWorktree;
+    use local_agent_terminal_repository_git::TestHooks;
+
+    let fixture = TempDir::new().expect("tempdir");
+    let source = fixture.path().join("source");
+    fs::create_dir(&source).expect("source");
+    let (_repository, _commit) = commit_repository(&source);
+    let managed_root = fixture.path().join("managed");
+    fs::create_dir(&managed_root).expect("managed");
+    let mut gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
+    let locator = locator(&gateway, &source);
+    let create = request(&gateway, &locator, &source);
+    gateway
+        .create_worktree(create.clone())
+        .expect("create worktree");
+
+    let barrier = Arc::new(Barrier::new(2));
+    gateway.set_test_hooks(TestHooks {
+        after_discard_rename: Some(barrier.clone()),
+        ..TestHooks::default()
+    });
+    let discard = DiscardWorktree {
+        repository: locator,
+        managed_path: create.managed_path,
+        task_id: create.task_id,
+        lease_claim: create.lease_claim,
+        expected_workspace_version: create.expected_workspace_version,
+        worktree_id: create.worktree_id,
+        branch: create.branch,
+        base_commit: create.base_commit,
+    };
+    let worker = std::thread::spawn(move || gateway.discard_worktree(discard));
+
+    barrier.wait();
+    let tombstone = fs::read_dir(&managed_root)
+        .expect("managed entries")
+        .map(|entry| entry.expect("managed entry").path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".local-agent-terminal-discard-"))
+        })
+        .expect("renamed tombstone");
+    let displaced = managed_root.join("displaced-tombstone");
+    let replacement = managed_root.join("foreign-replacement");
+    fs::create_dir(&replacement).expect("foreign replacement");
+    fs::write(replacement.join("KEEP.txt"), b"keep").expect("foreign sentinel");
+    let swap = fs::rename(&tombstone, &displaced);
+    if swap.is_ok() {
+        fs::rename(&replacement, &tombstone).expect("install foreign replacement");
+    }
+    barrier.wait();
+
+    let result = worker.join().expect("worker");
+    assert!(
+        swap.is_err() || result.is_err(),
+        "discard must deny the swap or fail closed"
+    );
+    let preserved = if swap.is_ok() {
+        tombstone.join("KEEP.txt")
+    } else {
+        replacement.join("KEEP.txt")
+    };
+    assert_eq!(
+        fs::read(preserved).expect("foreign replacement survives"),
+        b"keep"
+    );
+}

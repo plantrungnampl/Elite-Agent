@@ -57,22 +57,9 @@ impl SqliteStore {
                 .map_err(sqlite_error_to_port)?;
             let intent_payload: Value =
                 serde_json::from_str(&intent_payload).map_err(|_| integrity_failure())?;
-            let repository = parse_repository_snapshot(
-                intent_payload
-                    .get("repository")
-                    .ok_or_else(integrity_failure)?,
-            )?;
-            let persisted = NewProject {
-                project_id: project_id.clone(),
-                name: project.name.clone(),
-                repository: repository.clone(),
-                repository_path: project.repository_path.clone(),
-                settings: project.settings()?,
-                created_at: project.created_at.clone(),
-            };
-            if intent_payload != project_intent_json(&persisted)
-                || repository.stable_identity != project.repository_identity
-            {
+            let (repository_id, repository_identity) =
+                parse_project_created(&intent_payload, &project_id)?;
+            if repository_identity != project.repository_identity {
                 return Err(conflict());
             }
             let completion_payload: Option<String> = connection
@@ -90,20 +77,22 @@ impl SqliteStore {
                     let payload: Value =
                         serde_json::from_str(&payload).map_err(|_| integrity_failure())?;
                     let repository = parse_repository_snapshot(&payload)?;
-                    if repository.repository_id != persisted.repository.repository_id
-                        || repository.stable_identity != persisted.repository.stable_identity
+                    if repository.repository_id != repository_id
+                        || repository.stable_identity != repository_identity
                     {
                         return Err(integrity_failure());
                     }
                     let evidence = evidence_artifact_id(&payload)?.ok_or_else(integrity_failure)?;
                     verify_recovery_evidence(&connection, &project_id, &evidence)?;
-                    (repository, Some(evidence))
+                    (Some(repository), Some(evidence))
                 }
-                None => (repository, None),
+                None => (None, None),
             };
             recovery.push(RecoveryProject {
                 project_id,
                 repository_path: project.repository_path,
+                repository_id,
+                repository_identity,
                 repository,
                 repository_evidence_artifact_id,
             });
@@ -136,17 +125,11 @@ impl SqliteStore {
                 )
                 .map_err(sqlite_error_to_port)?;
             let payload: Value = serde_json::from_str(&payload).map_err(|_| integrity_failure())?;
-            let intent_repository = parse_repository_snapshot(
-                payload.get("repository").ok_or_else(integrity_failure)?,
-            )?;
-            if intent_repository.repository_id != requested_repository.repository_id
-                || intent_repository.stable_identity != requested_repository.stable_identity
+            let (intent_repository_id, intent_repository_identity) =
+                parse_project_created(&payload, &persisted_project.project_id)?;
+            if intent_repository_id != requested_repository.repository_id
+                || intent_repository_identity != requested_repository.stable_identity
             {
-                return Err(conflict());
-            }
-            let mut intent_project = persisted_project.clone();
-            intent_project.repository = intent_repository;
-            if payload != project_intent_json(&intent_project) {
                 return Err(conflict());
             }
             let completion: Option<String> = transaction
@@ -225,7 +208,7 @@ impl SqliteStore {
                 params![
                     format!("project.created:{}", project.project_id.as_str()),
                     stream_id,
-                    project_intent_json(&project).to_string(),
+                    project_created_json(&project).to_string(),
                     format!("project:create:{}", project.project_id.as_str()),
                     project.created_at,
                 ],
@@ -489,20 +472,37 @@ fn project_row_optional(
         .map_err(sqlite_error_to_port)
 }
 
-fn project_intent_json(project: &NewProject) -> Value {
+fn project_created_json(project: &NewProject) -> Value {
     json!({
-        "onboardingStatus": "pending",
         "projectId": project.project_id.as_str(),
-        "name": project.name,
-        "repositoryPath": project.repository_path,
-        "settings": {
-            "policyProfileId": project.settings.policy_profile_id,
-            "artifactRootMode": project.settings.artifact_root_mode.as_str(),
-            "artifactRootPath": project.settings.artifact_root_path,
-        },
-        "createdAt": project.created_at,
-        "repository": repository_snapshot_json(&project.repository, None),
+        "repositoryId": project.repository.repository_id.as_str(),
+        "repositoryIdentity": project.repository.stable_identity,
     })
+}
+
+fn parse_project_created(
+    value: &Value,
+    expected_project_id: &ProjectId,
+) -> Result<(RepositoryId, String), PortError> {
+    if value.get("projectId").and_then(Value::as_str) != Some(expected_project_id.as_str()) {
+        return Err(integrity_failure());
+    }
+    if let Some(repository) = value.get("repository") {
+        let repository = parse_repository_snapshot(repository)?;
+        return Ok((repository.repository_id, repository.stable_identity));
+    }
+    let repository_id = value
+        .get("repositoryId")
+        .and_then(Value::as_str)
+        .and_then(|value| RepositoryId::new(value).ok())
+        .ok_or_else(integrity_failure)?;
+    let repository_identity = value
+        .get("repositoryIdentity")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(integrity_failure)?;
+    Ok((repository_id, repository_identity))
 }
 
 fn same_project(existing: &ProjectRow, requested: &NewProject) -> bool {
