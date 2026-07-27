@@ -1,7 +1,5 @@
-warning: in the working copy of 'artifacts/verification/m1/outputs/architecture.log', LF will be replaced by CRLF the next time Git touches it
 warning: in the working copy of 'artifacts/verification/m1/outputs/browser-tests.log', LF will be replaced by CRLF the next time Git touches it
 warning: in the working copy of 'artifacts/verification/m1/outputs/contract-tests.log', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'artifacts/verification/m1/outputs/design-contracts.log', LF will be replaced by CRLF the next time Git touches it
 warning: in the working copy of 'artifacts/verification/m1/outputs/desktop-debug-build.log', LF will be replaced by CRLF the next time Git touches it
 warning: in the working copy of 'artifacts/verification/m1/outputs/frontend-build.log', LF will be replaced by CRLF the next time Git touches it
 warning: in the working copy of 'artifacts/verification/m1/outputs/frontend-tests.log', LF will be replaced by CRLF the next time Git touches it
@@ -10,4 +8,3 @@ warning: in the working copy of 'artifacts/verification/m1/outputs/recovery-matr
 warning: in the working copy of 'artifacts/verification/m1/outputs/repository-windows.log', LF will be replaced by CRLF the next time Git touches it
 warning: in the working copy of 'artifacts/verification/m1/outputs/rust-clippy.log', LF will be replaced by CRLF the next time Git touches it
 warning: in the working copy of 'artifacts/verification/m1/outputs/rust-tests.log', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'artifacts/verification/m1/toolchain.txt', LF will be replaced by CRLF the next time Git touches it

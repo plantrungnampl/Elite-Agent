@@ -4,19 +4,19 @@ architecture contracts: domain may not depend on workspace packages
 architecture contracts: generic Tauri command is forbidden: run_command
 architecture contracts: repository adapter may not spawn a process: lib.rs
 architecture contracts: repository adapter may not inspect PATH: lib.rs
-✔ architecture checker accepts the production workspace (82.9375ms)
-✔ architecture checker rejects a frontend Tauri invoke outside its API boundary (77.373ms)
-✔ architecture checker rejects an outward application dependency (40.0718ms)
-✔ architecture checker rejects even dev-only domain dependencies on adapters (38.7876ms)
-✔ architecture checker allows external domain test dependencies (41.5116ms)
-✔ architecture checker rejects a generic Tauri execution command (71.368ms)
-✔ architecture checker rejects grouped and aliased process imports (75.8865ms)
-✔ architecture checker rejects grouped and aliased PATH access (77.4276ms)
+✔ architecture checker accepts the production workspace (78.2164ms)
+✔ architecture checker rejects a frontend Tauri invoke outside its API boundary (72.323ms)
+✔ architecture checker rejects an outward application dependency (39.2684ms)
+✔ architecture checker rejects even dev-only domain dependencies on adapters (36.3462ms)
+✔ architecture checker allows external domain test dependencies (42.1881ms)
+✔ architecture checker rejects a generic Tauri execution command (71.9459ms)
+✔ architecture checker rejects grouped and aliased process imports (81.3413ms)
+✔ architecture checker rejects grouped and aliased PATH access (73.852ms)
 design contracts: checksum manifest is not exact
 design contracts: workflow global event target is not a phase
-✔ design verifier accepts the checked-in immutable design artifacts (59.1057ms)
-✔ design verifier rejects incomplete checksum manifests (47.3463ms)
-✔ design verifier rejects global events with an unknown target phase (49.3915ms)
+✔ design verifier accepts the checked-in immutable design artifacts (50.7237ms)
+✔ design verifier rejects incomplete checksum manifests (40.2894ms)
+✔ design verifier rejects global events with an unknown target phase (50.4115ms)
 ℹ tests 11
 ℹ suites 0
 ℹ pass 11
@@ -24,4 +24,4 @@ design contracts: workflow global event target is not a phase
 ℹ cancelled 0
 ℹ skipped 0
 ℹ todo 0
-ℹ duration_ms 562.7831
+ℹ duration_ms 551.2886

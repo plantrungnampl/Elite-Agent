@@ -8,7 +8,7 @@ All hostile fixtures are local and inert. Each execution-capable fixture has its
 
 ## Code quality: pass
 
-The focused Windows matrices, complete Rust workspace, clippy, formatting, Node contracts, frontend unit tests, real-browser accessibility/recovery tests, frontend build, and Windows desktop debug build pass. Every post-add validation boundary is fault-injected. Because target paths and worktree metadata have no atomic compare-and-delete operation, failed creation preserves the complete attempt and surfaces a conflict. A deterministic post-observation race proves simultaneous target, worktree-admin, and ref replacements remain untouched.
+The focused Windows matrices, complete Rust workspace, clippy, formatting, Node contracts, frontend unit tests, real-browser accessibility/recovery tests, frontend build, and Windows desktop debug build pass. Every post-add validation boundary is fault-injected. Because target paths and worktree metadata have no atomic compare-and-delete operation, failed creation preserves the complete attempt and surfaces a conflict. Startup retains the canonical worktree intent, re-inspects the preserved attempt, and offers adopt/discard only for an exact repository identity, base, branch, path, and Git-metadata match; replacement state remains preserved without either action. A deterministic post-observation race proves simultaneous target, worktree-admin, and ref replacements remain untouched.
 
 ## Evidence review: pass
 
