@@ -48,7 +48,7 @@
 **Interfaces:**
 - Consumes the approved Cargo dependency graph, approval JSON Schema, SQLite v1 DDL, and M2 roadmap. Produces executable constraints for `policy-engine`, `tool-runtime`, `platform-core`, and `platform-windows`, plus negative fixtures for outward dependencies, generic execution, raw shell, and authorization-bearing unknown fields.
 
-- [ ] **Step 1 - Write failing contract tests**
+- [x] **Step 1 - Write failing contract tests**
 
 Add Node tests that assert:
 
@@ -67,7 +67,7 @@ node --test tests/contracts/m2-contracts.test.mjs
 
 Expected RED: the M2 package allowlist, generic-execution scan, and new fixtures are absent. The design immutability assertion already passes.
 
-- [ ] **Step 2 - Implement only the contract checker and fixtures**
+- [x] **Step 2 - Implement only the contract checker and fixtures**
 
 Extend `scripts/check-architecture.mjs` with explicit allowed edges:
 
@@ -79,7 +79,7 @@ application/adapters <- bootstrap <- tauri-app
 
 Reject reverse edges, crate cycles, process construction outside `platform-windows`, concrete adapter construction outside `bootstrap`, raw command strings, raw path-bearing frontend DTOs, and generic Tauri command names. Do not create production crates in this task.
 
-- [ ] **Step 3 - Run focused and regression checks**
+- [x] **Step 3 - Run focused and regression checks**
 
 ```powershell
 node --test tests/contracts/m2-contracts.test.mjs tests/contracts/architecture.test.mjs tests/contracts/design-contracts.test.mjs
@@ -89,7 +89,7 @@ git diff --exit-code 321734f -- docs/multi-agent-terminal-design
 
 Expected GREEN: every hostile fixture fails for its intended reason, valid schema fixtures pass, existing M0/M1 checks remain green, and the design diff is empty.
 
-- [ ] **Step 4 - Commit**
+- [x] **Step 4 - Commit**
 
 ```powershell
 git add tests/contracts scripts/check-architecture.mjs
@@ -111,7 +111,7 @@ git commit -m "test: pin policy tool broker contracts"
 **Interfaces:**
 - Consumes existing `TaskId`, `RunId`, `FencingToken`, `WorkspaceVersion`, workflow phase names, and validated SHA-256 conventions. Produces pure validated policy/tool values and deterministic rule combination; it performs no I/O and makes no approval, persistence, or OS decision.
 
-- [ ] **Step 1 - Write failing domain tests**
+- [x] **Step 1 - Write failing domain tests**
 
 Cover empty/oversized IDs, malformed digests, unsupported policy versions, incomplete actor/resource bindings, expired decisions, duplicate rule IDs, deterministic rule order, no-match denial, and all effect combinations. Prove `deny > require_approval > allow_with_redaction > allow`, independent of input order. Add structured-tool tests that reject an empty executable/argv boundary, absolute or traversal capability paths, null bytes, duplicate expected writes, a write without a fencing token, and any `shell.raw` request in the default profile.
 
@@ -121,7 +121,7 @@ cargo test -p local-agent-terminal-domain --test policy_contract --test tool_con
 
 Expected RED: `policy` and `tool` modules and their value objects do not exist.
 
-- [ ] **Step 2 - Implement the smallest pure model**
+- [x] **Step 2 - Implement the smallest pure model**
 
 Use these contracts consistently in subsequent tasks:
 
@@ -169,7 +169,7 @@ pub fn combine_policy_rules(
 
 `combine_policy_rules` sorts and deduplicates rule IDs, denies on no match or invalid/expired binding, applies deny-overrides, and retains every matched rule plus required redaction directives. Add `CapabilityRef::{Source, Artifact, Worktree, Toolchain}`, `StructuredToolName::{FileRead, FileWrite, GitStatus, GitDiff, ProcessExec}`, `ProcessTrustTier::{BrokeredProcess, IsolatedWorker}`, `NetworkProfile::{Denied, ProviderEndpointOnly, ApprovedDestinations}`, and typed `ExpectedWrite`. `full_access_legacy` is not a constructible M2 process tier. Do not put an OS path or process handle in these values.
 
-- [ ] **Step 3 - Run focused, property, and regression tests**
+- [x] **Step 3 - Run focused, property, and regression tests**
 
 ```powershell
 cargo fmt --all -- --check
@@ -179,7 +179,7 @@ cargo test -p local-agent-terminal-domain
 
 Expected GREEN: precedence is deterministic across permutations, invalid values fail closed, and all existing workflow/workspace tests pass.
 
-- [ ] **Step 4 - Commit**
+- [x] **Step 4 - Commit**
 
 ```powershell
 git add crates/domain
@@ -206,7 +206,7 @@ git commit -m "feat: add pure policy and tool rules"
 **Interfaces:**
 - Consumes the Task 2 domain values, existing `CanonicalJsonRequest`, `ExecutorLeaseStore`, `ArtifactStore`, `EventStore`, clock/ID ports, and the exact approval-digest v1 schema. Produces object-safe application ports, typed request/result records, immutable approval DTOs, and one canonical digest implementation reused by policy and tool execution.
 
-- [ ] **Step 1 - Write failing port and digest tests**
+- [x] **Step 1 - Write failing port and digest tests**
 
 Add compile-time/object-safety tests and fakes that prove application ports accept only domain/application types. Add RFC 8785 vectors for object ordering, Unicode, escaping, integer bounds, negative zero/floating-point rejection, duplicate-key rejection at the parser boundary, and timestamp normalization. Deserialize the normative valid tool/policy-exception fixtures with `deny_unknown_fields`; mutate each bound field one at a time and prove the operation digest changes. Prove expired approvals, nonce reuse, policy/workspace/fencing changes, and a digest mismatch return typed non-retryable errors before a fake executor is called.
 
@@ -216,7 +216,7 @@ cargo test -p local-agent-terminal-application --test policy_tool_ports --test a
 
 Expected RED: the policy, approval, tool, and execution ports and schema-bound payload types are absent.
 
-- [ ] **Step 2 - Add object-safe ports and exact records**
+- [x] **Step 2 - Add object-safe ports and exact records**
 
 Define and export these inward contracts:
 
@@ -272,7 +272,7 @@ Represent a process request as registered executable identity, `Vec<String>` arg
 
 Add `ToolApprovalPayloadV1` and `PolicyExceptionApprovalPayloadV1` with `#[serde(deny_unknown_fields)]`, exact field names from the schema, and a `build_approval_request` function that validates, canonicalizes with the existing RFC 8785 path, hashes SHA-256 bytes, and returns both an artifact request and digest. Add `ApprovalRequestDto` containing only immutable core-generated summary, full digest, expiry, exact scopes, and an opaque approval ID. Input DTOs contain only `{ approvalId, expectedOperationDigest }` or `{ executionId }`.
 
-- [ ] **Step 3 - Run focused and regression checks**
+- [x] **Step 3 - Run focused and regression checks**
 
 ```powershell
 cargo fmt --all -- --check
@@ -283,7 +283,7 @@ node --test tests/contracts/m2-contracts.test.mjs
 
 Expected GREEN: every port is object-safe, canonical vectors are stable, every bound mutation invalidates the digest, unknown fields fail, and existing M0/M1 application tests remain green.
 
-- [ ] **Step 4 - Commit**
+- [x] **Step 4 - Commit**
 
 ```powershell
 git add crates/application
@@ -306,7 +306,7 @@ git commit -m "feat: define policy approval and tool ports"
 **Interfaces:**
 - Implements `PolicyDecisionStore`, `ApprovalStore`, and `ToolExecutionStore` against the existing SQLite v1 `policy_decisions`, `approvals`, `tool_executions`, `operation_intents`, `artifacts`, `events`, and projection tables. All foreign keys stay enabled; no test or production connection may bypass them.
 
-- [ ] **Step 1 - Write failing SQLite contract and crash tests**
+- [x] **Step 1 - Write failing SQLite contract and crash tests**
 
 Seed a real project, task, trusted system run, canonical request artifact, and active lease. Test all allowed effects/statuses, required foreign keys, unique `(run_id, request_id)` idempotency, operation-digest length/case, immutable granted approval contents, expiry, resolution races, nonce/digest replay rejection, and invalidation by workspace/policy/fencing changes. Prove `begin` atomically creates/claims the operation intent, tool execution, policy reference, and `tool.execution.started` event; inject a failure at each statement and assert total rollback.
 
@@ -318,7 +318,7 @@ cargo test -p local-agent-terminal-storage-sqlite --test policy_tool_store --tes
 
 Expected RED: the three stores and transactional M2 operations do not exist.
 
-- [ ] **Step 2 - Implement exact SQLite v1 adapters**
+- [x] **Step 2 - Implement exact SQLite v1 adapters**
 
 Reuse the normative tables without changing their public v1 meanings. Use `BEGIN IMMEDIATE` for approval resolution/invalidation and tool begin/finish transitions. Persist canonical arguments as a content-addressed artifact; persist `policy_decision_id`, optional `approval_id`, intent ID, fencing token, output artifact IDs, status, timestamps, exit code, correlation/causation IDs, and observation class.
 
@@ -332,7 +332,7 @@ execution: pending -> running -> succeeded | failed | terminated | interrupted |
 
 Reject all backward or ambiguous transitions. `valid_for` reads the stored request artifact, verifies its hash/size, checks exact digest/type/task/status/expiry, and returns no grant on malformed or missing evidence. Completion is idempotent only when all stored result fields match byte-for-byte.
 
-- [ ] **Step 3 - Run focused, schema, and regression checks**
+- [x] **Step 3 - Run focused, schema, and regression checks**
 
 ```powershell
 cargo fmt --all -- --check
@@ -343,7 +343,7 @@ node --test tests/contracts/design-contracts.test.mjs tests/contracts/m2-contrac
 
 Expected GREEN: FK checks remain enabled, every injected boundary is deterministic after reopen, duplicate requests are exact/idempotent, non-repeatable ambiguity is retained, and existing storage tests pass.
 
-- [ ] **Step 4 - Commit**
+- [x] **Step 4 - Commit**
 
 ```powershell
 git add crates/storage-sqlite
