@@ -1,13 +1,15 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use local_agent_terminal_application::{
-    bind_tool_approval_payload, canonical_approval_payload, ApprovalCheck, ApprovalDigestPayload,
-    ApprovalId, ApprovalInvalidation, ApprovalResolution, ApprovalSnapshot, ApprovalState,
-    ApprovalStore, AuthorizedProcessRequest, AuthorizedToolRequest, BoundToolApproval,
-    CancellationReceipt, CapabilityFilesystem, CapabilityResolver, Clock, ExecuteApprovedTool,
-    NewApproval, PolicyDecisionStore, PolicyEvaluator, PortError, ProcessLauncher, Retryability,
-    SafeErrorClassification, StructuredGit, StructuredToolExecutor, ToolApprovalOperationV1,
-    ToolApprovalPayloadV1, ToolExecutionId, ToolExecutionResult, ToolExecutionStore,
+    bind_tool_approval_payload, canonical_approval_payload, ApprovalCheck, ApprovalClaim,
+    ApprovalDigestPayload, ApprovalId, ApprovalInvalidation, ApprovalResolution, ApprovalSnapshot,
+    ApprovalState, ApprovalStore, AuthorizedProcessRequest, AuthorizedToolRequest,
+    BoundToolApproval, CancellationReceipt, CapabilityFilesystem, CapabilityResolver, Clock,
+    ExecuteApprovedTool, NewApproval, PolicyDecisionStore, PolicyEvaluator, PortError,
+    ProcessLauncher, Retryability, SafeErrorClassification, StructuredGit, StructuredToolExecutor,
+    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionId, ToolExecutionResult,
+    ToolExecutionStore,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken, NetworkProfile, Phase,
@@ -33,12 +35,38 @@ fn policy_and_tool_ports_are_object_safe() {
 #[test]
 fn valid_approval_reaches_the_executor_once() {
     let executor = CountingExecutor::default();
-    let approvals = FixedApprovals {
-        snapshot: approved_snapshot(),
-    };
+    let approvals = FixedApprovals::new(approved_snapshot());
     let use_case = ExecuteApprovedTool::new(&approvals, &executor, &FixedClock);
 
     let _ = use_case.execute(check(), authorized_tool_request());
+
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn executor_failure_does_not_make_an_approval_replayable() {
+    let executor = CountingExecutor::default();
+    let approvals = FixedApprovals::new(approved_snapshot());
+    let use_case = ExecuteApprovedTool::new(&approvals, &executor, &FixedClock);
+
+    let _ = use_case.execute(check(), authorized_tool_request());
+    let _ = use_case.execute(check(), authorized_tool_request());
+
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn concurrent_claims_reach_the_executor_at_most_once() {
+    let executor = CountingExecutor::default();
+    let approvals = FixedApprovals::new(approved_snapshot());
+    let use_case = ExecuteApprovedTool::new(&approvals, &executor, &FixedClock);
+
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| use_case.execute(check(), authorized_tool_request()));
+        let second = scope.spawn(|| use_case.execute(check(), authorized_tool_request()));
+        let _ = first.join();
+        let _ = second.join();
+    });
 
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
 }
@@ -57,9 +85,9 @@ fn invalid_or_consumed_approvals_do_not_call_the_executor() {
         ApprovalCase::MissingRequestBinding,
     ] {
         let executor = CountingExecutor::default();
-        let approvals = FixedApprovals {
-            snapshot: snapshot(case),
-        };
+        let initial = snapshot(case);
+        let initial_state = initial.state;
+        let approvals = FixedApprovals::new(initial);
         let use_case = ExecuteApprovedTool::new(&approvals, &executor, &FixedClock);
 
         let error = use_case
@@ -70,6 +98,7 @@ fn invalid_or_consumed_approvals_do_not_call_the_executor() {
             local_agent_terminal_application::Retryability::NonRetryable
         );
         assert_eq!(executor.calls.load(Ordering::SeqCst), 0, "{case:?}");
+        assert_eq!(approvals.state(), initial_state, "{case:?}");
     }
 }
 
@@ -83,9 +112,7 @@ fn request_digest_and_scope_mismatches_do_not_call_the_executor() {
         authorized_tool_request_for(RequestMutation::CrossTaskRead),
     ] {
         let executor = CountingExecutor::default();
-        let approvals = FixedApprovals {
-            snapshot: approved_snapshot(),
-        };
+        let approvals = FixedApprovals::new(approved_snapshot());
         let use_case = ExecuteApprovedTool::new(&approvals, &executor, &FixedClock);
 
         let error = use_case
@@ -119,9 +146,7 @@ fn every_changed_execution_detail_is_rejected_before_the_executor() {
         RequestMutation::CpuLimit,
     ] {
         let executor = CountingExecutor::default();
-        let approvals = FixedApprovals {
-            snapshot: approved_snapshot(),
-        };
+        let approvals = FixedApprovals::new(approved_snapshot());
         let use_case = ExecuteApprovedTool::new(&approvals, &executor, &FixedClock);
 
         let _ = use_case.execute(check(), authorized_tool_request_for(mutation));
@@ -267,7 +292,7 @@ fn approval_identity_and_nonce_mismatches_do_not_call_the_executor() {
 
     for snapshot in [wrong_id, missing_nonce, wrong_nonce] {
         let executor = CountingExecutor::default();
-        let approvals = FixedApprovals { snapshot };
+        let approvals = FixedApprovals::new(snapshot);
         let use_case = ExecuteApprovedTool::new(&approvals, &executor, &FixedClock);
 
         let _ = use_case.execute(check(), authorized_tool_request());
@@ -290,7 +315,19 @@ enum ApprovalCase {
 }
 
 struct FixedApprovals {
-    snapshot: ApprovalSnapshot,
+    snapshot: Mutex<ApprovalSnapshot>,
+}
+
+impl FixedApprovals {
+    fn new(snapshot: ApprovalSnapshot) -> Self {
+        Self {
+            snapshot: Mutex::new(snapshot),
+        }
+    }
+
+    fn state(&self) -> ApprovalState {
+        self.snapshot.lock().unwrap().state
+    }
 }
 
 impl ApprovalStore for FixedApprovals {
@@ -303,11 +340,46 @@ impl ApprovalStore for FixedApprovals {
     }
 
     fn valid_for(&self, _: ApprovalCheck) -> Result<Option<ApprovalSnapshot>, PortError> {
-        Ok(Some(self.snapshot.clone()))
+        Ok(Some(self.snapshot.lock().unwrap().clone()))
+    }
+
+    fn claim(&self, claim: ApprovalClaim) -> Result<Option<ApprovalSnapshot>, PortError> {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        if !approval_matches_claim(&snapshot, &claim) {
+            return Ok(None);
+        }
+        snapshot.state = ApprovalState::Consumed;
+        Ok(Some(snapshot.clone()))
     }
 
     fn invalidate(&self, _: ApprovalInvalidation) -> Result<u64, PortError> {
         unreachable!()
+    }
+}
+
+fn approval_matches_claim(snapshot: &ApprovalSnapshot, claim: &ApprovalClaim) -> bool {
+    snapshot.state == ApprovalState::Approved
+        && snapshot.approval_id == claim.approval_id
+        && snapshot.operation_digest == claim.expected_operation_digest
+        && snapshot.task_id == claim.task_id
+        && snapshot.workspace_version == claim.workspace_version
+        && snapshot.policy_snapshot_digest == claim.policy_snapshot_digest
+        && snapshot.fencing_token == claim.fencing_token
+        && snapshot.tool_request_binding_digest.as_ref() == Some(&claim.tool_request_binding_digest)
+        && snapshot.nonce == claim.nonce
+        && approval_is_live(&snapshot.expires_at, &claim.claimed_at)
+}
+
+fn approval_is_live(expires_at: &str, claimed_at: &str) -> bool {
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+
+    match (
+        OffsetDateTime::parse(expires_at, &Rfc3339),
+        OffsetDateTime::parse(claimed_at, &Rfc3339),
+    ) {
+        (Ok(expires_at), Ok(claimed_at)) => expires_at > claimed_at,
+        _ => false,
     }
 }
 

@@ -182,6 +182,19 @@ pub struct ApprovalCheck {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalClaim {
+    pub approval_id: ApprovalId,
+    pub expected_operation_digest: Sha256Digest,
+    pub task_id: TaskId,
+    pub workspace_version: WorkspaceVersion,
+    pub policy_snapshot_digest: Sha256Digest,
+    pub fencing_token: Option<u64>,
+    pub tool_request_binding_digest: ToolRequestBindingDigest,
+    pub nonce: String,
+    pub claimed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalInvalidation {
     pub task_id: TaskId,
     pub workspace_version: WorkspaceVersion,
@@ -191,6 +204,8 @@ pub trait ApprovalStore: Send + Sync {
     fn request(&self, approval: NewApproval) -> Result<ApprovalSnapshot, PortError>;
     fn resolve(&self, resolution: ApprovalResolution) -> Result<ApprovalSnapshot, PortError>;
     fn valid_for(&self, check: ApprovalCheck) -> Result<Option<ApprovalSnapshot>, PortError>;
+    /// Atomically compares every binding and transitions `Approved` to `Consumed`.
+    fn claim(&self, claim: ApprovalClaim) -> Result<Option<ApprovalSnapshot>, PortError>;
     fn invalidate(&self, request: ApprovalInvalidation) -> Result<u64, PortError>;
 }
 

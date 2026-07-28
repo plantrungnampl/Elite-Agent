@@ -1,7 +1,7 @@
 use crate::{
-    approval::valid_approval_nonce, ApprovalCheck, ApprovalSnapshot, ApprovalState, ApprovalStore,
-    AuthorizedToolRequest, Clock, PortError, SafeErrorClassification, StructuredToolExecutor,
-    ToolExecutionResult,
+    approval::valid_approval_nonce, ApprovalCheck, ApprovalClaim, ApprovalSnapshot, ApprovalState,
+    ApprovalStore, AuthorizedToolRequest, Clock, PortError, SafeErrorClassification,
+    StructuredToolExecutor, ToolExecutionResult,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -33,43 +33,43 @@ impl<'a> ExecuteApprovedTool<'a> {
         let now = self.clock.now_utc()?;
         let request_binding = request
             .revalidated_request_binding_digest()
-            .map_err(|_| denied())?;
+            .map_err(|_| denied())?
+            .clone();
         if !same_instant(&now, &check.checked_at) || !request_matches(&request, &check) {
             return Err(denied());
         }
-        let approval = self
-            .approvals
-            .valid_for(check.clone())?
-            .ok_or_else(denied)?;
-        validate_approval(
-            &approval,
-            &check,
-            request_binding,
-            request.approval_nonce(),
-            &now,
-        )?;
+        let claim = ApprovalClaim {
+            approval_id: check.approval_id,
+            expected_operation_digest: check.expected_operation_digest,
+            task_id: check.task_id,
+            workspace_version: check.workspace_version,
+            policy_snapshot_digest: check.policy_snapshot_digest,
+            fencing_token: check.fencing_token,
+            tool_request_binding_digest: request_binding,
+            nonce: request.approval_nonce().to_owned(),
+            claimed_at: now.clone(),
+        };
+        let approval = self.approvals.claim(claim.clone())?.ok_or_else(denied)?;
+        validate_claimed_approval(&approval, &claim)?;
         self.executor.execute(request)
     }
 }
 
-fn validate_approval(
+fn validate_claimed_approval(
     approval: &ApprovalSnapshot,
-    check: &ApprovalCheck,
-    request_binding: &crate::ToolRequestBindingDigest,
-    expected_nonce: &str,
-    now: &str,
+    claim: &ApprovalClaim,
 ) -> Result<(), PortError> {
-    if approval.state != ApprovalState::Approved
-        || approval.approval_id != check.approval_id
-        || is_expired(&approval.expires_at, now)
-        || approval.operation_digest != check.expected_operation_digest
-        || approval.task_id != check.task_id
-        || approval.workspace_version != check.workspace_version
-        || approval.policy_snapshot_digest != check.policy_snapshot_digest
-        || approval.fencing_token != check.fencing_token
-        || approval.tool_request_binding_digest.as_ref() != Some(request_binding)
+    if approval.state != ApprovalState::Consumed
+        || approval.approval_id != claim.approval_id
+        || is_expired(&approval.expires_at, &claim.claimed_at)
+        || approval.operation_digest != claim.expected_operation_digest
+        || approval.task_id != claim.task_id
+        || approval.workspace_version != claim.workspace_version
+        || approval.policy_snapshot_digest != claim.policy_snapshot_digest
+        || approval.fencing_token != claim.fencing_token
+        || approval.tool_request_binding_digest.as_ref() != Some(&claim.tool_request_binding_digest)
         || !valid_approval_nonce(&approval.nonce)
-        || approval.nonce != expected_nonce
+        || approval.nonce != claim.nonce
     {
         return Err(denied());
     }

@@ -21,7 +21,7 @@ mod workspace;
 pub use append_events::AppendEvents;
 pub use approval::{
     build_approval_request, canonical_approval_payload, parse_approval_payload, ApprovalCheck,
-    ApprovalDigestPayload, ApprovalId, ApprovalInvalidation, ApprovalRequestBuild,
+    ApprovalClaim, ApprovalDigestPayload, ApprovalId, ApprovalInvalidation, ApprovalRequestBuild,
     ApprovalResolution, ApprovalSnapshot, ApprovalState, ApprovalStore, CanonicalApprovalPayload,
     NewApproval, PolicyExceptionApprovalOperationV1, PolicyExceptionApprovalPayloadV1,
     ToolApprovalOperationV1, ToolApprovalPayloadV1,
