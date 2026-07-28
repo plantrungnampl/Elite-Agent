@@ -14,8 +14,10 @@ pub struct RedactionReport {
     pub digest: Sha256Digest,
 }
 
-pub(crate) fn redact(bytes: &[u8]) -> Result<(Vec<u8>, RedactionReport), PortError> {
-    let matches = scan(bytes);
+pub(crate) fn redact(
+    bytes: &[u8],
+    matches: Vec<SecretMatch>,
+) -> Result<(Vec<u8>, RedactionReport), PortError> {
     let mut effective = Vec::with_capacity(bytes.len());
     let mut cursor = 0;
     let mut entries = Vec::with_capacity(matches.len());
@@ -66,6 +68,30 @@ pub(crate) fn scan(bytes: &[u8]) -> Vec<SecretMatch> {
         "private_key",
         &mut matches,
     );
+    for (start_marker, end_marker) in [
+        (
+            b"-----BEGIN RSA PRIVATE KEY-----".as_slice(),
+            b"-----END RSA PRIVATE KEY-----".as_slice(),
+        ),
+        (
+            b"-----BEGIN EC PRIVATE KEY-----".as_slice(),
+            b"-----END EC PRIVATE KEY-----".as_slice(),
+        ),
+        (
+            b"-----BEGIN DSA PRIVATE KEY-----".as_slice(),
+            b"-----END DSA PRIVATE KEY-----".as_slice(),
+        ),
+        (
+            b"-----BEGIN ENCRYPTED PRIVATE KEY-----".as_slice(),
+            b"-----END ENCRYPTED PRIVATE KEY-----".as_slice(),
+        ),
+        (
+            b"-----BEGIN OPENSSH PRIVATE KEY-----".as_slice(),
+            b"-----END OPENSSH PRIVATE KEY-----".as_slice(),
+        ),
+    ] {
+        find_between(bytes, start_marker, end_marker, "private_key", &mut matches);
+    }
     find_line_value_ascii_case_insensitive(
         bytes,
         b"postgres://",

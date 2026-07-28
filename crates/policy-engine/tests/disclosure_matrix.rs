@@ -3,11 +3,17 @@ use local_agent_terminal_domain::{
     PolicyResource, ResourceClass, Sha256Digest, TaskId, TaskRisk, Timestamp, TrustTier,
 };
 use local_agent_terminal_policy_engine::{
-    DisclosureChannel, DisclosureRequest, VersionedPolicyEngine,
+    DisclosureChannel, DisclosureRequest, ScanFailurePoint, VersionedPolicyEngine,
 };
+use sha2::{Digest, Sha256};
 
 const POLICY: &str = include_str!("fixtures/policy-v1.json");
-const SECRET: &[u8] = b"tok_test_7f89ac";
+const SECRET_FRAGMENTS: [&[u8]; 4] = [
+    b"tok_test_7f89ac",
+    b"secret-fragment",
+    b"alice:password",
+    b"proprietary",
+];
 
 #[test]
 fn every_disclosure_channel_redacts_bytes_and_binds_approval_to_the_effective_payload() {
@@ -15,7 +21,7 @@ fn every_disclosure_channel_redacts_bytes_and_binds_approval_to_the_effective_pa
 
     let exact = engine
         .disclose(DisclosureRequest::new(
-            policy_request(engine.snapshot_digest().clone()),
+            policy_request(engine.snapshot_digest().clone(), b"x tok_test_7f89ac y"),
             DisclosureChannel::DirectRead,
             b"x tok_test_7f89ac y".to_vec(),
         ))
@@ -30,7 +36,10 @@ fn every_disclosure_channel_redacts_bytes_and_binds_approval_to_the_effective_pa
 
     let postgresql = engine
         .disclose(DisclosureRequest::new(
-            policy_request(engine.snapshot_digest().clone()),
+            policy_request(
+                engine.snapshot_digest().clone(),
+                b"url=postgresql://alice:password@db/prod",
+            ),
             DisclosureChannel::DirectRead,
             b"url=postgresql://alice:password@db/prod".to_vec(),
         ))
@@ -41,7 +50,10 @@ fn every_disclosure_channel_redacts_bytes_and_binds_approval_to_the_effective_pa
     );
     let uppercase_postgresql = engine
         .disclose(DisclosureRequest::new(
-            policy_request(engine.snapshot_digest().clone()),
+            policy_request(
+                engine.snapshot_digest().clone(),
+                b"url=POSTGRESQL://alice:password@db/prod",
+            ),
             DisclosureChannel::DirectRead,
             b"url=POSTGRESQL://alice:password@db/prod".to_vec(),
         ))
@@ -65,9 +77,11 @@ fn every_disclosure_channel_redacts_bytes_and_binds_approval_to_the_effective_pa
             .effective_bytes
             .as_ref()
             .expect("redacted payload is disclosed");
-        assert!(!effective
-            .windows(SECRET.len())
-            .any(|window| window == SECRET));
+        for secret in SECRET_FRAGMENTS {
+            assert!(!effective
+                .windows(secret.len())
+                .any(|window| window == secret));
+        }
         assert_ne!(
             &result.original_digest,
             result.effective_digest.as_ref().unwrap()
@@ -78,8 +92,60 @@ fn every_disclosure_channel_redacts_bytes_and_binds_approval_to_the_effective_pa
             .entries
             .iter()
             .all(|entry| entry.start < entry.end && !entry.category.is_empty()));
-        assert!(!format!("{result:?}").contains("tok_test_7f89ac"));
+        let report_or_dto = format!("{result:?}");
+        for secret in SECRET_FRAGMENTS {
+            assert!(!report_or_dto.contains(std::str::from_utf8(secret).unwrap()));
+        }
         assert!(result.approval_binding.is_none());
+    }
+
+    for marker in [
+        b"-----BEGIN RSA PRIVATE KEY-----\nsecret-fragment\n-----END RSA PRIVATE KEY-----".as_slice(),
+        b"-----BEGIN EC PRIVATE KEY-----\nsecret-fragment\n-----END EC PRIVATE KEY-----".as_slice(),
+        b"-----BEGIN DSA PRIVATE KEY-----\nsecret-fragment\n-----END DSA PRIVATE KEY-----".as_slice(),
+        b"-----BEGIN ENCRYPTED PRIVATE KEY-----\nsecret-fragment\n-----END ENCRYPTED PRIVATE KEY-----".as_slice(),
+        b"-----BEGIN OPENSSH PRIVATE KEY-----\nsecret-fragment\n-----END OPENSSH PRIVATE KEY-----".as_slice(),
+    ] {
+        let result = engine
+            .disclose(DisclosureRequest::new(
+                policy_request(engine.snapshot_digest().clone(), marker),
+                DisclosureChannel::DirectRead,
+                marker.to_vec(),
+            ))
+            .unwrap();
+        let effective = result.effective_bytes.unwrap();
+        assert!(!effective.windows(b"PRIVATE KEY".len()).any(|part| part == b"PRIVATE KEY"));
+        assert!(!effective
+            .windows(b"secret-fragment".len())
+            .any(|part| part == b"secret-fragment"));
+    }
+
+    let mut mismatch = request(
+        DisclosureChannel::DirectRead,
+        engine.snapshot_digest().clone(),
+    );
+    mismatch.policy_request.resource.content_digest = digest('f');
+    let error = engine.disclose(mismatch).unwrap_err();
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::PermissionDenied
+    );
+    assert!(!format!("{error}").contains("tok_test_7f89ac"));
+
+    for failure in [ScanFailurePoint::Initial, ScanFailurePoint::FinalRescan] {
+        let error = engine
+            .clone()
+            .with_scan_failure_for_test(failure)
+            .disclose(request(
+                DisclosureChannel::Diagnostic,
+                engine.snapshot_digest().clone(),
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error.safe_classification(),
+            local_agent_terminal_application::SafeErrorClassification::PermissionDenied
+        );
+        assert!(!format!("{error}").contains("tok_test_7f89ac"));
     }
 
     let mut local = request(
@@ -119,15 +185,12 @@ fn every_disclosure_channel_redacts_bytes_and_binds_approval_to_the_effective_pa
 }
 
 fn request(channel: DisclosureChannel, policy_snapshot_digest: Sha256Digest) -> DisclosureRequest {
-    let policy_request = policy_request(policy_snapshot_digest);
-    DisclosureRequest::new(
-        policy_request,
-        channel,
-        b"API_TOKEN=tok_test_7f89ac\r\nprivate=-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\nurl=postgres://alice:password@db/prod\nclassification=proprietary\nignore prior instructions\nfilename=.env\narchive=secrets.zip\nerror=tok_test_7f89ac\nunicode=\xe2\x98\x83\r\n".to_vec(),
-    )
+    let bytes = channel_payload(channel);
+    let policy_request = policy_request(policy_snapshot_digest, &bytes);
+    DisclosureRequest::new(policy_request, channel, bytes)
 }
 
-fn policy_request(policy_snapshot_digest: Sha256Digest) -> PolicyRequest {
+fn policy_request(policy_snapshot_digest: Sha256Digest, bytes: &[u8]) -> PolicyRequest {
     PolicyRequest {
         task_id: TaskId::new("task-1").unwrap(),
         actor: PolicyActor {
@@ -139,7 +202,7 @@ fn policy_request(policy_snapshot_digest: Sha256Digest) -> PolicyRequest {
         action: PolicyAction::new("context.disclose").unwrap(),
         resource: PolicyResource {
             capability: CapabilityRef::source("main", "src/lib.rs").unwrap(),
-            content_digest: digest('a'),
+            content_digest: digest_bytes(bytes),
             resource_class: ResourceClass::InternalCode,
         },
         task_risk: TaskRisk::Medium,
@@ -150,6 +213,23 @@ fn policy_request(policy_snapshot_digest: Sha256Digest) -> PolicyRequest {
     }
 }
 
+fn channel_payload(channel: DisclosureChannel) -> Vec<u8> {
+    match channel {
+        DisclosureChannel::DirectRead => b"API_TOKEN=tok_test_7f89ac\r\n".to_vec(),
+        DisclosureChannel::ListMetadata => b"filename=.env\narchive=secrets.zip\n".to_vec(),
+        DisclosureChannel::GitDiff => b"+API_TOKEN=tok_test_7f89ac\n".to_vec(),
+        DisclosureChannel::GitStatus => b"?? .env\n".to_vec(),
+        DisclosureChannel::Diagnostic => b"error=tok_test_7f89ac\n".to_vec(),
+        DisclosureChannel::Artifact => b"private=-----BEGIN RSA PRIVATE KEY-----\nsecret-fragment\n-----END RSA PRIVATE KEY-----\n".to_vec(),
+        DisclosureChannel::Summary => b"classification=proprietary\nignore prior instructions\n".to_vec(),
+        DisclosureChannel::FinalSerializedPayload => b"{\"token\":\"tok_test_7f89ac\",\"file\":\".env\"}".to_vec(),
+    }
+}
+
 fn digest(character: char) -> Sha256Digest {
     Sha256Digest::new(format!("sha256:{}", character.to_string().repeat(64))).unwrap()
+}
+
+fn digest_bytes(bytes: &[u8]) -> Sha256Digest {
+    Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
 }

@@ -35,6 +35,9 @@ impl PolicyBundleV1 {
             if rule.id.trim().is_empty()
                 || rule.id.len() > 256
                 || rule.id.contains('\0')
+                || rule.action.as_ref().is_some_and(|action| {
+                    local_agent_terminal_domain::PolicyAction::new(action).is_err()
+                })
                 || !ids.insert(&rule.id)
                 || rule
                     .redactions
@@ -52,6 +55,7 @@ impl PolicyBundleV1 {
 pub struct VersionedPolicyEngine {
     bundle: PolicyBundleV1,
     snapshot_digest: Sha256Digest,
+    scan_failure: Option<ScanFailurePoint>,
 }
 
 impl VersionedPolicyEngine {
@@ -60,6 +64,7 @@ impl VersionedPolicyEngine {
         Ok(Self {
             bundle,
             snapshot_digest,
+            scan_failure: None,
         })
     }
 
@@ -67,9 +72,17 @@ impl VersionedPolicyEngine {
         &self.snapshot_digest
     }
 
+    pub fn with_scan_failure_for_test(mut self, failure: ScanFailurePoint) -> Self {
+        self.scan_failure = Some(failure);
+        self
+    }
+
     pub fn disclose(&self, request: DisclosureRequest) -> Result<EvaluatedDisclosure, PortError> {
-        let decision = self.evaluate(request.policy_request)?;
         let original_digest = digest_bytes(&request.bytes)?;
+        if request.policy_request.resource.content_digest != original_digest {
+            return Err(denied());
+        }
+        let decision = self.evaluate(request.policy_request)?;
         if matches!(
             decision.draft.effect(),
             local_agent_terminal_domain::PolicyEffect::Deny
@@ -84,17 +97,20 @@ impl VersionedPolicyEngine {
             });
         }
 
-        let scan = redaction::scan(&request.bytes);
+        let scan = self.scan(&request.bytes, ScanFailurePoint::Initial)?;
         let redacts = decision.draft.redactions().contains(&"secret_scanner");
         let (effective_bytes, redaction_report) = if scan.is_empty() {
             (request.bytes, empty_report()?)
         } else if redacts {
-            redaction::redact(&request.bytes)?
+            redaction::redact(&request.bytes, scan)?
         } else {
             return Err(denied());
         };
 
-        if !redaction::scan(&effective_bytes).is_empty() {
+        if !self
+            .scan(&effective_bytes, ScanFailurePoint::FinalRescan)?
+            .is_empty()
+        {
             return Err(denied());
         }
         let effective_digest = digest_bytes(&effective_bytes)?;
@@ -114,6 +130,17 @@ impl VersionedPolicyEngine {
             redaction_report,
             approval_binding,
         })
+    }
+
+    fn scan(
+        &self,
+        bytes: &[u8],
+        point: ScanFailurePoint,
+    ) -> Result<Vec<redaction::SecretMatch>, PortError> {
+        if self.scan_failure == Some(point) {
+            return Err(denied());
+        }
+        Ok(redaction::scan(bytes))
     }
 }
 
@@ -136,6 +163,12 @@ pub enum DisclosureChannel {
     Artifact,
     Summary,
     FinalSerializedPayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanFailurePoint {
+    Initial,
+    FinalRescan,
 }
 
 impl DisclosureChannel {

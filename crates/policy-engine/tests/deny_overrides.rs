@@ -6,6 +6,7 @@ use local_agent_terminal_domain::{
 use local_agent_terminal_policy_engine::{
     DisclosureChannel, DisclosureRequest, VersionedPolicyEngine,
 };
+use sha2::{Digest, Sha256};
 
 const POLICY: &str = include_str!("fixtures/policy-v1.json");
 
@@ -91,6 +92,13 @@ fn deny_overrides_are_order_independent_and_request_bindings_change_the_decision
         r#"{"version":1,"rules":[{"id":"x","effect":"allow"},{"id":"x","effect":"deny"}]}"#
     )
     .is_err());
+    for action in ["", "\u{0}", &"x".repeat(257)] {
+        let policy = format!(
+            r#"{{"version":1,"rules":[{{"id":"x","effect":"allow","action":{}}}]}}"#,
+            serde_json::to_string(action).unwrap()
+        );
+        assert!(VersionedPolicyEngine::from_json(&policy).is_err());
+    }
     assert!(VersionedPolicyEngine::from_json(r#"{"version":1,"rules":[{"id":"x","effect":"allow_with_redaction","redactions":["unknown_scanner"]}]}"#).is_err());
     let mut missing_snapshot = baseline.policy_request;
     missing_snapshot.policy_snapshot_digest = digest('d');
@@ -98,7 +106,8 @@ fn deny_overrides_are_order_independent_and_request_bindings_change_the_decision
 }
 
 fn request(channel: DisclosureChannel) -> DisclosureRequest {
-    DisclosureRequest::new(policy_request(), channel, fixture_payload())
+    let bytes = fixture_payload();
+    DisclosureRequest::new(policy_request(&bytes), channel, bytes)
 }
 
 fn changed_request(
@@ -110,7 +119,7 @@ fn changed_request(
     changed
 }
 
-fn policy_request() -> PolicyRequest {
+fn policy_request(bytes: &[u8]) -> PolicyRequest {
     PolicyRequest {
         task_id: TaskId::new("task-1").unwrap(),
         actor: PolicyActor {
@@ -122,7 +131,7 @@ fn policy_request() -> PolicyRequest {
         action: PolicyAction::new("context.disclose").unwrap(),
         resource: PolicyResource {
             capability: CapabilityRef::source("main", "src/lib.rs").unwrap(),
-            content_digest: digest('a'),
+            content_digest: digest_bytes(bytes),
             resource_class: ResourceClass::InternalCode,
         },
         task_risk: TaskRisk::Medium,
@@ -139,4 +148,8 @@ fn fixture_payload() -> Vec<u8> {
 
 fn digest(character: char) -> Sha256Digest {
     Sha256Digest::new(format!("sha256:{}", character.to_string().repeat(64))).unwrap()
+}
+
+fn digest_bytes(bytes: &[u8]) -> Sha256Digest {
+    Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
 }
