@@ -6,37 +6,49 @@ mod git;
 
 use local_agent_terminal_application::{
     AuthorizedGitDiff, AuthorizedGitStatus, AuthorizedToolRequest, CancellationReceipt,
-    CapabilityFilesystem, CapabilityResolver, ExecutorLeaseStore, FileReadRequest,
+    CapabilityFileWriteSessionFactory, CapabilityFilesystem, CapabilityResolver,
+    ExecutorLeaseStore, FileReadRequest, FileWriteEvidenceStore, FileWriteRecoveryStore,
     FileWriteRequest, GitDiffResult, GitStatusResult, PortError, ProcessLauncher, StructuredGit,
     StructuredToolExecutor, ToolExecutionId, ToolExecutionResult, VerifiedBytes, VerifiedWrite,
-    WorkspaceMutationStore,
+    WorkspaceWriteCoordinator,
 };
 
 pub struct ToolRuntime<'a> {
     resolver: &'a dyn CapabilityResolver,
     filesystem: &'a dyn CapabilityFilesystem,
+    file_write_sessions: &'a dyn CapabilityFileWriteSessionFactory,
     git: &'a dyn StructuredGit,
     leases: &'a dyn ExecutorLeaseStore,
     process_launcher: &'a dyn ProcessLauncher,
-    workspace_mutations: &'a dyn WorkspaceMutationStore,
+    file_write_evidence: &'a dyn FileWriteEvidenceStore,
+    file_write_recovery: &'a dyn FileWriteRecoveryStore,
+    workspace_writes: &'a WorkspaceWriteCoordinator,
 }
 
 impl<'a> ToolRuntime<'a> {
+    // Composition keeps each independently replaceable application port explicit.
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         resolver: &'a dyn CapabilityResolver,
         filesystem: &'a dyn CapabilityFilesystem,
+        file_write_sessions: &'a dyn CapabilityFileWriteSessionFactory,
         git: &'a dyn StructuredGit,
         leases: &'a dyn ExecutorLeaseStore,
         process_launcher: &'a dyn ProcessLauncher,
-        workspace_mutations: &'a dyn WorkspaceMutationStore,
+        file_write_evidence: &'a dyn FileWriteEvidenceStore,
+        file_write_recovery: &'a dyn FileWriteRecoveryStore,
+        workspace_writes: &'a WorkspaceWriteCoordinator,
     ) -> Self {
         Self {
             resolver,
             filesystem,
+            file_write_sessions,
             git,
             leases,
             process_launcher,
-            workspace_mutations,
+            file_write_evidence,
+            file_write_recovery,
+            workspace_writes,
         }
     }
 
@@ -47,9 +59,11 @@ impl<'a> ToolRuntime<'a> {
     pub fn write(&self, request: FileWriteRequest) -> Result<VerifiedWrite, PortError> {
         filesystem::write(
             self.resolver,
-            self.filesystem,
+            self.file_write_sessions,
             self.leases,
-            self.workspace_mutations,
+            self.file_write_evidence,
+            self.file_write_recovery,
+            self.workspace_writes,
             request,
         )
     }

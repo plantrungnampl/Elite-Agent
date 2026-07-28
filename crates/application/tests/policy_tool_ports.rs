@@ -6,13 +6,16 @@ use local_agent_terminal_application::{
     parse_file_write_recovery_request, ApprovalCheck, ApprovalClaim, ApprovalDigestPayload,
     ApprovalId, ApprovalInvalidation, ApprovalResolution, ApprovalSnapshot, ApprovalState,
     ApprovalStore, AuthorizedProcessRequest, AuthorizedToolRequest, BoundToolApproval,
-    CancellationReceipt, CanonicalEvidenceRef, CapabilityFilesystem, CapabilityResolver,
-    CapabilityRootIdentity, Clock, DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest,
-    ExecuteApprovedTool, FileWritePolicyBinding, FileWritePreImage, FileWriteRecoveryRequest,
-    NewApproval, PolicyDecisionStore, PolicyEvaluator, PortError, ProcessLauncher,
-    RelativePathComponents, Retryability, SafeErrorClassification, StructuredGit,
-    StructuredToolExecutor, ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionId,
-    ToolExecutionResult, ToolExecutionStore,
+    CancellationReceipt, CanonicalEvidenceRef, CapabilityFileWriteSession,
+    CapabilityFileWriteSessionFactory, CapabilityFilesystem, CapabilityResolver,
+    CapabilityRootIdentity, CaptureFileWritePostEvidence, CaptureFileWritePreEvidence, Clock,
+    DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest, ExecuteApprovedTool,
+    FileWriteEvidenceStore, FileWritePolicyBinding, FileWritePostExpectation, FileWritePreImage,
+    FileWriteRecoveryRequest, NewApproval, ObservedFileImage, OpenFileWriteSession,
+    PolicyDecisionStore, PolicyEvaluator, PortError, ProcessLauncher, RelativePathComponents,
+    Retryability, SafeErrorClassification, StructuredGit, StructuredToolExecutor,
+    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionId, ToolExecutionResult,
+    ToolExecutionStore, VerifiedWrite,
 };
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken,
@@ -29,6 +32,9 @@ fn policy_and_tool_ports_are_object_safe() {
     assert_object_safe::<dyn PolicyEvaluator>();
     assert_object_safe::<dyn DisclosurePolicyEvaluator>();
     assert_object_safe::<dyn local_agent_terminal_application::FileWriteRecoveryStore>();
+    assert_object_safe::<dyn CapabilityFileWriteSession>();
+    assert_object_safe::<dyn CapabilityFileWriteSessionFactory>();
+    assert_object_safe::<dyn FileWriteEvidenceStore>();
     assert_object_safe::<dyn PolicyDecisionStore>();
     assert_object_safe::<dyn ApprovalStore>();
     assert_object_safe::<dyn CapabilityResolver>();
@@ -49,6 +55,107 @@ fn disclosure_request_binds_policy_input_channel_and_exact_bytes() {
 
     assert_eq!(request.channel, DisclosureChannel::FileRead);
     assert_eq!(request.bytes, b"API_TOKEN=secret");
+}
+
+#[test]
+fn file_write_session_input_binds_target_lease_and_authoritative_pre_image() {
+    let bytes = b"before".to_vec();
+    let expected_pre_digest =
+        Sha256Digest::new(format!("sha256:{:x}", sha2::Sha256::digest(&bytes))).unwrap();
+    let session = OpenFileWriteSession::new(
+        ToolExecutionId::new("file-write-session-1").unwrap(),
+        task_id(),
+        CapabilityRootIdentity::new("worktree-root-1").unwrap(),
+        RelativePathComponents::new(vec!["src".into(), "main.rs".into()]).unwrap(),
+        Some(expected_pre_digest.clone()),
+        LeaseClaim::new(
+            task_id(),
+            RunId::new("run-1").unwrap(),
+            FencingToken::new(19).unwrap(),
+        ),
+    )
+    .unwrap();
+    let pre_image = ObservedFileImage::present(bytes);
+    let expected_post = FileWritePostExpectation::new(digest('2'), 12).unwrap();
+
+    let capture =
+        CaptureFileWritePreEvidence::new(session.clone(), expected_post, pre_image).unwrap();
+
+    assert_eq!(capture.session(), &session);
+    assert_eq!(
+        capture.pre_image().present_bytes().unwrap().digest,
+        expected_pre_digest
+    );
+    assert_eq!(
+        capture.pre_image().present_bytes().unwrap().bytes,
+        b"before"
+    );
+
+    let cross_task_claim = LeaseClaim::new(
+        TaskId::new("task-2").unwrap(),
+        RunId::new("run-1").unwrap(),
+        FencingToken::new(19).unwrap(),
+    );
+    assert!(OpenFileWriteSession::new(
+        ToolExecutionId::new("file-write-session-2").unwrap(),
+        task_id(),
+        CapabilityRootIdentity::new("worktree-root-1").unwrap(),
+        RelativePathComponents::new(vec!["src".into(), "main.rs".into()]).unwrap(),
+        None,
+        cross_task_claim,
+    )
+    .is_err());
+
+    let mismatched_target = OpenFileWriteSession::new(
+        ToolExecutionId::new("file-write-session-3").unwrap(),
+        task_id(),
+        CapabilityRootIdentity::new("worktree-root-1").unwrap(),
+        RelativePathComponents::new(vec!["src".into(), "main.rs".into()]).unwrap(),
+        Some(digest('9')),
+        LeaseClaim::new(
+            task_id(),
+            RunId::new("run-1").unwrap(),
+            FencingToken::new(19).unwrap(),
+        ),
+    )
+    .unwrap();
+    assert!(CaptureFileWritePreEvidence::new(
+        mismatched_target,
+        FileWritePostExpectation::new(digest('2'), 12).unwrap(),
+        ObservedFileImage::present(b"before".to_vec()),
+    )
+    .is_err());
+}
+
+#[test]
+fn post_write_evidence_accepts_only_the_durable_digest_and_size() {
+    let recovery_request = file_write_recovery_request();
+    let matching = VerifiedWrite {
+        digest: recovery_request.expected_post_digest.clone(),
+        size_bytes: recovery_request.expected_post_size,
+    };
+
+    let capture =
+        CaptureFileWritePostEvidence::new(recovery_request.clone(), matching.clone()).unwrap();
+
+    assert_eq!(capture.recovery_request(), &recovery_request);
+    assert_eq!(capture.observed_post(), &matching);
+    assert!(CaptureFileWritePostEvidence::new(
+        recovery_request.clone(),
+        VerifiedWrite {
+            digest: digest('9'),
+            size_bytes: recovery_request.expected_post_size,
+        },
+    )
+    .is_err());
+    assert!(CaptureFileWritePostEvidence::new(
+        recovery_request.clone(),
+        VerifiedWrite {
+            digest: recovery_request.expected_post_digest.clone(),
+            size_bytes: recovery_request.expected_post_size + 1,
+        },
+    )
+    .is_err());
 }
 
 #[test]

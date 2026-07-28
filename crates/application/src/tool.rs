@@ -10,7 +10,7 @@ use crate::approval::{
     canonical_approval_payload, ApprovalDigestPayload, ApprovalId, ToolApprovalPayloadV1,
 };
 use crate::canonical_json::{invalid_input, sha256_digest};
-use crate::{PortError, WorkspaceMutationRequest};
+use crate::PortError;
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -82,13 +82,13 @@ pub struct AuthorizedFileRead {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileWriteRequest {
+    pub execution_id: ToolExecutionId,
     pub task_id: TaskId,
     pub capability: CapabilityRef,
     pub expected_digest: Option<Sha256Digest>,
     pub bytes: Vec<u8>,
-    pub fencing_token: FencingToken,
     pub lease_claim: LeaseClaim,
-    pub workspace_mutation: WorkspaceMutationRequest,
+    pub policy: FileWritePolicyBinding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +111,174 @@ pub struct VerifiedBytes {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedWrite {
     pub digest: Sha256Digest,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenFileWriteSession {
+    execution_id: ToolExecutionId,
+    task_id: TaskId,
+    root_identity: CapabilityRootIdentity,
+    relative_components: RelativePathComponents,
+    expected_pre_digest: Option<Sha256Digest>,
+    lease_claim: LeaseClaim,
+}
+
+impl OpenFileWriteSession {
+    pub fn new(
+        execution_id: ToolExecutionId,
+        task_id: TaskId,
+        root_identity: CapabilityRootIdentity,
+        relative_components: RelativePathComponents,
+        expected_pre_digest: Option<Sha256Digest>,
+        lease_claim: LeaseClaim,
+    ) -> Result<Self, PortError> {
+        if lease_claim.task_id() != &task_id {
+            return Err(invalid_input());
+        }
+        Ok(Self {
+            execution_id,
+            task_id,
+            root_identity,
+            relative_components,
+            expected_pre_digest,
+            lease_claim,
+        })
+    }
+
+    pub const fn execution_id(&self) -> &ToolExecutionId {
+        &self.execution_id
+    }
+
+    pub const fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    pub const fn root_identity(&self) -> &CapabilityRootIdentity {
+        &self.root_identity
+    }
+
+    pub fn relative_components(&self) -> &RelativePathComponents {
+        &self.relative_components
+    }
+
+    pub const fn expected_pre_digest(&self) -> Option<&Sha256Digest> {
+        self.expected_pre_digest.as_ref()
+    }
+
+    pub const fn lease_claim(&self) -> &LeaseClaim {
+        &self.lease_claim
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedFileImage {
+    present: Option<VerifiedBytes>,
+}
+
+impl ObservedFileImage {
+    pub const fn absent() -> Self {
+        Self { present: None }
+    }
+
+    pub fn present(bytes: Vec<u8>) -> Self {
+        let digest = Sha256Digest::new(sha256_digest(&bytes))
+            .expect("SHA-256 formatting is valid for observed file bytes");
+        Self {
+            present: Some(VerifiedBytes { digest, bytes }),
+        }
+    }
+
+    pub const fn present_bytes(&self) -> Option<&VerifiedBytes> {
+        self.present.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileWritePostExpectation {
+    digest: Sha256Digest,
+    size_bytes: u64,
+}
+
+impl FileWritePostExpectation {
+    pub fn new(digest: Sha256Digest, size_bytes: u64) -> Result<Self, PortError> {
+        if size_bytes > MAX_SAFE_INTEGER {
+            return Err(invalid_input());
+        }
+        Ok(Self { digest, size_bytes })
+    }
+
+    pub const fn digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedFileWriteCompensation {
+    Absent,
+    Restored(VerifiedWrite),
+}
+
+pub trait CapabilityFileWriteSession: Send {
+    fn pre_image(&self) -> &ObservedFileImage;
+    fn apply(&mut self, bytes: &[u8]) -> Result<(), PortError>;
+    fn verify_post_image(
+        &mut self,
+        expected: &FileWritePostExpectation,
+    ) -> Result<VerifiedWrite, PortError>;
+    fn restore_pre_image_and_verify(&mut self) -> Result<VerifiedFileWriteCompensation, PortError>;
+}
+
+pub trait CapabilityFileWriteSessionFactory: Send + Sync {
+    fn open(
+        &self,
+        request: OpenFileWriteSession,
+    ) -> Result<Box<dyn CapabilityFileWriteSession>, PortError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureFileWritePreEvidence {
+    session: OpenFileWriteSession,
+    expected_post: FileWritePostExpectation,
+    pre_image: ObservedFileImage,
+}
+
+impl CaptureFileWritePreEvidence {
+    pub fn new(
+        session: OpenFileWriteSession,
+        expected_post: FileWritePostExpectation,
+        pre_image: ObservedFileImage,
+    ) -> Result<Self, PortError> {
+        if let Some(expected) = session.expected_pre_digest() {
+            let Some(observed) = pre_image.present_bytes() else {
+                return Err(invalid_input());
+            };
+            if &observed.digest != expected {
+                return Err(invalid_input());
+            }
+        }
+        Ok(Self {
+            session,
+            expected_post,
+            pre_image,
+        })
+    }
+
+    pub const fn session(&self) -> &OpenFileWriteSession {
+        &self.session
+    }
+
+    pub const fn expected_post(&self) -> &FileWritePostExpectation {
+        &self.expected_post
+    }
+
+    pub const fn pre_image(&self) -> &ObservedFileImage {
+        &self.pre_image
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,6 +541,48 @@ pub struct FileWriteRecoverySnapshot {
     pub request: FileWriteRecoveryRequest,
     pub request_artifact: crate::CanonicalEvidenceRef,
     pub state: FileWriteRecoveryState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureFileWritePostEvidence {
+    recovery_request: FileWriteRecoveryRequest,
+    observed_post: VerifiedWrite,
+}
+
+impl CaptureFileWritePostEvidence {
+    pub fn new(
+        recovery_request: FileWriteRecoveryRequest,
+        observed_post: VerifiedWrite,
+    ) -> Result<Self, PortError> {
+        if observed_post.digest != recovery_request.expected_post_digest
+            || observed_post.size_bytes != recovery_request.expected_post_size
+        {
+            return Err(invalid_input());
+        }
+        Ok(Self {
+            recovery_request,
+            observed_post,
+        })
+    }
+
+    pub const fn recovery_request(&self) -> &FileWriteRecoveryRequest {
+        &self.recovery_request
+    }
+
+    pub const fn observed_post(&self) -> &VerifiedWrite {
+        &self.observed_post
+    }
+}
+
+pub trait FileWriteEvidenceStore: Send + Sync {
+    fn capture_pre_write(
+        &self,
+        request: CaptureFileWritePreEvidence,
+    ) -> Result<FileWriteRecoveryIntent, PortError>;
+    fn capture_post_write(
+        &self,
+        request: CaptureFileWritePostEvidence,
+    ) -> Result<FileWriteRecoveryCompletion, PortError>;
 }
 
 pub trait FileWriteRecoveryStore: Send + Sync {
