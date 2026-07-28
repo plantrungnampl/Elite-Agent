@@ -368,7 +368,7 @@ git commit -m "feat: persist policy approvals and tool audit"
 **Interfaces:**
 - Implements application `PolicyEvaluator`. Consumes a versioned, trusted policy snapshot and complete `PolicyRequest`; produces a decision with actor/resource/operation/policy digests, sorted matched rules, effect, expiry, and a content-addressed redaction report. It never reads a repository path or sends data to a provider.
 
-- [ ] **Step 1 - Write failing policy and disclosure tests**
+- [x] **Step 1 - Write failing policy and disclosure tests**
 
 Create deterministic fixtures containing API tokens, private keys, connection strings, proprietary classifications, prompt-injection text, secret-bearing filenames, archive metadata, error messages, and Unicode/CRLF variants. Test direct read, filename/metadata listing, Git diff/status, diagnostic, artifact, summary, and final serialized-payload channels. Assert:
 
@@ -385,7 +385,7 @@ cargo test -p local-agent-terminal-policy-engine --test deny_overrides --test di
 
 Expected RED: the policy-engine crate and fixtures are absent.
 
-- [ ] **Step 2 - Implement the minimal deterministic engine**
+- [x] **Step 2 - Implement the minimal deterministic engine**
 
 Parse `PolicyBundleV1` with `deny_unknown_fields`, validate unique rule IDs and a canonical snapshot digest, then compile only explicit built-in matchers. Classify trusted metadata separately from hostile content. Scan before indexing/read disclosure and scan the final serialized effective payload again. Use byte offsets internally so redaction does not depend on Unicode character width.
 
@@ -411,7 +411,7 @@ impl VersionedPolicyEngine {
 
 Ordinary diagnostics expose only category, rule IDs, byte counts, and stable redacted identifiers. Do not persist exact secret matches in normal artifacts.
 
-- [ ] **Step 3 - Run focused, property, and architecture checks**
+- [x] **Step 3 - Run focused, property, and architecture checks**
 
 ```powershell
 cargo fmt --all -- --check
@@ -422,7 +422,7 @@ node scripts/check-architecture.mjs
 
 Expected GREEN: all channels obey the same decision, deny-overrides is order-independent, failed enforcement denies, and the new crate has only inward edges.
 
-- [ ] **Step 4 - Commit**
+- [x] **Step 4 - Commit**
 
 ```powershell
 git add Cargo.toml Cargo.lock crates/policy-engine
