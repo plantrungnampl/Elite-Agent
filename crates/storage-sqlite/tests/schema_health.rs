@@ -13,6 +13,8 @@ const NORMATIVE_SQL: &str =
     include_str!("../../../docs/multi-agent-terminal-design/schemas/sqlite-v1.sql");
 const PRIOR_V1_CHECKSUM: &str =
     "sha256:016173b278c07b241c61d9a0e93533803b787861b945d4393ca26ee24d165f62";
+const PRIOR_V2_CHECKSUM: &str =
+    "sha256:c2487f24da333edafd83e6e25853f142933dde21f0e419ac4a8795996469b086";
 const PRIOR_V1_HARDENING: &str = r#"
 CREATE TRIGGER events_update_forbidden
 BEFORE UPDATE ON events
@@ -86,14 +88,14 @@ fn first_startup_applies_schema_and_records_checksum() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(latest, (2, migration_checksum()));
+    assert_eq!(latest, (3, migration_checksum()));
     assert_eq!(
         connection
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        2
+        3
     );
     assert_eq!(
         connection
@@ -108,7 +110,7 @@ fn first_startup_applies_schema_and_records_checksum() {
 }
 
 #[test]
-fn exact_prior_v1_database_upgrades_to_v2_without_losing_data() {
+fn exact_prior_v1_database_upgrades_to_v3_without_losing_data() {
     let directory = TempDirectory::new();
     let path = directory.0.join("state.sqlite3");
     let mut connection = Connection::open(&path).unwrap();
@@ -135,7 +137,7 @@ fn exact_prior_v1_database_upgrades_to_v2_without_losing_data() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        2
+        3
     );
     assert!(connection
         .execute("UPDATE tasks SET fencing_epoch = 0 WHERE id = 'task-1'", [])
@@ -149,6 +151,66 @@ fn exact_prior_v1_database_upgrades_to_v2_without_losing_data() {
             [format!("sha256:{}", "a".repeat(64))],
         )
         .is_err());
+}
+
+#[test]
+fn exact_prior_v2_database_upgrades_without_rewriting_its_checksum() {
+    let directory = TempDirectory::new();
+    let path = directory.0.join("state.sqlite3");
+    SqliteStore::open(&path).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TRIGGER policy_decisions_update_forbidden;
+             DROP TRIGGER policy_decisions_delete_forbidden;
+             DROP TRIGGER approval_request_fields_immutable;
+             DROP TRIGGER approval_status_forward_only;
+             DROP TRIGGER operation_intent_status_forward_only;
+             DROP TRIGGER tool_execution_status_forward_only;
+             DROP INDEX tool_execution_approval_single_use;
+             DELETE FROM schema_migrations WHERE version = 3;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE schema_migrations SET checksum = ?1 WHERE version = 2",
+            [PRIOR_V2_CHECKSUM],
+        )
+        .unwrap();
+    drop(connection);
+
+    SqliteStore::open(&path).unwrap();
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version = 2",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        PRIOR_V2_CHECKSUM
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'trigger' AND name = 'approval_status_forward_only'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -189,7 +251,7 @@ fn later_startup_rejects_changed_or_unsupported_schema() {
              (version, name, applied_at, application_version, checksum)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                3,
+                4,
                 "future",
                 "2026-07-26T00:00:00Z",
                 "9.0.0",
@@ -200,8 +262,8 @@ fn later_startup_rejects_changed_or_unsupported_schema() {
     assert!(matches!(
         SqliteStore::open(&unsupported_path),
         Err(OpenError::UnsupportedSchema {
-            found: 3,
-            supported: 2
+            found: 4,
+            supported: 3
         })
     ));
 }
@@ -317,7 +379,7 @@ fn startup_rejects_unknown_nonempty_database_without_mutating_it() {
         SqliteStore::open(&path),
         Err(OpenError::UnsupportedSchema {
             found: 0,
-            supported: 2
+            supported: 3
         })
     ));
 

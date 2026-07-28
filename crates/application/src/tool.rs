@@ -87,6 +87,15 @@ impl ToolRequestBindingDigest {
     pub const fn as_sha256(&self) -> &Sha256Digest {
         &self.0
     }
+
+    /// Restores a syntactically validated digest loaded from authoritative persistence.
+    ///
+    /// Construction does not authorize a request; callers must still compare every
+    /// persisted binding during the atomic approval claim.
+    #[must_use]
+    pub const fn from_persisted(digest: Sha256Digest) -> Self {
+        Self(digest)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

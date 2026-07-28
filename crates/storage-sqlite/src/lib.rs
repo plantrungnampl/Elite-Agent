@@ -1,12 +1,15 @@
 #![forbid(unsafe_code)]
 
+mod approval_store;
 mod artifact_journal;
 mod event_store;
 mod health;
 mod lease_store;
 mod migrations;
+mod policy_store;
 mod project_store;
 mod task_query;
+mod tool_execution_store;
 mod workspace_store;
 
 use std::path::{Path, PathBuf};
