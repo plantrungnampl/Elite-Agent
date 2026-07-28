@@ -2,20 +2,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use local_agent_terminal_application::{
-    bind_tool_approval_payload, canonical_approval_payload, ApprovalCheck, ApprovalClaim,
-    ApprovalDigestPayload, ApprovalId, ApprovalInvalidation, ApprovalResolution, ApprovalSnapshot,
-    ApprovalState, ApprovalStore, AuthorizedProcessRequest, AuthorizedToolRequest,
-    BoundToolApproval, CancellationReceipt, CapabilityFilesystem, CapabilityResolver, Clock,
-    DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest, ExecuteApprovedTool,
-    NewApproval, PolicyDecisionStore, PolicyEvaluator, PortError, ProcessLauncher, Retryability,
-    SafeErrorClassification, StructuredGit, StructuredToolExecutor, ToolApprovalOperationV1,
-    ToolApprovalPayloadV1, ToolExecutionId, ToolExecutionResult, ToolExecutionStore,
+    bind_tool_approval_payload, canonical_approval_payload, canonical_file_write_recovery_request,
+    parse_file_write_recovery_request, ApprovalCheck, ApprovalClaim, ApprovalDigestPayload,
+    ApprovalId, ApprovalInvalidation, ApprovalResolution, ApprovalSnapshot, ApprovalState,
+    ApprovalStore, AuthorizedProcessRequest, AuthorizedToolRequest, BoundToolApproval,
+    CancellationReceipt, CanonicalEvidenceRef, CapabilityFilesystem, CapabilityResolver,
+    CapabilityRootIdentity, Clock, DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest,
+    ExecuteApprovedTool, FileWritePolicyBinding, FileWritePreImage, FileWriteRecoveryRequest,
+    NewApproval, PolicyDecisionStore, PolicyEvaluator, PortError, ProcessLauncher,
+    RelativePathComponents, Retryability, SafeErrorClassification, StructuredGit,
+    StructuredToolExecutor, ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionId,
+    ToolExecutionResult, ToolExecutionStore,
 };
 use local_agent_terminal_domain::{
-    CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken, NetworkProfile, Phase,
-    PlanStepId, ProcessBinding, ProcessInvocation, ProcessToolRequest, ProcessTrustTier, RunId,
-    Sha256Digest, TaskId, WorkspaceVersion,
+    ActorId, ArtifactId, CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken,
+    GitObjectId, LeaseClaim, NetworkProfile, Phase, PlanStepId, PolicyEffect, ProcessBinding,
+    ProcessInvocation, ProcessToolRequest, ProcessTrustTier, ProjectId, RunId, Sequence,
+    Sha256Digest, TaskId, WorkspaceFingerprint, WorkspaceVersion,
 };
+use sha2::Digest;
 
 fn assert_object_safe<T: ?Sized>() {}
 
@@ -23,6 +28,7 @@ fn assert_object_safe<T: ?Sized>() {}
 fn policy_and_tool_ports_are_object_safe() {
     assert_object_safe::<dyn PolicyEvaluator>();
     assert_object_safe::<dyn DisclosurePolicyEvaluator>();
+    assert_object_safe::<dyn local_agent_terminal_application::FileWriteRecoveryStore>();
     assert_object_safe::<dyn PolicyDecisionStore>();
     assert_object_safe::<dyn ApprovalStore>();
     assert_object_safe::<dyn CapabilityResolver>();
@@ -43,6 +49,82 @@ fn disclosure_request_binds_policy_input_channel_and_exact_bytes() {
 
     assert_eq!(request.channel, DisclosureChannel::FileRead);
     assert_eq!(request.bytes, b"API_TOKEN=secret");
+}
+
+#[test]
+fn file_write_recovery_request_round_trips_canonical_identity() {
+    let request = file_write_recovery_request();
+
+    let canonical = canonical_file_write_recovery_request(&request).unwrap();
+
+    assert_eq!(
+        parse_file_write_recovery_request(&canonical.canonical_bytes).unwrap(),
+        request
+    );
+    assert_eq!(
+        canonical.operation_digest,
+        Sha256Digest::new(format!(
+            "sha256:{:x}",
+            sha2::Sha256::digest(&canonical.canonical_bytes)
+        ))
+        .unwrap()
+    );
+    assert!(!String::from_utf8(canonical.canonical_bytes)
+        .unwrap()
+        .contains("C:\\"));
+}
+
+#[test]
+fn file_write_recovery_digest_changes_with_every_effect_identity() {
+    let baseline = file_write_recovery_request();
+    let baseline_digest = canonical_file_write_recovery_request(&baseline)
+        .unwrap()
+        .operation_digest;
+    let mut changed_target = baseline.clone();
+    changed_target.relative_components =
+        RelativePathComponents::new(vec!["other.txt".to_owned()]).unwrap();
+    let mut changed_lease = baseline.clone();
+    changed_lease.lease_claim = LeaseClaim::new(
+        task_id(),
+        RunId::new("run-2").unwrap(),
+        FencingToken::new(20).unwrap(),
+    );
+    let mut changed_pre_image = baseline.clone();
+    changed_pre_image.pre_image = FileWritePreImage::Absent;
+    let mut changed_post = baseline.clone();
+    changed_post.expected_post_digest = digest('9');
+    let mut changed_policy = baseline.clone();
+    changed_policy.policy.operation_digest = digest('8');
+
+    for changed in [
+        changed_target,
+        changed_lease,
+        changed_pre_image,
+        changed_post,
+        changed_policy,
+    ] {
+        assert_ne!(
+            canonical_file_write_recovery_request(&changed)
+                .unwrap()
+                .operation_digest,
+            baseline_digest
+        );
+    }
+}
+
+#[test]
+fn file_write_recovery_request_rejects_unbound_or_noncanonical_evidence() {
+    let mut cross_task = file_write_recovery_request();
+    let FileWritePreImage::Artifact(pre_image) = &mut cross_task.pre_image else {
+        unreachable!()
+    };
+    pre_image.task_id = Some(TaskId::new("task-2").unwrap());
+    assert!(canonical_file_write_recovery_request(&cross_task).is_err());
+
+    let canonical = canonical_file_write_recovery_request(&file_write_recovery_request()).unwrap();
+    let mut noncanonical = vec![b' '];
+    noncanonical.extend_from_slice(&canonical.canonical_bytes);
+    assert!(parse_file_write_recovery_request(&noncanonical).is_err());
 }
 
 #[test]
@@ -748,6 +830,53 @@ fn policy_request() -> local_agent_terminal_domain::PolicyRequest {
         purpose: "test".to_owned(),
         policy_snapshot_digest: digest('b'),
         evaluated_at: Timestamp::from_unix_seconds(1),
+    }
+}
+
+fn file_write_recovery_request() -> FileWriteRecoveryRequest {
+    let task_id = task_id();
+    FileWriteRecoveryRequest {
+        execution_id: ToolExecutionId::new("file-write-1").unwrap(),
+        task_id: task_id.clone(),
+        root_identity: CapabilityRootIdentity::new("worktree-root-1").unwrap(),
+        relative_components: RelativePathComponents::new(vec!["src".into(), "main.rs".into()])
+            .unwrap(),
+        lease_claim: LeaseClaim::new(
+            task_id.clone(),
+            RunId::new("run-1").unwrap(),
+            FencingToken::new(19).unwrap(),
+        ),
+        expected_sequence: Sequence::new(7),
+        pre_image: FileWritePreImage::Artifact(evidence("pre-image", "1", "objects/pre-image")),
+        expected_post_digest: digest('2'),
+        expected_post_size: 12,
+        pre_fingerprint: WorkspaceFingerprint::new(
+            GitObjectId::new("a".repeat(40)).unwrap(),
+            digest('3').as_str(),
+            digest('4').as_str(),
+        )
+        .unwrap(),
+        pre_evidence: evidence("pre-evidence", "5", "objects/pre-evidence"),
+        actor_id: ActorId::new("tool-runtime").unwrap(),
+        correlation_id: "file-write:file-write-1".to_owned(),
+        policy: FileWritePolicyBinding {
+            decision_id: "policy-file-write-1".to_owned(),
+            operation_digest: digest('6'),
+            policy_snapshot_digest: digest('b'),
+            effect: PolicyEffect::Allow,
+            approval_id: None,
+        },
+    }
+}
+
+fn evidence(id: &str, hash: &str, storage_key: &str) -> CanonicalEvidenceRef {
+    CanonicalEvidenceRef {
+        artifact_id: ArtifactId::new(id).unwrap(),
+        content_hash: format!("sha256:{}", hash.repeat(64)),
+        storage_key: storage_key.to_owned(),
+        size_bytes: 12,
+        project_id: ProjectId::new("project-1").unwrap(),
+        task_id: Some(task_id()),
     }
 }
 

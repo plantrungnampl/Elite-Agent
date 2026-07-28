@@ -58,14 +58,19 @@ pub use repository::{
     RepositorySnapshot, WorktreeObservation, WorktreeSnapshot, WorktreeState,
 };
 pub use tool::{
-    bind_tool_approval_payload, AuthorizedFileRead, AuthorizedFileWrite, AuthorizedGitDiff,
+    bind_tool_approval_payload, canonical_file_write_recovery_request,
+    parse_file_write_recovery_request, AuthorizedFileRead, AuthorizedFileWrite, AuthorizedGitDiff,
     AuthorizedGitStatus, AuthorizedProcessRequest, AuthorizedToolRequest, BoundToolApproval,
-    CancellationReceipt, CapabilityFilesystem, CapabilityRequest, CapabilityResolver,
-    CapabilityRootIdentity, FileReadRequest, FileWriteRequest, GitDiffResult, GitStatusResult,
-    NewToolExecution, NewToolIntent, OperationIntentSnapshot, ProcessLauncher, ProcessReceipt,
-    RelativePathComponents, ResolvedCapability, StructuredGit, StructuredToolExecutor,
-    ToolExecutionCompletion, ToolExecutionId, ToolExecutionResult, ToolExecutionSnapshot,
-    ToolExecutionStore, ToolRequestBindingDigest, VerifiedBytes, VerifiedWrite,
+    CancellationReceipt, CanonicalFileWriteRecoveryRequest, CapabilityFilesystem,
+    CapabilityRequest, CapabilityResolver, CapabilityRootIdentity, FileReadRequest,
+    FileWritePolicyBinding, FileWritePreImage, FileWriteRecoveryCompletion,
+    FileWriteRecoveryIntent, FileWriteRecoveryRequest, FileWriteRecoverySnapshot,
+    FileWriteRecoveryState, FileWriteRecoveryStore, FileWriteRequest, GitDiffResult,
+    GitStatusResult, NewToolExecution, NewToolIntent, OperationIntentSnapshot, ProcessLauncher,
+    ProcessReceipt, RelativePathComponents, ResolvedCapability, StructuredGit,
+    StructuredToolExecutor, ToolExecutionCompletion, ToolExecutionId, ToolExecutionResult,
+    ToolExecutionSnapshot, ToolExecutionStore, ToolRequestBindingDigest, VerifiedBytes,
+    VerifiedWrite,
 };
 pub use workspace::{
     ArtifactRootMode, GetWorkspaceDashboard, IdempotencyClass, IntentTransition, NewProject,
