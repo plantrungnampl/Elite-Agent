@@ -1897,6 +1897,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "local-agent-terminal-platform-windows"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "local-agent-terminal-application",
+ "local-agent-terminal-domain",
+ "sha2",
+ "tempfile",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "local-agent-terminal-policy-engine"
 version = "0.1.0"
 dependencies = [
