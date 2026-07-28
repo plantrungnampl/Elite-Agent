@@ -1897,6 +1897,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "local-agent-terminal-policy-engine"
+version = "0.1.0"
+dependencies = [
+ "local-agent-terminal-application",
+ "local-agent-terminal-domain",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
+]
+
+[[package]]
 name = "local-agent-terminal-repository-git"
 version = "0.1.0"
 dependencies = [

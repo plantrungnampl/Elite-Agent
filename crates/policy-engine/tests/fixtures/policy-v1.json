@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "cloud-secret-deny",
+      "effect": "deny",
+      "resourceClass": "secret"
+    },
+    {
+      "id": "cloud-redact",
+      "effect": "allow_with_redaction",
+      "locality": "cloud",
+      "action": "context.disclose",
+      "redactions": ["secret_scanner"]
+    },
+    {
+      "id": "local-approval",
+      "effect": "require_approval",
+      "locality": "local",
+      "resourceClass": "internal_code",
+      "action": "context.disclose",
+      "redactions": ["secret_scanner"]
+    }
+  ]
+}

@@ -4,6 +4,7 @@ members = [
     "crates/application",
     "crates/bootstrap",
     "crates/domain",
+    "crates/policy-engine",
     "crates/repository-git",
     "crates/storage-files",
     "crates/storage-sqlite",
