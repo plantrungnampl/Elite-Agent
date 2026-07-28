@@ -1,0 +1,12 @@
+[package]
+name = "local-agent-terminal-tool-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+local-agent-terminal-application = { path = "../application" }
+local-agent-terminal-domain = { path = "../domain" }
+sha2 = "0.10"
+
+[dev-dependencies]
+sha2 = "0.10"

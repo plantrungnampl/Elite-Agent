@@ -58,8 +58,9 @@ pub use tool::{
     bind_tool_approval_payload, AuthorizedFileRead, AuthorizedFileWrite, AuthorizedGitDiff,
     AuthorizedGitStatus, AuthorizedProcessRequest, AuthorizedToolRequest, BoundToolApproval,
     CancellationReceipt, CapabilityFilesystem, CapabilityRequest, CapabilityResolver,
-    GitDiffResult, GitStatusResult, NewToolExecution, NewToolIntent, OperationIntentSnapshot,
-    ProcessLauncher, ProcessReceipt, ResolvedCapability, StructuredGit, StructuredToolExecutor,
+    CapabilityRootIdentity, FileReadRequest, FileWriteRequest, GitDiffResult, GitStatusResult,
+    NewToolExecution, NewToolIntent, OperationIntentSnapshot, ProcessLauncher, ProcessReceipt,
+    RelativePathComponents, ResolvedCapability, StructuredGit, StructuredToolExecutor,
     ToolExecutionCompletion, ToolExecutionId, ToolExecutionResult, ToolExecutionSnapshot,
     ToolExecutionStore, ToolRequestBindingDigest, VerifiedBytes, VerifiedWrite,
 };

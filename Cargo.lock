@@ -1949,6 +1949,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "local-agent-terminal-tool-runtime"
+version = "0.1.0"
+dependencies = [
+ "local-agent-terminal-application",
+ "local-agent-terminal-domain",
+ "sha2",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

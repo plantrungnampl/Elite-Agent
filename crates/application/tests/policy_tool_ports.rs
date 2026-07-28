@@ -411,6 +411,34 @@ impl StructuredToolExecutor for CountingExecutor {
             cancelled: true,
         })
     }
+
+    fn file_read(
+        &self,
+        _: local_agent_terminal_application::FileReadRequest,
+    ) -> Result<local_agent_terminal_application::VerifiedBytes, PortError> {
+        unreachable!()
+    }
+
+    fn file_write(
+        &self,
+        _: local_agent_terminal_application::FileWriteRequest,
+    ) -> Result<local_agent_terminal_application::VerifiedWrite, PortError> {
+        unreachable!()
+    }
+
+    fn git_status(
+        &self,
+        _: local_agent_terminal_application::AuthorizedGitStatus,
+    ) -> Result<local_agent_terminal_application::GitStatusResult, PortError> {
+        unreachable!()
+    }
+
+    fn git_diff(
+        &self,
+        _: local_agent_terminal_application::AuthorizedGitDiff,
+    ) -> Result<local_agent_terminal_application::GitDiffResult, PortError> {
+        unreachable!()
+    }
 }
 
 fn snapshot(case: ApprovalCase) -> ApprovalSnapshot {

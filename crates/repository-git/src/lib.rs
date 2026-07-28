@@ -3,6 +3,7 @@
 mod hazards;
 mod inspect;
 mod paths;
+mod tools;
 mod unsafe_checkout;
 mod worktree;
 
@@ -16,6 +17,18 @@ use local_agent_terminal_application::{
     RepositoryGateway, RepositoryLocator, RepositorySnapshot, WorktreeObservation,
     WorktreeSnapshot,
 };
+use local_agent_terminal_domain::TaskId;
+
+pub struct GitStructuredTools {
+    locator: RepositoryLocator,
+    task_id: TaskId,
+}
+
+impl GitStructuredTools {
+    pub const fn new(locator: RepositoryLocator, task_id: TaskId) -> Self {
+        Self { locator, task_id }
+    }
+}
 
 pub struct GitRepositoryGateway {
     pub(crate) trusted_workspace_root: PathBuf,

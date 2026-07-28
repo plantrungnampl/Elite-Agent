@@ -1,12 +1,12 @@
 use local_agent_terminal_domain::{
-    CapabilityRef, FencingToken, NetworkProfile, ProcessToolRequest, ProcessTrustTier,
-    Sha256Digest, TaskId, WorkspaceVersion,
+    CapabilityRef, FencingToken, GitObjectId, LeaseClaim, NetworkProfile, ProcessToolRequest,
+    ProcessTrustTier, RepositoryId, Sha256Digest, TaskId,
 };
 use serde_json::{json, Value};
 
 use crate::approval::{canonical_approval_payload, ApprovalDigestPayload, ToolApprovalPayloadV1};
 use crate::canonical_json::{invalid_input, sha256_digest};
-use crate::PortError;
+use crate::{PortError, WorkspaceMutationRequest};
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -20,22 +20,82 @@ pub struct CapabilityRequest {
 pub struct ResolvedCapability {
     pub capability: CapabilityRef,
     pub content_digest: Option<Sha256Digest>,
+    pub root_identity: CapabilityRootIdentity,
+    pub relative_components: RelativePathComponents,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityRootIdentity(String);
+
+impl CapabilityRootIdentity {
+    pub fn new(value: impl Into<String>) -> Result<Self, PortError> {
+        let value = value.into();
+        if value.trim().is_empty() || value.len() > 256 || value.contains(['\0', '/', '\\', ':']) {
+            return Err(invalid_input());
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelativePathComponents(Vec<String>);
+
+impl RelativePathComponents {
+    pub fn new(components: Vec<String>) -> Result<Self, PortError> {
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|component| !valid_path_component(component))
+        {
+            return Err(invalid_input());
+        }
+        Ok(Self(components))
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileReadRequest {
+    pub task_id: TaskId,
+    pub capability: CapabilityRef,
+    pub expected_digest: Option<Sha256Digest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedFileRead {
     pub task_id: TaskId,
-    pub capability: CapabilityRef,
+    pub root_identity: CapabilityRootIdentity,
+    pub relative_components: RelativePathComponents,
     pub expected_digest: Option<Sha256Digest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorizedFileWrite {
+pub struct FileWriteRequest {
     pub task_id: TaskId,
     pub capability: CapabilityRef,
     pub expected_digest: Option<Sha256Digest>,
     pub bytes: Vec<u8>,
     pub fencing_token: FencingToken,
+    pub lease_claim: LeaseClaim,
+    pub workspace_mutation: WorkspaceMutationRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedFileWrite {
+    pub task_id: TaskId,
+    pub root_identity: CapabilityRootIdentity,
+    pub relative_components: RelativePathComponents,
+    pub expected_digest: Option<Sha256Digest>,
+    pub bytes: Vec<u8>,
+    pub fencing_token: FencingToken,
+    pub lease_claim: LeaseClaim,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,29 +107,40 @@ pub struct VerifiedBytes {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedWrite {
     pub digest: Sha256Digest,
-    pub workspace_version: WorkspaceVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedGitStatus {
     pub task_id: TaskId,
     pub worktree: CapabilityRef,
+    pub policy_decision_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedGitDiff {
     pub task_id: TaskId,
     pub worktree: CapabilityRef,
+    pub policy_decision_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitStatusResult {
     pub digest: Sha256Digest,
+    pub repository_id: RepositoryId,
+    pub revision: GitObjectId,
+    pub path_scope: CapabilityRef,
+    pub truncated: bool,
+    pub policy_decision_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitDiffResult {
     pub digest: Sha256Digest,
+    pub repository_id: RepositoryId,
+    pub revision: GitObjectId,
+    pub path_scope: CapabilityRef,
+    pub truncated: bool,
+    pub policy_decision_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +333,48 @@ pub trait ToolExecutionStore: Send + Sync {
 pub trait StructuredToolExecutor: Send + Sync {
     fn execute(&self, request: AuthorizedToolRequest) -> Result<ToolExecutionResult, PortError>;
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError>;
+    fn file_read(&self, request: FileReadRequest) -> Result<VerifiedBytes, PortError>;
+    fn file_write(&self, request: FileWriteRequest) -> Result<VerifiedWrite, PortError>;
+    fn git_status(&self, request: AuthorizedGitStatus) -> Result<GitStatusResult, PortError>;
+    fn git_diff(&self, request: AuthorizedGitDiff) -> Result<GitDiffResult, PortError>;
+}
+
+fn valid_path_component(value: &str) -> bool {
+    let stem = value
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    !value.is_empty()
+        && value.len() <= 255
+        && !matches!(value, "." | "..")
+        && !value.ends_with(['.', ' '])
+        && !value.contains(['\0', '/', '\\', ':'])
+        && !matches!(
+            stem.as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        )
 }
 
 pub fn bind_tool_approval_payload(
