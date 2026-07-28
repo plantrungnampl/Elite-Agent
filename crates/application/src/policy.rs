@@ -1,11 +1,37 @@
-use local_agent_terminal_domain::{PolicyDecisionDraft, PolicyRequest, Sha256Digest, Timestamp};
+use local_agent_terminal_domain::{
+    CapabilityRef, PolicyActor, PolicyDecisionDraft, PolicyRequest, ResourceClass, Sha256Digest,
+    TaskId, TaskRisk, Timestamp,
+};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
-use crate::PortError;
+use crate::{
+    canonical_json::{invalid_input, sha256_digest},
+    PortError,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyDecision {
     pub draft: PolicyDecisionDraft,
     pub operation_digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDecisionId(String);
+
+impl PolicyDecisionId {
+    pub fn from_decision(decision: &PolicyDecision) -> Self {
+        let digest = decision
+            .operation_digest
+            .as_str()
+            .strip_prefix("sha256:")
+            .expect("validated SHA-256 digests always carry the prefix");
+        Self(format!("policy-decision:{digest}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +52,30 @@ pub enum DisclosureChannel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisclosureContextRequest {
+    pub task_id: TaskId,
+    pub capability: CapabilityRef,
+    pub channel: DisclosureChannel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedDisclosureContext {
+    pub actor: PolicyActor,
+    pub resource_class: ResourceClass,
+    pub task_risk: TaskRisk,
+    pub workflow_phase: String,
+    pub purpose: String,
+    pub policy_snapshot_digest: Sha256Digest,
+}
+
+pub trait DisclosureContextProvider: Send + Sync {
+    fn context(
+        &self,
+        request: DisclosureContextRequest,
+    ) -> Result<TrustedDisclosureContext, PortError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisclosureRequest {
     pub policy_request: PolicyRequest,
     pub channel: DisclosureChannel,
@@ -33,17 +83,79 @@ pub struct DisclosureRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyApprovalBinding {
+    pub effective_payload_digest: Sha256Digest,
+    pub redaction_report_digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyApprovedDisclosure {
     pub decision: PolicyDecision,
+    pub channel: DisclosureChannel,
     pub original_digest: Sha256Digest,
     pub effective_bytes: Option<Vec<u8>>,
     pub effective_digest: Option<Sha256Digest>,
+    pub redaction_report_digest: Sha256Digest,
+    pub approval_binding: Option<PolicyApprovalBinding>,
 }
 
 pub trait DisclosurePolicyEvaluator: Send + Sync {
     fn disclose(&self, request: DisclosureRequest) -> Result<PolicyApprovedDisclosure, PortError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyBoundBytes {
+    pub policy_decision_id: PolicyDecisionId,
+    pub original_digest: Sha256Digest,
+    pub redaction_report_digest: Sha256Digest,
+    pub digest: Sha256Digest,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisclosureOutcome<T> {
+    Disclosed(T),
+    Denied,
+    ApprovalRequired { binding: PolicyApprovalBinding },
+}
+
+impl<T> DisclosureOutcome<T> {
+    pub fn map<U>(self, transform: impl FnOnce(T) -> U) -> DisclosureOutcome<U> {
+        match self {
+            Self::Disclosed(value) => DisclosureOutcome::Disclosed(transform(value)),
+            Self::Denied => DisclosureOutcome::Denied,
+            Self::ApprovalRequired { binding } => DisclosureOutcome::ApprovalRequired { binding },
+        }
+    }
+}
+
 pub trait PolicyDecisionStore: Send + Sync {
-    fn record(&self, decision: RecordedPolicyDecision) -> Result<(), PortError>;
+    fn record(&self, decision: RecordedPolicyDecision) -> Result<PolicyDecisionId, PortError>;
+}
+
+pub fn parse_policy_timestamp(value: &str) -> Result<Timestamp, PortError> {
+    let timestamp = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| invalid_input())?;
+    Ok(Timestamp::from_unix_seconds(timestamp.unix_timestamp()))
+}
+
+pub fn bind_disclosure_channel(
+    mut decision: PolicyDecision,
+    channel: DisclosureChannel,
+) -> Result<PolicyDecision, PortError> {
+    let value = serde_json::json!({
+        "operationDigest": decision.operation_digest.as_str(),
+        "disclosureChannel": disclosure_channel_name(channel),
+    });
+    let canonical = serde_json_canonicalizer::to_vec(&value).map_err(|_| invalid_input())?;
+    decision.operation_digest =
+        Sha256Digest::new(sha256_digest(&canonical)).map_err(|_| invalid_input())?;
+    Ok(decision)
+}
+
+const fn disclosure_channel_name(channel: DisclosureChannel) -> &'static str {
+    match channel {
+        DisclosureChannel::FileRead => "file_read",
+        DisclosureChannel::GitStatus => "git_status",
+        DisclosureChannel::GitDiff => "git_diff",
+    }
 }

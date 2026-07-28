@@ -5,20 +5,519 @@ use local_agent_terminal_application::{
     canonical_file_write_recovery_request, AcquireLease, AuthorizedFileRead, AuthorizedGitDiff,
     AuthorizedGitStatus, CapabilityFileWriteSession, CapabilityFileWriteSessionFactory,
     CapabilityFilesystem, CapabilityRequest, CapabilityResolver, CapabilityRootIdentity,
-    CaptureFileWritePostEvidence, CaptureFileWritePreEvidence, ExecutorLeaseStore, FileReadRequest,
-    FileWriteEvidenceStore, FileWritePolicyBinding, FileWritePostExpectation, FileWritePreImage,
-    FileWriteRecoveryCompletion, FileWriteRecoveryIntent, FileWriteRecoverySnapshot,
-    FileWriteRecoveryState, FileWriteRecoveryStore, FileWriteRequest, GitDiffResult,
-    GitStatusRequest, GitStatusResult, LeaseSnapshot, ObservedFileImage, OpenFileWriteSession,
-    PortError, ProcessLauncher, ProcessReceipt, RelativePathComponents, ResolvedCapability,
-    RevokeLease, StructuredGit, StructuredToolExecutor, ToolExecutionId, VerifiedBytes,
-    VerifiedFileWriteCompensation, VerifiedWrite, WorkspaceWriteCoordinator,
+    CaptureFileWritePostEvidence, CaptureFileWritePreEvidence, Clock, DisclosureContextProvider,
+    DisclosureContextRequest, DisclosureOutcome, DisclosurePolicyEvaluator, DisclosureRequest,
+    ExecutorLeaseStore, FileReadRequest, FileWriteEvidenceStore, FileWritePolicyBinding,
+    FileWritePostExpectation, FileWritePreImage, FileWriteRecoveryCompletion,
+    FileWriteRecoveryIntent, FileWriteRecoverySnapshot, FileWriteRecoveryState,
+    FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest, GitStatusRequest, LeaseSnapshot,
+    ObservedFileImage, OpenFileWriteSession, PolicyApprovedDisclosure, PolicyDecisionId,
+    PolicyDecisionStore, PortError, ProcessLauncher, ProcessReceipt, RawGitDiffResult,
+    RawGitStatusResult, RecordedPolicyDecision, RelativePathComponents, ResolvedCapability,
+    RevokeLease, StructuredGit, StructuredToolExecutor, ToolExecutionId, TrustedDisclosureContext,
+    VerifiedBytes, VerifiedFileWriteCompensation, VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
-    ActorId, ArtifactId, CapabilityRef, FencingToken, GitObjectId, LeaseClaim, PolicyEffect,
-    ProjectId, RunId, Sequence, Sha256Digest, TaskId, WorkspaceFingerprint,
+    ActorId, ActorLocality, ArtifactId, CapabilityRef, FencingToken, GitObjectId, LeaseClaim,
+    PolicyActor, PolicyEffect, ProjectId, ResourceClass, RunId, Sequence, Sha256Digest, TaskId,
+    TaskRisk, TrustTier, WorkspaceFingerprint,
 };
+use local_agent_terminal_policy_engine::{ScanFailurePoint, VersionedPolicyEngine};
 use local_agent_terminal_tool_runtime::ToolRuntime;
+
+#[test]
+fn file_read_forces_resolved_digest_records_authoritative_decision_and_returns_only_effective_bytes(
+) {
+    let original = b"x tok_test_7f89ac y".to_vec();
+    let resolver = DisclosureResolver {
+        observed_digest: digest(&original),
+    };
+    let filesystem = DisclosureFilesystem {
+        original: original.clone(),
+        expected_digest: Mutex::new(None),
+    };
+    let engine = VersionedPolicyEngine::from_json(
+        r#"{"version":1,"rules":[{"id":"cloud-redact","effect":"allow_with_redaction","locality":"cloud","action":"context.disclose","redactions":["secret_scanner"]}]}"#,
+    )
+    .unwrap();
+    let context = FixedDisclosureContext {
+        snapshot_digest: engine.snapshot_digest().clone(),
+        resource_class: ResourceClass::InternalCode,
+        locality: ActorLocality::Cloud,
+    };
+    let decisions = RecordingDecisionStore::default();
+    let harness = Harness::new(Some(b"before".to_vec()));
+    let runtime = ToolRuntime::new(
+        &resolver,
+        &filesystem,
+        &harness.sessions,
+        &harness.git,
+        &harness.leases,
+        &harness.process,
+        &harness.evidence,
+        &harness.recovery,
+        &harness.writes,
+        &context,
+        &engine,
+        &decisions,
+        &FixedClock,
+    );
+
+    let outcome = runtime
+        .file_read(FileReadRequest {
+            task_id: task(),
+            capability: capability("secret.txt"),
+            expected_digest: None,
+        })
+        .unwrap();
+    let DisclosureOutcome::Disclosed(disclosure) = outcome else {
+        panic!("cloud redaction must disclose only effective bytes");
+    };
+    let expected = b"x [REDACTED:api_token:665cc10fef9147d3] y";
+
+    assert_eq!(disclosure.bytes, expected);
+    assert_eq!(disclosure.digest, digest(expected));
+    assert_eq!(disclosure.original_digest, digest(&original));
+    assert_eq!(
+        filesystem.expected_digest.lock().unwrap().as_ref(),
+        Some(&digest(&original))
+    );
+    let recorded = decisions.recorded.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        disclosure.policy_decision_id,
+        PolicyDecisionId::from_decision(&recorded[0].decision)
+    );
+}
+
+#[test]
+fn denied_file_read_records_the_decision_without_exposing_an_oracle() {
+    let original = b"private contents".to_vec();
+    let resolver = DisclosureResolver {
+        observed_digest: digest(&original),
+    };
+    let filesystem = DisclosureFilesystem {
+        original,
+        expected_digest: Mutex::new(None),
+    };
+    let engine = VersionedPolicyEngine::from_json(
+        r#"{"version":1,"rules":[{"id":"deny-secret","effect":"deny","resourceClass":"secret","action":"context.disclose"}]}"#,
+    )
+    .unwrap();
+    let context = FixedDisclosureContext {
+        snapshot_digest: engine.snapshot_digest().clone(),
+        resource_class: ResourceClass::Secret,
+        locality: ActorLocality::Cloud,
+    };
+    let decisions = RecordingDecisionStore::default();
+    let harness = Harness::new(Some(b"before".to_vec()));
+    let runtime = ToolRuntime::new(
+        &resolver,
+        &filesystem,
+        &harness.sessions,
+        &harness.git,
+        &harness.leases,
+        &harness.process,
+        &harness.evidence,
+        &harness.recovery,
+        &harness.writes,
+        &context,
+        &engine,
+        &decisions,
+        &FixedClock,
+    );
+
+    let outcome = runtime
+        .file_read(FileReadRequest {
+            task_id: task(),
+            capability: capability("secret.txt"),
+            expected_digest: None,
+        })
+        .unwrap();
+
+    assert_eq!(format!("{outcome:?}"), "Denied");
+    assert_eq!(decisions.recorded.lock().unwrap().len(), 1);
+    for forbidden in [
+        "secret.txt",
+        "worktree:",
+        "sha256:",
+        "policy-decision:",
+        "private contents",
+        "size",
+        "exists",
+    ] {
+        assert!(!format!("{outcome:?}").contains(forbidden));
+    }
+}
+
+#[test]
+fn git_status_is_policy_bound_before_bytes_cross_the_runtime_boundary() {
+    let original = b"token=tok_test_7f89ac\n".to_vec();
+    let git = StatusDisclosureGit {
+        original: original.clone(),
+    };
+    let engine = VersionedPolicyEngine::from_json(
+        r#"{"version":1,"rules":[{"id":"cloud-redact","effect":"allow_with_redaction","locality":"cloud","action":"context.disclose","redactions":["secret_scanner"]}]}"#,
+    )
+    .unwrap();
+    let context = FixedDisclosureContext {
+        snapshot_digest: engine.snapshot_digest().clone(),
+        resource_class: ResourceClass::InternalCode,
+        locality: ActorLocality::Cloud,
+    };
+    let decisions = RecordingDecisionStore::default();
+    let harness = Harness::new(Some(b"before".to_vec()));
+    let runtime = ToolRuntime::new(
+        &RootResolver,
+        &harness.reads,
+        &harness.sessions,
+        &git,
+        &harness.leases,
+        &harness.process,
+        &harness.evidence,
+        &harness.recovery,
+        &harness.writes,
+        &context,
+        &engine,
+        &decisions,
+        &FixedClock,
+    );
+
+    let outcome = runtime
+        .git_status(GitStatusRequest {
+            task_id: task(),
+            worktree: capability("."),
+        })
+        .unwrap();
+    let DisclosureOutcome::Disclosed(status) = outcome else {
+        panic!("redacted Git status must be disclosed");
+    };
+    let expected = b"token=[REDACTED:api_token:665cc10fef9147d3]\n";
+
+    assert_eq!(status.disclosure.bytes, expected);
+    assert_eq!(status.disclosure.digest, digest(expected));
+    assert_eq!(status.disclosure.original_digest, digest(&original));
+    assert_eq!(
+        status.repository_id,
+        local_agent_terminal_domain::RepositoryId::new("repo-1").unwrap()
+    );
+    assert_eq!(status.revision, GitObjectId::new("a".repeat(40)).unwrap());
+    assert_eq!(status.path_scope, capability("."));
+    assert!(!status.truncated);
+    assert_eq!(decisions.recorded.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn git_diff_copies_only_validated_metadata_and_policy_bound_effective_bytes() {
+    let original = b"diff tok_test_7f89ac\n".to_vec();
+    let git = StatusDisclosureGit {
+        original: original.clone(),
+    };
+    let engine = disclosure_engine("allow_with_redaction", "cloud");
+    let context = disclosure_context(&engine, ActorLocality::Cloud);
+    let decisions = RecordingDecisionStore::default();
+    let harness = Harness::new(None);
+    let runtime = ToolRuntime::new(
+        &RootResolver,
+        &harness.reads,
+        &harness.sessions,
+        &git,
+        &harness.leases,
+        &harness.process,
+        &harness.evidence,
+        &harness.recovery,
+        &harness.writes,
+        &context,
+        &engine,
+        &decisions,
+        &FixedClock,
+    );
+
+    let outcome = runtime
+        .git_diff(GitDiffRequest {
+            task_id: task(),
+            worktree: capability("."),
+        })
+        .unwrap();
+    let DisclosureOutcome::Disclosed(diff) = outcome else {
+        panic!("redacted Git diff must be disclosed");
+    };
+    let expected = b"diff [REDACTED:api_token:665cc10fef9147d3]\n";
+
+    assert_eq!(diff.disclosure.bytes, expected);
+    assert_eq!(diff.disclosure.digest, digest(expected));
+    assert_eq!(diff.disclosure.original_digest, digest(&original));
+    assert_eq!(
+        diff.repository_id,
+        local_agent_terminal_domain::RepositoryId::new("repo-1").unwrap()
+    );
+    assert_eq!(diff.revision, GitObjectId::new("b".repeat(40)).unwrap());
+    assert_eq!(diff.path_scope, capability("."));
+    assert!(diff.truncated);
+}
+
+#[test]
+fn disclosure_channel_changes_the_recorded_decision_identity() {
+    let original = b"clean observation\n".to_vec();
+    let git = StatusDisclosureGit { original };
+    let engine = disclosure_engine("allow", "cloud");
+    let context = disclosure_context(&engine, ActorLocality::Cloud);
+    let decisions = RecordingDecisionStore::default();
+    let harness = Harness::new(None);
+    let runtime = ToolRuntime::new(
+        &RootResolver,
+        &harness.reads,
+        &harness.sessions,
+        &git,
+        &harness.leases,
+        &harness.process,
+        &harness.evidence,
+        &harness.recovery,
+        &harness.writes,
+        &context,
+        &engine,
+        &decisions,
+        &FixedClock,
+    );
+
+    runtime
+        .git_status(GitStatusRequest {
+            task_id: task(),
+            worktree: capability("."),
+        })
+        .unwrap();
+    runtime
+        .git_diff(GitDiffRequest {
+            task_id: task(),
+            worktree: capability("."),
+        })
+        .unwrap();
+
+    let recorded = decisions.recorded.lock().unwrap();
+    assert_ne!(
+        recorded[0].decision.operation_digest,
+        recorded[1].decision.operation_digest
+    );
+    assert_ne!(
+        PolicyDecisionId::from_decision(&recorded[0].decision),
+        PolicyDecisionId::from_decision(&recorded[1].decision)
+    );
+}
+
+#[test]
+fn approval_required_records_the_decision_and_returns_only_the_exact_binding() {
+    let original = b"tok_test_7f89ac".to_vec();
+    let resolver = DisclosureResolver {
+        observed_digest: digest(&original),
+    };
+    let filesystem = DisclosureFilesystem {
+        original,
+        expected_digest: Mutex::new(None),
+    };
+    let engine = disclosure_engine("require_approval", "local");
+    let context = disclosure_context(&engine, ActorLocality::Local);
+    let decisions = RecordingDecisionStore::default();
+    let harness = Harness::new(None);
+    let runtime = ToolRuntime::new(
+        &resolver,
+        &filesystem,
+        &harness.sessions,
+        &harness.git,
+        &harness.leases,
+        &harness.process,
+        &harness.evidence,
+        &harness.recovery,
+        &harness.writes,
+        &context,
+        &engine,
+        &decisions,
+        &FixedClock,
+    );
+
+    let outcome = runtime
+        .file_read(FileReadRequest {
+            task_id: task(),
+            capability: capability("approval.txt"),
+            expected_digest: None,
+        })
+        .unwrap();
+    let DisclosureOutcome::ApprovalRequired { ref binding } = outcome else {
+        panic!("local restricted disclosure must require approval");
+    };
+
+    assert_eq!(
+        binding.effective_payload_digest,
+        digest(b"[REDACTED:api_token:665cc10fef9147d3]")
+    );
+    assert_eq!(decisions.recorded.lock().unwrap().len(), 1);
+    let rendered = format!("{outcome:?}");
+    assert!(!rendered.contains("tok_test_7f89ac"));
+    assert!(!rendered.contains("policy-decision:"));
+}
+
+#[test]
+fn scanner_failures_and_stale_policy_snapshots_disclose_nothing_and_record_nothing() {
+    for failure in [ScanFailurePoint::Initial, ScanFailurePoint::FinalRescan] {
+        let original = b"tok_test_7f89ac".to_vec();
+        let resolver = DisclosureResolver {
+            observed_digest: digest(&original),
+        };
+        let filesystem = DisclosureFilesystem {
+            original,
+            expected_digest: Mutex::new(None),
+        };
+        let engine =
+            disclosure_engine("allow_with_redaction", "cloud").with_scan_failure_for_test(failure);
+        let context = disclosure_context(&engine, ActorLocality::Cloud);
+        let decisions = RecordingDecisionStore::default();
+        let harness = Harness::new(None);
+        let runtime = ToolRuntime::new(
+            &resolver,
+            &filesystem,
+            &harness.sessions,
+            &harness.git,
+            &harness.leases,
+            &harness.process,
+            &harness.evidence,
+            &harness.recovery,
+            &harness.writes,
+            &context,
+            &engine,
+            &decisions,
+            &FixedClock,
+        );
+
+        let error = runtime
+            .file_read(FileReadRequest {
+                task_id: task(),
+                capability: capability("scan.txt"),
+                expected_digest: None,
+            })
+            .expect_err("scanner failure must fail closed");
+        assert_eq!(
+            error.safe_classification(),
+            local_agent_terminal_application::SafeErrorClassification::PermissionDenied
+        );
+        assert!(decisions.recorded.lock().unwrap().is_empty());
+    }
+
+    let original = b"clean".to_vec();
+    let resolver = DisclosureResolver {
+        observed_digest: digest(&original),
+    };
+    let filesystem = DisclosureFilesystem {
+        original,
+        expected_digest: Mutex::new(None),
+    };
+    let engine = disclosure_engine("allow", "cloud");
+    let context = FixedDisclosureContext {
+        snapshot_digest: digest(b"stale-policy"),
+        resource_class: ResourceClass::InternalCode,
+        locality: ActorLocality::Cloud,
+    };
+    let decisions = RecordingDecisionStore::default();
+    let harness = Harness::new(None);
+    let runtime = ToolRuntime::new(
+        &resolver,
+        &filesystem,
+        &harness.sessions,
+        &harness.git,
+        &harness.leases,
+        &harness.process,
+        &harness.evidence,
+        &harness.recovery,
+        &harness.writes,
+        &context,
+        &engine,
+        &decisions,
+        &FixedClock,
+    );
+
+    assert!(runtime
+        .file_read(FileReadRequest {
+            task_id: task(),
+            capability: capability("stale.txt"),
+            expected_digest: None,
+        })
+        .is_err());
+    assert!(decisions.recorded.lock().unwrap().is_empty());
+}
+
+#[test]
+fn evaluator_echo_mismatches_are_rejected_before_recording_or_disclosure() {
+    for tamper in [
+        EvaluatorTamper::Request,
+        EvaluatorTamper::Channel,
+        EvaluatorTamper::OriginalDigest,
+    ] {
+        let engine = disclosure_engine("allow", "cloud");
+        let evaluator = TamperingEvaluator { engine, tamper };
+        let context = disclosure_context(&evaluator.engine, ActorLocality::Cloud);
+        let decisions = RecordingDecisionStore::default();
+
+        let error = run_file_disclosure(&evaluator, &context, &decisions)
+            .expect_err("tampered evaluator echo must fail closed");
+
+        assert_eq!(
+            error.safe_classification(),
+            local_agent_terminal_application::SafeErrorClassification::IntegrityFailure,
+            "{tamper:?}"
+        );
+        assert!(decisions.recorded.lock().unwrap().is_empty(), "{tamper:?}");
+    }
+}
+
+#[test]
+fn mismatched_store_identity_is_rejected_after_recording_and_before_disclosure() {
+    let engine = disclosure_engine("allow", "cloud");
+    let context = disclosure_context(&engine, ActorLocality::Cloud);
+    let decisions = WrongIdDecisionStore::default();
+
+    let error = run_file_disclosure(&engine, &context, &decisions)
+        .expect_err("the persistence identity must echo the authoritative decision");
+
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(decisions.recorded.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn git_result_digest_mismatch_is_rejected_before_policy_or_disclosure() {
+    let engine = disclosure_engine("allow", "cloud");
+    let context = disclosure_context(&engine, ActorLocality::Cloud);
+    let decisions = RecordingDecisionStore::default();
+    let harness = Harness::new(None);
+    let runtime = ToolRuntime::new(
+        &RootResolver,
+        &harness.reads,
+        &harness.sessions,
+        &TamperedStatusGit,
+        &harness.leases,
+        &harness.process,
+        &harness.evidence,
+        &harness.recovery,
+        &harness.writes,
+        &context,
+        &engine,
+        &decisions,
+        &FixedClock,
+    );
+
+    let error = runtime
+        .git_status(GitStatusRequest {
+            task_id: task(),
+            worktree: capability("."),
+        })
+        .expect_err("raw Git bytes must match the adapter digest");
+
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::IntegrityFailure
+    );
+    assert!(decisions.recorded.lock().unwrap().is_empty());
+}
 
 #[test]
 fn git_status_passes_only_the_resolvers_opaque_root_to_the_git_port() {
@@ -35,6 +534,10 @@ fn git_status_passes_only_the_resolvers_opaque_root_to_the_git_port() {
         &harness.evidence,
         &harness.recovery,
         &harness.writes,
+        &harness.disclosure_context,
+        &harness.disclosure_policy,
+        &harness.policy_decisions,
+        &harness.clock,
     );
 
     runtime
@@ -296,12 +799,25 @@ struct Harness {
     evidence: Evidence,
     recovery: Recovery,
     writes: WorkspaceWriteCoordinator,
+    disclosure_context: FixedDisclosureContext,
+    disclosure_policy: VersionedPolicyEngine,
+    policy_decisions: RecordingDecisionStore,
+    clock: FixedClock,
 }
 
 impl Harness {
     fn new(initial: Option<Vec<u8>>) -> Self {
         let log = RecordingLog::default();
         let target = Target::new(initial);
+        let disclosure_policy = VersionedPolicyEngine::from_json(
+            r#"{"version":1,"rules":[{"id":"default-allow","effect":"allow","action":"context.disclose"}]}"#,
+        )
+        .unwrap();
+        let disclosure_context = FixedDisclosureContext {
+            snapshot_digest: disclosure_policy.snapshot_digest().clone(),
+            resource_class: ResourceClass::InternalCode,
+            locality: ActorLocality::Local,
+        };
         Self {
             resolver: Resolver {
                 allowed: AtomicBool::new(true),
@@ -334,6 +850,10 @@ impl Harness {
                 indeterminate: AtomicBool::new(false),
             },
             writes: WorkspaceWriteCoordinator::new(),
+            disclosure_context,
+            disclosure_policy,
+            policy_decisions: RecordingDecisionStore::default(),
+            clock: FixedClock,
             log,
         }
     }
@@ -349,6 +869,10 @@ impl Harness {
             &self.evidence,
             &self.recovery,
             &self.writes,
+            &self.disclosure_context,
+            &self.disclosure_policy,
+            &self.policy_decisions,
+            &self.clock,
         )
     }
 
@@ -388,6 +912,192 @@ impl Target {
 struct Resolver {
     allowed: AtomicBool,
     log: RecordingLog,
+}
+
+struct DisclosureResolver {
+    observed_digest: Sha256Digest,
+}
+
+impl CapabilityResolver for DisclosureResolver {
+    fn resolve(&self, request: CapabilityRequest) -> Result<ResolvedCapability, PortError> {
+        Ok(ResolvedCapability {
+            capability: request.capability,
+            content_digest: Some(self.observed_digest.clone()),
+            root_identity: CapabilityRootIdentity::new("disclosure-root").unwrap(),
+            target: local_agent_terminal_application::ResolvedCapabilityTarget::Relative(
+                RelativePathComponents::new(vec!["secret.txt".to_owned()]).unwrap(),
+            ),
+        })
+    }
+}
+
+struct DisclosureFilesystem {
+    original: Vec<u8>,
+    expected_digest: Mutex<Option<Sha256Digest>>,
+}
+
+impl CapabilityFilesystem for DisclosureFilesystem {
+    fn read(&self, request: AuthorizedFileRead) -> Result<VerifiedBytes, PortError> {
+        *self.expected_digest.lock().unwrap() = request.expected_digest;
+        Ok(VerifiedBytes {
+            digest: digest(&self.original),
+            bytes: self.original.clone(),
+        })
+    }
+
+    fn write(
+        &self,
+        _: local_agent_terminal_application::AuthorizedFileWrite,
+    ) -> Result<VerifiedWrite, PortError> {
+        unreachable!("disclosure test does not write")
+    }
+}
+
+struct FixedDisclosureContext {
+    snapshot_digest: Sha256Digest,
+    resource_class: ResourceClass,
+    locality: ActorLocality,
+}
+
+fn disclosure_engine(effect: &str, locality: &str) -> VersionedPolicyEngine {
+    VersionedPolicyEngine::from_json(&format!(
+        r#"{{"version":1,"rules":[{{"id":"disclosure-rule","effect":"{effect}","locality":"{locality}","action":"context.disclose","redactions":["secret_scanner"]}}]}}"#
+    ))
+    .unwrap()
+}
+
+fn disclosure_context(
+    engine: &VersionedPolicyEngine,
+    locality: ActorLocality,
+) -> FixedDisclosureContext {
+    FixedDisclosureContext {
+        snapshot_digest: engine.snapshot_digest().clone(),
+        resource_class: ResourceClass::InternalCode,
+        locality,
+    }
+}
+
+impl DisclosureContextProvider for FixedDisclosureContext {
+    fn context(&self, _: DisclosureContextRequest) -> Result<TrustedDisclosureContext, PortError> {
+        Ok(TrustedDisclosureContext {
+            actor: PolicyActor {
+                connection_id: "connection-1".to_owned(),
+                agent_id: "agent-1".to_owned(),
+                trust_tier: TrustTier::IsolatedWorker,
+                locality: self.locality,
+            },
+            resource_class: self.resource_class,
+            task_risk: TaskRisk::Medium,
+            workflow_phase: "implementation".to_owned(),
+            purpose: "inspect the requested file".to_owned(),
+            policy_snapshot_digest: self.snapshot_digest.clone(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct RecordingDecisionStore {
+    recorded: Mutex<Vec<RecordedPolicyDecision>>,
+}
+
+impl PolicyDecisionStore for RecordingDecisionStore {
+    fn record(&self, decision: RecordedPolicyDecision) -> Result<PolicyDecisionId, PortError> {
+        let id = PolicyDecisionId::from_decision(&decision.decision);
+        self.recorded.lock().unwrap().push(decision);
+        Ok(id)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EvaluatorTamper {
+    Request,
+    Channel,
+    OriginalDigest,
+}
+
+struct TamperingEvaluator {
+    engine: VersionedPolicyEngine,
+    tamper: EvaluatorTamper,
+}
+
+impl DisclosurePolicyEvaluator for TamperingEvaluator {
+    fn disclose(
+        &self,
+        mut request: DisclosureRequest,
+    ) -> Result<PolicyApprovedDisclosure, PortError> {
+        if matches!(self.tamper, EvaluatorTamper::Request) {
+            request.policy_request.purpose = "different purpose".to_owned();
+        }
+        let mut disclosure = DisclosurePolicyEvaluator::disclose(&self.engine, request)?;
+        match self.tamper {
+            EvaluatorTamper::Request => {}
+            EvaluatorTamper::Channel => {
+                disclosure.channel = local_agent_terminal_application::DisclosureChannel::GitDiff;
+            }
+            EvaluatorTamper::OriginalDigest => {
+                disclosure.original_digest = digest(b"different bytes");
+            }
+        }
+        Ok(disclosure)
+    }
+}
+
+#[derive(Default)]
+struct WrongIdDecisionStore {
+    recorded: Mutex<Vec<RecordedPolicyDecision>>,
+}
+
+impl PolicyDecisionStore for WrongIdDecisionStore {
+    fn record(&self, decision: RecordedPolicyDecision) -> Result<PolicyDecisionId, PortError> {
+        self.recorded.lock().unwrap().push(decision.clone());
+        let mut different = decision.decision;
+        different.operation_digest = digest(b"different policy decision");
+        Ok(PolicyDecisionId::from_decision(&different))
+    }
+}
+
+fn run_file_disclosure(
+    evaluator: &dyn DisclosurePolicyEvaluator,
+    context: &dyn DisclosureContextProvider,
+    decisions: &dyn PolicyDecisionStore,
+) -> Result<DisclosureOutcome<local_agent_terminal_application::PolicyBoundBytes>, PortError> {
+    let original = b"clean".to_vec();
+    let resolver = DisclosureResolver {
+        observed_digest: digest(&original),
+    };
+    let filesystem = DisclosureFilesystem {
+        original,
+        expected_digest: Mutex::new(None),
+    };
+    let harness = Harness::new(None);
+    let runtime = ToolRuntime::new(
+        &resolver,
+        &filesystem,
+        &harness.sessions,
+        &harness.git,
+        &harness.leases,
+        &harness.process,
+        &harness.evidence,
+        &harness.recovery,
+        &harness.writes,
+        context,
+        evaluator,
+        decisions,
+        &FixedClock,
+    );
+    runtime.file_read(FileReadRequest {
+        task_id: task(),
+        capability: capability("clean.txt"),
+        expected_digest: None,
+    })
+}
+
+struct FixedClock;
+
+impl Clock for FixedClock {
+    fn now_utc(&self) -> Result<String, PortError> {
+        Ok("2026-07-28T12:00:00Z".to_owned())
+    }
 }
 
 struct RootResolver;
@@ -782,11 +1492,58 @@ impl ExecutorLeaseStore for Leases {
 struct Git;
 
 impl StructuredGit for Git {
-    fn status(&self, _: AuthorizedGitStatus) -> Result<GitStatusResult, PortError> {
+    fn status(&self, _: AuthorizedGitStatus) -> Result<RawGitStatusResult, PortError> {
         unreachable!()
     }
 
-    fn diff(&self, _: AuthorizedGitDiff) -> Result<GitDiffResult, PortError> {
+    fn diff(&self, _: AuthorizedGitDiff) -> Result<RawGitDiffResult, PortError> {
+        unreachable!()
+    }
+}
+
+struct StatusDisclosureGit {
+    original: Vec<u8>,
+}
+
+impl StructuredGit for StatusDisclosureGit {
+    fn status(&self, request: AuthorizedGitStatus) -> Result<RawGitStatusResult, PortError> {
+        Ok(RawGitStatusResult {
+            digest: digest(&self.original),
+            bytes: self.original.clone(),
+            repository_id: local_agent_terminal_domain::RepositoryId::new("repo-1").unwrap(),
+            revision: GitObjectId::new("a".repeat(40)).unwrap(),
+            path_scope: request.worktree,
+            truncated: false,
+        })
+    }
+
+    fn diff(&self, _: AuthorizedGitDiff) -> Result<RawGitDiffResult, PortError> {
+        Ok(RawGitDiffResult {
+            digest: digest(&self.original),
+            bytes: self.original.clone(),
+            repository_id: local_agent_terminal_domain::RepositoryId::new("repo-1").unwrap(),
+            revision: GitObjectId::new("b".repeat(40)).unwrap(),
+            path_scope: capability("."),
+            truncated: true,
+        })
+    }
+}
+
+struct TamperedStatusGit;
+
+impl StructuredGit for TamperedStatusGit {
+    fn status(&self, request: AuthorizedGitStatus) -> Result<RawGitStatusResult, PortError> {
+        Ok(RawGitStatusResult {
+            digest: digest(b"different"),
+            bytes: b"raw status".to_vec(),
+            repository_id: local_agent_terminal_domain::RepositoryId::new("repo-1").unwrap(),
+            revision: GitObjectId::new("a".repeat(40)).unwrap(),
+            path_scope: request.worktree,
+            truncated: false,
+        })
+    }
+
+    fn diff(&self, _: AuthorizedGitDiff) -> Result<RawGitDiffResult, PortError> {
         unreachable!()
     }
 }
@@ -797,9 +1554,9 @@ struct RootRecordingGit {
 }
 
 impl StructuredGit for RootRecordingGit {
-    fn status(&self, request: AuthorizedGitStatus) -> Result<GitStatusResult, PortError> {
+    fn status(&self, request: AuthorizedGitStatus) -> Result<RawGitStatusResult, PortError> {
         *self.root.lock().unwrap() = Some(request.root_identity);
-        Ok(GitStatusResult {
+        Ok(RawGitStatusResult {
             digest: digest(b""),
             bytes: Vec::new(),
             repository_id: local_agent_terminal_domain::RepositoryId::new("repo-1").unwrap(),
@@ -809,7 +1566,7 @@ impl StructuredGit for RootRecordingGit {
         })
     }
 
-    fn diff(&self, _: AuthorizedGitDiff) -> Result<GitDiffResult, PortError> {
+    fn diff(&self, _: AuthorizedGitDiff) -> Result<RawGitDiffResult, PortError> {
         unreachable!()
     }
 }

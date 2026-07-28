@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use local_agent_terminal_application::{
-    DisclosurePolicyEvaluator, DisclosureRequest as ApplicationDisclosureRequest,
+    bind_disclosure_channel, DisclosurePolicyEvaluator,
+    DisclosureRequest as ApplicationDisclosureRequest, PolicyApprovalBinding,
     PolicyApprovedDisclosure, PolicyDecision, PolicyEvaluator, PortError, Retryability,
     SafeErrorClassification,
 };
@@ -160,6 +161,7 @@ impl DisclosurePolicyEvaluator for VersionedPolicyEngine {
         &self,
         request: ApplicationDisclosureRequest,
     ) -> Result<PolicyApprovedDisclosure, PortError> {
+        let application_channel = request.channel;
         let disclosure = VersionedPolicyEngine::disclose(
             self,
             DisclosureRequest::new(
@@ -179,10 +181,18 @@ impl DisclosurePolicyEvaluator for VersionedPolicyEngine {
             ),
         )?;
         Ok(PolicyApprovedDisclosure {
-            decision: disclosure.decision,
+            decision: bind_disclosure_channel(disclosure.decision, application_channel)?,
+            channel: application_channel,
             original_digest: disclosure.original_digest,
             effective_bytes: disclosure.effective_bytes,
             effective_digest: disclosure.effective_digest,
+            redaction_report_digest: disclosure.redaction_report.digest,
+            approval_binding: disclosure
+                .approval_binding
+                .map(|binding| PolicyApprovalBinding {
+                    effective_payload_digest: binding.effective_payload_digest,
+                    redaction_report_digest: binding.redaction_report_digest,
+                }),
         })
     }
 }

@@ -314,7 +314,7 @@ pub struct AuthorizedGitDiff {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitStatusResult {
+pub struct RawGitStatusResult {
     pub digest: Sha256Digest,
     pub bytes: Vec<u8>,
     pub repository_id: RepositoryId,
@@ -324,9 +324,27 @@ pub struct GitStatusResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitDiffResult {
+pub struct RawGitDiffResult {
     pub digest: Sha256Digest,
     pub bytes: Vec<u8>,
+    pub repository_id: RepositoryId,
+    pub revision: GitObjectId,
+    pub path_scope: CapabilityRef,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitStatusResult {
+    pub disclosure: crate::PolicyBoundBytes,
+    pub repository_id: RepositoryId,
+    pub revision: GitObjectId,
+    pub path_scope: CapabilityRef,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitDiffResult {
+    pub disclosure: crate::PolicyBoundBytes,
     pub repository_id: RepositoryId,
     pub revision: GitObjectId,
     pub path_scope: CapabilityRef,
@@ -735,8 +753,8 @@ pub trait CapabilityFilesystem: Send + Sync {
 }
 
 pub trait StructuredGit: Send + Sync {
-    fn status(&self, request: AuthorizedGitStatus) -> Result<GitStatusResult, PortError>;
-    fn diff(&self, request: AuthorizedGitDiff) -> Result<GitDiffResult, PortError>;
+    fn status(&self, request: AuthorizedGitStatus) -> Result<RawGitStatusResult, PortError>;
+    fn diff(&self, request: AuthorizedGitDiff) -> Result<RawGitDiffResult, PortError>;
 }
 
 pub trait ProcessLauncher: Send + Sync {
@@ -757,10 +775,19 @@ pub trait ToolExecutionStore: Send + Sync {
 pub trait StructuredToolExecutor: Send + Sync {
     fn execute(&self, request: AuthorizedToolRequest) -> Result<ToolExecutionResult, PortError>;
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError>;
-    fn file_read(&self, request: FileReadRequest) -> Result<VerifiedBytes, PortError>;
+    fn file_read(
+        &self,
+        request: FileReadRequest,
+    ) -> Result<crate::DisclosureOutcome<crate::PolicyBoundBytes>, PortError>;
     fn file_write(&self, request: FileWriteRequest) -> Result<VerifiedWrite, PortError>;
-    fn git_status(&self, request: GitStatusRequest) -> Result<GitStatusResult, PortError>;
-    fn git_diff(&self, request: GitDiffRequest) -> Result<GitDiffResult, PortError>;
+    fn git_status(
+        &self,
+        request: GitStatusRequest,
+    ) -> Result<crate::DisclosureOutcome<GitStatusResult>, PortError>;
+    fn git_diff(
+        &self,
+        request: GitDiffRequest,
+    ) -> Result<crate::DisclosureOutcome<GitDiffResult>, PortError>;
 }
 
 #[derive(Deserialize)]

@@ -1967,6 +1967,7 @@ version = "0.1.0"
 dependencies = [
  "local-agent-terminal-application",
  "local-agent-terminal-domain",
+ "local-agent-terminal-policy-engine",
  "sha2",
 ]
 

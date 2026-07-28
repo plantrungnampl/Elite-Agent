@@ -41,8 +41,11 @@ pub use lease::{
     AcquireExecutorLease, AcquireLease, ExecutorLeaseStore, LeaseSnapshot, LeaseState, RevokeLease,
 };
 pub use policy::{
-    DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest, PolicyApprovedDisclosure,
-    PolicyDecision, PolicyDecisionStore, PolicyEvaluator, RecordedPolicyDecision,
+    bind_disclosure_channel, parse_policy_timestamp, DisclosureChannel, DisclosureContextProvider,
+    DisclosureContextRequest, DisclosureOutcome, DisclosurePolicyEvaluator, DisclosureRequest,
+    PolicyApprovalBinding, PolicyApprovedDisclosure, PolicyBoundBytes, PolicyDecision,
+    PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator, RecordedPolicyDecision,
+    TrustedDisclosureContext,
 };
 pub use ports::{
     AppendOperation, AppendResult, ArtifactContent, ArtifactJournal, ArtifactJournalEntry,
@@ -69,11 +72,11 @@ pub use tool::{
     FileWriteRecoveryRequest, FileWriteRecoverySnapshot, FileWriteRecoveryState,
     FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest,
     GitStatusResult, NewToolExecution, NewToolIntent, ObservedFileImage, OpenFileWriteSession,
-    OperationIntentSnapshot, ProcessLauncher, ProcessReceipt, RelativePathComponents,
-    ResolvedCapability, ResolvedCapabilityTarget, StructuredGit, StructuredToolExecutor,
-    ToolExecutionCompletion, ToolExecutionId, ToolExecutionResult, ToolExecutionSnapshot,
-    ToolExecutionStore, ToolRequestBindingDigest, VerifiedBytes, VerifiedFileWriteCompensation,
-    VerifiedWrite,
+    OperationIntentSnapshot, ProcessLauncher, ProcessReceipt, RawGitDiffResult, RawGitStatusResult,
+    RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget, StructuredGit,
+    StructuredToolExecutor, ToolExecutionCompletion, ToolExecutionId, ToolExecutionResult,
+    ToolExecutionSnapshot, ToolExecutionStore, ToolRequestBindingDigest, VerifiedBytes,
+    VerifiedFileWriteCompensation, VerifiedWrite,
 };
 pub use workspace::{
     ArtifactRootMode, GetWorkspaceDashboard, IdempotencyClass, IntentTransition, NewProject,

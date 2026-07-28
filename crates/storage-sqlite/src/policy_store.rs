@@ -1,5 +1,6 @@
 use local_agent_terminal_application::{
-    PolicyDecisionStore, PortError, RecordedPolicyDecision, Retryability, SafeErrorClassification,
+    PolicyDecisionId, PolicyDecisionStore, PortError, RecordedPolicyDecision, Retryability,
+    SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     ActorLocality, CapabilityRef, PolicyEffect, ResourceClass, TaskRisk, TrustTier,
@@ -27,7 +28,7 @@ type PersistedPolicyDecision = (
 );
 
 impl PolicyDecisionStore for SqliteStore {
-    fn record(&self, recorded: RecordedPolicyDecision) -> Result<(), PortError> {
+    fn record(&self, recorded: RecordedPolicyDecision) -> Result<PolicyDecisionId, PortError> {
         let request = recorded.decision.draft.request();
         let actor_json = actor_json(request);
         let resource_json = resource_json(request);
@@ -50,10 +51,7 @@ impl PolicyDecisionStore for SqliteStore {
                 timestamp(&connection, value.unix_seconds())
             })
             .transpose()?;
-        let decision_id = format!(
-            "policy-decision:{}",
-            &recorded.decision.operation_digest.as_str()[7..]
-        );
+        let decision_id = PolicyDecisionId::from_decision(&recorded.decision);
         let effect = effect_name(recorded.decision.draft.effect());
 
         let mut connection = self.connection().map_err(open_error_to_port)?;
@@ -68,7 +66,7 @@ impl PolicyDecisionStore for SqliteStore {
                     policy_snapshot_digest, operation_digest, created_at, expires_at, approval_id
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL)",
                 params![
-                    decision_id,
+                    decision_id.as_str(),
                     request.task_id.as_str(),
                     actor_json.to_string(),
                     actor_binding_digest,
@@ -92,7 +90,10 @@ impl PolicyDecisionStore for SqliteStore {
                         resource_digest, purpose, workflow_phase, effect, matched_rules_json,
                         policy_snapshot_digest, expires_at
                  FROM policy_decisions WHERE id = ?1 AND operation_digest = ?2",
-                params![decision_id, recorded.decision.operation_digest.as_str()],
+                params![
+                    decision_id.as_str(),
+                    recorded.decision.operation_digest.as_str()
+                ],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -131,14 +132,15 @@ impl PolicyDecisionStore for SqliteStore {
                 "SELECT EXISTS(
                     SELECT 1 FROM policy_decisions WHERE id = ?1 AND created_at = ?2
                 )",
-                params![decision_id, created_at],
+                params![decision_id.as_str(), created_at],
                 |row| row.get(0),
             )
             .map_err(sqlite_error_to_port)?;
         if persisted.as_ref() != Some(&expected) || !created_at_matches {
             return Err(conflict());
         }
-        transaction.commit().map_err(sqlite_error_to_port)
+        transaction.commit().map_err(sqlite_error_to_port)?;
+        Ok(decision_id)
     }
 }
 

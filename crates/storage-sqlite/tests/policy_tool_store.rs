@@ -68,10 +68,17 @@ fn policy_decisions_are_persisted_in_the_normative_table() {
     ];
     for (effect, expected, character) in cases {
         let operation_digest = digest(character);
-        database
+        let decision_id = database
             .store
             .record(policy_decision(effect, operation_digest.clone()))
             .unwrap();
+        assert_eq!(
+            decision_id.as_str(),
+            format!(
+                "policy-decision:{}",
+                operation_digest.as_str().strip_prefix("sha256:").unwrap()
+            )
+        );
         let actual: String = configured_connection(&database.path)
             .query_row(
                 "SELECT effect FROM policy_decisions WHERE operation_digest = ?1",

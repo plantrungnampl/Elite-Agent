@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use git2::{DiffLineType, DiffOptions, ObjectType, Oid, Patch};
 use local_agent_terminal_application::{
-    AuthorizedGitDiff, AuthorizedGitStatus, GitDiffResult, GitStatusResult, PortError,
+    AuthorizedGitDiff, AuthorizedGitStatus, PortError, RawGitDiffResult, RawGitStatusResult,
     Retryability, SafeErrorClassification, StructuredGit,
 };
 use local_agent_terminal_domain::{CapabilityRef, GitObjectId, Sha256Digest};
@@ -24,7 +24,7 @@ const MAX_DIFF_HUNKS: usize = 8_192;
 const MAX_DIFF_LINES: usize = 65_536;
 
 impl StructuredGit for GitStructuredTools {
-    fn status(&self, request: AuthorizedGitStatus) -> Result<GitStatusResult, PortError> {
+    fn status(&self, request: AuthorizedGitStatus) -> Result<RawGitStatusResult, PortError> {
         let registration =
             self.authorize(&request.task_id, &request.worktree, &request.root_identity)?;
         let (repository, config) =
@@ -47,7 +47,7 @@ impl StructuredGit for GitStructuredTools {
         self.status_result(request, registration, output)
     }
 
-    fn diff(&self, request: AuthorizedGitDiff) -> Result<GitDiffResult, PortError> {
+    fn diff(&self, request: AuthorizedGitDiff) -> Result<RawGitDiffResult, PortError> {
         let registration =
             self.authorize(&request.task_id, &request.worktree, &request.root_identity)?;
         let (repository, config) =
@@ -123,9 +123,9 @@ impl GitStructuredTools {
         request: AuthorizedGitStatus,
         registration: &crate::GitWorktreeRegistration,
         output: BoundedOutput,
-    ) -> Result<GitStatusResult, PortError> {
+    ) -> Result<RawGitStatusResult, PortError> {
         let digest = digest(&output.bytes);
-        Ok(GitStatusResult {
+        Ok(RawGitStatusResult {
             digest,
             bytes: output.bytes,
             repository_id: registration.locator.repository_id.clone(),
@@ -140,9 +140,9 @@ impl GitStructuredTools {
         request: AuthorizedGitDiff,
         registration: &crate::GitWorktreeRegistration,
         output: BoundedOutput,
-    ) -> Result<GitDiffResult, PortError> {
+    ) -> Result<RawGitDiffResult, PortError> {
         let digest = digest(&output.bytes);
-        Ok(GitDiffResult {
+        Ok(RawGitDiffResult {
             digest,
             bytes: output.bytes,
             repository_id: registration.locator.repository_id.clone(),

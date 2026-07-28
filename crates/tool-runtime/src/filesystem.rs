@@ -30,15 +30,16 @@ pub(crate) fn read(
         ResolvedCapabilityTarget::Relative(components) => components,
         ResolvedCapabilityTarget::Root => return Err(denied()),
     };
+    let observed_digest = resolved.content_digest.ok_or_else(denied)?;
     let result = filesystem
         .read(AuthorizedFileRead {
             task_id: request.task_id,
             root_identity: resolved.root_identity,
             relative_components,
-            expected_digest: request.expected_digest,
+            expected_digest: Some(observed_digest.clone()),
         })
         .map_err(|_| denied())?;
-    if digest(&result.bytes) != result.digest {
+    if digest(&result.bytes) != result.digest || result.digest != observed_digest {
         return Err(denied());
     }
     Ok(result)

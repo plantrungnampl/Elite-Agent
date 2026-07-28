@@ -9,4 +9,5 @@ local-agent-terminal-domain = { path = "../domain" }
 sha2 = "0.10"
 
 [dev-dependencies]
+local-agent-terminal-policy-engine = { path = "../policy-engine" }
 sha2 = "0.10"

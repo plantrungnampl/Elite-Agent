@@ -617,7 +617,12 @@ impl StructuredToolExecutor for CountingExecutor {
     fn file_read(
         &self,
         _: local_agent_terminal_application::FileReadRequest,
-    ) -> Result<local_agent_terminal_application::VerifiedBytes, PortError> {
+    ) -> Result<
+        local_agent_terminal_application::DisclosureOutcome<
+            local_agent_terminal_application::PolicyBoundBytes,
+        >,
+        PortError,
+    > {
         unreachable!()
     }
 
@@ -631,14 +636,24 @@ impl StructuredToolExecutor for CountingExecutor {
     fn git_status(
         &self,
         _: local_agent_terminal_application::GitStatusRequest,
-    ) -> Result<local_agent_terminal_application::GitStatusResult, PortError> {
+    ) -> Result<
+        local_agent_terminal_application::DisclosureOutcome<
+            local_agent_terminal_application::GitStatusResult,
+        >,
+        PortError,
+    > {
         unreachable!()
     }
 
     fn git_diff(
         &self,
         _: local_agent_terminal_application::GitDiffRequest,
-    ) -> Result<local_agent_terminal_application::GitDiffResult, PortError> {
+    ) -> Result<
+        local_agent_terminal_application::DisclosureOutcome<
+            local_agent_terminal_application::GitDiffResult,
+        >,
+        PortError,
+    > {
         unreachable!()
     }
 }
