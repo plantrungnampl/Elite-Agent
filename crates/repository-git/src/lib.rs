@@ -13,20 +13,82 @@ use std::sync::Mutex;
 use std::sync::{Arc, Barrier};
 
 use local_agent_terminal_application::{
-    CreateWorktree, DiscardWorktree, InspectRepository, InspectWorktree, PortError,
-    RepositoryGateway, RepositoryLocator, RepositorySnapshot, WorktreeObservation,
+    CapabilityRootIdentity, CreateWorktree, DiscardWorktree, InspectRepository, InspectWorktree,
+    PortError, RepositoryGateway, RepositoryLocator, RepositorySnapshot, WorktreeObservation,
     WorktreeSnapshot,
 };
-use local_agent_terminal_domain::TaskId;
+use local_agent_terminal_domain::{GitObjectId, TaskId};
 
 pub struct GitStructuredTools {
-    locator: RepositoryLocator,
+    registrations: Vec<GitWorktreeRegistration>,
+    #[cfg(feature = "test-seams")]
+    snapshot_hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(feature = "test-seams")]
+    before_generation_hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+pub struct GitWorktreeRegistration {
+    root_identity: CapabilityRootIdentity,
     task_id: TaskId,
+    locator: RepositoryLocator,
+    revision: GitObjectId,
 }
 
 impl GitStructuredTools {
-    pub const fn new(locator: RepositoryLocator, task_id: TaskId) -> Self {
-        Self { locator, task_id }
+    pub fn new(registrations: Vec<GitWorktreeRegistration>) -> Result<Self, PortError> {
+        if registrations.is_empty()
+            || registrations
+                .iter()
+                .enumerate()
+                .any(|(index, registration)| {
+                    registrations[index + 1..].iter().any(|other| {
+                        registration.root_identity == other.root_identity
+                            || (registration.task_id == other.task_id
+                                && registration.locator.repository_id
+                                    == other.locator.repository_id)
+                    })
+                })
+        {
+            return Err(paths::invalid());
+        }
+        Ok(Self {
+            registrations,
+            #[cfg(feature = "test-seams")]
+            snapshot_hook: None,
+            #[cfg(feature = "test-seams")]
+            before_generation_hook: None,
+        })
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub fn with_snapshot_hook_for_test(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.snapshot_hook = Some(std::sync::Arc::new(hook));
+        self
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub fn with_before_generation_hook_for_test(
+        mut self,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        self.before_generation_hook = Some(std::sync::Arc::new(hook));
+        self
+    }
+}
+
+impl GitWorktreeRegistration {
+    pub fn new(
+        root_identity: CapabilityRootIdentity,
+        task_id: TaskId,
+        locator: RepositoryLocator,
+        revision: GitObjectId,
+    ) -> Result<Self, PortError> {
+        Ok(Self {
+            root_identity,
+            task_id,
+            locator,
+            revision,
+        })
     }
 }
 

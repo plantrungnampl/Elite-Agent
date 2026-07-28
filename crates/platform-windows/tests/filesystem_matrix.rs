@@ -11,8 +11,8 @@ use local_agent_terminal_application::{
     AuthorizedFileRead, AuthorizedFileWrite, CapabilityFileWriteSessionFactory,
     CapabilityFilesystem, CapabilityRequest, CapabilityResolver, CapabilityRootIdentity,
     FileWritePostExpectation, OpenFileWriteSession, PortError, RelativePathComponents,
-    Retryability, SafeErrorClassification, ToolExecutionId, VerifiedFileWriteCompensation,
-    VerifiedWrite,
+    ResolvedCapabilityTarget, Retryability, SafeErrorClassification, ToolExecutionId,
+    VerifiedFileWriteCompensation, VerifiedWrite,
 };
 use local_agent_terminal_domain::{
     ArtifactId, CapabilityRef, FencingToken, LeaseClaim, RunId, Sha256Digest, TaskId,
@@ -173,7 +173,7 @@ fn unsupported_windows_path_forms_fail_closed() {
     )
     .unwrap()])
     .unwrap();
-    for path in [".", "NUL", "COM1.txt", "trailing.", "trailing ", "bad*.txt"] {
+    for path in ["NUL", "COM1.txt", "trailing.", "trailing ", "bad*.txt"] {
         let capability = CapabilityRef::worktree(task.clone(), path).unwrap();
         assert_non_disclosing(
             adapter
@@ -184,6 +184,30 @@ fn unsupported_windows_path_forms_fail_closed() {
                 .unwrap_err(),
         );
     }
+    assert!(RelativePathComponents::new(Vec::new()).is_err());
+    assert!(RelativePathComponents::new(vec![".".to_owned()]).is_err());
+}
+
+#[test]
+fn worktree_root_capability_resolves_explicitly_without_weakening_file_components() {
+    let root_dir = TempDir::new().unwrap();
+    let task = task("task-1");
+    let adapter = WindowsCapabilityAdapter::new(vec![CapabilityRegistration::worktree(
+        root("worktree-root"),
+        task.clone(),
+        root_dir.path(),
+    )
+    .unwrap()])
+    .unwrap();
+
+    let resolved = adapter
+        .resolve(CapabilityRequest {
+            task_id: task.clone(),
+            capability: CapabilityRef::worktree(task, ".").unwrap(),
+        })
+        .unwrap();
+
+    assert_eq!(resolved.target, ResolvedCapabilityTarget::Root);
     assert!(RelativePathComponents::new(Vec::new()).is_err());
     assert!(RelativePathComponents::new(vec![".".to_owned()]).is_err());
 }
@@ -387,7 +411,7 @@ fn replacement_races_are_contained_by_retained_and_exact_file_handles() {
             AuthorizedFileRead {
                 task_id: task,
                 root_identity,
-                relative_components: resolved.relative_components,
+                relative_components: resolved_relative(resolved.target),
                 expected_digest: None,
             },
             || {
@@ -449,7 +473,7 @@ fn ancestor_and_leaf_reparse_replacement_after_resolution_cannot_escape() {
                 .read(AuthorizedFileRead {
                     task_id: task.clone(),
                     root_identity: root_identity.clone(),
-                    relative_components: resolved.relative_components,
+                    relative_components: resolved_relative(resolved.target),
                     expected_digest: None,
                 })
                 .unwrap_err(),
@@ -746,7 +770,10 @@ fn absent_worktree_target_resolves_without_a_fabricated_content_digest() {
         .unwrap();
 
     assert_eq!(resolved.content_digest, None);
-    assert_eq!(resolved.relative_components.as_slice(), ["created.txt"]);
+    assert_eq!(
+        resolved_relative(resolved.target).as_slice(),
+        ["created.txt"]
+    );
     assert!(directory_names(root_dir.path()).is_empty());
 }
 
@@ -1246,7 +1273,7 @@ fn resolve_and_read(
         .read(AuthorizedFileRead {
             task_id: task_id.clone(),
             root_identity: resolved.root_identity,
-            relative_components: resolved.relative_components,
+            relative_components: resolved_relative(resolved.target),
             expected_digest: resolved.content_digest,
         })
         .unwrap()
@@ -1255,6 +1282,13 @@ fn resolve_and_read(
 
 fn task(value: &str) -> TaskId {
     TaskId::new(value).unwrap()
+}
+
+fn resolved_relative(target: ResolvedCapabilityTarget) -> RelativePathComponents {
+    match target {
+        ResolvedCapabilityTarget::Relative(components) => components,
+        ResolvedCapabilityTarget::Root => panic!("test requires a relative capability target"),
+    }
 }
 
 fn root(value: &str) -> CapabilityRootIdentity {

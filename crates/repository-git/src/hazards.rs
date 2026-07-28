@@ -6,6 +6,12 @@ use local_agent_terminal_application::{PortError, RepositoryHazard, RepositoryHa
 
 use crate::paths;
 
+const MAX_HOOK_ENTRIES: usize = 256;
+const MAX_CONFIG_ENTRIES: usize = 256;
+const MAX_CONFIG_BYTES: usize = 64 * 1024;
+const MAX_ATTRIBUTE_SCAN_ENTRIES: usize = 4_096;
+const MAX_ATTRIBUTE_PATH_BYTES: usize = 256 * 1024;
+
 pub(crate) fn scan(
     repository: &Repository,
     config: &Config,
@@ -21,7 +27,17 @@ pub(crate) fn scan(
             return Ok(hazards);
         }
     };
+    let mut config_entries = 0usize;
+    let mut config_bytes = 0usize;
     while let Some(entry) = entries.next() {
+        config_entries = config_entries.saturating_add(1);
+        if config_entries > MAX_CONFIG_ENTRIES {
+            hazards.push(hazard(
+                RepositoryHazardReason::UnsafeConfiguration,
+                "configuration entry limit exceeded",
+            ));
+            break;
+        }
         let Ok(entry) = entry else {
             hazards.push(hazard(
                 RepositoryHazardReason::UnsafeConfiguration,
@@ -35,6 +51,16 @@ pub(crate) fn scan(
         } else {
             String::new()
         };
+        config_bytes = config_bytes
+            .saturating_add(entry.name_bytes().len())
+            .saturating_add(entry.value_bytes().len());
+        if config_bytes > MAX_CONFIG_BYTES {
+            hazards.push(hazard(
+                RepositoryHazardReason::UnsafeConfiguration,
+                "configuration byte limit exceeded",
+            ));
+            break;
+        }
         if entry.include_depth() > 0
             || !matches!(entry.level(), ConfigLevel::Local | ConfigLevel::Worktree)
         {
@@ -50,8 +76,13 @@ pub(crate) fn scan(
                 "hooks path configured",
             ));
         } else if name == "core.fsmonitor"
-            || name == "credential.helper"
+            || name.starts_with("credential.")
             || name == "core.sshcommand"
+            || name.starts_with("ssh.")
+            || name.starts_with("http.")
+            || name.starts_with("https.")
+            || name.starts_with("protocol.")
+            || name.ends_with(".proxy")
             || name.starts_with("include.")
             || name.starts_with("includeif.")
             || name.starts_with("url.")
@@ -89,7 +120,10 @@ pub(crate) fn scan(
                 "unsupported repository extension",
             ));
         } else if (name.starts_with("diff.") || name.starts_with("merge."))
-            && (name.ends_with(".driver") || name.ends_with(".command") || name == "diff.external")
+            && (name.ends_with(".driver")
+                || name.ends_with(".command")
+                || name.ends_with(".textconv")
+                || name == "diff.external")
         {
             hazards.push(hazard(
                 RepositoryHazardReason::UnsafeConfiguration,
@@ -98,9 +132,11 @@ pub(crate) fn scan(
         }
     }
 
-    let common_dir = repository.commondir();
-    if common_dir.join("hooks").is_dir() {
-        // A default hooks directory is inert; only an explicit core.hooksPath is hazardous.
+    if repository_hooks_present(repository)? {
+        hazards.push(hazard(
+            RepositoryHazardReason::HooksConfigured,
+            "repository hook present",
+        ));
     }
     if let Some(tree) = resolved_head_tree(repository)? {
         if head_blob(repository, &tree, Path::new(".gitmodules"))?.is_some() {
@@ -138,6 +174,101 @@ pub(crate) fn scan(
     }
     deduplicate(&mut hazards);
     Ok(hazards)
+}
+
+pub(crate) fn structured_attributes_present(repository: &Repository) -> Result<bool, PortError> {
+    let committed = resolved_head_tree(repository)?
+        .map(|tree| tree_contains_attributes(repository, &tree))
+        .transpose()?
+        .unwrap_or(false);
+    Ok(committed || worktree_contains_attributes(repository)?)
+}
+
+fn tree_contains_attributes(_repository: &Repository, tree: &Tree<'_>) -> Result<bool, PortError> {
+    let mut entries = 0usize;
+    let mut path_bytes = 0usize;
+    let mut found = false;
+    let mut exceeded = false;
+    let walked = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        entries = entries.saturating_add(1);
+        path_bytes = path_bytes
+            .saturating_add(root.len())
+            .saturating_add(entry.name_bytes().len());
+        if entries > MAX_ATTRIBUTE_SCAN_ENTRIES || path_bytes > MAX_ATTRIBUTE_PATH_BYTES {
+            exceeded = true;
+            return git2::TreeWalkResult::Abort;
+        }
+        if entry.name_bytes().eq_ignore_ascii_case(b".gitattributes") {
+            found = true;
+        }
+        git2::TreeWalkResult::Ok
+    });
+    if exceeded {
+        return Err(paths::permission());
+    }
+    walked.map_err(paths::map_git_error)?;
+    Ok(found)
+}
+
+fn worktree_contains_attributes(repository: &Repository) -> Result<bool, PortError> {
+    if std::fs::symlink_metadata(repository.path().join("info/attributes")).is_ok() {
+        return Ok(true);
+    }
+    let workdir = repository.workdir().ok_or_else(paths::permission)?;
+    let mut pending = vec![workdir.to_owned()];
+    let mut entries = 0usize;
+    let mut path_bytes = 0usize;
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).map_err(|_| paths::permission())? {
+            let entry = entry.map_err(|_| paths::permission())?;
+            let name = entry.file_name();
+            if directory == workdir && name == ".git" {
+                continue;
+            }
+            entries = entries.saturating_add(1);
+            path_bytes = path_bytes.saturating_add(name.to_string_lossy().len());
+            if entries > MAX_ATTRIBUTE_SCAN_ENTRIES || path_bytes > MAX_ATTRIBUTE_PATH_BYTES {
+                return Err(paths::permission());
+            }
+            let metadata =
+                std::fs::symlink_metadata(entry.path()).map_err(|_| paths::permission())?;
+            if metadata.file_type().is_symlink() {
+                return Err(paths::permission());
+            }
+            if name
+                .to_string_lossy()
+                .eq_ignore_ascii_case(".gitattributes")
+            {
+                return Ok(true);
+            }
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn repository_hooks_present(repository: &Repository) -> Result<bool, PortError> {
+    let entries = match std::fs::read_dir(repository.commondir().join("hooks")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(paths::permission()),
+    };
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_HOOK_ENTRIES {
+            return Ok(true);
+        }
+        let name = entry
+            .map_err(|_| paths::permission())?
+            .file_name()
+            .into_string()
+            .map_err(|_| paths::integrity())?;
+        if !name.ends_with(".sample") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn resolved_head_tree(repository: &Repository) -> Result<Option<Tree<'_>>, PortError> {

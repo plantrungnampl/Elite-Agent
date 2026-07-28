@@ -25,7 +25,13 @@ pub struct ResolvedCapability {
     pub capability: CapabilityRef,
     pub content_digest: Option<Sha256Digest>,
     pub root_identity: CapabilityRootIdentity,
-    pub relative_components: RelativePathComponents,
+    pub target: ResolvedCapabilityTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedCapabilityTarget {
+    Root,
+    Relative(RelativePathComponents),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,37 +288,49 @@ impl CaptureFileWritePreEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitStatusRequest {
+    pub task_id: TaskId,
+    pub worktree: CapabilityRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitDiffRequest {
+    pub task_id: TaskId,
+    pub worktree: CapabilityRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedGitStatus {
     pub task_id: TaskId,
     pub worktree: CapabilityRef,
-    pub policy_decision_id: String,
+    pub root_identity: CapabilityRootIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedGitDiff {
     pub task_id: TaskId,
     pub worktree: CapabilityRef,
-    pub policy_decision_id: String,
+    pub root_identity: CapabilityRootIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitStatusResult {
     pub digest: Sha256Digest,
+    pub bytes: Vec<u8>,
     pub repository_id: RepositoryId,
     pub revision: GitObjectId,
     pub path_scope: CapabilityRef,
     pub truncated: bool,
-    pub policy_decision_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitDiffResult {
     pub digest: Sha256Digest,
+    pub bytes: Vec<u8>,
     pub repository_id: RepositoryId,
     pub revision: GitObjectId,
     pub path_scope: CapabilityRef,
     pub truncated: bool,
-    pub policy_decision_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -741,8 +759,8 @@ pub trait StructuredToolExecutor: Send + Sync {
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError>;
     fn file_read(&self, request: FileReadRequest) -> Result<VerifiedBytes, PortError>;
     fn file_write(&self, request: FileWriteRequest) -> Result<VerifiedWrite, PortError>;
-    fn git_status(&self, request: AuthorizedGitStatus) -> Result<GitStatusResult, PortError>;
-    fn git_diff(&self, request: AuthorizedGitDiff) -> Result<GitDiffResult, PortError>;
+    fn git_status(&self, request: GitStatusRequest) -> Result<GitStatusResult, PortError>;
+    fn git_diff(&self, request: GitDiffRequest) -> Result<GitDiffResult, PortError>;
 }
 
 #[derive(Deserialize)]

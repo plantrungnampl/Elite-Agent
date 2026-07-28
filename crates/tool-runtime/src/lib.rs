@@ -5,10 +5,10 @@ mod filesystem;
 mod git;
 
 use local_agent_terminal_application::{
-    AuthorizedGitDiff, AuthorizedGitStatus, AuthorizedToolRequest, CancellationReceipt,
-    CapabilityFileWriteSessionFactory, CapabilityFilesystem, CapabilityResolver,
-    ExecutorLeaseStore, FileReadRequest, FileWriteEvidenceStore, FileWriteRecoveryStore,
-    FileWriteRequest, GitDiffResult, GitStatusResult, PortError, ProcessLauncher, StructuredGit,
+    AuthorizedToolRequest, CancellationReceipt, CapabilityFileWriteSessionFactory,
+    CapabilityFilesystem, CapabilityResolver, ExecutorLeaseStore, FileReadRequest,
+    FileWriteEvidenceStore, FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest,
+    GitDiffResult, GitStatusRequest, GitStatusResult, PortError, ProcessLauncher, StructuredGit,
     StructuredToolExecutor, ToolExecutionId, ToolExecutionResult, VerifiedBytes, VerifiedWrite,
     WorkspaceWriteCoordinator,
 };
@@ -68,11 +68,11 @@ impl<'a> ToolRuntime<'a> {
         )
     }
 
-    pub fn status(&self, request: AuthorizedGitStatus) -> Result<GitStatusResult, PortError> {
+    pub fn status(&self, request: GitStatusRequest) -> Result<GitStatusResult, PortError> {
         git::status(self.resolver, self.git, request)
     }
 
-    pub fn diff(&self, request: AuthorizedGitDiff) -> Result<GitDiffResult, PortError> {
+    pub fn diff(&self, request: GitDiffRequest) -> Result<GitDiffResult, PortError> {
         git::diff(self.resolver, self.git, request)
     }
 }
@@ -96,11 +96,11 @@ impl StructuredToolExecutor for ToolRuntime<'_> {
         self.write(request)
     }
 
-    fn git_status(&self, request: AuthorizedGitStatus) -> Result<GitStatusResult, PortError> {
+    fn git_status(&self, request: GitStatusRequest) -> Result<GitStatusResult, PortError> {
         self.status(request)
     }
 
-    fn git_diff(&self, request: AuthorizedGitDiff) -> Result<GitDiffResult, PortError> {
+    fn git_diff(&self, request: GitDiffRequest) -> Result<GitDiffResult, PortError> {
         self.diff(request)
     }
 }

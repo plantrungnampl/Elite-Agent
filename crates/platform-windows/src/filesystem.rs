@@ -12,8 +12,8 @@ use local_agent_terminal_application::{
     AuthorizedFileRead, AuthorizedFileWrite, CapabilityFileWriteSession,
     CapabilityFileWriteSessionFactory, CapabilityFilesystem, CapabilityRequest, CapabilityResolver,
     CapabilityRootIdentity, FileWritePostExpectation, ObservedFileImage, OpenFileWriteSession,
-    PortError, RelativePathComponents, ResolvedCapability, Retryability, SafeErrorClassification,
-    VerifiedBytes, VerifiedFileWriteCompensation, VerifiedWrite,
+    PortError, RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget, Retryability,
+    SafeErrorClassification, VerifiedBytes, VerifiedFileWriteCompensation, VerifiedWrite,
 };
 use local_agent_terminal_domain::{ArtifactId, CapabilityRef, Sha256Digest, TaskId};
 use sha2::{Digest, Sha256};
@@ -333,24 +333,28 @@ impl CapabilityResolver for WindowsCapabilityAdapter {
             .iter()
             .find(|registration| registration.matches(&request.task_id, &request.capability))
             .ok_or_else(denied)?;
-        let relative_components = registration.components_for(&request.capability)?;
-        let content_digest = if registration.binding == RegistrationBinding::Worktree {
-            registration
-                .read_optional(relative_components.as_slice(), || Ok(()))?
-                .map(|verified| verified.digest)
-        } else {
-            Some(
+        let target = registration.target_for(&request.capability)?;
+        let content_digest = match &target {
+            ResolvedCapabilityTarget::Root => None,
+            ResolvedCapabilityTarget::Relative(relative_components)
+                if registration.binding == RegistrationBinding::Worktree =>
+            {
+                registration
+                    .read_optional(relative_components.as_slice(), || Ok(()))?
+                    .map(|verified| verified.digest)
+            }
+            ResolvedCapabilityTarget::Relative(relative_components) => Some(
                 registration
                     .read(relative_components.as_slice(), None, || Ok(()))?
                     .digest,
-            )
+            ),
         };
 
         Ok(ResolvedCapability {
             capability: request.capability,
             content_digest,
             root_identity: registration.root_identity.clone(),
-            relative_components,
+            target,
         })
     }
 }
@@ -397,20 +401,26 @@ impl RegisteredCapability {
         }
     }
 
-    fn components_for(
+    fn target_for(
         &self,
         capability: &CapabilityRef,
-    ) -> Result<RelativePathComponents, PortError> {
+    ) -> Result<ResolvedCapabilityTarget, PortError> {
         match (&self.binding, capability, &self.fixed_leaf) {
             (RegistrationBinding::Source { .. }, CapabilityRef::Source(source), None) => {
-                relative_components(source.path())
+                relative_components(source.path()).map(ResolvedCapabilityTarget::Relative)
             }
             (RegistrationBinding::Worktree, CapabilityRef::Worktree(worktree), None) => {
-                relative_components(worktree.path())
+                if worktree.path() == "." {
+                    Ok(ResolvedCapabilityTarget::Root)
+                } else {
+                    relative_components(worktree.path()).map(ResolvedCapabilityTarget::Relative)
+                }
             }
             (RegistrationBinding::Artifact { .. }, CapabilityRef::Artifact(_), Some(leaf))
             | (RegistrationBinding::Toolchain { .. }, CapabilityRef::Toolchain(_), Some(leaf)) => {
-                RelativePathComponents::new(vec![leaf.name.clone()]).map_err(|_| denied())
+                RelativePathComponents::new(vec![leaf.name.clone()])
+                    .map(ResolvedCapabilityTarget::Relative)
+                    .map_err(|_| denied())
             }
             _ => Err(denied()),
         }

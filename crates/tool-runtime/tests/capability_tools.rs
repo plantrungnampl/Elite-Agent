@@ -9,9 +9,9 @@ use local_agent_terminal_application::{
     FileWriteEvidenceStore, FileWritePolicyBinding, FileWritePostExpectation, FileWritePreImage,
     FileWriteRecoveryCompletion, FileWriteRecoveryIntent, FileWriteRecoverySnapshot,
     FileWriteRecoveryState, FileWriteRecoveryStore, FileWriteRequest, GitDiffResult,
-    GitStatusResult, LeaseSnapshot, ObservedFileImage, OpenFileWriteSession, PortError,
-    ProcessLauncher, ProcessReceipt, RelativePathComponents, ResolvedCapability, RevokeLease,
-    StructuredGit, StructuredToolExecutor, ToolExecutionId, VerifiedBytes,
+    GitStatusRequest, GitStatusResult, LeaseSnapshot, ObservedFileImage, OpenFileWriteSession,
+    PortError, ProcessLauncher, ProcessReceipt, RelativePathComponents, ResolvedCapability,
+    RevokeLease, StructuredGit, StructuredToolExecutor, ToolExecutionId, VerifiedBytes,
     VerifiedFileWriteCompensation, VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
@@ -19,6 +19,36 @@ use local_agent_terminal_domain::{
     ProjectId, RunId, Sequence, Sha256Digest, TaskId, WorkspaceFingerprint,
 };
 use local_agent_terminal_tool_runtime::ToolRuntime;
+
+#[test]
+fn git_status_passes_only_the_resolvers_opaque_root_to_the_git_port() {
+    let harness = Harness::new(Some(b"before".to_vec()));
+    let resolver = RootResolver;
+    let git = RootRecordingGit::default();
+    let runtime = ToolRuntime::new(
+        &resolver,
+        &harness.reads,
+        &harness.sessions,
+        &git,
+        &harness.leases,
+        &harness.process,
+        &harness.evidence,
+        &harness.recovery,
+        &harness.writes,
+    );
+
+    runtime
+        .git_status(GitStatusRequest {
+            task_id: task(),
+            worktree: CapabilityRef::worktree(task(), ".").unwrap(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        git.root.lock().unwrap().as_ref().unwrap().as_str(),
+        "git-root"
+    );
+}
 
 #[test]
 fn resolved_capabilities_expose_only_opaque_roots_and_normalized_components() {
@@ -360,6 +390,19 @@ struct Resolver {
     log: RecordingLog,
 }
 
+struct RootResolver;
+
+impl CapabilityResolver for RootResolver {
+    fn resolve(&self, request: CapabilityRequest) -> Result<ResolvedCapability, PortError> {
+        Ok(ResolvedCapability {
+            capability: request.capability,
+            content_digest: None,
+            root_identity: CapabilityRootIdentity::new("git-root").unwrap(),
+            target: local_agent_terminal_application::ResolvedCapabilityTarget::Root,
+        })
+    }
+}
+
 impl CapabilityResolver for Resolver {
     fn resolve(&self, request: CapabilityRequest) -> Result<ResolvedCapability, PortError> {
         self.log.push("resolve");
@@ -370,7 +413,9 @@ impl CapabilityResolver for Resolver {
             capability: request.capability,
             content_digest: None,
             root_identity: CapabilityRootIdentity::new("root-1").unwrap(),
-            relative_components: RelativePathComponents::new(vec!["workspace".to_owned()]).unwrap(),
+            target: local_agent_terminal_application::ResolvedCapabilityTarget::Relative(
+                RelativePathComponents::new(vec!["workspace".to_owned()]).unwrap(),
+            ),
         })
     }
 }
@@ -739,6 +784,29 @@ struct Git;
 impl StructuredGit for Git {
     fn status(&self, _: AuthorizedGitStatus) -> Result<GitStatusResult, PortError> {
         unreachable!()
+    }
+
+    fn diff(&self, _: AuthorizedGitDiff) -> Result<GitDiffResult, PortError> {
+        unreachable!()
+    }
+}
+
+#[derive(Default)]
+struct RootRecordingGit {
+    root: Mutex<Option<CapabilityRootIdentity>>,
+}
+
+impl StructuredGit for RootRecordingGit {
+    fn status(&self, request: AuthorizedGitStatus) -> Result<GitStatusResult, PortError> {
+        *self.root.lock().unwrap() = Some(request.root_identity);
+        Ok(GitStatusResult {
+            digest: digest(b""),
+            bytes: Vec::new(),
+            repository_id: local_agent_terminal_domain::RepositoryId::new("repo-1").unwrap(),
+            revision: GitObjectId::new("a".repeat(40)).unwrap(),
+            path_scope: request.worktree,
+            truncated: false,
+        })
     }
 
     fn diff(&self, _: AuthorizedGitDiff) -> Result<GitDiffResult, PortError> {

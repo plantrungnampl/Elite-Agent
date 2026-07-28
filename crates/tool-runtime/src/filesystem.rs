@@ -5,8 +5,9 @@ use local_agent_terminal_application::{
     FileWriteEvidenceStore, FileWritePolicyBinding, FileWritePostExpectation, FileWritePreImage,
     FileWriteRecoveryCompletion, FileWriteRecoveryIntent, FileWriteRecoverySnapshot,
     FileWriteRecoveryState, FileWriteRecoveryStore, FileWriteRequest, ObservedFileImage,
-    OpenFileWriteSession, PortError, Retryability, SafeErrorClassification, VerifiedBytes,
-    VerifiedFileWriteCompensation, VerifiedWrite, WorkspaceWriteCoordinator,
+    OpenFileWriteSession, PortError, ResolvedCapabilityTarget, Retryability,
+    SafeErrorClassification, VerifiedBytes, VerifiedFileWriteCompensation, VerifiedWrite,
+    WorkspaceWriteCoordinator,
 };
 use sha2::{Digest, Sha256};
 
@@ -25,11 +26,15 @@ pub(crate) fn read(
         &request.capability,
         request.expected_digest.as_ref(),
     )?;
+    let relative_components = match resolved.target {
+        ResolvedCapabilityTarget::Relative(components) => components,
+        ResolvedCapabilityTarget::Root => return Err(denied()),
+    };
     let result = filesystem
         .read(AuthorizedFileRead {
             task_id: request.task_id,
             root_identity: resolved.root_identity,
-            relative_components: resolved.relative_components,
+            relative_components,
             expected_digest: request.expected_digest,
         })
         .map_err(|_| denied())?;
@@ -58,6 +63,10 @@ pub(crate) fn write(
         policy,
     } = request;
     let resolved = resolve(resolver, &task_id, &capability, expected_digest.as_ref())?;
+    let relative_components = match resolved.target {
+        ResolvedCapabilityTarget::Relative(components) => components,
+        ResolvedCapabilityTarget::Root => return Err(denied()),
+    };
     if lease_claim.task_id() != &task_id {
         return Err(conflict());
     }
@@ -71,7 +80,7 @@ pub(crate) fn write(
         execution_id.clone(),
         task_id,
         resolved.root_identity,
-        resolved.relative_components,
+        relative_components,
         expected_digest,
         lease_claim.clone(),
     )

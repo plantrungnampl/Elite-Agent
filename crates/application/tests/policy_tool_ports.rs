@@ -630,14 +630,14 @@ impl StructuredToolExecutor for CountingExecutor {
 
     fn git_status(
         &self,
-        _: local_agent_terminal_application::AuthorizedGitStatus,
+        _: local_agent_terminal_application::GitStatusRequest,
     ) -> Result<local_agent_terminal_application::GitStatusResult, PortError> {
         unreachable!()
     }
 
     fn git_diff(
         &self,
-        _: local_agent_terminal_application::AuthorizedGitDiff,
+        _: local_agent_terminal_application::GitDiffRequest,
     ) -> Result<local_agent_terminal_application::GitDiffResult, PortError> {
         unreachable!()
     }
