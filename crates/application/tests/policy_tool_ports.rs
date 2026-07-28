@@ -6,10 +6,10 @@ use local_agent_terminal_application::{
     ApprovalDigestPayload, ApprovalId, ApprovalInvalidation, ApprovalResolution, ApprovalSnapshot,
     ApprovalState, ApprovalStore, AuthorizedProcessRequest, AuthorizedToolRequest,
     BoundToolApproval, CancellationReceipt, CapabilityFilesystem, CapabilityResolver, Clock,
-    ExecuteApprovedTool, NewApproval, PolicyDecisionStore, PolicyEvaluator, PortError,
-    ProcessLauncher, Retryability, SafeErrorClassification, StructuredGit, StructuredToolExecutor,
-    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionId, ToolExecutionResult,
-    ToolExecutionStore,
+    DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest, ExecuteApprovedTool,
+    NewApproval, PolicyDecisionStore, PolicyEvaluator, PortError, ProcessLauncher, Retryability,
+    SafeErrorClassification, StructuredGit, StructuredToolExecutor, ToolApprovalOperationV1,
+    ToolApprovalPayloadV1, ToolExecutionId, ToolExecutionResult, ToolExecutionStore,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken, NetworkProfile, Phase,
@@ -22,6 +22,7 @@ fn assert_object_safe<T: ?Sized>() {}
 #[test]
 fn policy_and_tool_ports_are_object_safe() {
     assert_object_safe::<dyn PolicyEvaluator>();
+    assert_object_safe::<dyn DisclosurePolicyEvaluator>();
     assert_object_safe::<dyn PolicyDecisionStore>();
     assert_object_safe::<dyn ApprovalStore>();
     assert_object_safe::<dyn CapabilityResolver>();
@@ -30,6 +31,18 @@ fn policy_and_tool_ports_are_object_safe() {
     assert_object_safe::<dyn ProcessLauncher>();
     assert_object_safe::<dyn ToolExecutionStore>();
     assert_object_safe::<dyn StructuredToolExecutor>();
+}
+
+#[test]
+fn disclosure_request_binds_policy_input_channel_and_exact_bytes() {
+    let request = DisclosureRequest {
+        policy_request: policy_request(),
+        channel: DisclosureChannel::FileRead,
+        bytes: b"API_TOKEN=secret".to_vec(),
+    };
+
+    assert_eq!(request.channel, DisclosureChannel::FileRead);
+    assert_eq!(request.bytes, b"API_TOKEN=secret");
 }
 
 #[test]
@@ -708,6 +721,34 @@ fn approved_operation_digest() -> Sha256Digest {
 
 fn task_id() -> TaskId {
     TaskId::new("task-1").unwrap()
+}
+
+fn policy_request() -> local_agent_terminal_domain::PolicyRequest {
+    use local_agent_terminal_domain::{
+        ActorLocality, CapabilityRef, PolicyAction, PolicyActor, PolicyResource, ResourceClass,
+        TaskRisk, Timestamp, TrustTier,
+    };
+
+    local_agent_terminal_domain::PolicyRequest {
+        task_id: task_id(),
+        actor: PolicyActor {
+            connection_id: "connection-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            trust_tier: TrustTier::CoreAdapter,
+            locality: ActorLocality::Local,
+        },
+        action: PolicyAction::new("tool.read").unwrap(),
+        resource: PolicyResource {
+            capability: CapabilityRef::worktree(task_id(), "file.txt").unwrap(),
+            content_digest: digest('a'),
+            resource_class: ResourceClass::InternalCode,
+        },
+        task_risk: TaskRisk::Low,
+        workflow_phase: "Implementation".to_owned(),
+        purpose: "test".to_owned(),
+        policy_snapshot_digest: digest('b'),
+        evaluated_at: Timestamp::from_unix_seconds(1),
+    }
 }
 
 fn digest(character: char) -> Sha256Digest {

@@ -40,7 +40,10 @@ pub use execute_tool::ExecuteApprovedTool;
 pub use lease::{
     AcquireExecutorLease, AcquireLease, ExecutorLeaseStore, LeaseSnapshot, LeaseState, RevokeLease,
 };
-pub use policy::{PolicyDecision, PolicyDecisionStore, PolicyEvaluator, RecordedPolicyDecision};
+pub use policy::{
+    DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest, PolicyApprovedDisclosure,
+    PolicyDecision, PolicyDecisionStore, PolicyEvaluator, RecordedPolicyDecision,
+};
 pub use ports::{
     AppendOperation, AppendResult, ArtifactContent, ArtifactJournal, ArtifactJournalEntry,
     ArtifactJournalInvalidation, ArtifactJournalStatus, ArtifactJournalTransition, ArtifactRef,

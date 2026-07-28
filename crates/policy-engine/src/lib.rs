@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use local_agent_terminal_application::{
-    PolicyDecision, PolicyEvaluator, PortError, Retryability, SafeErrorClassification,
+    DisclosurePolicyEvaluator, DisclosureRequest as ApplicationDisclosureRequest,
+    PolicyApprovedDisclosure, PolicyDecision, PolicyEvaluator, PortError, Retryability,
+    SafeErrorClassification,
 };
 use local_agent_terminal_domain::{PolicyRequest, Sha256Digest};
 use serde::Deserialize;
@@ -150,6 +152,38 @@ impl PolicyEvaluator for VersionedPolicyEngine {
             return Err(denied());
         }
         self.bundle.evaluate(request)
+    }
+}
+
+impl DisclosurePolicyEvaluator for VersionedPolicyEngine {
+    fn disclose(
+        &self,
+        request: ApplicationDisclosureRequest,
+    ) -> Result<PolicyApprovedDisclosure, PortError> {
+        let disclosure = VersionedPolicyEngine::disclose(
+            self,
+            DisclosureRequest::new(
+                request.policy_request,
+                match request.channel {
+                    local_agent_terminal_application::DisclosureChannel::FileRead => {
+                        DisclosureChannel::DirectRead
+                    }
+                    local_agent_terminal_application::DisclosureChannel::GitStatus => {
+                        DisclosureChannel::GitStatus
+                    }
+                    local_agent_terminal_application::DisclosureChannel::GitDiff => {
+                        DisclosureChannel::GitDiff
+                    }
+                },
+                request.bytes,
+            ),
+        )?;
+        Ok(PolicyApprovedDisclosure {
+            decision: disclosure.decision,
+            original_digest: disclosure.original_digest,
+            effective_bytes: disclosure.effective_bytes,
+            effective_digest: disclosure.effective_digest,
+        })
     }
 }
 
