@@ -1,8 +1,14 @@
 use local_agent_terminal_domain::{
-    CapabilityRef, FencingToken, ProcessToolRequest, Sha256Digest, TaskId, WorkspaceVersion,
+    CapabilityRef, FencingToken, NetworkProfile, ProcessToolRequest, ProcessTrustTier,
+    Sha256Digest, TaskId, WorkspaceVersion,
 };
+use serde_json::{json, Value};
 
+use crate::approval::{canonical_approval_payload, ApprovalDigestPayload, ToolApprovalPayloadV1};
+use crate::canonical_json::{invalid_input, sha256_digest};
 use crate::PortError;
+
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityRequest {
@@ -75,6 +81,31 @@ pub struct AuthorizedProcessRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRequestBindingDigest(Sha256Digest);
+
+impl ToolRequestBindingDigest {
+    pub const fn as_sha256(&self) -> &Sha256Digest {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundToolApproval {
+    payload: ToolApprovalPayloadV1,
+    request_binding_digest: ToolRequestBindingDigest,
+}
+
+impl BoundToolApproval {
+    pub const fn payload(&self) -> &ToolApprovalPayloadV1 {
+        &self.payload
+    }
+
+    pub const fn request_binding_digest(&self) -> &ToolRequestBindingDigest {
+        &self.request_binding_digest
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessReceipt {
     pub execution_id: ToolExecutionId,
     pub exit_code: Option<i32>,
@@ -136,8 +167,53 @@ pub struct ToolExecutionSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedToolRequest {
     pub execution_id: ToolExecutionId,
-    pub operation_digest: Sha256Digest,
-    pub request: AuthorizedProcessRequest,
+    request: AuthorizedProcessRequest,
+    approval: BoundToolApproval,
+}
+
+impl AuthorizedToolRequest {
+    pub fn new(
+        execution_id: ToolExecutionId,
+        approval: BoundToolApproval,
+        request: AuthorizedProcessRequest,
+    ) -> Self {
+        Self {
+            execution_id,
+            request,
+            approval,
+        }
+    }
+
+    pub(crate) fn revalidated_operation_digest(&self) -> Result<Sha256Digest, PortError> {
+        let rebound = bind_process_request(self.approval.payload.clone(), &self.request)?;
+        if rebound != self.approval.payload {
+            return Err(invalid_input());
+        }
+        canonical_approval_payload(&ApprovalDigestPayload::Tool(rebound))
+            .map(|canonical| canonical.operation_digest)
+    }
+
+    pub(crate) fn revalidated_request_binding_digest(
+        &self,
+    ) -> Result<&ToolRequestBindingDigest, PortError> {
+        let current = canonical_tool_request_binding(&self.request)?;
+        if current != self.approval.request_binding_digest {
+            return Err(invalid_input());
+        }
+        Ok(&self.approval.request_binding_digest)
+    }
+
+    pub(crate) fn approval_nonce(&self) -> &str {
+        &self.approval.payload.nonce
+    }
+
+    pub fn process_request(&self) -> &AuthorizedProcessRequest {
+        &self.request
+    }
+
+    pub fn into_process_request(self) -> AuthorizedProcessRequest {
+        self.request
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,4 +253,165 @@ pub trait ToolExecutionStore: Send + Sync {
 pub trait StructuredToolExecutor: Send + Sync {
     fn execute(&self, request: AuthorizedToolRequest) -> Result<ToolExecutionResult, PortError>;
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError>;
+}
+
+pub fn bind_tool_approval_payload(
+    payload: ToolApprovalPayloadV1,
+    request: &AuthorizedProcessRequest,
+) -> Result<BoundToolApproval, PortError> {
+    let payload = bind_process_request(payload, request)?;
+    canonical_approval_payload(&ApprovalDigestPayload::Tool(payload.clone()))?;
+    Ok(BoundToolApproval {
+        payload,
+        request_binding_digest: canonical_tool_request_binding(request)?,
+    })
+}
+
+fn bind_process_request(
+    mut payload: ToolApprovalPayloadV1,
+    request: &AuthorizedProcessRequest,
+) -> Result<ToolApprovalPayloadV1, PortError> {
+    let process = &request.process;
+    let binding = process.binding();
+    payload.task_id = binding.task_id().as_str().to_owned();
+    payload.operation.run_id = binding.run_id().as_str().to_owned();
+    payload.operation.plan_step_id = binding.plan_step_id().as_str().to_owned();
+    payload.operation.tool = "process.exec".to_owned();
+    payload.operation.arguments_digest = canonical_process_arguments_digest(process)?.to_string();
+    payload.operation.cwd_capability = logical_capability(process.cwd());
+    payload.operation.environment_profile_digest =
+        binding.environment_profile().digest().as_str().to_owned();
+    payload.operation.network_profile = network_profile(process.network()).to_owned();
+    payload.operation.expected_writes = process
+        .expected_writes()
+        .iter()
+        .map(|write| logical_capability(write.capability()))
+        .collect();
+    payload.operation.executor_fencing_token =
+        process.executor_fencing_token().map(FencingToken::get);
+    payload.workspace_version = binding.workspace_version().get();
+    Ok(payload)
+}
+
+fn canonical_process_arguments_digest(
+    request: &ProcessToolRequest,
+) -> Result<Sha256Digest, PortError> {
+    let value = json!({
+        "schema": "process-argv.v1",
+        "argv": request.argv(),
+    });
+    let canonical_bytes = serde_json_canonicalizer::to_vec(&value).map_err(|_| invalid_input())?;
+    Sha256Digest::new(sha256_digest(&canonical_bytes)).map_err(|_| invalid_input())
+}
+
+fn canonical_tool_request_binding(
+    request: &AuthorizedProcessRequest,
+) -> Result<ToolRequestBindingDigest, PortError> {
+    validate_safe_integer_fields(request)?;
+    let process = &request.process;
+    let binding = process.binding();
+    let value = json!({
+        "schema": "authorized-process-request.v1",
+        "taskId": binding.task_id().as_str(),
+        "runId": binding.run_id().as_str(),
+        "planStepId": binding.plan_step_id().as_str(),
+        "workflowPhase": binding.workflow_phase().as_str(),
+        "workspaceVersion": binding.workspace_version().get(),
+        "environmentProfile": {
+            "name": binding.environment_profile().name(),
+            "digest": binding.environment_profile().digest().as_str(),
+        },
+        "timeoutMs": binding.timeout_ms(),
+        "executable": capability_value(process.executable()),
+        "argv": process.argv(),
+        "cwd": capability_value(process.cwd()),
+        "trustTier": trust_tier(process.trust_tier()),
+        "networkProfile": network_profile(process.network()),
+        "expectedReads": request
+            .expected_reads
+            .iter()
+            .map(capability_value)
+            .collect::<Vec<_>>(),
+        "expectedWrites": process
+            .expected_writes()
+            .iter()
+            .map(|write| capability_value(write.capability()))
+            .collect::<Vec<_>>(),
+        "memoryLimitBytes": request.memory_limit_bytes,
+        "cpuTimeLimitMs": request.cpu_time_limit_ms,
+        "executorFencingToken": process.executor_fencing_token().map(FencingToken::get),
+    });
+    let canonical_bytes = serde_json_canonicalizer::to_vec(&value).map_err(|_| invalid_input())?;
+    Sha256Digest::new(sha256_digest(&canonical_bytes))
+        .map(ToolRequestBindingDigest)
+        .map_err(|_| invalid_input())
+}
+
+fn validate_safe_integer_fields(request: &AuthorizedProcessRequest) -> Result<(), PortError> {
+    let process = &request.process;
+    let binding = process.binding();
+    let unsafe_integer = [
+        binding.workspace_version().get(),
+        binding.timeout_ms(),
+        process
+            .executor_fencing_token()
+            .map(FencingToken::get)
+            .unwrap_or_default(),
+        request.memory_limit_bytes.unwrap_or_default(),
+        request.cpu_time_limit_ms.unwrap_or_default(),
+    ]
+    .into_iter()
+    .any(|value| value > MAX_SAFE_INTEGER);
+    if unsafe_integer {
+        return Err(invalid_input());
+    }
+    Ok(())
+}
+
+fn capability_value(capability: &CapabilityRef) -> Value {
+    match capability {
+        CapabilityRef::Source(value) => {
+            json!({"kind": "source", "revision": value.revision(), "path": value.path()})
+        }
+        CapabilityRef::Artifact(value) => {
+            json!({"kind": "artifact", "artifactId": value.artifact_id().as_str()})
+        }
+        CapabilityRef::Worktree(value) => {
+            json!({"kind": "worktree", "taskId": value.task_id().as_str(), "path": value.path()})
+        }
+        CapabilityRef::Toolchain(value) => {
+            json!({"kind": "toolchain", "name": value.name()})
+        }
+    }
+}
+
+fn logical_capability(capability: &CapabilityRef) -> String {
+    match capability {
+        CapabilityRef::Source(value) => {
+            format!("source:{}:{}", value.revision(), value.path())
+        }
+        CapabilityRef::Artifact(value) => format!("artifact:{}", value.artifact_id().as_str()),
+        CapabilityRef::Worktree(value) if value.path() == "." => {
+            format!("worktree:{}", value.task_id().as_str())
+        }
+        CapabilityRef::Worktree(value) => {
+            format!("worktree:{}:{}", value.task_id().as_str(), value.path())
+        }
+        CapabilityRef::Toolchain(value) => format!("toolchain:{}", value.name()),
+    }
+}
+
+const fn trust_tier(value: ProcessTrustTier) -> &'static str {
+    match value {
+        ProcessTrustTier::BrokeredProcess => "brokered_process",
+        ProcessTrustTier::IsolatedWorker => "isolated_worker",
+    }
+}
+
+const fn network_profile(value: NetworkProfile) -> &'static str {
+    match value {
+        NetworkProfile::Denied => "denied",
+        NetworkProfile::ProviderEndpointOnly => "provider_endpoint_only",
+        NetworkProfile::ApprovedDestinations => "approved_destinations",
+    }
 }

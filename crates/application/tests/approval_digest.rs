@@ -1,6 +1,6 @@
 use local_agent_terminal_application::{
     build_approval_request, canonical_approval_payload, parse_approval_payload,
-    ApprovalDigestPayload, ApprovalId,
+    ApprovalDigestPayload, ApprovalId, ToolApprovalPayloadV1,
 };
 use local_agent_terminal_domain::{ArtifactId, ProjectId, TaskId};
 use serde_json::{json, Value};
@@ -52,6 +52,76 @@ fn authorization_parser_rejects_duplicate_keys_floats_negative_zero_and_unsafe_i
     for raw in hostile {
         assert!(parse_approval_payload(&raw).is_err(), "{raw}");
     }
+}
+
+#[test]
+fn tool_parser_requires_nullable_fencing_and_rejects_null_optional_digests() {
+    let value: Value = serde_json::from_str(TOOL_FIXTURE).unwrap();
+    let mut missing_fencing = value.clone();
+    missing_fencing
+        .pointer_mut("/operation")
+        .and_then(Value::as_object_mut)
+        .unwrap()
+        .remove("executorFencingToken");
+    let mut null_executable_digest = value.clone();
+    set(
+        &mut null_executable_digest,
+        "/operation/executableDigest",
+        Value::Null,
+    );
+    let mut null_script_digest = value.clone();
+    null_script_digest
+        .pointer_mut("/operation")
+        .and_then(Value::as_object_mut)
+        .unwrap()
+        .insert("scriptDigest".to_owned(), Value::Null);
+
+    for hostile in &[missing_fencing, null_executable_digest, null_script_digest] {
+        assert!(
+            parse_approval_payload(&serde_json::to_string(hostile).unwrap()).is_err(),
+            "{hostile}"
+        );
+        assert!(serde_json::from_value::<ToolApprovalPayloadV1>(hostile.clone()).is_err());
+    }
+
+    let mut explicit_null_fencing = value.clone();
+    set(
+        &mut explicit_null_fencing,
+        "/operation/executorFencingToken",
+        Value::Null,
+    );
+    assert!(
+        parse_approval_payload(&serde_json::to_string(&explicit_null_fencing).unwrap()).is_ok()
+    );
+    assert!(serde_json::from_value::<ToolApprovalPayloadV1>(explicit_null_fencing.clone()).is_ok());
+
+    let mut absent_optional_digests = value;
+    absent_optional_digests
+        .pointer_mut("/operation")
+        .and_then(Value::as_object_mut)
+        .unwrap()
+        .remove("executableDigest");
+    assert!(
+        parse_approval_payload(&serde_json::to_string(&absent_optional_digests).unwrap()).is_ok()
+    );
+    assert!(serde_json::from_value::<ToolApprovalPayloadV1>(absent_optional_digests).is_ok());
+}
+
+#[test]
+fn approval_ids_are_safe_opaque_path_segments() {
+    for invalid in [
+        "../../x",
+        "..\\..\\x",
+        ".",
+        "..",
+        "approval/1",
+        "approval\\1",
+    ] {
+        assert!(ApprovalId::new(invalid).is_err(), "{invalid}");
+    }
+
+    let valid = ApprovalId::new("approval_ABC-123").unwrap();
+    assert_eq!(valid.as_str(), "approval_ABC-123");
 }
 
 #[test]

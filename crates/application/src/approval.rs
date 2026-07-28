@@ -8,6 +8,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::canonical_json::sha256_digest;
+use crate::tool::ToolRequestBindingDigest;
 use crate::{CanonicalJsonRequest, PortError, Retryability, SafeErrorClassification};
 
 const SCHEMA: &str = "approval-digest.v1";
@@ -34,15 +35,24 @@ pub struct ToolApprovalOperationV1 {
     pub run_id: String,
     pub plan_step_id: String,
     pub tool: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub executable_digest: Option<String>,
     pub arguments_digest: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_null_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub script_digest: Option<String>,
     pub cwd_capability: String,
     pub environment_profile_digest: String,
     pub network_profile: String,
     pub expected_writes: Vec<String>,
+    #[serde(deserialize_with = "deserialize_nullable_u64")]
     pub executor_fencing_token: Option<u64>,
 }
 
@@ -107,7 +117,7 @@ pub struct ApprovalId(String);
 impl ApprovalId {
     pub fn new(value: impl Into<String>) -> Result<Self, PortError> {
         let value = value.into();
-        if !valid_identifier(&value) {
+        if !valid_approval_id(&value) {
             return Err(invalid_input());
         }
         Ok(Self(value))
@@ -135,6 +145,7 @@ pub struct NewApproval {
     pub workspace_version: WorkspaceVersion,
     pub policy_snapshot_digest: Sha256Digest,
     pub fencing_token: Option<u64>,
+    pub tool_request_binding_digest: Option<ToolRequestBindingDigest>,
     pub expires_at: String,
     pub nonce: String,
 }
@@ -148,6 +159,7 @@ pub struct ApprovalSnapshot {
     pub workspace_version: WorkspaceVersion,
     pub policy_snapshot_digest: Sha256Digest,
     pub fencing_token: Option<u64>,
+    pub tool_request_binding_digest: Option<ToolRequestBindingDigest>,
     pub expires_at: String,
     pub nonce: String,
 }
@@ -347,7 +359,7 @@ fn validate_common(
         || !matches!(approval_type, "tool" | "policy_exception")
         || !valid_identifier(task_id)
         || !valid_digest(policy_snapshot_digest)
-        || !valid_nonce(nonce)
+        || !valid_approval_nonce(nonce)
         || workspace_version_is_unsafe(workspace_version)
         || timestamps_are_invalid(requested_at, expires_at)
     {
@@ -409,6 +421,13 @@ fn valid_identifier(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 256 && !value.contains('\0')
 }
 
+fn valid_approval_id(value: &str) -> bool {
+    (1..=256).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 fn valid_digest(value: &str) -> bool {
     value.len() == SHA256_LENGTH
         && value.starts_with("sha256:")
@@ -417,11 +436,25 @@ fn valid_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn valid_nonce(value: &str) -> bool {
+pub(crate) fn valid_approval_nonce(value: &str) -> bool {
     (32..=256).contains(&value.len())
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn deserialize_optional_non_null_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_nullable_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer)
 }
 
 fn invalid_input() -> PortError {

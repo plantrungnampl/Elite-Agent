@@ -55,12 +55,13 @@ pub use repository::{
     RepositorySnapshot, WorktreeObservation, WorktreeSnapshot, WorktreeState,
 };
 pub use tool::{
-    AuthorizedFileRead, AuthorizedFileWrite, AuthorizedGitDiff, AuthorizedGitStatus,
-    AuthorizedProcessRequest, AuthorizedToolRequest, CancellationReceipt, CapabilityFilesystem,
-    CapabilityRequest, CapabilityResolver, GitDiffResult, GitStatusResult, NewToolExecution,
-    NewToolIntent, OperationIntentSnapshot, ProcessLauncher, ProcessReceipt, ResolvedCapability,
-    StructuredGit, StructuredToolExecutor, ToolExecutionCompletion, ToolExecutionId,
-    ToolExecutionResult, ToolExecutionSnapshot, ToolExecutionStore, VerifiedBytes, VerifiedWrite,
+    bind_tool_approval_payload, AuthorizedFileRead, AuthorizedFileWrite, AuthorizedGitDiff,
+    AuthorizedGitStatus, AuthorizedProcessRequest, AuthorizedToolRequest, BoundToolApproval,
+    CancellationReceipt, CapabilityFilesystem, CapabilityRequest, CapabilityResolver,
+    GitDiffResult, GitStatusResult, NewToolExecution, NewToolIntent, OperationIntentSnapshot,
+    ProcessLauncher, ProcessReceipt, ResolvedCapability, StructuredGit, StructuredToolExecutor,
+    ToolExecutionCompletion, ToolExecutionId, ToolExecutionResult, ToolExecutionSnapshot,
+    ToolExecutionStore, ToolRequestBindingDigest, VerifiedBytes, VerifiedWrite,
 };
 pub use workspace::{
     ArtifactRootMode, GetWorkspaceDashboard, IdempotencyClass, IntentTransition, NewProject,
