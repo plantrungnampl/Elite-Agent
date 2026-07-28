@@ -22,6 +22,35 @@ test("architecture checker accepts the workspace while M2 packages are absent", 
   assert.match(run("scripts/check-architecture.mjs"), /architecture contracts: ok/);
 });
 
+test("architecture checker rejects application dependencies outside its exact allowlist", () => {
+  const directory = mkdtempSync(join(tmpdir(), "m2-contracts-"));
+  try {
+    const metadata = join(directory, "metadata.json");
+    writeFileSync(metadata, JSON.stringify({
+      packages: [
+        { name: "local-agent-terminal-domain", dependencies: [] },
+        {
+          name: "local-agent-terminal-application",
+          dependencies: [
+            { name: "local-agent-terminal-domain" },
+            { name: "unreviewed-dependency" },
+          ],
+        },
+      ],
+      workspace_members: [
+        "local-agent-terminal-domain",
+        "local-agent-terminal-application",
+      ],
+    }), "utf8");
+    assert.throws(
+      () => run("scripts/check-architecture.mjs", "--metadata", metadata),
+      /application may depend only on domain or general-purpose libraries/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("architecture checker rejects outward M2 adapter dependencies", () => {
   for (const [name, pattern] of [
     ["policy-engine-outward-metadata.json", /policy-engine has an outward internal dependency/],

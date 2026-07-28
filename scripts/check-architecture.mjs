@@ -68,6 +68,7 @@ function verifyCargo(metadata) {
     "serde_json_canonicalizer",
     "sha2",
     "thiserror",
+    "time",
   ]);
   if (
     allDependencies(application).some(

@@ -106,7 +106,7 @@ pub fn canonical_evidence(
     })
 }
 
-fn sha256_digest(bytes: &[u8]) -> String {
+pub(crate) fn sha256_digest(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(71);
     encoded.push_str("sha256:");
@@ -116,7 +116,7 @@ fn sha256_digest(bytes: &[u8]) -> String {
     encoded
 }
 
-fn invalid_input() -> PortError {
+pub(crate) fn invalid_input() -> PortError {
     PortError::failure(
         SafeErrorClassification::InvalidInput,
         Retryability::NonRetryable,

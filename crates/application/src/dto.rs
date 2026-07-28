@@ -130,6 +130,29 @@ pub struct ConfirmDiscardWorkspaceRequestDto {
     pub confirmed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApproveOperationRequestDto {
+    pub approval_id: String,
+    pub expected_operation_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CancelToolExecutionRequestDto {
+    pub execution_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalRequestDto {
+    pub approval_id: String,
+    pub summary: String,
+    pub operation_digest: String,
+    pub expires_at: String,
+    pub scopes: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandErrorDto {
