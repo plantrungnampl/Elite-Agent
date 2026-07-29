@@ -44,9 +44,10 @@ use local_agent_terminal_platform_windows::{
     block_next_job_cleanup_failure_for_test, bypass_aap_attestation_for_test,
     configure_all_packages_canary_for_test, fail_after_resume_for_test,
     fail_lpac_token_verification_for_test, fail_next_output_reader_start_for_test,
-    lpac_lifecycle_counts_for_test, omit_all_application_packages_policy_for_test,
-    output_reader_counts_for_test, IsolatedWorkerBoundaryAdapter, IsolatedWorkerBoundaryBinding,
-    IsolatedWorkerBoundaryClaims, JobCleanupFailurePointForTest, LpacLifecycleCountsForTest,
+    lpac_lifecycle_counts_for_test, observe_stderr_marker_for_test,
+    omit_all_application_packages_policy_for_test, output_reader_counts_for_test,
+    IsolatedWorkerBoundaryAdapter, IsolatedWorkerBoundaryBinding, IsolatedWorkerBoundaryClaims,
+    JobCleanupFailurePointForTest, LpacLifecycleCountsForTest,
     LpacTokenVerificationMismatchForTest, PreparedIsolatedWorkerBoundary,
 };
 use local_agent_terminal_platform_windows::{
@@ -1239,6 +1240,165 @@ fn output_overflow_terminates_the_job_and_returns_only_the_bound() {
     assert_real_lpac_lifecycle(&execution_id);
 }
 
+#[test]
+fn stderr_overflow_terminates_the_real_lpac_job_and_returns_only_the_bound() {
+    let root = TempDir::new().unwrap();
+    let launcher = registered_lpac_launcher(root.path());
+    let mut request = request(
+        vec![
+            "--exact".to_owned(),
+            "process_child_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        BTreeMap::from([("LAT_PROCESS_HELPER".to_owned(), "stderr-flood".to_owned())]),
+    );
+    request.execution_id = ToolExecutionId::new("execution-lpac-stderr-overflow").unwrap();
+    request.limits.max_stderr_bytes = 32;
+    let execution_id = request.execution_id.clone();
+    #[cfg(feature = "test-seams")]
+    let oversized_marker = b"stderr-observation-sentinel";
+    #[cfg(feature = "test-seams")]
+    let observation =
+        observe_stderr_marker_for_test(execution_id.clone(), oversized_marker).unwrap();
+
+    let receipt = launcher.execute(request).unwrap();
+
+    assert_eq!(receipt.status, ProcessStatus::Terminated);
+    assert!(receipt.stderr.truncated);
+    assert_eq!(receipt.stderr.bytes.len(), 32);
+    assert!(receipt.job_receipt.kill_on_close);
+    assert!(receipt.job_receipt.no_breakaway);
+    assert!(receipt.job_receipt.job_memory_limit);
+    assert!(receipt.job_receipt.job_cpu_time_limit);
+    assert_eq!(receipt.job_receipt.memory_limit_bytes, 256 * 1024 * 1024);
+    assert_eq!(receipt.job_receipt.cpu_time_limit_ms, 5_000);
+    assert_eq!(receipt.job_receipt.max_active_processes, 8);
+    assert!(!receipt.job_receipt.resource_limit_terminated);
+    assert!(receipt.job_receipt.tree_terminated);
+    #[cfg(feature = "test-seams")]
+    {
+        assert!(!observation.observed());
+        assert!(observation.buffered_len() < oversized_marker.len());
+        drop(observation);
+        assert!(observe_stderr_marker_for_test(execution_id.clone(), oversized_marker).is_some());
+    }
+    assert_real_lpac_lifecycle(&execution_id);
+}
+
+#[test]
+fn bounded_inert_helper_outlives_a_short_real_lpac_timeout() {
+    let root = TempDir::new().unwrap();
+    let launcher = registered_lpac_launcher(root.path());
+    let mut request = request(
+        vec![
+            "--exact".to_owned(),
+            "process_child_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        BTreeMap::from([(
+            "LAT_PROCESS_HELPER".to_owned(),
+            "bounded-inert-wait".to_owned(),
+        )]),
+    );
+    request.execution_id = ToolExecutionId::new("execution-lpac-bounded-inert-timeout").unwrap();
+    request.timeout_ms = 100;
+
+    let receipt = launcher.execute(request).unwrap();
+
+    assert_eq!(receipt.status, ProcessStatus::Terminated);
+    assert!(receipt.job_receipt.tree_terminated);
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn explicit_cancellation_terminates_a_live_real_lpac_root() {
+    let root = TempDir::new().unwrap();
+    let launcher = Arc::new(registered_lpac_launcher(root.path()));
+    let started_marker = b"bounded-inert-started";
+    let mut request = request(
+        vec![
+            "--exact".to_owned(),
+            "process_child_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        BTreeMap::from([(
+            "LAT_PROCESS_HELPER".to_owned(),
+            "bounded-inert-wait".to_owned(),
+        )]),
+    );
+    request.execution_id = ToolExecutionId::new("execution-lpac-explicit-cancel").unwrap();
+    request.timeout_ms = 30_000;
+    let execution_id = request.execution_id.clone();
+    let stderr_observation =
+        observe_stderr_marker_for_test(execution_id.clone(), started_marker).unwrap();
+    let unrelated_execution_id =
+        ToolExecutionId::new("execution-lpac-explicit-cancel-unrelated").unwrap();
+    let unrelated_observation =
+        observe_stderr_marker_for_test(unrelated_execution_id, started_marker).unwrap();
+    let executing = Arc::clone(&launcher);
+    let execution = thread::spawn(move || executing.execute(request));
+
+    let resume_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let lifecycle = lpac_lifecycle_counts_for_test(&execution_id);
+        if lifecycle.resumes_succeeded == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < resume_deadline,
+            "LPAC root did not resume: {lifecycle:?}"
+        );
+        thread::yield_now();
+    }
+
+    let output_deadline = Instant::now() + Duration::from_secs(5);
+    while !stderr_observation.observed() {
+        assert!(
+            Instant::now() < output_deadline,
+            "LPAC root stderr marker was not observed"
+        );
+        thread::yield_now();
+    }
+    assert!(!unrelated_observation.observed());
+
+    let cancellation = launcher.cancel(&execution_id).unwrap();
+    let receipt = execution.join().unwrap().unwrap();
+
+    assert_eq!(cancellation.execution_id, execution_id);
+    assert_eq!(cancellation.status, ProcessStatus::Terminated);
+    assert!(cancellation.cancelled);
+    let cancellation_job = cancellation.job_receipt.unwrap();
+    assert!(cancellation_job.kill_on_close);
+    assert!(cancellation_job.no_breakaway);
+    assert!(cancellation_job.job_memory_limit);
+    assert!(cancellation_job.job_cpu_time_limit);
+    assert_eq!(cancellation_job.memory_limit_bytes, 256 * 1024 * 1024);
+    assert_eq!(cancellation_job.cpu_time_limit_ms, 5_000);
+    assert_eq!(cancellation_job.max_active_processes, 8);
+    assert!(!cancellation_job.resource_limit_terminated);
+    assert!(cancellation_job.tree_terminated);
+
+    assert_eq!(receipt.execution_id, execution_id);
+    assert_eq!(receipt.status, ProcessStatus::Terminated);
+    assert!(receipt
+        .stderr
+        .bytes
+        .windows(started_marker.len())
+        .any(|window| window == started_marker));
+    assert!(receipt.job_receipt.kill_on_close);
+    assert!(receipt.job_receipt.no_breakaway);
+    assert!(receipt.job_receipt.job_memory_limit);
+    assert!(receipt.job_receipt.job_cpu_time_limit);
+    assert_eq!(receipt.job_receipt.memory_limit_bytes, 256 * 1024 * 1024);
+    assert_eq!(receipt.job_receipt.cpu_time_limit_ms, 5_000);
+    assert_eq!(receipt.job_receipt.max_active_processes, 8);
+    assert!(!receipt.job_receipt.resource_limit_terminated);
+    assert!(receipt.job_receipt.tree_terminated);
+    assert_real_lpac_lifecycle(&execution_id);
+    drop(stderr_observation);
+    assert!(observe_stderr_marker_for_test(execution_id, started_marker).is_some());
+}
+
 #[cfg(feature = "test-seams")]
 #[test]
 fn cancellation_terminates_descendants_and_breakaway_is_denied() {
@@ -2042,6 +2202,11 @@ fn process_child_helper() {
             }
         }
         Some("flood") => println!("{}", "x".repeat(128 * 1024)),
+        Some("stderr-flood") => eprintln!("{}", "x".repeat(128 * 1024)),
+        Some("bounded-inert-wait") => {
+            eprintln!("bounded-inert-started");
+            thread::park_timeout(Duration::from_secs(30));
+        }
         Some("canary-read") => {
             let read_status = if fs::read(std::env::var_os("LAT_PROCESS_CANARY").unwrap()).is_ok() {
                 "success"

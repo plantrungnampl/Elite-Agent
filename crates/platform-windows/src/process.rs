@@ -70,6 +70,122 @@ static OUTPUT_READER_COUNTS: Mutex<BTreeMap<ToolExecutionId, (usize, usize)>> =
     Mutex::new(BTreeMap::new());
 
 #[cfg(feature = "test-seams")]
+static STDERR_OBSERVATIONS: Mutex<BTreeMap<ToolExecutionId, StderrMarkerObservationState>> =
+    Mutex::new(BTreeMap::new());
+
+#[cfg(feature = "test-seams")]
+const MAX_STDERR_OBSERVATION_MARKER_BYTES: usize = 64;
+
+#[cfg(feature = "test-seams")]
+struct StderrMarkerObservationState {
+    marker: Vec<u8>,
+    tail: Vec<u8>,
+    observed: bool,
+}
+
+#[cfg(feature = "test-seams")]
+impl StderrMarkerObservationState {
+    fn new(marker: &[u8]) -> Self {
+        Self {
+            marker: marker.to_vec(),
+            tail: Vec::new(),
+            observed: false,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        if self.observed || bytes.is_empty() {
+            return;
+        }
+        if bytes
+            .windows(self.marker.len())
+            .any(|window| window == self.marker)
+        {
+            self.observed = true;
+            self.tail.clear();
+            return;
+        }
+
+        let retained_bytes = self.marker.len() - 1;
+        let prefix_len = bytes.len().min(retained_bytes);
+        let mut boundary = Vec::with_capacity(self.tail.len() + prefix_len);
+        boundary.extend_from_slice(&self.tail);
+        boundary.extend_from_slice(&bytes[..prefix_len]);
+        if boundary
+            .windows(self.marker.len())
+            .any(|window| window == self.marker)
+        {
+            self.observed = true;
+            self.tail.clear();
+            return;
+        }
+
+        let previous_tail_start = self
+            .tail
+            .len()
+            .saturating_sub(retained_bytes.saturating_sub(bytes.len()));
+        let bytes_start = bytes.len().saturating_sub(retained_bytes);
+        let mut tail = Vec::with_capacity(retained_bytes);
+        tail.extend_from_slice(&self.tail[previous_tail_start..]);
+        tail.extend_from_slice(&bytes[bytes_start..]);
+        if tail.len() > retained_bytes {
+            tail.drain(..tail.len() - retained_bytes);
+        }
+        self.tail = tail;
+    }
+
+    fn observed(&self) -> bool {
+        self.observed
+    }
+
+    fn buffered_len(&self) -> usize {
+        self.tail.len()
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub struct StderrMarkerObservationForTest {
+    execution_id: ToolExecutionId,
+}
+
+#[cfg(feature = "test-seams")]
+impl StderrMarkerObservationForTest {
+    pub fn observed(&self) -> bool {
+        STDERR_OBSERVATIONS
+            .lock()
+            .ok()
+            .and_then(|observations| {
+                observations
+                    .get(&self.execution_id)
+                    .map(StderrMarkerObservationState::observed)
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn buffered_len(&self) -> usize {
+        STDERR_OBSERVATIONS
+            .lock()
+            .ok()
+            .and_then(|observations| {
+                observations
+                    .get(&self.execution_id)
+                    .map(StderrMarkerObservationState::buffered_len)
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(feature = "test-seams")]
+impl Drop for StderrMarkerObservationForTest {
+    fn drop(&mut self) {
+        if let Ok(mut observations) = STDERR_OBSERVATIONS.lock() {
+            observations.remove(&self.execution_id);
+        }
+    }
+}
+
+#[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub fn fail_next_output_reader_start_for_test(execution_id: ToolExecutionId) {
     if let Ok(mut failure) = FAIL_OUTPUT_READER_START.lock() {
@@ -108,6 +224,26 @@ pub fn output_reader_counts_for_test(execution_id: &ToolExecutionId) -> (usize, 
         .ok()
         .and_then(|counts| counts.get(execution_id).copied())
         .unwrap_or_default()
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn observe_stderr_marker_for_test(
+    execution_id: ToolExecutionId,
+    marker: &[u8],
+) -> Option<StderrMarkerObservationForTest> {
+    if marker.is_empty() || marker.len() > MAX_STDERR_OBSERVATION_MARKER_BYTES {
+        return None;
+    }
+    let mut observations = STDERR_OBSERVATIONS.lock().ok()?;
+    if observations.contains_key(&execution_id) {
+        return None;
+    }
+    observations.insert(
+        execution_id.clone(),
+        StderrMarkerObservationState::new(marker),
+    );
+    Some(StderrMarkerObservationForTest { execution_id })
 }
 
 #[cfg(feature = "test-seams")]
@@ -472,12 +608,14 @@ impl ProcessLauncher for WindowsProcessLauncher {
             request.limits.max_stdout_bytes,
             Arc::downgrade(&child.active),
             &request.execution_id,
+            OutputStream::Stdout,
         )?;
         let stderr_reader = output_reader(
             child.stderr_read,
             request.limits.max_stderr_bytes,
             Arc::downgrade(&child.active),
             &request.execution_id,
+            OutputStream::Stderr,
         )?;
         cleanup.register()?;
 
@@ -961,14 +1099,21 @@ struct OutputReader {
     execution_id: ToolExecutionId,
 }
 
+#[derive(Clone, Copy)]
+enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
 fn output_reader(
     handle: OwnedHandle,
     max_bytes: u64,
     active: Weak<ActiveJob>,
     execution_id: &ToolExecutionId,
+    stream: OutputStream,
 ) -> Result<OutputReader, PortError> {
     #[cfg(not(feature = "test-seams"))]
-    let _ = execution_id;
+    let _ = (execution_id, stream);
     #[cfg(feature = "test-seams")]
     {
         let mut failure = FAIL_OUTPUT_READER_START
@@ -980,9 +1125,13 @@ fn output_reader(
         }
     }
     let max_bytes = usize::try_from(max_bytes).map_err(|_| invalid_input())?;
+    #[cfg(feature = "test-seams")]
+    let stderr_execution_id = matches!(stream, OutputStream::Stderr).then(|| execution_id.clone());
+    #[cfg(not(feature = "test-seams"))]
+    let stderr_execution_id = None;
     let handle = std::thread::Builder::new()
         .name("bounded-process-output".to_owned())
-        .spawn(move || read_bounded(handle.into_file(), max_bytes, &active))
+        .spawn(move || read_bounded(handle.into_file(), max_bytes, &active, stderr_execution_id))
         .map_err(|_| internal_error())?;
     #[cfg(feature = "test-seams")]
     if let Ok(mut counts) = OUTPUT_READER_COUNTS.lock() {
@@ -999,6 +1148,7 @@ fn read_bounded(
     mut file: File,
     max_bytes: usize,
     active: &Weak<ActiveJob>,
+    stderr_execution_id: Option<ToolExecutionId>,
 ) -> Result<BoundedOutput, PortError> {
     let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
     let mut buffer = [0_u8; 8 * 1024];
@@ -1008,6 +1158,16 @@ fn read_bounded(
         if count == 0 {
             break;
         }
+        #[cfg(feature = "test-seams")]
+        if let Some(execution_id) = stderr_execution_id.as_ref() {
+            if let Ok(mut observations) = STDERR_OBSERVATIONS.lock() {
+                if let Some(observation) = observations.get_mut(execution_id) {
+                    observation.observe(&buffer[..count]);
+                }
+            }
+        }
+        #[cfg(not(feature = "test-seams"))]
+        let _ = &stderr_execution_id;
         let remaining = max_bytes.saturating_sub(bytes.len());
         bytes.extend_from_slice(&buffer[..count.min(remaining)]);
         if count > remaining {
@@ -1318,4 +1478,30 @@ fn internal_error() -> PortError {
         SafeErrorClassification::Internal,
         Retryability::NonRetryable,
     )
+}
+
+#[cfg(all(test, feature = "test-seams"))]
+mod tests {
+    use super::StderrMarkerObservationState;
+
+    #[test]
+    fn stderr_marker_observation_matches_across_read_chunks() {
+        let mut observation = StderrMarkerObservationState::new(b"bounded-inert-started");
+
+        observation.observe(b"bounded-inert-");
+        observation.observe(b"started");
+
+        assert!(observation.observed());
+    }
+
+    #[test]
+    fn stderr_marker_observation_retains_only_a_marker_length_tail() {
+        let marker = b"stderr-observation-sentinel";
+        let mut observation = StderrMarkerObservationState::new(marker);
+
+        observation.observe(&vec![b'x'; 128 * 1024]);
+
+        assert!(!observation.observed());
+        assert!(observation.buffered_len() < marker.len());
+    }
 }

@@ -28,7 +28,8 @@ pub use process::WindowsProcessLauncher;
 #[cfg(feature = "test-seams")]
 pub use process::{
     fail_after_resume_for_test, fail_next_output_reader_start_for_test,
-    omit_all_application_packages_policy_for_test, output_reader_counts_for_test,
+    observe_stderr_marker_for_test, omit_all_application_packages_policy_for_test,
+    output_reader_counts_for_test, StderrMarkerObservationForTest,
 };
 #[cfg(feature = "test-seams")]
 pub use process::{
