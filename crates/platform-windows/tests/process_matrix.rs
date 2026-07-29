@@ -5,19 +5,27 @@ use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+#[cfg(feature = "test-seams")]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "test-seams")]
+use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "test-seams")]
+use std::time::Instant;
 
+#[cfg(feature = "test-seams")]
+use local_agent_terminal_application::ExecutableFileIdentity;
 use local_agent_terminal_application::{
     validate_and_order_process_writes, AcquireLease, AuthorizedExpectedWrite,
-    AuthorizedProcessRequest, CapabilityRootIdentity, EnforcedNetworkProfile,
-    ExecutableFileIdentity, ExecutorLeaseStore, LeaseSnapshot, LeaseState,
-    NetworkEnforcementReceipt, ObservedProcessWrite, PortError, ProcessFenceAuthority,
-    ProcessLauncher, ProcessLimits, ProcessStatus, ProcessWorkingDirectory, RelativePathComponents,
-    ResolvedCapability, ResolvedCapabilityTarget, ResolvedEnvironmentProfile, RevokeLease,
-    ToolExecutionId, VerifiedWrite, WorkspaceWriteCoordinator,
+    AuthorizedProcessRequest, CapabilityRootIdentity, EnforcedNetworkProfile, ExecutorLeaseStore,
+    LeaseSnapshot, LeaseState, NetworkEnforcementReceipt, ObservedProcessWrite, PortError,
+    ProcessFenceAuthority, ProcessLauncher, ProcessLimits, ProcessStatus, ProcessWorkingDirectory,
+    RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget,
+    ResolvedEnvironmentProfile, RevokeLease, ToolExecutionId, VerifiedWrite,
+    WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, ExpectedWrite, FencingToken, LeaseClaim, NetworkProfile, ProcessTrustTier,
@@ -29,21 +37,35 @@ use local_agent_terminal_platform_core::{
 };
 #[cfg(feature = "test-seams")]
 use local_agent_terminal_platform_windows::{
-    block_next_job_cleanup_failure_for_test, fail_after_resume_for_test,
-    fail_next_output_reader_start_for_test, output_reader_counts_for_test,
-    JobCleanupFailurePointForTest,
+    block_next_job_cleanup_failure_for_test, bypass_aap_attestation_for_test,
+    configure_all_packages_canary_for_test, fail_after_resume_for_test,
+    fail_lpac_token_verification_for_test, fail_next_output_reader_start_for_test,
+    lpac_lifecycle_counts_for_test, omit_all_application_packages_policy_for_test,
+    output_reader_counts_for_test, IsolatedWorkerBoundaryAdapter, IsolatedWorkerBoundaryBinding,
+    IsolatedWorkerBoundaryClaims, JobCleanupFailurePointForTest, LpacLifecycleCountsForTest,
+    LpacTokenVerificationMismatchForTest, PreparedIsolatedWorkerBoundary,
 };
 use local_agent_terminal_platform_windows::{
-    IsolatedWorkerBoundaryAdapter, IsolatedWorkerBoundaryBinding, IsolatedWorkerBoundaryClaims,
-    PreparedIsolatedWorkerBoundary, WindowsExecutableInspector,
+    TrustedLpacWorktreeRegistration, WindowsExecutableInspector,
     WindowsPrivateRuntimeDirectoryInspector, WindowsProcessLauncher,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, STILL_ACTIVE};
+#[cfg(feature = "test-seams")]
+use windows_sys::Win32::Foundation::STILL_ACTIVE;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, FILETIME,
+};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, TokenCapabilities, TokenIsAppContainer, SID_AND_ATTRIBUTES, TOKEN_GROUPS,
+    TOKEN_QUERY,
+};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, CREATE_BREAKAWAY_FROM_JOB,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetProcessTimes, OpenProcessToken, CREATE_BREAKAWAY_FROM_JOB,
+};
+#[cfg(feature = "test-seams")]
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 #[test]
@@ -126,6 +148,7 @@ fn missing_os_containment_denies_before_child_code_runs() {
     assert!(!marker.exists());
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn unrepresentable_cpu_limit_is_rejected_before_boundary_preparation() {
     let root = TempDir::new().unwrap();
@@ -172,6 +195,7 @@ fn output_reader_start_failure_never_resumes_or_leaves_an_active_job() {
     assert!(launcher.cancel(&execution_id).is_err());
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn verified_boundary_runs_in_a_real_kill_on_close_job_and_captures_output() {
     let root = TempDir::new().unwrap();
@@ -197,6 +221,329 @@ fn verified_boundary_runs_in_a_real_kill_on_close_job_and_captures_output() {
     assert!(receipt.job_receipt.no_breakaway);
 }
 
+#[test]
+fn real_lpac_child_reports_less_privileged_appcontainer_identity() {
+    let root = TempDir::new().unwrap();
+    let launcher = registered_lpac_launcher(root.path());
+    let mut request = request(
+        vec![
+            "--exact".to_owned(),
+            "process_child_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        lpac_identity_environment(),
+    );
+    request.execution_id = ToolExecutionId::new("execution-lpac-identity").unwrap();
+    let execution_id = request.execution_id.clone();
+
+    let receipt = launcher.execute(request).unwrap();
+    let stdout = String::from_utf8(receipt.stdout.bytes).unwrap();
+    let stderr = String::from_utf8(receipt.stderr.bytes).unwrap();
+
+    assert_eq!(receipt.status, ProcessStatus::Exited);
+    assert_eq!(receipt.exit_code, Some(0), "stderr={stderr:?}");
+    assert!(receipt.job_receipt.kill_on_close);
+    assert!(receipt.job_receipt.no_breakaway);
+
+    assert!(stderr.is_empty(), "stderr={stderr:?}");
+    assert!(stdout.lines().any(|line| line == "appcontainer=1"));
+    assert!(stdout.lines().any(|line| line == "capabilities=0"));
+    assert!(stdout.lines().any(|line| line == "reserved-env=valid"));
+    assert!(stdout.lines().any(|line| line == "cwd-root-readable=1"));
+    #[cfg(feature = "test-seams")]
+    assert_eq!(
+        lpac_lifecycle_counts_for_test(&execution_id),
+        LpacLifecycleCountsForTest {
+            profiles_created: 1,
+            profiles_deleted: 1,
+            acl_grants: 2,
+            acl_revokes: 2,
+            suspended_children_created: 1,
+            resumes_succeeded: 1,
+            last_windows_error: None,
+        }
+    );
+    #[cfg(not(feature = "test-seams"))]
+    let _ = execution_id;
+}
+
+#[test]
+fn lpac_rejects_physical_cwd_rebind_before_profile_or_child() {
+    let container = TempDir::new().unwrap();
+    let registered_parent = container.path().join("registered-parent");
+    let registered_root = registered_parent.join("worktree");
+    let rebound_parent = container.path().join("rebound-parent");
+    let relocated_root = registered_parent.join("relocated-worktree");
+    fs::create_dir_all(&registered_root).unwrap();
+    let launcher = registered_lpac_launcher(&registered_root);
+
+    fs::rename(&registered_parent, &rebound_parent)
+        .expect_err("the retained root handle must deny the physical ancestor rename");
+
+    fs::rename(&registered_root, &relocated_root)
+        .expect("the physical leaf rename must exercise the path-rebind case");
+    fs::create_dir(&registered_root).unwrap();
+
+    assert!(registered_root.is_dir());
+    assert!(relocated_root.is_dir());
+    let marker = container.path().join("physical-cwd-rebind-marker");
+    let request = lpac_marker_request("execution-physical-cwd-rebind", &marker);
+
+    assert_lpac_rejected_before_resume(&launcher, request, &marker, false);
+
+    drop(launcher);
+    fs::rename(&registered_parent, &rebound_parent)
+        .expect("the ancestor rename must succeed after releasing the retained root handle");
+    assert!(rebound_parent.is_dir());
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn lpac_policy_attestation_accepts_lpac_and_rejects_ordinary_appcontainer_before_resume() {
+    let worktree = TempDir::new().unwrap();
+
+    let launcher = registered_lpac_launcher(worktree.path());
+    let mut intended_request = request(
+        vec![
+            "--exact".to_owned(),
+            "process_child_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        lpac_identity_environment(),
+    );
+    intended_request.execution_id = ToolExecutionId::new("execution-policy-lpac").unwrap();
+    let intended_execution_id = intended_request.execution_id.clone();
+    launcher
+        .execute(intended_request)
+        .expect("the intended LPAC token must pass policy attestation");
+    assert_eq!(
+        lpac_lifecycle_counts_for_test(&intended_execution_id),
+        LpacLifecycleCountsForTest {
+            profiles_created: 1,
+            profiles_deleted: 1,
+            acl_grants: 2,
+            acl_revokes: 2,
+            suspended_children_created: 1,
+            resumes_succeeded: 1,
+            last_windows_error: None,
+        }
+    );
+
+    let launcher = registered_lpac_launcher(worktree.path());
+    let mut ordinary_request = request(
+        vec![
+            "--exact".to_owned(),
+            "process_child_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        lpac_identity_environment(),
+    );
+    ordinary_request.execution_id = ToolExecutionId::new("execution-policy-control").unwrap();
+    let ordinary_execution_id = ordinary_request.execution_id.clone();
+    omit_all_application_packages_policy_for_test(ordinary_execution_id.clone());
+
+    launcher
+        .execute(ordinary_request)
+        .expect_err("ordinary AppContainer control must fail policy attestation before resume");
+    assert_eq!(
+        lpac_lifecycle_counts_for_test(&ordinary_execution_id),
+        LpacLifecycleCountsForTest {
+            profiles_created: 1,
+            profiles_deleted: 1,
+            acl_grants: 2,
+            acl_revokes: 2,
+            suspended_children_created: 1,
+            resumes_succeeded: 0,
+            last_windows_error: None,
+        }
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn lpac_rejects_reserved_environment_names_before_profile_creation() {
+    for (index, reserved_name) in ["LOCALAPPDATA", "temp", "TmP"].into_iter().enumerate() {
+        let root = TempDir::new().unwrap();
+        let launcher = registered_lpac_launcher(root.path());
+        let mut environment = lpac_identity_environment();
+        environment.insert(reserved_name.to_owned(), "caller-controlled".to_owned());
+        let mut request = request(
+            vec![
+                "--exact".to_owned(),
+                "process_child_helper".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            environment,
+        );
+        request.execution_id =
+            ToolExecutionId::new(format!("execution-reserved-environment-{index}")).unwrap();
+        let execution_id = request.execution_id.clone();
+
+        launcher
+            .execute(request)
+            .expect_err("reserved AppContainer environment names must be rejected");
+        assert_eq!(
+            lpac_lifecycle_counts_for_test(&execution_id),
+            LpacLifecycleCountsForTest::default(),
+            "reserved name {reserved_name:?} reached an LPAC side effect"
+        );
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn lpac_denies_all_application_packages_only_filesystem_canary() {
+    let worktree = TempDir::new().unwrap();
+    let canary_directory = TempDir::new().unwrap();
+    let canary = canary_directory.path().join("all-packages-canary.bin");
+    fs::write(&canary, b"behavioral canary").unwrap();
+    configure_all_packages_canary_for_test(canary_directory.path(), &canary)
+        .unwrap_or_else(|error| panic!("canary DACL setup failed with Windows error {error}"));
+    assert_eq!(fs::read(&canary).unwrap(), b"behavioral canary");
+
+    let run_case = |execution_name: &str, omit_lpac_policy: bool| {
+        let launcher = registered_lpac_launcher(worktree.path());
+        let mut environment = lpac_identity_environment();
+        environment.insert("LAT_PROCESS_HELPER".to_owned(), "canary-read".to_owned());
+        environment.insert(
+            "LAT_PROCESS_CANARY".to_owned(),
+            canary.to_string_lossy().into_owned(),
+        );
+        let mut request = request(
+            vec![
+                "--exact".to_owned(),
+                "process_child_helper".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            environment,
+        );
+        request.execution_id = ToolExecutionId::new(execution_name).unwrap();
+        let execution_id = request.execution_id.clone();
+        if omit_lpac_policy {
+            omit_all_application_packages_policy_for_test(execution_id.clone());
+            bypass_aap_attestation_for_test(execution_id.clone());
+        }
+
+        let receipt = launcher
+            .execute(request)
+            .expect("the configured AppContainer policy must pass");
+        let lifecycle = lpac_lifecycle_counts_for_test(&execution_id);
+        let stdout = String::from_utf8(receipt.stdout.bytes).unwrap();
+        let stderr = String::from_utf8(receipt.stderr.bytes).unwrap();
+        assert_eq!(receipt.status, ProcessStatus::Exited);
+        assert_eq!(receipt.exit_code, Some(0));
+        assert!(stderr.is_empty(), "stderr={stderr:?}");
+        assert_eq!(lifecycle.profiles_created, 1);
+        assert_eq!(lifecycle.profiles_deleted, 1);
+        assert_eq!(lifecycle.acl_grants, 2);
+        assert_eq!(lifecycle.acl_revokes, 2);
+        assert_eq!(lifecycle.suspended_children_created, 1);
+        assert_eq!(lifecycle.resumes_succeeded, 1);
+        stdout
+    };
+
+    let ordinary_app_container = run_case("execution-aap-canary-control", true);
+    assert!(
+        ordinary_app_container.contains("canary-read=success;cwd-root-readable=1"),
+        "ordinary AppContainer control could not read the AAP-only canary: {ordinary_app_container:?}"
+    );
+    let intended_lpac = run_case("execution-aap-canary-lpac", false);
+    assert!(
+        intended_lpac.contains("canary-read=denied;cwd-root-readable=1"),
+        "intended LPAC read the AAP-only canary: {intended_lpac:?}"
+    );
+}
+
+#[test]
+fn lpac_rejects_unregistered_root_before_resume() {
+    let root = TempDir::new().unwrap();
+    let launcher = registered_lpac_launcher(root.path());
+    let marker = root.path().join("unregistered-root-must-not-run.txt");
+    let mut request = lpac_marker_request("lpac-unregistered-root", &marker);
+    let ProcessWorkingDirectory::IsolatedWorktree(cwd) = &mut request.cwd else {
+        unreachable!()
+    };
+    cwd.root_identity = CapabilityRootIdentity::new("unregistered-worktree").unwrap();
+
+    assert_lpac_rejected_before_resume(&launcher, request, &marker, false);
+}
+
+#[test]
+fn lpac_rejects_relative_cwd_before_resume() {
+    let root = TempDir::new().unwrap();
+    let launcher = registered_lpac_launcher(root.path());
+    let marker = root.path().join("relative-cwd-must-not-run.txt");
+    let mut request = lpac_marker_request("lpac-relative-cwd", &marker);
+    let task_id = request.executor_claim.task_id().clone();
+    let ProcessWorkingDirectory::IsolatedWorktree(cwd) = &mut request.cwd else {
+        unreachable!()
+    };
+    cwd.capability = CapabilityRef::worktree(task_id, "nested").unwrap();
+    cwd.target = ResolvedCapabilityTarget::Relative(
+        RelativePathComponents::new(vec!["nested".to_owned()]).unwrap(),
+    );
+
+    assert_lpac_rejected_before_resume(&launcher, request, &marker, false);
+}
+
+#[test]
+fn lpac_rejects_expected_writes_before_resume() {
+    let root = TempDir::new().unwrap();
+    let launcher = registered_lpac_launcher(root.path());
+    let marker = root.path().join("expected-write-must-not-run.txt");
+    let mut request = lpac_marker_request("lpac-expected-write", &marker);
+    request.expected_writes = vec![authorized_write("output.txt", "test-worktree")];
+
+    assert_lpac_rejected_before_resume(&launcher, request, &marker, false);
+}
+
+#[test]
+fn lpac_rejects_non_denied_network_before_resume() {
+    let root = TempDir::new().unwrap();
+    let launcher = registered_lpac_launcher(root.path());
+    let marker = root.path().join("network-mode-must-not-run.txt");
+    let mut request = lpac_marker_request("lpac-network-mode", &marker);
+    let network_digest = digest(b"provider-endpoint-only");
+    request.network = EnforcedNetworkProfile {
+        profile: NetworkProfile::ProviderEndpointOnly,
+        profile_digest: network_digest.clone(),
+        receipt: NetworkEnforcementReceipt::new("provider-network", network_digest).unwrap(),
+    };
+
+    assert_lpac_rejected_before_resume(&launcher, request, &marker, false);
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn lpac_token_verification_mismatch_never_resumes_child() {
+    for (mismatch, name) in [
+        (
+            LpacTokenVerificationMismatchForTest::AppContainer,
+            "appcontainer",
+        ),
+        (
+            LpacTokenVerificationMismatchForTest::LessPrivilegedAppContainer,
+            "lpac",
+        ),
+        (LpacTokenVerificationMismatchForTest::PackageSid, "sid"),
+        (
+            LpacTokenVerificationMismatchForTest::Capabilities,
+            "capabilities",
+        ),
+    ] {
+        let root = TempDir::new().unwrap();
+        let launcher = registered_lpac_launcher(root.path());
+        let marker = root
+            .path()
+            .join(format!("{name}-mismatch-must-not-run.txt"));
+        let request = lpac_marker_request(&format!("lpac-{name}-mismatch"), &marker);
+        fail_lpac_token_verification_for_test(request.execution_id.clone(), mismatch);
+
+        assert_lpac_rejected_before_resume(&launcher, request, &marker, true);
+    }
+}
+
+#[cfg(feature = "test-seams")]
 #[test]
 fn failed_boundary_reverification_never_resumes_child_code() {
     let root = TempDir::new().unwrap();
@@ -226,6 +573,7 @@ fn failed_boundary_reverification_never_resumes_child_code() {
     assert!(!marker.exists());
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn lease_replacement_after_initial_check_is_denied_before_resume() {
     let root = TempDir::new().unwrap();
@@ -275,6 +623,7 @@ fn lease_replacement_after_initial_check_is_denied_before_resume() {
     assert!(launcher.cancel(&execution_id).is_err());
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn every_boundary_receipt_mismatch_is_rejected_before_child_creation() {
     for mismatch in [
@@ -327,6 +676,7 @@ fn every_boundary_receipt_mismatch_is_rejected_before_child_creation() {
     }
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn executable_digest_is_revalidated_before_child_creation() {
     let root = TempDir::new().unwrap();
@@ -354,6 +704,7 @@ fn executable_digest_is_revalidated_before_child_creation() {
     assert!(!marker.exists());
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn output_overflow_terminates_the_job_and_returns_only_the_bound() {
     let root = TempDir::new().unwrap();
@@ -378,6 +729,7 @@ fn output_overflow_terminates_the_job_and_returns_only_the_bound() {
     assert!(receipt.job_receipt.tree_terminated);
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn cancellation_terminates_descendants_and_breakaway_is_denied() {
     let root = TempDir::new().unwrap();
@@ -419,6 +771,7 @@ fn cancellation_terminates_descendants_and_breakaway_is_denied() {
     assert!(!process_is_active(descendant_pid));
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn write_capable_process_blocks_lease_acquire_and_revoke_until_cancellation_completes() {
     for change in [
@@ -599,6 +952,7 @@ fn post_resume_cleanup_fault_keeps_fence_until_job_exit_is_retried() {
     }
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn wall_timeout_waits_for_the_full_process_tree() {
     let root = TempDir::new().unwrap();
@@ -632,6 +986,7 @@ fn wall_timeout_waits_for_the_full_process_tree() {
     assert!(!process_is_active(descendant_pid));
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn typed_windows_command_line_preserves_metacharacters_as_one_argument() {
     let root = TempDir::new().unwrap();
@@ -656,6 +1011,7 @@ fn typed_windows_command_line_preserves_metacharacters_as_one_argument() {
     );
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn child_environment_starts_empty_and_does_not_inherit_parent_canary() {
     const CANARY: &str = "LAT_PARENT_SECRET_CANARY_TASK7";
@@ -680,6 +1036,7 @@ fn child_environment_starts_empty_and_does_not_inherit_parent_canary() {
     assert!(String::from_utf8_lossy(&receipt.stdout.bytes).contains("canary=missing"));
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn brokered_worktree_and_unenforced_expected_writes_never_start_child_code() {
     for mutation in [
@@ -719,6 +1076,7 @@ fn brokered_worktree_and_unenforced_expected_writes_never_start_child_code() {
     }
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn enforced_expected_write_scope_is_bound_and_returns_observed_evidence() {
     let root = TempDir::new().unwrap();
@@ -746,6 +1104,7 @@ fn enforced_expected_write_scope_is_bound_and_returns_observed_evidence() {
     assert_eq!(receipt.observed_writes[0].write().size_bytes, 14);
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn reversed_write_evidence_is_canonicalized_to_approved_scope_order() {
     let root = TempDir::new().unwrap();
@@ -785,6 +1144,7 @@ fn reversed_write_evidence_is_canonicalized_to_approved_scope_order() {
     assert_eq!(receipt.observed_writes[1].write().digest, digest(b"second"));
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn logical_aliases_for_one_physical_write_scope_are_ambiguous() {
     let root = TempDir::new().unwrap();
@@ -841,6 +1201,7 @@ fn write_scope_matcher_rejects_more_than_the_approval_limit() {
     );
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn write_evidence_must_match_approved_scopes_one_to_one() {
     for mutation in [
@@ -954,6 +1315,7 @@ fn write_evidence_must_match_approved_scopes_one_to_one() {
     }
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn cpu_job_limit_terminates_busy_process_before_wall_timeout() {
     let root = TempDir::new().unwrap();
@@ -978,6 +1340,7 @@ fn cpu_job_limit_terminates_busy_process_before_wall_timeout() {
     assert!(receipt.job_receipt.tree_terminated);
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn memory_job_limit_denies_additional_committed_memory() {
     let root = TempDir::new().unwrap();
@@ -1002,6 +1365,7 @@ fn memory_job_limit_denies_additional_committed_memory() {
     assert!(String::from_utf8_lossy(&receipt.stdout.bytes).contains("memory-denied"));
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn memory_limit_is_shared_by_the_complete_descendant_tree() {
     let root = TempDir::new().unwrap();
@@ -1024,6 +1388,7 @@ fn memory_limit_is_shared_by_the_complete_descendant_tree() {
     assert!(String::from_utf8_lossy(&receipt.stdout.bytes).contains("memory-denied"));
 }
 
+#[cfg(feature = "test-seams")]
 #[test]
 fn cpu_limit_is_shared_by_the_complete_descendant_tree() {
     let root = TempDir::new().unwrap();
@@ -1069,6 +1434,26 @@ fn process_child_helper() {
     match std::env::var("LAT_PROCESS_HELPER").ok().as_deref() {
         Some("emit") => println!("literal ;&|$()"),
         Some("argv") => println!("argv={}", skip_value.unwrap()),
+        Some("lpac-identity") => {
+            let is_app_container = current_process_token_flag(TokenIsAppContainer);
+            let capability_count = current_process_token_group_count(TokenCapabilities);
+            let local_app_data = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+            let expected_temp = local_app_data.join("Temp");
+            assert_eq!(
+                std::env::var_os("TEMP").as_deref(),
+                Some(expected_temp.as_os_str())
+            );
+            assert_eq!(
+                std::env::var_os("TMP").as_deref(),
+                Some(expected_temp.as_os_str())
+            );
+            let mut root_entries = fs::read_dir(".").unwrap();
+            assert!(root_entries.next().is_none());
+            println!("appcontainer={is_app_container}");
+            println!("capabilities={capability_count}");
+            println!("reserved-env=valid");
+            println!("cwd-root-readable=1");
+        }
         Some("cpu") => {
             let mut value = 0_u64;
             loop {
@@ -1132,6 +1517,16 @@ fn process_child_helper() {
             }
         }
         Some("flood") => println!("{}", "x".repeat(128 * 1024)),
+        Some("canary-read") => {
+            let read_status = if fs::read(std::env::var_os("LAT_PROCESS_CANARY").unwrap()).is_ok() {
+                "success"
+            } else {
+                "denied"
+            };
+            let mut root_entries = fs::read_dir(".").unwrap();
+            assert!(root_entries.next().is_none());
+            println!("canary-read={read_status};cwd-root-readable=1");
+        }
         Some("marker") => {
             fs::write(std::env::var_os("LAT_PROCESS_MARKER").unwrap(), b"ran").unwrap();
         }
@@ -1173,6 +1568,113 @@ fn process_child_helper() {
     }
 }
 
+fn current_process_token_flag(information_class: i32) -> u32 {
+    let mut token = std::ptr::null_mut();
+    // SAFETY: token points to writable handle storage and the pseudo-handle is valid.
+    assert_ne!(
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+        0
+    );
+    let flag = token_flag(token, information_class);
+    // SAFETY: token was returned by OpenProcessToken and remains owned here.
+    assert_ne!(unsafe { CloseHandle(token) }, 0);
+    flag
+}
+
+fn current_process_token_group_count(information_class: i32) -> u32 {
+    let mut token = std::ptr::null_mut();
+    // SAFETY: token points to writable handle storage and the pseudo-handle is valid.
+    assert_ne!(
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+        0
+    );
+    let group_count = token_group_count(token, information_class);
+    // SAFETY: token was returned by OpenProcessToken and remains owned here.
+    assert_ne!(unsafe { CloseHandle(token) }, 0);
+    group_count
+}
+
+fn token_group_count(token: windows_sys::Win32::Foundation::HANDLE, information_class: i32) -> u32 {
+    let mut required = 0_u32;
+    // SAFETY: this sizing query intentionally supplies no buffer and writes only required.
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            information_class,
+            std::ptr::null_mut(),
+            0,
+            &mut required,
+        )
+    };
+    let query_error = unsafe { GetLastError() };
+    assert_eq!(queried, 0);
+    assert_eq!(query_error, ERROR_INSUFFICIENT_BUFFER);
+    assert!(required as usize >= std::mem::size_of::<u32>());
+
+    let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
+    let mut buffer = vec![0_usize; words];
+    let mut returned = 0_u32;
+    // SAFETY: the usize buffer is suitably aligned, writable for required bytes, and token is
+    // valid for TOKEN_QUERY.
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            information_class,
+            buffer.as_mut_ptr().cast(),
+            required,
+            &mut returned,
+        )
+    };
+    assert_ne!(
+        queried,
+        0,
+        "token information class {information_class} failed with Windows error {}",
+        unsafe { GetLastError() }
+    );
+    assert!(returned as usize >= std::mem::size_of::<u32>());
+    assert!(returned <= required);
+
+    // SAFETY: the usize buffer is aligned for u32 and the returned-length check covers it.
+    let group_count = unsafe { buffer.as_ptr().cast::<u32>().read() };
+    if group_count == 0 {
+        return 0;
+    }
+    let groups_bytes = std::mem::offset_of!(TOKEN_GROUPS, Groups)
+        .checked_add(
+            usize::try_from(group_count)
+                .unwrap()
+                .checked_mul(std::mem::size_of::<SID_AND_ATTRIBUTES>())
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(returned as usize >= groups_bytes);
+    group_count
+}
+
+fn token_flag(token: windows_sys::Win32::Foundation::HANDLE, information_class: i32) -> u32 {
+    let mut flag = 0_u32;
+    let mut returned = 0_u32;
+    // SAFETY: flag is writable for the declared size and token is a valid query handle.
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            information_class,
+            (&mut flag as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+            &mut returned,
+        )
+    };
+    assert_ne!(
+        queried,
+        0,
+        "token information class {information_class} failed with Windows error {}",
+        unsafe { GetLastError() }
+    );
+    assert_eq!(returned, std::mem::size_of::<u32>() as u32);
+    flag
+}
+
+#[cfg(feature = "test-seams")]
 struct TestOnlyBoundary {
     cwd: PathBuf,
     fail_before_resume: bool,
@@ -1184,11 +1686,13 @@ struct TestOnlyBoundary {
     observed_writes: Vec<ObservedProcessWrite>,
 }
 
+#[cfg(feature = "test-seams")]
 struct LeaseReplacingBoundary {
     inner: TestOnlyBoundary,
     authority: ProcessFenceAuthority,
 }
 
+#[cfg(feature = "test-seams")]
 impl IsolatedWorkerBoundaryAdapter for LeaseReplacingBoundary {
     fn prepare(
         &self,
@@ -1264,6 +1768,7 @@ impl ExecutorLeaseStore for ReplaceableLeaseStore {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "test-seams")]
 enum BoundaryMismatch {
     Identity,
     Acl,
@@ -1284,17 +1789,20 @@ enum BoundaryMismatch {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "test-seams")]
 enum LaunchMutation {
     BrokeredWorktree,
     ExpectedWrite,
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "test-seams")]
 enum CoordinatedLeaseChange {
     Acquire,
     Revoke,
 }
 
+#[cfg(feature = "test-seams")]
 impl CoordinatedLeaseChange {
     const fn name(self) -> &'static str {
         match self {
@@ -1329,6 +1837,7 @@ impl CoordinatedLeaseChange {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "test-seams")]
 enum WriteEvidenceMutation {
     Missing,
     Extra,
@@ -1339,6 +1848,7 @@ enum WriteEvidenceMutation {
     Path,
 }
 
+#[cfg(feature = "test-seams")]
 impl TestOnlyBoundary {
     fn valid(cwd: PathBuf) -> Self {
         Self {
@@ -1354,6 +1864,7 @@ impl TestOnlyBoundary {
     }
 }
 
+#[cfg(feature = "test-seams")]
 impl IsolatedWorkerBoundaryAdapter for TestOnlyBoundary {
     fn prepare(
         &self,
@@ -1412,6 +1923,7 @@ impl IsolatedWorkerBoundaryAdapter for TestOnlyBoundary {
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn mutate_claims(claims: &mut IsolatedWorkerBoundaryClaims, mismatch: BoundaryMismatch) {
     match mismatch {
         BoundaryMismatch::Identity | BoundaryMismatch::Acl => {}
@@ -1467,6 +1979,68 @@ fn mutate_claims(claims: &mut IsolatedWorkerBoundaryClaims, mismatch: BoundaryMi
         BoundaryMismatch::Argv => claims.argv.push("extra".to_owned()),
         BoundaryMismatch::Timeout => claims.timeout_ms += 1,
     }
+}
+
+fn registered_lpac_launcher(root: &std::path::Path) -> WindowsProcessLauncher {
+    WindowsProcessLauncher::with_lpac_boundary(vec![TrustedLpacWorktreeRegistration::new(
+        TaskId::new("task-1").unwrap(),
+        CapabilityRootIdentity::new("test-worktree").unwrap(),
+        root,
+    )
+    .unwrap()])
+    .unwrap()
+}
+
+fn lpac_identity_environment() -> BTreeMap<String, String> {
+    BTreeMap::from([("LAT_PROCESS_HELPER".to_owned(), "lpac-identity".to_owned())])
+}
+
+fn lpac_marker_request(execution_id: &str, marker: &std::path::Path) -> AuthorizedProcessRequest {
+    let mut request = request(
+        vec![
+            "--exact".to_owned(),
+            "process_child_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        BTreeMap::from([
+            ("LAT_PROCESS_HELPER".to_owned(), "marker".to_owned()),
+            (
+                "LAT_PROCESS_MARKER".to_owned(),
+                marker.to_string_lossy().into_owned(),
+            ),
+        ]),
+    );
+    request.execution_id = ToolExecutionId::new(execution_id).unwrap();
+    request
+}
+
+fn assert_lpac_rejected_before_resume(
+    launcher: &WindowsProcessLauncher,
+    request: AuthorizedProcessRequest,
+    marker: &std::path::Path,
+    suspended_child_expected: bool,
+) {
+    let execution_id = request.execution_id.clone();
+
+    assert!(launcher.execute(request).is_err());
+    assert!(!marker.exists());
+    assert!(launcher.cancel(&execution_id).is_err());
+    #[cfg(feature = "test-seams")]
+    {
+        let counts = lpac_lifecycle_counts_for_test(&execution_id);
+        if suspended_child_expected {
+            assert_eq!(counts.profiles_created, 1);
+            assert_eq!(counts.profiles_deleted, 1);
+            assert_eq!(counts.acl_grants, 2);
+            assert_eq!(counts.acl_revokes, 2);
+            assert_eq!(counts.suspended_children_created, 1);
+            assert_eq!(counts.resumes_succeeded, 0);
+        } else {
+            assert_eq!(counts, LpacLifecycleCountsForTest::default());
+        }
+    }
+    #[cfg(not(feature = "test-seams"))]
+    let _ = suspended_child_expected;
 }
 
 fn request(argv: Vec<String>, environment: BTreeMap<String, String>) -> AuthorizedProcessRequest {
@@ -1584,10 +2158,12 @@ fn digest(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
 }
 
+#[cfg(feature = "test-seams")]
 fn boundary_binding() -> IsolatedWorkerBoundaryBinding {
     IsolatedWorkerBoundaryBinding::new("test-only-identity", "test-only-acl").unwrap()
 }
 
+#[cfg(feature = "test-seams")]
 fn wait_for_file(path: &PathBuf) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -1631,6 +2207,7 @@ fn process_user_time_ticks() -> u64 {
     (u64::from(user_time.dwHighDateTime) << 32) | u64::from(user_time.dwLowDateTime)
 }
 
+#[cfg(feature = "test-seams")]
 fn process_is_active(process_id: u32) -> bool {
     // SAFETY: OpenProcess is called with query-only access and a numeric PID.
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
@@ -1648,11 +2225,13 @@ fn process_is_active(process_id: u32) -> bool {
     active
 }
 
+#[cfg(feature = "test-seams")]
 struct EnvironmentVariableGuard {
     name: &'static str,
     previous: Option<std::ffi::OsString>,
 }
 
+#[cfg(feature = "test-seams")]
 impl EnvironmentVariableGuard {
     fn set(name: &'static str, value: &str) -> Self {
         let previous = std::env::var_os(name);
@@ -1661,6 +2240,7 @@ impl EnvironmentVariableGuard {
     }
 }
 
+#[cfg(feature = "test-seams")]
 impl Drop for EnvironmentVariableGuard {
     fn drop(&mut self) {
         if let Some(value) = &self.previous {

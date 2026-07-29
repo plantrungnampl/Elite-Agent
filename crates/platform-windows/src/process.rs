@@ -1,29 +1,37 @@
 use std::collections::BTreeMap;
-use std::ffi::{c_void, OsStr};
+use std::ffi::{c_void, OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "test-seams")]
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use local_agent_terminal_application::{
-    validate_and_order_process_writes, AuthorizedExpectedWrite, AuthorizedProcessRequest,
-    BoundedOutput, CancellationReceipt, EnforcedNetworkProfile, ObservedProcessWrite, PortError,
-    ProcessFenceBinding, ProcessLauncher, ProcessLimits, ProcessReceipt, ProcessStatus,
-    ProcessWorkingDirectory, ResolvedEnvironmentProfile, ResolvedExecutable, Retryability,
-    SafeErrorClassification, ToolExecutionId, WorkspaceWritePermit,
+    validate_and_order_process_writes, AuthorizedProcessRequest, BoundedOutput,
+    CancellationReceipt, ObservedProcessWrite, PortError, ProcessLauncher, ProcessReceipt,
+    ProcessStatus, Retryability, SafeErrorClassification, ToolExecutionId, WorkspaceWritePermit,
 };
-use local_agent_terminal_domain::{LeaseClaim, ProcessTrustTier, Sha256Digest};
+#[cfg(feature = "test-seams")]
+use local_agent_terminal_application::{
+    AuthorizedExpectedWrite, EnforcedNetworkProfile, ProcessFenceBinding, ProcessLimits,
+    ProcessWorkingDirectory, ResolvedEnvironmentProfile, ResolvedExecutable,
+};
+#[cfg(feature = "test-seams")]
+use local_agent_terminal_domain::LeaseClaim;
+use local_agent_terminal_domain::{ProcessTrustTier, Sha256Digest};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{
     SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Security::SECURITY_CAPABILITIES;
 use windows_sys::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_SHARE_READ,
 };
@@ -31,11 +39,17 @@ use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, ResumeThread,
     UpdateProcThreadAttribute, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
+use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
 use crate::job::{create_job, terminate_process, validate_job_limits, ActiveJob, OwnedHandle};
+use crate::lpac::{
+    record_current_windows_error, record_resume_succeeded, record_suspended_child_created,
+    LpacBoundary, PreparedLpacBoundary, TrustedLpacWorktreeRegistration,
+};
 
 const FAILED_THREAD_RESUME: u32 = u32::MAX;
 
@@ -44,6 +58,9 @@ static FAIL_OUTPUT_READER_START: Mutex<Option<ToolExecutionId>> = Mutex::new(Non
 
 #[cfg(feature = "test-seams")]
 static FAIL_AFTER_RESUME: Mutex<Option<ToolExecutionId>> = Mutex::new(None);
+
+#[cfg(feature = "test-seams")]
+static OMIT_ALL_APPLICATION_PACKAGES_POLICY: Mutex<Option<ToolExecutionId>> = Mutex::new(None);
 
 #[cfg(feature = "test-seams")]
 static OUTPUT_READER_COUNTS: Mutex<BTreeMap<ToolExecutionId, (usize, usize)>> =
@@ -63,6 +80,28 @@ pub fn fail_after_resume_for_test(execution_id: ToolExecutionId) {
     if let Ok(mut failure) = FAIL_AFTER_RESUME.lock() {
         *failure = Some(execution_id);
     }
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn omit_all_application_packages_policy_for_test(execution_id: ToolExecutionId) {
+    if let Ok(mut configured) = OMIT_ALL_APPLICATION_PACKAGES_POLICY.lock() {
+        *configured = Some(execution_id);
+    }
+}
+
+#[cfg(feature = "test-seams")]
+fn take_omit_all_application_packages_policy(execution_id: &ToolExecutionId) -> bool {
+    OMIT_ALL_APPLICATION_PACKAGES_POLICY
+        .lock()
+        .is_ok_and(|mut configured| {
+            if configured.as_ref() == Some(execution_id) {
+                configured.take();
+                true
+            } else {
+                false
+            }
+        })
 }
 
 #[cfg(feature = "test-seams")]
@@ -93,6 +132,7 @@ fn take_after_resume_failure(execution_id: &ToolExecutionId) -> bool {
 /// the trusted computing base and must keep its identity, ACL, and network controls
 /// active until the process tree has exited.
 #[derive(Debug)]
+#[cfg(feature = "test-seams")]
 pub struct PreparedIsolatedWorkerBoundary {
     launch_cwd: PathBuf,
     identity_receipt: String,
@@ -102,6 +142,7 @@ pub struct PreparedIsolatedWorkerBoundary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "test-seams")]
 pub struct IsolatedWorkerBoundaryClaims {
     pub execution_id: ToolExecutionId,
     pub trust_tier: ProcessTrustTier,
@@ -117,6 +158,7 @@ pub struct IsolatedWorkerBoundaryClaims {
     pub executor_fence: ProcessFenceBinding,
 }
 
+#[cfg(feature = "test-seams")]
 impl IsolatedWorkerBoundaryClaims {
     pub fn from_request(request: &AuthorizedProcessRequest) -> Self {
         Self {
@@ -137,11 +179,13 @@ impl IsolatedWorkerBoundaryClaims {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "test-seams")]
 pub struct IsolatedWorkerBoundaryBinding {
     identity_receipt: String,
     acl_receipt: String,
 }
 
+#[cfg(feature = "test-seams")]
 impl IsolatedWorkerBoundaryBinding {
     pub fn new(
         identity_receipt: impl Into<String>,
@@ -159,6 +203,7 @@ impl IsolatedWorkerBoundaryBinding {
     }
 }
 
+#[cfg(feature = "test-seams")]
 impl PreparedIsolatedWorkerBoundary {
     pub fn new(
         launch_cwd: impl Into<PathBuf>,
@@ -211,6 +256,7 @@ impl PreparedIsolatedWorkerBoundary {
 /// Implementations must enforce a dedicated identity, filesystem/registry ACLs,
 /// network policy, and write observation. Tests may inject a fake implementation
 /// to exercise Job Object lifecycle only; that is not containment evidence.
+#[cfg(feature = "test-seams")]
 pub trait IsolatedWorkerBoundaryAdapter: Send + Sync {
     fn prepare(
         &self,
@@ -238,13 +284,119 @@ pub trait IsolatedWorkerBoundaryAdapter: Send + Sync {
 }
 
 pub struct WindowsProcessLauncher {
-    boundary: Option<ConfiguredIsolatedWorkerBoundary>,
+    boundary: Option<ConfiguredProcessBoundary>,
     active: Mutex<BTreeMap<ToolExecutionId, Arc<ActiveJob>>>,
 }
 
+#[cfg(feature = "test-seams")]
 struct ConfiguredIsolatedWorkerBoundary {
     adapter: Arc<dyn IsolatedWorkerBoundaryAdapter>,
     binding: IsolatedWorkerBoundaryBinding,
+}
+
+enum ConfiguredProcessBoundary {
+    Lpac(LpacBoundary),
+    #[cfg(feature = "test-seams")]
+    ClaimOnly(ConfiguredIsolatedWorkerBoundary),
+}
+
+enum PreparedProcessBoundary {
+    Lpac(PreparedLpacBoundary),
+    #[cfg(feature = "test-seams")]
+    ClaimOnly(Box<PreparedIsolatedWorkerBoundary>),
+}
+
+impl ConfiguredProcessBoundary {
+    fn prepare(
+        &self,
+        request: &AuthorizedProcessRequest,
+    ) -> Result<PreparedProcessBoundary, PortError> {
+        match self {
+            Self::Lpac(boundary) => boundary.prepare(request).map(PreparedProcessBoundary::Lpac),
+            #[cfg(feature = "test-seams")]
+            Self::ClaimOnly(configured) => {
+                let prepared = configured.adapter.prepare(request)?;
+                verify_prepared_boundary(request, &prepared, &configured.binding)?;
+                Ok(PreparedProcessBoundary::ClaimOnly(Box::new(prepared)))
+            }
+        }
+    }
+
+    fn verify_before_resume(
+        &self,
+        _request: &AuthorizedProcessRequest,
+        prepared: &PreparedProcessBoundary,
+        process: HANDLE,
+    ) -> Result<(), PortError> {
+        match (self, prepared) {
+            (Self::Lpac(_), PreparedProcessBoundary::Lpac(prepared)) => {
+                prepared.verify_child_token(process)
+            }
+            #[cfg(feature = "test-seams")]
+            (Self::ClaimOnly(configured), PreparedProcessBoundary::ClaimOnly(prepared)) => {
+                configured.adapter.verify_before_resume(_request, prepared)
+            }
+            #[cfg(feature = "test-seams")]
+            _ => Err(integrity_failure()),
+        }
+    }
+
+    fn observed_writes(
+        &self,
+        _request: &AuthorizedProcessRequest,
+        prepared: &PreparedProcessBoundary,
+    ) -> Result<Vec<ObservedProcessWrite>, PortError> {
+        match (self, prepared) {
+            (Self::Lpac(_), PreparedProcessBoundary::Lpac(_)) => Ok(Vec::new()),
+            #[cfg(feature = "test-seams")]
+            (Self::ClaimOnly(configured), PreparedProcessBoundary::ClaimOnly(prepared)) => {
+                configured.adapter.observed_writes(_request, prepared)
+            }
+            #[cfg(feature = "test-seams")]
+            _ => Err(integrity_failure()),
+        }
+    }
+}
+
+impl PreparedProcessBoundary {
+    fn launch_cwd(&self) -> &Path {
+        match self {
+            Self::Lpac(prepared) => prepared.launch_cwd(),
+            #[cfg(feature = "test-seams")]
+            Self::ClaimOnly(prepared) => prepared.launch_cwd(),
+        }
+    }
+
+    fn security_capabilities(&self) -> Option<SECURITY_CAPABILITIES> {
+        match self {
+            Self::Lpac(prepared) => Some(prepared.security_capabilities()),
+            #[cfg(feature = "test-seams")]
+            Self::ClaimOnly(_) => None,
+        }
+    }
+
+    fn environment_block(
+        &self,
+        _request: &AuthorizedProcessRequest,
+    ) -> Result<Vec<u16>, PortError> {
+        match self {
+            Self::Lpac(prepared) => os_environment_block(prepared.environment()),
+            #[cfg(feature = "test-seams")]
+            Self::ClaimOnly(_) => environment_block(&_request.environment.values),
+        }
+    }
+
+    fn requires_proven_tree_exit(&self) -> bool {
+        matches!(self, Self::Lpac(_))
+    }
+
+    fn cleanup(&mut self) -> Result<(), PortError> {
+        match self {
+            Self::Lpac(prepared) => prepared.cleanup(),
+            #[cfg(feature = "test-seams")]
+            Self::ClaimOnly(_) => Ok(()),
+        }
+    }
 }
 
 impl WindowsProcessLauncher {
@@ -260,17 +412,31 @@ impl WindowsProcessLauncher {
     ///
     /// The caller is responsible for admitting only an adapter that has passed the
     /// complete containment acceptance suite.
+    #[cfg(feature = "test-seams")]
     pub fn with_isolated_worker_boundary(
         boundary: Arc<dyn IsolatedWorkerBoundaryAdapter>,
         binding: IsolatedWorkerBoundaryBinding,
     ) -> Self {
         Self {
-            boundary: Some(ConfiguredIsolatedWorkerBoundary {
-                adapter: boundary,
-                binding,
-            }),
+            boundary: Some(ConfiguredProcessBoundary::ClaimOnly(
+                ConfiguredIsolatedWorkerBoundary {
+                    adapter: boundary,
+                    binding,
+                },
+            )),
             active: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub fn with_lpac_boundary(
+        registrations: Vec<TrustedLpacWorktreeRegistration>,
+    ) -> Result<Self, PortError> {
+        Ok(Self {
+            boundary: Some(ConfiguredProcessBoundary::Lpac(LpacBoundary::new(
+                registrations,
+            )?)),
+            active: Mutex::new(BTreeMap::new()),
+        })
     }
 }
 
@@ -283,23 +449,24 @@ impl Default for WindowsProcessLauncher {
 impl ProcessLauncher for WindowsProcessLauncher {
     fn execute(&self, request: AuthorizedProcessRequest) -> Result<ProcessReceipt, PortError> {
         let configured = self.boundary.as_ref().ok_or_else(permission_denied)?;
-        let boundary = &configured.adapter;
         validate_request(&request)?;
         let _executable_guard = verify_executable_and_retain(&request.executable)?;
-        let prepared = boundary.prepare(&request)?;
-        verify_prepared_boundary(&request, &prepared, &configured.binding)?;
+        let prepared = configured.prepare(&request)?;
 
         let started_at = Instant::now();
         let child = create_suspended_process(&request, &prepared)?;
-        let mut cleanup =
-            ExecutionCleanupGuard::new(self, request.execution_id.clone(), child.active.clone());
+        let mut cleanup = ExecutionCleanupGuard::new(
+            self,
+            request.execution_id.clone(),
+            child.active.clone(),
+            prepared,
+        );
         child.active.configure_and_assign(&request)?;
-        if let Err(error) = boundary.verify_before_resume(&request, &prepared) {
-            child.active.terminate()?;
-            child.active.wait_process(INFINITE);
-            child.active.wait_tree_exit()?;
-            return Err(error);
-        }
+        configured.verify_before_resume(
+            &request,
+            cleanup.prepared(),
+            child.active.process_handle(),
+        )?;
 
         drop(child.stdout_write);
         drop(child.stderr_write);
@@ -329,7 +496,7 @@ impl ProcessLauncher for WindowsProcessLauncher {
                 child.active.wait_tree_exit()?;
                 join_output(stdout_reader)?;
                 join_output(stderr_reader)?;
-                cleanup.disarm();
+                cleanup.finish()?;
                 return Err(error);
             }
         };
@@ -344,6 +511,7 @@ impl ProcessLauncher for WindowsProcessLauncher {
             child.active.wait_tree_exit()?;
             return Err(platform_error());
         }
+        record_resume_succeeded(&request.execution_id);
         #[cfg(feature = "test-seams")]
         if take_after_resume_failure(&request.execution_id) {
             return Err(platform_error());
@@ -372,7 +540,7 @@ impl ProcessLauncher for WindowsProcessLauncher {
         } else {
             Some(child.active.exit_code()?)
         };
-        let observed_writes = boundary.observed_writes(&request, &prepared);
+        let observed_writes = configured.observed_writes(&request, cleanup.prepared());
         let observed_writes =
             validate_and_order_process_writes(&request.expected_writes, observed_writes?)?;
 
@@ -393,7 +561,7 @@ impl ProcessLauncher for WindowsProcessLauncher {
             job_receipt,
             observed_writes,
         };
-        cleanup.disarm();
+        cleanup.finish()?;
         Ok(receipt)
     }
 
@@ -436,6 +604,7 @@ struct ExecutionCleanupGuard<'launcher, 'permit> {
     launcher: &'launcher WindowsProcessLauncher,
     execution_id: ToolExecutionId,
     active: Arc<ActiveJob>,
+    boundary: Option<PreparedProcessBoundary>,
     permit: Option<WorkspaceWritePermit<'permit>>,
     registered: bool,
     armed: bool,
@@ -446,11 +615,13 @@ impl<'launcher, 'permit> ExecutionCleanupGuard<'launcher, 'permit> {
         launcher: &'launcher WindowsProcessLauncher,
         execution_id: ToolExecutionId,
         active: Arc<ActiveJob>,
+        boundary: PreparedProcessBoundary,
     ) -> Self {
         Self {
             launcher,
             execution_id,
             active,
+            boundary: Some(boundary),
             permit: None,
             registered: false,
             armed: true,
@@ -459,6 +630,12 @@ impl<'launcher, 'permit> ExecutionCleanupGuard<'launcher, 'permit> {
 
     fn hold_permit(&mut self, permit: WorkspaceWritePermit<'permit>) {
         self.permit = Some(permit);
+    }
+
+    fn prepared(&self) -> &PreparedProcessBoundary {
+        self.boundary
+            .as_ref()
+            .expect("prepared boundary remains owned until cleanup completes")
     }
 
     fn register(&mut self) -> Result<(), PortError> {
@@ -471,19 +648,28 @@ impl<'launcher, 'permit> ExecutionCleanupGuard<'launcher, 'permit> {
         Ok(())
     }
 
-    fn disarm(mut self) {
+    fn finish(mut self) -> Result<(), PortError> {
+        if let Some(boundary) = self.boundary.as_mut() {
+            boundary.cleanup()?;
+        }
+        self.boundary.take();
         if self.registered {
             self.launcher
                 .remove_active(&self.execution_id, &self.active);
             self.registered = false;
         }
         self.armed = false;
+        Ok(())
     }
 }
 
 impl Drop for ExecutionCleanupGuard<'_, '_> {
     fn drop(&mut self) {
-        if self.armed && self.permit.is_some() {
+        let boundary_requires_tree_exit = self
+            .boundary
+            .as_ref()
+            .is_some_and(PreparedProcessBoundary::requires_proven_tree_exit);
+        if self.armed && (self.permit.is_some() || boundary_requires_tree_exit) {
             loop {
                 let tree_exited = self.active.terminate().is_ok()
                     && self.active.wait_process(INFINITE) == WAIT_OBJECT_0
@@ -496,6 +682,14 @@ impl Drop for ExecutionCleanupGuard<'_, '_> {
         } else if self.armed && self.active.terminate().is_ok() {
             self.active.wait_process(INFINITE);
             let _ = self.active.wait_tree_exit();
+        }
+        if self.armed {
+            if let Some(boundary) = self.boundary.as_mut() {
+                while boundary.cleanup().is_err() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            self.boundary.take();
         }
         if self.registered {
             self.launcher
@@ -529,7 +723,7 @@ struct SuspendedChild {
 
 fn create_suspended_process(
     request: &AuthorizedProcessRequest,
-    boundary: &PreparedIsolatedWorkerBoundary,
+    boundary: &PreparedProcessBoundary,
 ) -> Result<SuspendedChild, PortError> {
     let job = create_job()?;
     let (stdin_read, stdin_write) = create_pipe_pair(PipeInheritance::Read)?;
@@ -541,7 +735,11 @@ fn create_suspended_process(
         stdout_write.as_raw(),
         stderr_write.as_raw(),
     ];
-    let attributes = ThreadAttributeList::handles(&inherited)?;
+    let attributes = ThreadAttributeList::new(
+        &inherited,
+        boundary.security_capabilities(),
+        &request.execution_id,
+    )?;
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -552,8 +750,8 @@ fn create_suspended_process(
 
     let application = wide_nul(request.executable.canonical_path.as_os_str())?;
     let mut command_line = command_line(&request.executable.canonical_path, &request.argv)?;
-    let environment = environment_block(&request.environment.values)?;
-    let current_directory = wide_nul(boundary.launch_cwd.as_os_str())?;
+    let environment = boundary.environment_block(request)?;
+    let current_directory = wide_nul(boundary.launch_cwd().as_os_str())?;
     let mut process_information = PROCESS_INFORMATION::default();
     // SAFETY: all pointers reference live, correctly terminated buffers; startup and
     // process_information use their documented layouts; the handle list limits
@@ -576,8 +774,10 @@ fn create_suspended_process(
         )
     };
     if created == 0 {
+        record_current_windows_error(&request.execution_id);
         return Err(platform_error());
     }
+    record_suspended_child_created(&request.execution_id);
 
     let process = OwnedHandle::new(process_information.hProcess)?;
     let primary_thread = OwnedHandle::new(process_information.hThread).inspect_err(|_| {
@@ -634,28 +834,57 @@ fn create_pipe_pair(
 struct ThreadAttributeList {
     words: Vec<usize>,
     initialized: bool,
+    security_capabilities: Option<Box<SECURITY_CAPABILITIES>>,
+    all_application_packages_policy: Option<Box<u32>>,
 }
 
 impl ThreadAttributeList {
-    fn handles(handles: &[HANDLE]) -> Result<Self, PortError> {
+    fn new(
+        handles: &[HANDLE],
+        security_capabilities: Option<SECURITY_CAPABILITIES>,
+        execution_id: &ToolExecutionId,
+    ) -> Result<Self, PortError> {
+        #[cfg(feature = "test-seams")]
+        let omit_policy = take_omit_all_application_packages_policy(execution_id);
+        #[cfg(not(feature = "test-seams"))]
+        let omit_policy = false;
+        let has_security_capabilities = security_capabilities.is_some();
+        let include_policy = has_security_capabilities && !omit_policy;
+        let attribute_count = 1 + u32::from(has_security_capabilities) + u32::from(include_policy);
         let mut bytes_required = 0;
         // SAFETY: the first call intentionally supplies null to query required size.
         unsafe {
-            InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut bytes_required);
+            InitializeProcThreadAttributeList(
+                ptr::null_mut(),
+                attribute_count,
+                0,
+                &mut bytes_required,
+            );
         }
         if bytes_required == 0 {
+            record_current_windows_error(execution_id);
             return Err(platform_error());
         }
         let word_count = bytes_required.div_ceil(size_of::<usize>());
         let mut list = Self {
             words: vec![0; word_count],
             initialized: false,
+            security_capabilities: security_capabilities.map(Box::new),
+            all_application_packages_policy: include_policy
+                .then(|| Box::new(PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT)),
         };
         // SAFETY: words provides an aligned writable allocation of at least the
         // queried size for one attribute.
-        if unsafe { InitializeProcThreadAttributeList(list.as_raw(), 1, 0, &mut bytes_required) }
-            == 0
+        if unsafe {
+            InitializeProcThreadAttributeList(
+                list.as_raw(),
+                attribute_count,
+                0,
+                &mut bytes_required,
+            )
+        } == 0
         {
+            record_current_windows_error(execution_id);
             return Err(platform_error());
         }
         list.initialized = true;
@@ -672,7 +901,44 @@ impl ThreadAttributeList {
             )
         } == 0
         {
+            record_current_windows_error(execution_id);
             return Err(platform_error());
+        }
+        if let Some(capabilities) = list.security_capabilities.as_deref() {
+            if unsafe {
+                UpdateProcThreadAttribute(
+                    list.as_raw(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                    (capabilities as *const SECURITY_CAPABILITIES)
+                        .cast_mut()
+                        .cast::<c_void>(),
+                    size_of::<SECURITY_CAPABILITIES>(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                )
+            } == 0
+            {
+                record_current_windows_error(execution_id);
+                return Err(platform_error());
+            }
+            if let Some(policy) = list.all_application_packages_policy.as_deref() {
+                if unsafe {
+                    UpdateProcThreadAttribute(
+                        list.as_raw(),
+                        0,
+                        PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY as usize,
+                        (policy as *const u32).cast_mut().cast::<c_void>(),
+                        size_of::<u32>(),
+                        ptr::null_mut(),
+                        ptr::null(),
+                    )
+                } == 0
+                {
+                    record_current_windows_error(execution_id);
+                    return Err(platform_error());
+                }
+            }
         }
         Ok(list)
     }
@@ -847,6 +1113,7 @@ fn executable_identity(file: &File) -> Result<String, PortError> {
     ))
 }
 
+#[cfg(feature = "test-seams")]
 fn verify_prepared_boundary(
     request: &AuthorizedProcessRequest,
     prepared: &PreparedIsolatedWorkerBoundary,
@@ -886,6 +1153,7 @@ fn verify_prepared_boundary(
     Ok(())
 }
 
+#[cfg(feature = "test-seams")]
 fn cwd_root_identity(cwd: &ProcessWorkingDirectory) -> Option<&str> {
     match cwd {
         ProcessWorkingDirectory::IsolatedWorktree(resolved) => {
@@ -956,12 +1224,28 @@ fn quote_argument(argument: &str) -> String {
     quoted
 }
 
+#[cfg(feature = "test-seams")]
 fn environment_block(values: &BTreeMap<String, String>) -> Result<Vec<u16>, PortError> {
     let mut block = Vec::new();
     for (name, value) in values {
         block.extend(OsStr::new(name).encode_wide());
         block.push('=' as u16);
         block.extend(OsStr::new(value).encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    if values.is_empty() {
+        block.push(0);
+    }
+    Ok(block)
+}
+
+fn os_environment_block(values: &BTreeMap<OsString, OsString>) -> Result<Vec<u16>, PortError> {
+    let mut block = Vec::new();
+    for (name, value) in values {
+        block.extend(name.encode_wide());
+        block.push('=' as u16);
+        block.extend(value.encode_wide());
         block.push(0);
     }
     block.push(0);
@@ -1000,6 +1284,7 @@ fn output_digest(stdout: &[u8], stderr: &[u8]) -> Sha256Digest {
         .expect("SHA-256 formatting always satisfies the domain invariant")
 }
 
+#[cfg(feature = "test-seams")]
 fn valid_receipt(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 256 && !value.contains(['\0', '\r', '\n'])
 }

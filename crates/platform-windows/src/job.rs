@@ -214,6 +214,10 @@ impl ActiveJob {
         unsafe { WaitForSingleObject(self.process.as_raw(), timeout_ms) }
     }
 
+    pub(super) fn process_handle(&self) -> HANDLE {
+        self.process.as_raw()
+    }
+
     pub(super) fn stop_remaining_tree(&self) -> Result<(), PortError> {
         let grace_deadline = Instant::now() + NATURAL_TREE_EXIT_GRACE;
         while self.active_process_count()? != 0 && Instant::now() < grace_deadline {
