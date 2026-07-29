@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use local_agent_terminal_application::{
-    ExecutableArtifactInspector, ExecutableProfileResolver, ExecutableVerificationGuard, PortError,
-    ResolvedExecutable, Retryability, SafeErrorClassification,
+    ApprovedExecutableIdentity, ExecutableArtifactInspector, ExecutableProfileResolver,
+    ExecutableVerificationGuard, PortError, ResolvedExecutable, Retryability,
+    SafeErrorClassification,
 };
 use local_agent_terminal_domain::Sha256Digest;
 
@@ -49,8 +50,7 @@ pub struct ExecutableRegistry {
 
 #[derive(Debug)]
 struct RegisteredExecutable {
-    version: String,
-    resolved: ResolvedExecutable,
+    approved: ApprovedExecutableIdentity,
 }
 
 impl ExecutableRegistry {
@@ -70,13 +70,8 @@ impl ExecutableRegistry {
             )?;
             validate_inspection(&registration, &resolved)?;
             drop(retained);
-            loaded.insert(
-                registration.toolchain_id,
-                RegisteredExecutable {
-                    version: registration.version,
-                    resolved,
-                },
-            );
+            let approved = ApprovedExecutableIdentity::new(resolved, registration.version)?;
+            loaded.insert(registration.toolchain_id, RegisteredExecutable { approved });
         }
         Ok(Self {
             registrations: loaded,
@@ -91,15 +86,18 @@ impl ExecutableRegistry {
     ) -> Result<ResolvedExecutable, PortError> {
         self.registrations
             .get(toolchain_id)
-            .filter(|registered| registered.version == version)
-            .map(|registered| registered.resolved.clone())
+            .filter(|registered| registered.approved.version() == version)
+            .map(|registered| registered.approved.executable().clone())
             .ok_or_else(denied)
     }
 
-    pub fn resolve_registered(&self, toolchain_id: &str) -> Result<ResolvedExecutable, PortError> {
+    pub fn resolve_registered(
+        &self,
+        toolchain_id: &str,
+    ) -> Result<ApprovedExecutableIdentity, PortError> {
         self.registrations
             .get(toolchain_id)
-            .map(|registered| registered.resolved.clone())
+            .map(|registered| registered.approved.clone())
             .ok_or_else(denied)
     }
 
@@ -110,18 +108,19 @@ impl ExecutableRegistry {
         let registered = self
             .registrations
             .get(&executable.toolchain_id)
-            .filter(|registered| &registered.resolved == executable)
+            .filter(|registered| registered.approved.executable() == executable)
             .ok_or_else(denied)?;
         let (observed, retained) = self.inspector.inspect_and_retain(
             registered
-                .resolved
+                .approved
+                .executable()
                 .canonical_path
                 .to_str()
                 .ok_or_else(invalid_input)?,
-            &registered.resolved.toolchain_id,
-            &registered.resolved.sha256,
+            &registered.approved.executable().toolchain_id,
+            &registered.approved.executable().sha256,
         )?;
-        if observed != registered.resolved {
+        if &observed != registered.approved.executable() {
             return Err(integrity_failure());
         }
         Ok(retained)
@@ -129,7 +128,10 @@ impl ExecutableRegistry {
 }
 
 impl ExecutableProfileResolver for ExecutableRegistry {
-    fn resolve_registered(&self, toolchain_id: &str) -> Result<ResolvedExecutable, PortError> {
+    fn resolve_registered(
+        &self,
+        toolchain_id: &str,
+    ) -> Result<ApprovedExecutableIdentity, PortError> {
         Self::resolve_registered(self, toolchain_id)
     }
 

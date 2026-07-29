@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -5,17 +6,18 @@ use local_agent_terminal_application::{
     bind_tool_approval_payload, canonical_approval_payload, canonical_file_write_recovery_request,
     parse_file_write_recovery_request, ApprovalCheck, ApprovalClaim, ApprovalDigestPayload,
     ApprovalId, ApprovalInvalidation, ApprovalResolution, ApprovalSnapshot, ApprovalState,
-    ApprovalStore, ApprovedProcessExecutor, ApprovedProcessRequest, AuthorizedToolRequest,
-    BoundToolApproval, CancellationReceipt, CanonicalEvidenceRef, CapabilityFileWriteSession,
-    CapabilityFileWriteSessionFactory, CapabilityFilesystem, CapabilityResolver,
-    CapabilityRootIdentity, CaptureFileWritePostEvidence, CaptureFileWritePreEvidence, Clock,
-    DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest, ExecuteApprovedTool,
-    FileWriteEvidenceStore, FileWritePolicyBinding, FileWritePostExpectation, FileWritePreImage,
-    FileWriteRecoveryRequest, NewApproval, ObservedFileImage, OpenFileWriteSession,
-    PolicyDecisionStore, PolicyEvaluator, PortError, ProcessLauncher, ProcessStatus,
-    RelativePathComponents, Retryability, SafeErrorClassification, StructuredGit,
-    StructuredToolExecutor, ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionId,
-    ToolExecutionResult, ToolExecutionStore, VerifiedWrite,
+    ApprovalStore, ApprovedExecutableIdentity, ApprovedProcessExecutor, ApprovedProcessRequest,
+    AuthorizedToolRequest, BoundToolApproval, CancellationReceipt, CanonicalEvidenceRef,
+    CapabilityFileWriteSession, CapabilityFileWriteSessionFactory, CapabilityFilesystem,
+    CapabilityResolver, CapabilityRootIdentity, CaptureFileWritePostEvidence,
+    CaptureFileWritePreEvidence, Clock, DisclosureChannel, DisclosurePolicyEvaluator,
+    DisclosureRequest, ExecutableFileIdentity, ExecuteApprovedTool, FileWriteEvidenceStore,
+    FileWritePolicyBinding, FileWritePostExpectation, FileWritePreImage, FileWriteRecoveryRequest,
+    NewApproval, ObservedFileImage, OpenFileWriteSession, PolicyDecisionStore, PolicyEvaluator,
+    PortError, ProcessLauncher, ProcessStatus, RelativePathComponents, ResolvedExecutable,
+    Retryability, SafeErrorClassification, StructuredGit, StructuredToolExecutor,
+    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionId, ToolExecutionResult,
+    ToolExecutionStore, VerifiedWrite,
 };
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken,
@@ -481,6 +483,57 @@ fn trusted_request_binding_covers_every_execution_detail() {
 }
 
 #[test]
+fn process_approval_freezes_digest_version_path_and_file_identity() {
+    let baseline_request = authorized_process_request_for(RequestMutation::None);
+    let baseline = approved_tool_binding(&baseline_request, APPROVAL_NONCE);
+
+    assert_eq!(
+        baseline.payload().operation.executable_digest.as_deref(),
+        Some(digest('d').as_str())
+    );
+
+    for approved_executable in [
+        approved_executable_identity(
+            "cargo",
+            "1.98.0",
+            "approved-cargo.exe",
+            digest('d'),
+            "file-cargo",
+        ),
+        approved_executable_identity(
+            "cargo",
+            "1.97.1",
+            "approved-cargo.exe",
+            digest('9'),
+            "file-cargo",
+        ),
+        approved_executable_identity(
+            "cargo",
+            "1.97.1",
+            "replacement-cargo.exe",
+            digest('d'),
+            "file-cargo",
+        ),
+        approved_executable_identity(
+            "cargo",
+            "1.97.1",
+            "approved-cargo.exe",
+            digest('d'),
+            "replacement-file-cargo",
+        ),
+    ] {
+        let mut changed_request = baseline_request.clone();
+        changed_request.approved_executable = approved_executable;
+        let changed = approved_tool_binding(&changed_request, APPROVAL_NONCE);
+
+        assert_ne!(
+            changed.request_binding_digest(),
+            baseline.request_binding_digest()
+        );
+    }
+}
+
+#[test]
 fn approval_identity_and_nonce_mismatches_do_not_call_the_executor() {
     let mut wrong_id = approved_snapshot();
     wrong_id.approval_id = ApprovalId::new("approval-2").unwrap();
@@ -856,6 +909,17 @@ fn authorized_process_request_for(mutation: RequestMutation) -> ApprovedProcessR
     )
     .unwrap();
     ApprovedProcessRequest {
+        approved_executable: approved_executable_identity(
+            if mutation == RequestMutation::Executable {
+                "rustc"
+            } else {
+                "cargo"
+            },
+            "1.97.1",
+            "approved-cargo.exe",
+            digest('d'),
+            "file-cargo",
+        ),
         process,
         expected_reads: match mutation {
             RequestMutation::ExpectedReads => {
@@ -869,6 +933,31 @@ fn authorized_process_request_for(mutation: RequestMutation) -> ApprovedProcessR
         memory_limit_bytes: (mutation == RequestMutation::MemoryLimit).then_some(1024),
         cpu_time_limit_ms: (mutation == RequestMutation::CpuLimit).then_some(500),
     }
+}
+
+fn approved_executable_identity(
+    toolchain_id: &str,
+    version: &str,
+    file_name: &str,
+    sha256: Sha256Digest,
+    file_identity: &str,
+) -> ApprovedExecutableIdentity {
+    ApprovedExecutableIdentity::new(
+        ResolvedExecutable {
+            canonical_path: absolute_test_path(file_name),
+            sha256,
+            file_identity: ExecutableFileIdentity::new(file_identity).unwrap(),
+            toolchain_id: toolchain_id.to_owned(),
+        },
+        version,
+    )
+    .unwrap()
+}
+
+fn absolute_test_path(file_name: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join("local-agent-terminal-approved-executables")
+        .join(file_name)
 }
 
 const APPROVAL_NONCE: &str = "0123456789abcdef0123456789abcdef";

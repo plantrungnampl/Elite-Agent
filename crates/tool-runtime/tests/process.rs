@@ -1,12 +1,14 @@
 use std::fs;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use local_agent_terminal_application::{
-    AcquireLease, ApprovedProcessRequest, AuthorizedProcessRequest, BoundedOutput,
-    CancellationReceipt, CapabilityRequest, CapabilityResolver, CapabilityRootIdentity,
-    ExecutorLeaseStore, JobReceipt, LeaseSnapshot, PortError, ProcessLauncher, ProcessReceipt,
-    ProcessStatus, ProcessWorkingDirectory, ResolvedCapability, ResolvedCapabilityTarget,
-    RevokeLease, ToolExecutionId,
+    AcquireLease, ApprovedExecutableIdentity, ApprovedProcessRequest, AuthorizedProcessRequest,
+    BoundedOutput, CancellationReceipt, CapabilityRequest, CapabilityResolver,
+    CapabilityRootIdentity, ExecutorLeaseStore, JobReceipt, LeaseSnapshot, PortError,
+    ProcessLauncher, ProcessReceipt, ProcessStatus, ProcessWorkingDirectory, ResolvedCapability,
+    ResolvedCapabilityTarget, RevokeLease, SafeErrorClassification, ToolExecutionId,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, EnvironmentProfile, FencingToken, LeaseClaim, NetworkProfile, Phase, PlanStepId,
@@ -21,6 +23,7 @@ use local_agent_terminal_platform_core::{
 use local_agent_terminal_platform_windows::WindowsExecutableInspector;
 use local_agent_terminal_tool_runtime::ProcessRuntime;
 use sha2::{Digest, Sha256};
+use tempfile::TempDir;
 
 #[test]
 fn brokered_process_cannot_receive_a_worktree_cwd() {
@@ -87,6 +90,28 @@ fn unresolved_profiles_cwd_and_stale_lease_never_reach_the_launcher() {
     }
 }
 
+#[test]
+fn old_approval_executable_identity_replacement_never_reaches_launcher() {
+    for replacement in [
+        ExecutableReplacement::Version,
+        ExecutableReplacement::Digest,
+        ExecutableReplacement::Path,
+        ExecutableReplacement::FileIdentity,
+        ExecutableReplacement::Registry,
+    ] {
+        let outcome = execute_replacement_case(replacement);
+
+        let error = outcome.result.expect_err("replacement must be denied");
+        assert_eq!(
+            error.safe_classification(),
+            SafeErrorClassification::IntegrityFailure,
+            "{replacement:?}"
+        );
+        assert_eq!(outcome.launcher_calls, 0, "{replacement:?}");
+        assert!(outcome.request.is_none(), "{replacement:?}");
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaseMutation {
     None,
@@ -99,27 +124,138 @@ enum CaseMutation {
     ExpectedReads,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutableReplacement {
+    Version,
+    Digest,
+    Path,
+    FileIdentity,
+    Registry,
+}
+
 struct CaseOutcome {
     result: Result<ProcessReceipt, PortError>,
     request: Option<AuthorizedProcessRequest>,
     execution_id: ToolExecutionId,
     claim: LeaseClaim,
+    launcher_calls: usize,
 }
 
 fn execute_case(argv: Vec<String>, mutation: CaseMutation) -> CaseOutcome {
     let executable_path = std::env::current_exe().unwrap();
-    let executable_digest = digest(&fs::read(&executable_path).unwrap());
-    let executables = ExecutableRegistry::load(
-        vec![TrustedExecutableRegistration::new(
-            "cargo",
-            "test-version",
-            &executable_path,
-            executable_digest,
-        )
-        .unwrap()],
+    let executables = executable_registry(&executable_path, "test-version");
+    let approved_executable = executables.resolve_registered("cargo").unwrap();
+    execute_with_registry(argv, mutation, &executables, approved_executable)
+}
+
+fn execute_replacement_case(replacement: ExecutableReplacement) -> CaseOutcome {
+    let root = TempDir::new().unwrap();
+    let approved_path = root.path().join("approved-tool.exe");
+    fs::copy(std::env::current_exe().unwrap(), &approved_path).unwrap();
+    let approved_registry = executable_registry(&approved_path, "approved-version");
+    let approved_executable = approved_registry.resolve_registered("cargo").unwrap();
+
+    let replacement_path = root.path().join("replacement-tool.exe");
+    let (registered_path, registered_version) = match replacement {
+        ExecutableReplacement::Version => (approved_path.clone(), "replacement-version"),
+        ExecutableReplacement::Digest => {
+            fs::write(&approved_path, b"replacement executable digest").unwrap();
+            (approved_path.clone(), "approved-version")
+        }
+        ExecutableReplacement::Path => {
+            fs::hard_link(&approved_path, &replacement_path).unwrap();
+            (replacement_path, "approved-version")
+        }
+        ExecutableReplacement::FileIdentity => {
+            fs::copy(&approved_path, &replacement_path).unwrap();
+            fs::remove_file(&approved_path).unwrap();
+            fs::rename(&replacement_path, &approved_path).unwrap();
+            (approved_path.clone(), "approved-version")
+        }
+        ExecutableReplacement::Registry => {
+            fs::write(&replacement_path, b"replacement registry executable").unwrap();
+            (replacement_path, "replacement-version")
+        }
+    };
+    let current_registry = executable_registry(&registered_path, registered_version);
+    let current_executable = current_registry.resolve_registered("cargo").unwrap();
+    assert_replacement_fixture(replacement, &approved_executable, &current_executable);
+
+    execute_with_registry(
+        vec!["test".to_owned()],
+        CaseMutation::None,
+        &current_registry,
+        approved_executable,
+    )
+}
+
+fn executable_registry(path: &Path, version: &str) -> ExecutableRegistry {
+    let executable_digest = digest(&fs::read(path).unwrap());
+    ExecutableRegistry::load(
+        vec![
+            TrustedExecutableRegistration::new("cargo", version, path, executable_digest).unwrap(),
+        ],
         std::sync::Arc::new(WindowsExecutableInspector),
     )
-    .unwrap();
+    .unwrap()
+}
+
+fn assert_replacement_fixture(
+    replacement: ExecutableReplacement,
+    approved: &ApprovedExecutableIdentity,
+    current: &ApprovedExecutableIdentity,
+) {
+    match replacement {
+        ExecutableReplacement::Version => {
+            assert_eq!(approved.executable(), current.executable());
+            assert_ne!(approved.version(), current.version());
+        }
+        ExecutableReplacement::Digest => {
+            assert_eq!(approved.version(), current.version());
+            assert_eq!(
+                approved.executable().canonical_path,
+                current.executable().canonical_path
+            );
+            assert_eq!(
+                approved.executable().file_identity,
+                current.executable().file_identity
+            );
+            assert_ne!(approved.executable().sha256, current.executable().sha256);
+        }
+        ExecutableReplacement::Path => {
+            assert_eq!(approved.version(), current.version());
+            assert_eq!(approved.executable().sha256, current.executable().sha256);
+            assert_eq!(
+                approved.executable().file_identity,
+                current.executable().file_identity
+            );
+            assert_ne!(
+                approved.executable().canonical_path,
+                current.executable().canonical_path
+            );
+        }
+        ExecutableReplacement::FileIdentity => {
+            assert_eq!(approved.version(), current.version());
+            assert_eq!(approved.executable().sha256, current.executable().sha256);
+            assert_eq!(
+                approved.executable().canonical_path,
+                current.executable().canonical_path
+            );
+            assert_ne!(
+                approved.executable().file_identity,
+                current.executable().file_identity
+            );
+        }
+        ExecutableReplacement::Registry => assert_ne!(approved, current),
+    }
+}
+
+fn execute_with_registry(
+    argv: Vec<String>,
+    mutation: CaseMutation,
+    executables: &ExecutableRegistry,
+    approved_executable: ApprovedExecutableIdentity,
+) -> CaseOutcome {
     let environment_digest = Sha256Digest::new(
         "sha256:c465e195c2dd90a8fc0317b7ba545d3fa5233faec2b1a216c4d205dc7be61c65",
     )
@@ -165,7 +301,7 @@ fn execute_case(argv: Vec<String>, mutation: CaseMutation) -> CaseOutcome {
     };
     let launcher = CapturingLauncher::default();
     let runtime = ProcessRuntime::new(
-        &executables,
+        executables,
         &environments,
         &networks,
         vec![enforced_network],
@@ -219,6 +355,7 @@ fn execute_case(argv: Vec<String>, mutation: CaseMutation) -> CaseOutcome {
     let result = runtime.execute(
         execution_id.clone(),
         ApprovedProcessRequest {
+            approved_executable,
             process,
             expected_reads: if mutation == CaseMutation::ExpectedReads {
                 vec![CapabilityRef::worktree(TaskId::new("task-1").unwrap(), "src").unwrap()]
@@ -230,21 +367,25 @@ fn execute_case(argv: Vec<String>, mutation: CaseMutation) -> CaseOutcome {
         },
     );
     let request = launcher.request.lock().unwrap().clone();
+    let launcher_calls = launcher.calls.load(Ordering::SeqCst);
     CaseOutcome {
         result,
         request,
         execution_id,
         claim,
+        launcher_calls,
     }
 }
 
 #[derive(Default)]
 struct CapturingLauncher {
     request: Mutex<Option<AuthorizedProcessRequest>>,
+    calls: AtomicUsize,
 }
 
 impl ProcessLauncher for CapturingLauncher {
     fn execute(&self, request: AuthorizedProcessRequest) -> Result<ProcessReceipt, PortError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let execution_id = request.execution_id.clone();
         *self.request.lock().unwrap() = Some(request);
         Ok(ProcessReceipt {

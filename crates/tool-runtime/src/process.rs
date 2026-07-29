@@ -73,6 +73,9 @@ impl<'a> ProcessRuntime<'a> {
             _ => return Err(permission_denied()),
         };
         let executable = self.executables.resolve_registered(executable_id)?;
+        if executable != approved.approved_executable {
+            return Err(integrity_failure());
+        }
         let binding = process.binding();
         let environment = self.environments.resolve(
             binding.environment_profile().name(),
@@ -108,7 +111,7 @@ impl<'a> ProcessRuntime<'a> {
         let authorized = AuthorizedProcessRequest {
             execution_id,
             trust_tier: process.trust_tier(),
-            executable,
+            executable: executable.executable().clone(),
             argv: process.argv().to_vec(),
             cwd: ProcessWorkingDirectory::IsolatedWorktree(resolved_cwd),
             environment,

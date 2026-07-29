@@ -1983,6 +1983,7 @@ dependencies = [
  "local-agent-terminal-platform-windows",
  "local-agent-terminal-policy-engine",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]

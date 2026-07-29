@@ -43,6 +43,41 @@ pub struct ResolvedExecutable {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedExecutableIdentity {
+    executable: ResolvedExecutable,
+    version: String,
+}
+
+impl ApprovedExecutableIdentity {
+    pub fn new(
+        executable: ResolvedExecutable,
+        version: impl Into<String>,
+    ) -> Result<Self, PortError> {
+        let version = version.into();
+        let canonical_path = executable.canonical_path.to_str();
+        if !valid_registration_name(&executable.toolchain_id)
+            || !valid_registration_name(&version)
+            || !executable.canonical_path.is_absolute()
+            || canonical_path.is_none_or(|path| path.contains('\0'))
+        {
+            return Err(invalid_input());
+        }
+        Ok(Self {
+            executable,
+            version,
+        })
+    }
+
+    pub const fn executable(&self) -> &ResolvedExecutable {
+        &self.executable
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectoryFileIdentity(String);
 
 impl DirectoryFileIdentity {
@@ -456,6 +491,7 @@ pub struct GitDiffResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovedProcessRequest {
+    pub approved_executable: ApprovedExecutableIdentity,
     pub process: ProcessToolRequest,
     pub expected_reads: Vec<CapabilityRef>,
     pub memory_limit_bytes: Option<u64>,
@@ -960,7 +996,10 @@ pub trait ExecutableArtifactInspector: Send + Sync {
 }
 
 pub trait ExecutableProfileResolver: Send + Sync {
-    fn resolve_registered(&self, toolchain_id: &str) -> Result<ResolvedExecutable, PortError>;
+    fn resolve_registered(
+        &self,
+        toolchain_id: &str,
+    ) -> Result<ApprovedExecutableIdentity, PortError>;
     fn verify_and_retain(
         &self,
         executable: &ResolvedExecutable,
@@ -1271,11 +1310,14 @@ fn bind_process_request(
     request: &ApprovedProcessRequest,
 ) -> Result<ToolApprovalPayloadV1, PortError> {
     let process = &request.process;
+    let approved_executable = approved_executable_identity(request)?;
     let binding = process.binding();
     payload.task_id = binding.task_id().as_str().to_owned();
     payload.operation.run_id = binding.run_id().as_str().to_owned();
     payload.operation.plan_step_id = binding.plan_step_id().as_str().to_owned();
     payload.operation.tool = "process.exec".to_owned();
+    payload.operation.executable_digest =
+        Some(approved_executable.executable().sha256.as_str().to_owned());
     payload.operation.arguments_digest = canonical_process_arguments_digest(process)?.to_string();
     payload.operation.cwd_capability = logical_capability(process.cwd());
     payload.operation.environment_profile_digest =
@@ -1308,6 +1350,12 @@ fn canonical_tool_request_binding(
 ) -> Result<ToolRequestBindingDigest, PortError> {
     validate_safe_integer_fields(request)?;
     let process = &request.process;
+    let approved_executable = approved_executable_identity(request)?;
+    let approved_executable_path = approved_executable
+        .executable()
+        .canonical_path
+        .to_str()
+        .ok_or_else(invalid_input)?;
     let binding = process.binding();
     let value = json!({
         "schema": "authorized-process-request.v1",
@@ -1322,6 +1370,13 @@ fn canonical_tool_request_binding(
         },
         "timeoutMs": binding.timeout_ms(),
         "executable": capability_value(process.executable()),
+        "approvedExecutable": {
+            "toolchainId": approved_executable.executable().toolchain_id,
+            "version": approved_executable.version(),
+            "canonicalPath": approved_executable_path,
+            "sha256": approved_executable.executable().sha256.as_str(),
+            "fileIdentity": approved_executable.executable().file_identity.as_str(),
+        },
         "argv": process.argv(),
         "cwd": capability_value(process.cwd()),
         "trustTier": trust_tier(process.trust_tier()),
@@ -1344,6 +1399,24 @@ fn canonical_tool_request_binding(
     Sha256Digest::new(sha256_digest(&canonical_bytes))
         .map(ToolRequestBindingDigest)
         .map_err(|_| invalid_input())
+}
+
+fn approved_executable_identity(
+    request: &ApprovedProcessRequest,
+) -> Result<&ApprovedExecutableIdentity, PortError> {
+    let CapabilityRef::Toolchain(toolchain) = request.process.executable() else {
+        return Err(invalid_input());
+    };
+    if toolchain.name() != request.approved_executable.executable().toolchain_id {
+        return Err(invalid_input());
+    }
+    Ok(&request.approved_executable)
+}
+
+fn valid_registration_name(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 256
+        && !value.contains(['\0', '/', '\\', ':', '\r', '\n'])
 }
 
 fn validate_safe_integer_fields(request: &ApprovedProcessRequest) -> Result<(), PortError> {

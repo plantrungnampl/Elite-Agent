@@ -6,8 +6,9 @@ use std::sync::{Arc, Barrier};
 use local_agent_terminal_application::{
     bind_tool_approval_payload, canonical_approval_payload, ApprovalCheck, ApprovalClaim,
     ApprovalDigestPayload, ApprovalId, ApprovalInvalidation, ApprovalResolution, ApprovalState,
-    ApprovalStore, ApprovedProcessRequest, NewApproval, PolicyDecision, PolicyDecisionStore,
-    RecordedPolicyDecision, ToolApprovalOperationV1, ToolApprovalPayloadV1,
+    ApprovalStore, ApprovedExecutableIdentity, ApprovedProcessRequest, ExecutableFileIdentity,
+    NewApproval, PolicyDecision, PolicyDecisionStore, RecordedPolicyDecision, ResolvedExecutable,
+    ToolApprovalOperationV1, ToolApprovalPayloadV1,
 };
 use local_agent_terminal_domain::{
     combine_policy_rules, ActorLocality, CapabilityRef, EnvironmentProfile, MatchedPolicyRule,
@@ -721,6 +722,18 @@ fn approval_payload() -> (
     )
     .unwrap();
     let request = ApprovedProcessRequest {
+        approved_executable: ApprovedExecutableIdentity::new(
+            ResolvedExecutable {
+                canonical_path: std::env::temp_dir()
+                    .join("local-agent-terminal-approved-executables")
+                    .join("cargo.exe"),
+                sha256: digest('d'),
+                file_identity: ExecutableFileIdentity::new("storage-test-cargo").unwrap(),
+                toolchain_id: "cargo".to_owned(),
+            },
+            "1.97.1",
+        )
+        .unwrap(),
         process: ProcessToolRequest::new(
             binding,
             ProcessInvocation::new(
