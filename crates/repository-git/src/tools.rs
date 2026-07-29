@@ -29,7 +29,9 @@ impl StructuredGit for GitStructuredTools {
             self.authorize(&request.task_id, &request.worktree, &request.root_identity)?;
         let (repository, config) =
             paths::open_for_locator(&registration.locator).map_err(|_| denied())?;
-        verify_revision(&repository, &registration.revision)?;
+        registration
+            .verify_opened(&repository)
+            .map_err(|_| denied())?;
         self.reject_hazards(&repository, &config)?;
         let before = capture_repository(&repository)?;
         self.run_before_generation_hook();
@@ -52,7 +54,9 @@ impl StructuredGit for GitStructuredTools {
             self.authorize(&request.task_id, &request.worktree, &request.root_identity)?;
         let (repository, config) =
             paths::open_for_locator(&registration.locator).map_err(|_| denied())?;
-        verify_revision(&repository, &registration.revision)?;
+        registration
+            .verify_opened(&repository)
+            .map_err(|_| denied())?;
         self.reject_hazards(&repository, &config)?;
         let before = capture_repository(&repository)?;
         self.run_before_generation_hook();
@@ -612,7 +616,10 @@ fn revision(repository: &git2::Repository) -> Result<GitObjectId, PortError> {
     GitObjectId::new(oid.to_string()).map_err(|_| denied())
 }
 
-fn verify_revision(repository: &git2::Repository, expected: &GitObjectId) -> Result<(), PortError> {
+pub(crate) fn verify_revision(
+    repository: &git2::Repository,
+    expected: &GitObjectId,
+) -> Result<(), PortError> {
     if revision(repository).as_ref() != Ok(expected) {
         return Err(denied());
     }

@@ -1,26 +1,44 @@
 use std::ffi::{OsStr, OsString};
+use std::fs::File as StdFile;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::windows::io::AsRawHandle;
+use std::mem::size_of;
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Component, Path, PathBuf, Prefix};
+use std::ptr;
 
 use cap_fs_ext::{
     DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt, OsMetadataExt,
 };
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, File, OpenOptions, OpenOptionsExt};
+use cap_std::fs::{Dir, File, OpenOptions};
 use local_agent_terminal_application::{
     AuthorizedFileRead, AuthorizedFileWrite, CapabilityFileWriteSession,
     CapabilityFileWriteSessionFactory, CapabilityFilesystem, CapabilityRequest, CapabilityResolver,
-    CapabilityRootIdentity, FileWritePostExpectation, ObservedFileImage, OpenFileWriteSession,
-    PortError, RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget, Retryability,
-    SafeErrorClassification, VerifiedBytes, VerifiedFileWriteCompensation, VerifiedWrite,
+    CapabilityRootIdentity, FileWritePostExpectation, FileWriteRecoveryRequest, ObservedFileImage,
+    OpenFileWriteSession, PortError, RelativePathComponents, ResolvedCapability,
+    ResolvedCapabilityTarget, Retryability, SafeErrorClassification, VerifiedBytes,
+    VerifiedFileWriteCompensation, VerifiedWrite,
 };
 use local_agent_terminal_domain::{ArtifactId, CapabilityRef, Sha256Digest, TaskId};
 use sha2::{Digest, Sha256};
-use windows_sys::Win32::Storage::FileSystem::{
-    FileIdInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ID_INFO,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows_sys::Wdk::Storage::FileSystem::{
+    FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE, FILE_DIRECTORY_FILE,
+    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
+    FILE_SYNCHRONOUS_IO_NONALERT,
 };
+use windows_sys::Win32::Foundation::{
+    HANDLE, OBJ_CASE_INSENSITIVE, STATUS_OBJECT_NAME_COLLISION, STATUS_SUCCESS, UNICODE_STRING,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    FileDispositionInfoEx, FileIdInfo, GetFileInformationByHandleEx, SetFileInformationByHandle,
+    DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
+    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
+};
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 const MAX_READ_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 4_096;
@@ -176,6 +194,10 @@ struct WindowsFileWriteSession {
     compensation_post_stage_hook: Option<Box<dyn FnOnce() -> std::io::Result<()> + Send>>,
     #[cfg(feature = "test-seams")]
     post_rename_hook: Option<Box<dyn FnOnce() -> std::io::Result<()> + Send>>,
+    #[cfg(feature = "test-seams")]
+    pre_operation_hook: Option<Box<dyn FnOnce() -> std::io::Result<()> + Send>>,
+    #[cfg(feature = "test-seams")]
+    compensation_pre_operation_hook: Option<Box<dyn FnOnce() -> std::io::Result<()> + Send>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +207,11 @@ enum ExpectedTarget {
         identity: FileIdentity,
         verified: VerifiedWrite,
     },
+}
+
+enum RetainedTarget {
+    Absent,
+    Present(StdFile),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +305,28 @@ impl WindowsCapabilityAdapter {
     ) -> Result<Box<dyn CapabilityFileWriteSession>, PortError> {
         let mut session = self.open_file_write_session(request)?;
         session.post_rename_hook = Some(hook);
+        Ok(Box::new(session))
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub fn open_write_session_with_pre_operation_hook(
+        &self,
+        request: OpenFileWriteSession,
+        hook: Box<dyn FnOnce() -> std::io::Result<()> + Send>,
+    ) -> Result<Box<dyn CapabilityFileWriteSession>, PortError> {
+        let mut session = self.open_file_write_session(request)?;
+        session.pre_operation_hook = Some(hook);
+        Ok(Box::new(session))
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub fn open_write_session_with_compensation_pre_operation_hook(
+        &self,
+        request: OpenFileWriteSession,
+        hook: Box<dyn FnOnce() -> std::io::Result<()> + Send>,
+    ) -> Result<Box<dyn CapabilityFileWriteSession>, PortError> {
+        let mut session = self.open_file_write_session(request)?;
+        session.compensation_pre_operation_hook = Some(hook);
         Ok(Box::new(session))
     }
 
@@ -376,6 +425,28 @@ impl CapabilityFileWriteSessionFactory for WindowsCapabilityAdapter {
     ) -> Result<Box<dyn CapabilityFileWriteSession>, PortError> {
         self.open_file_write_session(request)
             .map(|session| Box::new(session) as Box<dyn CapabilityFileWriteSession>)
+    }
+
+    fn observe_recovery_target(
+        &self,
+        request: &FileWriteRecoveryRequest,
+    ) -> Result<ObservedFileImage, PortError> {
+        let registration = self
+            .registrations
+            .iter()
+            .find(|registration| {
+                registration.binding == RegistrationBinding::Worktree
+                    && registration.owner_task_id == request.task_id
+                    && registration.root_identity == request.root_identity
+            })
+            .ok_or_else(denied)?;
+        registration
+            .read_optional(request.relative_components.as_slice(), || Ok(()))
+            .map(|observed| {
+                observed.map_or_else(ObservedFileImage::absent, |verified| {
+                    ObservedFileImage::present(verified.bytes)
+                })
+            })
     }
 }
 
@@ -559,6 +630,10 @@ impl RegisteredCapability {
             compensation_post_stage_hook: None,
             #[cfg(feature = "test-seams")]
             post_rename_hook: None,
+            #[cfg(feature = "test-seams")]
+            pre_operation_hook: None,
+            #[cfg(feature = "test-seams")]
+            compensation_pre_operation_hook: None,
         })
     }
 }
@@ -594,8 +669,21 @@ impl CapabilityFileWriteSession for WindowsFileWriteSession {
         let compensation = match self.pre_target.clone() {
             ExpectedTarget::Absent => {
                 let parent = self.revalidate_parent()?;
-                self.require_target(&parent, &applied)?.ok_or_else(denied)?;
-                parent.remove_file(&self.leaf_name).map_err(read_io_error)?;
+                let RetainedTarget::Present(applied_file) =
+                    retain_expected_target(&parent, &self.leaf_name, &applied)?
+                else {
+                    return Err(denied());
+                };
+                #[cfg(feature = "test-seams")]
+                if self
+                    .compensation_pre_operation_hook
+                    .take()
+                    .is_some_and(|hook| hook().is_err())
+                {
+                    return Err(denied());
+                }
+                mark_for_deletion(&applied_file)?;
+                drop(applied_file);
                 sync_directory_handle(&parent)?;
                 let parent = self.revalidate_parent()?;
                 drop(self.require_target(&parent, &ExpectedTarget::Absent)?);
@@ -605,6 +693,7 @@ impl CapabilityFileWriteSession for WindowsFileWriteSession {
                 #[cfg(feature = "test-seams")]
                 {
                     self.post_stage_hook = self.compensation_post_stage_hook.take();
+                    self.pre_operation_hook = self.compensation_pre_operation_hook.take();
                 }
                 let bytes = self
                     .pre_image
@@ -649,11 +738,42 @@ impl WindowsFileWriteSession {
         }
         let result = (|| {
             let destination_parent = self.revalidate_parent()?;
-            drop(self.require_target(&destination_parent, expected)?);
+            let rename_parent = self.open_rename_parent(&destination_parent)?;
             require_named_identity(&staged_parent, &temp_name, staged_identity)?;
-            staged_parent
-                .rename(&temp_name, &destination_parent, &self.leaf_name)
-                .map_err(read_io_error)?;
+            let retained = retain_expected_target(&destination_parent, &self.leaf_name, expected)?;
+            #[cfg(feature = "test-seams")]
+            if self
+                .pre_operation_hook
+                .take()
+                .is_some_and(|hook| hook().is_err())
+            {
+                return Err(denied());
+            }
+            match retained {
+                RetainedTarget::Absent => {
+                    rename_noreplace(&staged_file, &rename_parent, OsStr::new(&self.leaf_name))
+                        .map_err(read_io_error)?
+                }
+                RetainedTarget::Present(target_file) => {
+                    self.move_to_unique_backup(&target_file, &rename_parent)?;
+                    if rename_noreplace(&staged_file, &rename_parent, OsStr::new(&self.leaf_name))
+                        .is_err()
+                    {
+                        drop(rename_noreplace(
+                            &target_file,
+                            &rename_parent,
+                            OsStr::new(&self.leaf_name),
+                        ));
+                        return Err(denied());
+                    }
+                    let applied = ExpectedTarget::Present {
+                        identity: staged_identity,
+                        verified: staged_verified.clone(),
+                    };
+                    self.applied_target = Some(applied);
+                    mark_for_deletion(&target_file)?;
+                }
+            }
             let applied = ExpectedTarget::Present {
                 identity: staged_identity,
                 verified: staged_verified,
@@ -684,20 +804,17 @@ impl WindowsFileWriteSession {
         &mut self,
         parent: &Dir,
         bytes: &[u8],
-    ) -> Result<(String, File, FileIdentity), PortError> {
+    ) -> Result<(String, StdFile, FileIdentity), PortError> {
         let generation = self.temp_generation;
         self.temp_generation = self.temp_generation.checked_add(1).ok_or_else(denied)?;
         for attempt in 0..MAX_TEMP_CREATE_ATTEMPTS {
             let name = format!(".lat-write-{}-{generation}-{attempt}.tmp", self.temp_key);
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            options.follow(FollowSymlinks::No);
-            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-            let mut file = match parent.open_with(&name, &options) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(read_io_error(error)),
-            };
+            let mut file =
+                match open_relative_for_update(parent, OsStr::new(&name), FILE_CREATE, true) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(read_io_error(error)),
+                };
             let identity = file_identity(&file).map_err(read_io_error)?;
             if file
                 .write_all(bytes)
@@ -711,6 +828,34 @@ impl WindowsFileWriteSession {
             return Ok((name, file, identity));
         }
         Err(denied())
+    }
+
+    fn move_to_unique_backup(&mut self, file: &StdFile, parent: &StdFile) -> Result<(), PortError> {
+        let generation = self.temp_generation;
+        self.temp_generation = self.temp_generation.checked_add(1).ok_or_else(denied)?;
+        for attempt in 0..MAX_TEMP_CREATE_ATTEMPTS {
+            let name = format!(".lat-write-{}-{generation}-{attempt}.bak", self.temp_key);
+            match rename_noreplace(file, parent, OsStr::new(&name)) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(read_io_error(error)),
+            }
+        }
+        Err(denied())
+    }
+
+    fn open_rename_parent(&self, expected: &Dir) -> Result<StdFile, PortError> {
+        let (parent, name) = if self.directories.len() == 1 {
+            (&self.root_parent, &self.directory_names[0])
+        } else {
+            (
+                &self.directories[self.directories.len() - 2],
+                self.directory_names
+                    .last()
+                    .expect("directory name retained"),
+            )
+        };
+        open_rename_parent(parent, name, expected)
     }
 
     fn revalidate_parent(&self) -> Result<Dir, PortError> {
@@ -749,6 +894,207 @@ impl WindowsFileWriteSession {
             ExpectedTarget::Present { verified, .. } => Ok(Some(verified)),
         }
     }
+}
+
+fn open_relative_for_update(
+    parent: &Dir,
+    name: &OsStr,
+    disposition: u32,
+    writable: bool,
+) -> std::io::Result<StdFile> {
+    let desired_access = FILE_GENERIC_READ
+        | FILE_READ_ATTRIBUTES
+        | DELETE
+        | SYNCHRONIZE
+        | if writable { FILE_GENERIC_WRITE } else { 0 };
+    open_relative_native(
+        parent,
+        name,
+        disposition,
+        desired_access,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        FILE_NON_DIRECTORY_FILE,
+    )
+}
+
+fn open_rename_parent(parent: &Dir, name: &OsStr, expected: &Dir) -> Result<StdFile, PortError> {
+    let opened = open_relative_native(
+        parent,
+        name,
+        FILE_OPEN,
+        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_DIRECTORY_FILE,
+    )
+    .map_err(read_io_error)?;
+    let metadata = opened.metadata().map_err(read_io_error)?;
+    if !metadata.is_dir()
+        || std::os::windows::fs::MetadataExt::file_attributes(&metadata)
+            & FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        || file_identity(&opened).map_err(read_io_error)?
+            != file_identity(expected).map_err(read_io_error)?
+    {
+        return Err(denied());
+    }
+    Ok(opened)
+}
+
+fn open_relative_native(
+    parent: &Dir,
+    name: &OsStr,
+    disposition: u32,
+    desired_access: u32,
+    share_access: u32,
+    kind: u32,
+) -> std::io::Result<StdFile> {
+    let mut name = name.encode_wide().collect::<Vec<_>>();
+    let byte_length = name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let unicode_name = UNICODE_STRING {
+        Length: byte_length,
+        MaximumLength: byte_length,
+        Buffer: name.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle() as HANDLE,
+        ObjectName: &unicode_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: ptr::null(),
+        SecurityQualityOfService: ptr::null(),
+    };
+    let mut handle: HANDLE = ptr::null_mut();
+    let mut io_status = IO_STATUS_BLOCK::default();
+    // SAFETY: all pointers reference initialized values for this synchronous
+    // call, and a successful uniquely owned handle is converted exactly once.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            desired_access,
+            &attributes,
+            &mut io_status,
+            ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            share_access,
+            disposition,
+            kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            ptr::null(),
+            0,
+        )
+    };
+    if status == STATUS_OBJECT_NAME_COLLISION {
+        return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+    }
+    if status != STATUS_SUCCESS || handle.is_null() {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    // SAFETY: successful `NtCreateFile` returned one uniquely owned handle.
+    Ok(unsafe { StdFile::from_raw_handle(handle) })
+}
+
+fn retain_expected_target(
+    parent: &Dir,
+    name: &str,
+    expected: &ExpectedTarget,
+) -> Result<RetainedTarget, PortError> {
+    match expected {
+        ExpectedTarget::Absent => {
+            if exact_name_exists(parent, OsStr::new(name)).map_err(read_io_error)? {
+                return Err(denied());
+            }
+            Ok(RetainedTarget::Absent)
+        }
+        ExpectedTarget::Present { .. } => {
+            require_exact_name(parent, OsStr::new(name)).map_err(read_io_error)?;
+            let mut file = open_relative_for_update(parent, OsStr::new(name), FILE_OPEN, false)
+                .map_err(read_io_error)?;
+            let metadata = file.metadata().map_err(read_io_error)?;
+            if metadata.is_dir()
+                || std::os::windows::fs::MetadataExt::file_attributes(&metadata)
+                    & FILE_ATTRIBUTE_REPARSE_POINT
+                    != 0
+            {
+                return Err(denied());
+            }
+            let observed = ExpectedTarget::Present {
+                identity: file_identity(&file).map_err(read_io_error)?,
+                verified: verified_write(&read_bounded(&mut file)?)?,
+            };
+            if &observed != expected {
+                return Err(denied());
+            }
+            Ok(RetainedTarget::Present(file))
+        }
+    }
+}
+
+fn rename_noreplace(file: &StdFile, parent: &StdFile, name: &OsStr) -> std::io::Result<()> {
+    let name = name.encode_wide().collect::<Vec<_>>();
+    let name_bytes = name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let buffer_bytes = size_of::<FILE_RENAME_INFORMATION>()
+        .checked_add(name_bytes as usize)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let words = buffer_bytes
+        .checked_add(size_of::<usize>() - 1)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?
+        / size_of::<usize>();
+    let mut buffer = vec![0_usize; words];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    let mut io_status = IO_STATUS_BLOCK::default();
+    // SAFETY: the aligned buffer holds the fixed structure and exact UTF-16
+    // name. Both retained handles stay valid for the synchronous call.
+    let status = unsafe {
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = parent.as_raw_handle() as HANDLE;
+        (*info).FileNameLength = name_bytes;
+        ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
+        NtSetInformationFile(
+            file.as_raw_handle() as HANDLE,
+            &mut io_status,
+            info.cast(),
+            buffer_bytes as u32,
+            FileRenameInformation,
+        )
+    };
+    if status == STATUS_OBJECT_NAME_COLLISION {
+        return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+    }
+    if status != STATUS_SUCCESS {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    Ok(())
+}
+
+fn mark_for_deletion(file: &StdFile) -> Result<(), PortError> {
+    let mut disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: `disposition` is the exact buffer required by the API and the
+    // retained file handle was opened with DELETE access.
+    let success = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as HANDLE,
+            FileDispositionInfoEx,
+            ptr::from_mut(&mut disposition).cast(),
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    };
+    if success == 0 {
+        return Err(denied());
+    }
+    Ok(())
 }
 
 fn open_registered_root(path: &Path) -> Result<(Dir, OsString, Dir), PortError> {
@@ -905,7 +1251,7 @@ fn sync_directory_handle(directory: &Dir) -> Result<(), PortError> {
         .map_err(read_io_error)
 }
 
-fn read_bounded(file: &mut File) -> Result<Vec<u8>, PortError> {
+fn read_bounded(file: &mut (impl Read + Seek)) -> Result<Vec<u8>, PortError> {
     file.seek(SeekFrom::Start(0)).map_err(read_io_error)?;
     let mut bytes = Vec::new();
     file.take((MAX_READ_BYTES + 1) as u64)

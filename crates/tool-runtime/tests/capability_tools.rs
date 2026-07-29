@@ -9,13 +9,14 @@ use local_agent_terminal_application::{
     DisclosureContextRequest, DisclosureOutcome, DisclosurePolicyEvaluator, DisclosureRequest,
     ExecutorLeaseStore, FileReadRequest, FileWriteEvidenceStore, FileWritePolicyBinding,
     FileWritePostExpectation, FileWritePreImage, FileWriteRecoveryCompletion,
-    FileWriteRecoveryIntent, FileWriteRecoverySnapshot, FileWriteRecoveryState,
-    FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest, GitStatusRequest, LeaseSnapshot,
-    ObservedFileImage, OpenFileWriteSession, PolicyApprovedDisclosure, PolicyDecisionId,
-    PolicyDecisionStore, PortError, ProcessLauncher, ProcessReceipt, RawGitDiffResult,
-    RawGitStatusResult, RecordedPolicyDecision, RelativePathComponents, ResolvedCapability,
-    RevokeLease, StructuredGit, StructuredToolExecutor, ToolExecutionId, TrustedDisclosureContext,
-    VerifiedBytes, VerifiedFileWriteCompensation, VerifiedWrite, WorkspaceWriteCoordinator,
+    FileWriteRecoveryFailure, FileWriteRecoveryIntent, FileWriteRecoverySnapshot,
+    FileWriteRecoveryState, FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest,
+    GitStatusRequest, LeaseSnapshot, ObservedFileImage, OpenFileWriteSession,
+    PolicyApprovedDisclosure, PolicyDecisionId, PolicyDecisionStore, PortError, ProcessLauncher,
+    ProcessReceipt, RawGitDiffResult, RawGitStatusResult, RecordedPolicyDecision,
+    RelativePathComponents, ResolvedCapability, RevokeLease, StructuredGit, StructuredToolExecutor,
+    ToolExecutionId, TrustedDisclosureContext, VerifiedBytes, VerifiedFileWriteCompensation,
+    VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     ActorId, ActorLocality, ArtifactId, CapabilityRef, FencingToken, GitObjectId, LeaseClaim,
@@ -648,8 +649,133 @@ fn atomic_complete_failure_restores_and_verifies_the_pre_image() {
     assert_eq!(harness.target(), Some(b"before".to_vec()));
     assert!(harness
         .calls()
-        .ends_with(&["complete", "restore_pre_image_and_verify"]));
+        .ends_with(&["complete", "restore_pre_image_and_verify", "fail"]));
+    assert_eq!(
+        *harness.recovery.state.lock().unwrap(),
+        Some(FileWriteRecoveryState::Compensated)
+    );
+    assert!(harness.recovery.recover().unwrap().is_empty());
     assert!(!harness.recovery.indeterminate.load(Ordering::SeqCst));
+}
+
+#[test]
+fn compensated_write_persistence_failure_recovers_exact_pre_image_without_replaying_effect() {
+    let harness = Harness::new(Some(b"before".to_vec()));
+    harness
+        .recovery
+        .complete_fails
+        .store(true, Ordering::SeqCst);
+    harness.recovery.fail_fails.store(true, Ordering::SeqCst);
+
+    let error = harness
+        .runtime()
+        .file_write(write_request())
+        .expect_err("terminal persistence failure must fail closed");
+
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(harness.target(), Some(b"before".to_vec()));
+    assert_eq!(
+        *harness.recovery.state.lock().unwrap(),
+        Some(FileWriteRecoveryState::Started)
+    );
+    harness.recovery.fail_fails.store(false, Ordering::SeqCst);
+
+    let recovered = harness.runtime().recover_file_writes().unwrap();
+
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        recovered[0].state,
+        FileWriteRecoveryState::RecoveredNoNetEffect
+    );
+    assert!(harness.recovery.recover().unwrap().is_empty());
+    assert_eq!(
+        harness
+            .calls()
+            .iter()
+            .filter(|call| **call == "apply")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn started_recovery_resolves_exact_post_and_marks_unproven_outcomes_indeterminate() {
+    for (current, expected_state, complete_fails) in [
+        (
+            b"replacement".to_vec(),
+            FileWriteRecoveryState::Completed,
+            false,
+        ),
+        (
+            b"replacement".to_vec(),
+            FileWriteRecoveryState::Indeterminate,
+            true,
+        ),
+        (
+            b"unexpected".to_vec(),
+            FileWriteRecoveryState::Indeterminate,
+            false,
+        ),
+    ] {
+        let harness = Harness::new(Some(b"before".to_vec()));
+        harness
+            .recovery
+            .complete_fails
+            .store(true, Ordering::SeqCst);
+        harness.recovery.fail_fails.store(true, Ordering::SeqCst);
+        assert!(harness.runtime().file_write(write_request()).is_err());
+        *harness.sessions.target.bytes.lock().unwrap() = Some(current);
+        harness
+            .recovery
+            .complete_fails
+            .store(complete_fails, Ordering::SeqCst);
+        harness.recovery.fail_fails.store(false, Ordering::SeqCst);
+
+        let recovered = harness.runtime().recover_file_writes().unwrap();
+
+        assert_eq!(recovered[0].state, expected_state);
+        assert_eq!(
+            harness
+                .calls()
+                .iter()
+                .filter(|call| **call == "apply")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn prepared_recovery_becomes_terminal_without_opening_a_write_session() {
+    let harness = Harness::new(Some(b"before".to_vec()));
+    harness
+        .recovery
+        .complete_fails
+        .store(true, Ordering::SeqCst);
+    harness.recovery.fail_fails.store(true, Ordering::SeqCst);
+    assert!(harness.runtime().file_write(write_request()).is_err());
+    *harness.recovery.state.lock().unwrap() = Some(FileWriteRecoveryState::Prepared);
+    harness.recovery.fail_fails.store(false, Ordering::SeqCst);
+    let opens_before = harness
+        .calls()
+        .iter()
+        .filter(|call| **call == "open_session")
+        .count();
+
+    let recovered = harness.runtime().recover_file_writes().unwrap();
+
+    assert_eq!(recovered[0].state, FileWriteRecoveryState::Failed);
+    assert_eq!(
+        harness
+            .calls()
+            .iter()
+            .filter(|call| **call == "open_session")
+            .count(),
+        opens_before
+    );
 }
 
 #[test]
@@ -740,10 +866,16 @@ fn tampered_post_write_evidence_is_compensated_before_completion() {
         local_agent_terminal_application::SafeErrorClassification::IntegrityFailure
     );
     assert_eq!(harness.target(), Some(b"before".to_vec()));
-    assert!(harness
-        .calls()
-        .ends_with(&["capture_post_write", "restore_pre_image_and_verify"]));
+    assert!(harness.calls().ends_with(&[
+        "capture_post_write",
+        "restore_pre_image_and_verify",
+        "fail"
+    ]));
     assert!(!harness.calls().contains(&"complete"));
+    assert_eq!(
+        *harness.recovery.state.lock().unwrap(),
+        Some(FileWriteRecoveryState::Compensated)
+    );
 }
 
 #[test]
@@ -846,8 +978,10 @@ impl Harness {
                 log: log.clone(),
                 intent: Mutex::new(None),
                 complete_fails: AtomicBool::new(false),
+                fail_fails: AtomicBool::new(false),
                 prepare_state_tamper: AtomicBool::new(false),
                 indeterminate: AtomicBool::new(false),
+                state: Mutex::new(None),
             },
             writes: WorkspaceWriteCoordinator::new(),
             disclosure_context,
@@ -1176,6 +1310,20 @@ impl CapabilityFileWriteSessionFactory for SessionFactory {
             compensation_fails: self.compensation_fails.load(Ordering::SeqCst),
         }))
     }
+
+    fn observe_recovery_target(
+        &self,
+        _: &local_agent_terminal_application::FileWriteRecoveryRequest,
+    ) -> Result<ObservedFileImage, PortError> {
+        self.log.push("observe_recovery_target");
+        Ok(self
+            .target
+            .bytes
+            .lock()
+            .unwrap()
+            .clone()
+            .map_or_else(ObservedFileImage::absent, ObservedFileImage::present))
+    }
 }
 
 struct Session {
@@ -1388,8 +1536,10 @@ struct Recovery {
     log: RecordingLog,
     intent: Mutex<Option<FileWriteRecoveryIntent>>,
     complete_fails: AtomicBool,
+    fail_fails: AtomicBool,
     prepare_state_tamper: AtomicBool,
     indeterminate: AtomicBool,
+    state: Mutex<Option<FileWriteRecoveryState>>,
 }
 
 impl FileWriteRecoveryStore for Recovery {
@@ -1404,11 +1554,13 @@ impl FileWriteRecoveryStore for Recovery {
         } else {
             FileWriteRecoveryState::Prepared
         };
+        *self.state.lock().unwrap() = Some(state);
         Ok(snapshot(intent, state))
     }
 
     fn start(&self, _: &ToolExecutionId) -> Result<FileWriteRecoverySnapshot, PortError> {
         self.log.push("start");
+        *self.state.lock().unwrap() = Some(FileWriteRecoveryState::Started);
         Ok(snapshot(
             self.intent.lock().unwrap().clone().unwrap(),
             FileWriteRecoveryState::Started,
@@ -1423,9 +1575,33 @@ impl FileWriteRecoveryStore for Recovery {
         if self.complete_fails.load(Ordering::SeqCst) {
             return Err(conflict());
         }
+        *self.state.lock().unwrap() = Some(FileWriteRecoveryState::Completed);
         Ok(snapshot(
             self.intent.lock().unwrap().clone().unwrap(),
             FileWriteRecoveryState::Completed,
+        ))
+    }
+
+    fn fail(
+        &self,
+        _: &ToolExecutionId,
+        failure: FileWriteRecoveryFailure,
+    ) -> Result<FileWriteRecoverySnapshot, PortError> {
+        self.log.push("fail");
+        if self.fail_fails.load(Ordering::SeqCst) {
+            return Err(conflict());
+        }
+        let state = match failure {
+            FileWriteRecoveryFailure::NotStarted => FileWriteRecoveryState::Failed,
+            FileWriteRecoveryFailure::RecoveredNoNetEffect(_) => {
+                FileWriteRecoveryState::RecoveredNoNetEffect
+            }
+            FileWriteRecoveryFailure::Compensated(_) => FileWriteRecoveryState::Compensated,
+        };
+        *self.state.lock().unwrap() = Some(state);
+        Ok(snapshot(
+            self.intent.lock().unwrap().clone().unwrap(),
+            state,
         ))
     }
 
@@ -1435,6 +1611,7 @@ impl FileWriteRecoveryStore for Recovery {
     ) -> Result<FileWriteRecoverySnapshot, PortError> {
         self.log.push("mark_indeterminate");
         self.indeterminate.store(true, Ordering::SeqCst);
+        *self.state.lock().unwrap() = Some(FileWriteRecoveryState::Indeterminate);
         Ok(snapshot(
             self.intent.lock().unwrap().clone().unwrap(),
             FileWriteRecoveryState::Indeterminate,
@@ -1442,7 +1619,22 @@ impl FileWriteRecoveryStore for Recovery {
     }
 
     fn recover(&self) -> Result<Vec<FileWriteRecoverySnapshot>, PortError> {
-        Ok(Vec::new())
+        let Some(state) = *self.state.lock().unwrap() else {
+            return Ok(Vec::new());
+        };
+        if matches!(
+            state,
+            FileWriteRecoveryState::Prepared
+                | FileWriteRecoveryState::Started
+                | FileWriteRecoveryState::Indeterminate
+        ) {
+            Ok(vec![snapshot(
+                self.intent.lock().unwrap().clone().unwrap(),
+                state,
+            )])
+        } else {
+            Ok(Vec::new())
+        }
     }
 }
 

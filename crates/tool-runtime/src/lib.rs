@@ -9,12 +9,12 @@ use local_agent_terminal_application::{
     CapabilityFileWriteSessionFactory, CapabilityFilesystem, CapabilityResolver, Clock,
     DisclosureChannel, DisclosureContextProvider, DisclosureContextRequest, DisclosureOutcome,
     DisclosurePolicyEvaluator, DisclosureRequest, ExecutorLeaseStore, FileReadRequest,
-    FileWriteEvidenceStore, FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest,
-    GitDiffResult, GitStatusRequest, GitStatusResult, PolicyBoundBytes, PolicyDecisionId,
-    PolicyDecisionStore, PortError, ProcessLauncher, RawGitDiffResult, RawGitStatusResult,
-    RecordedPolicyDecision, Retryability, SafeErrorClassification, StructuredGit,
-    StructuredToolExecutor, ToolExecutionId, ToolExecutionResult, VerifiedBytes, VerifiedWrite,
-    WorkspaceWriteCoordinator,
+    FileWriteEvidenceStore, FileWriteRecoverySnapshot, FileWriteRecoveryStore, FileWriteRequest,
+    GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, PolicyBoundBytes,
+    PolicyDecisionId, PolicyDecisionStore, PortError, ProcessLauncher, RawGitDiffResult,
+    RawGitStatusResult, RecordedPolicyDecision, Retryability, SafeErrorClassification,
+    StructuredGit, StructuredToolExecutor, ToolExecutionId, ToolExecutionResult, VerifiedBytes,
+    VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, PolicyAction, PolicyEffect, PolicyRequest, PolicyResource, TaskId,
@@ -91,6 +91,14 @@ impl<'a> ToolRuntime<'a> {
             self.file_write_recovery,
             self.workspace_writes,
             request,
+        )
+    }
+
+    pub fn recover_file_writes(&self) -> Result<Vec<FileWriteRecoverySnapshot>, PortError> {
+        filesystem::recover(
+            self.file_write_sessions,
+            self.file_write_evidence,
+            self.file_write_recovery,
         )
     }
 

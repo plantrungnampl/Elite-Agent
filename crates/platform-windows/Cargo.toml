@@ -13,8 +13,11 @@ local-agent-terminal-application = { path = "../application" }
 local-agent-terminal-domain = { path = "../domain" }
 sha2 = "0.10"
 windows-sys = { version = "0.61.2", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    "Win32_System_IO",
 ] }
 
 [dev-dependencies]

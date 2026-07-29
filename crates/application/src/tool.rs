@@ -244,6 +244,10 @@ pub trait CapabilityFileWriteSessionFactory: Send + Sync {
         &self,
         request: OpenFileWriteSession,
     ) -> Result<Box<dyn CapabilityFileWriteSession>, PortError>;
+    fn observe_recovery_target(
+        &self,
+        request: &FileWriteRecoveryRequest,
+    ) -> Result<ObservedFileImage, PortError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -568,8 +572,18 @@ pub struct FileWriteRecoveryCompletion {
 pub enum FileWriteRecoveryState {
     Prepared,
     Started,
+    Failed,
+    RecoveredNoNetEffect,
+    Compensated,
     Completed,
     Indeterminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileWriteRecoveryFailure {
+    NotStarted,
+    RecoveredNoNetEffect(VerifiedFileWriteCompensation),
+    Compensated(VerifiedFileWriteCompensation),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -631,6 +645,11 @@ pub trait FileWriteRecoveryStore: Send + Sync {
     fn complete(
         &self,
         completion: FileWriteRecoveryCompletion,
+    ) -> Result<FileWriteRecoverySnapshot, PortError>;
+    fn fail(
+        &self,
+        execution_id: &ToolExecutionId,
+        failure: FileWriteRecoveryFailure,
     ) -> Result<FileWriteRecoverySnapshot, PortError>;
     fn mark_indeterminate(
         &self,

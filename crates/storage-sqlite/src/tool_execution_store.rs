@@ -4,11 +4,11 @@ use std::path::{Component, Path, PathBuf};
 use local_agent_terminal_application::{
     canonical_file_write_recovery_request, parse_file_write_recovery_request,
     ApprovalDigestPayload, CanonicalEvidenceRef, FileWritePreImage, FileWriteRecoveryCompletion,
-    FileWriteRecoveryIntent, FileWriteRecoveryRequest, FileWriteRecoverySnapshot,
-    FileWriteRecoveryState, FileWriteRecoveryStore, NewToolExecution, NewToolIntent,
-    OperationIntentSnapshot, PortError, Retryability, SafeErrorClassification,
+    FileWriteRecoveryFailure, FileWriteRecoveryIntent, FileWriteRecoveryRequest,
+    FileWriteRecoverySnapshot, FileWriteRecoveryState, FileWriteRecoveryStore, NewToolExecution,
+    NewToolIntent, OperationIntentSnapshot, PortError, Retryability, SafeErrorClassification,
     ToolExecutionCompletion, ToolExecutionId, ToolExecutionSnapshot, ToolExecutionStore,
-    WorkspaceMutationRequest,
+    VerifiedFileWriteCompensation, WorkspaceMutationRequest,
 };
 use local_agent_terminal_domain::{
     ArtifactId, PolicyEffect, ProjectId, Sequence, Sha256Digest, TaskId,
@@ -326,6 +326,82 @@ impl FileWriteRecoveryStore for SqliteStore {
         )?;
         transaction.commit().map_err(sqlite_error_to_port)?;
         load_file_write_snapshot(self, &completion.execution_id)
+    }
+
+    fn fail(
+        &self,
+        execution_id: &ToolExecutionId,
+        failure: FileWriteRecoveryFailure,
+    ) -> Result<FileWriteRecoverySnapshot, PortError> {
+        let snapshot = load_file_write_snapshot(self, execution_id)?;
+        let terminal = file_write_failure_transition(&snapshot, &failure)?;
+        if snapshot.state == terminal.state {
+            return Ok(snapshot);
+        }
+        let receipt = json!({
+            "schema": "file-write-terminal.v1",
+            "executionId": execution_id.as_str(),
+            "outcome": terminal.outcome,
+        })
+        .to_string();
+        let error = json!({
+            "classification": terminal.outcome,
+        })
+        .to_string();
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error_to_port)?;
+        let intent_changed = transaction
+            .execute(
+                "UPDATE operation_intents
+                 SET status = ?1, external_receipt_json = ?2, error_json = ?3,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE id = ?4 AND operation_kind = 'file.write' AND status = ?5",
+                params![
+                    terminal.intent_status,
+                    receipt,
+                    error,
+                    execution_id.as_str(),
+                    terminal.expected_intent_status,
+                ],
+            )
+            .map_err(sqlite_error_to_port)?;
+        let execution_changed = transaction
+            .execute(
+                "UPDATE tool_executions
+                 SET status = ?1,
+                     completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE id = ?2 AND tool_name = 'file.write' AND status = ?3",
+                params![
+                    terminal.execution_status,
+                    execution_id.as_str(),
+                    terminal.expected_execution_status,
+                ],
+            )
+            .map_err(sqlite_error_to_port)?;
+        if intent_changed != 1 || execution_changed != 1 {
+            return Err(conflict());
+        }
+        append_tool_event(
+            &transaction,
+            snapshot.request.task_id.as_str(),
+            execution_id.as_str(),
+            "tool.execution.completed",
+            "None",
+            json!({
+                "executionId": execution_id.as_str(),
+                "status": "failed",
+                "outcome": terminal.outcome,
+            }),
+        )?;
+        transaction.commit().map_err(sqlite_error_to_port)?;
+        let terminal_snapshot = load_file_write_snapshot(self, execution_id)?;
+        if terminal_snapshot.state == terminal.state {
+            Ok(terminal_snapshot)
+        } else {
+            Err(integrity_failure())
+        }
     }
 
     fn mark_indeterminate(
@@ -827,6 +903,92 @@ impl ToolExecutionStore for SqliteStore {
     }
 }
 
+struct FileWriteFailureTransition {
+    state: FileWriteRecoveryState,
+    outcome: &'static str,
+    expected_intent_status: &'static str,
+    intent_status: &'static str,
+    expected_execution_status: &'static str,
+    execution_status: &'static str,
+}
+
+fn file_write_failure_transition(
+    snapshot: &FileWriteRecoverySnapshot,
+    failure: &FileWriteRecoveryFailure,
+) -> Result<FileWriteFailureTransition, PortError> {
+    let transition = match failure {
+        FileWriteRecoveryFailure::NotStarted => FileWriteFailureTransition {
+            state: FileWriteRecoveryState::Failed,
+            outcome: "not_started",
+            expected_intent_status: "pending",
+            intent_status: "cancelled",
+            expected_execution_status: "pending",
+            execution_status: "denied",
+        },
+        FileWriteRecoveryFailure::RecoveredNoNetEffect(evidence) => {
+            validate_recovered_pre_image(&snapshot.request, evidence)?;
+            FileWriteFailureTransition {
+                state: FileWriteRecoveryState::RecoveredNoNetEffect,
+                outcome: "recovered_no_net_effect",
+                expected_intent_status: "started",
+                intent_status: "failed",
+                expected_execution_status: "running",
+                execution_status: "failed",
+            }
+        }
+        FileWriteRecoveryFailure::Compensated(evidence) => {
+            validate_recovered_pre_image(&snapshot.request, evidence)?;
+            FileWriteFailureTransition {
+                state: FileWriteRecoveryState::Compensated,
+                outcome: "compensated",
+                expected_intent_status: "started",
+                intent_status: "failed",
+                expected_execution_status: "running",
+                execution_status: "failed",
+            }
+        }
+    };
+    let valid_source = snapshot.state == transition.state
+        || matches!(
+            (&snapshot.state, failure),
+            (
+                FileWriteRecoveryState::Prepared,
+                FileWriteRecoveryFailure::NotStarted
+            ) | (
+                FileWriteRecoveryState::Started,
+                FileWriteRecoveryFailure::RecoveredNoNetEffect(_)
+                    | FileWriteRecoveryFailure::Compensated(_)
+            )
+        );
+    if valid_source {
+        Ok(transition)
+    } else {
+        Err(conflict())
+    }
+}
+
+fn validate_recovered_pre_image(
+    request: &FileWriteRecoveryRequest,
+    evidence: &VerifiedFileWriteCompensation,
+) -> Result<(), PortError> {
+    let matches = match (&request.pre_image, evidence) {
+        (FileWritePreImage::Absent, VerifiedFileWriteCompensation::Absent) => true,
+        (
+            FileWritePreImage::Artifact(pre_image),
+            VerifiedFileWriteCompensation::Restored(restored),
+        ) => {
+            pre_image.content_hash == restored.digest.as_str()
+                && pre_image.size_bytes == restored.size_bytes
+        }
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(integrity_failure())
+    }
+}
+
 #[derive(Debug)]
 struct FileWriteRow {
     task_id: String,
@@ -910,6 +1072,15 @@ fn load_file_write_snapshot(
     let state = match (row.intent_status.as_str(), row.execution_status.as_str()) {
         ("pending", "pending") => FileWriteRecoveryState::Prepared,
         ("started", "running") => FileWriteRecoveryState::Started,
+        ("cancelled", "denied") => {
+            require_file_write_terminal_receipt(&row, "not_started")?;
+            FileWriteRecoveryState::Failed
+        }
+        ("failed", "failed") => match file_write_terminal_outcome(&row)?.as_str() {
+            "compensated" => FileWriteRecoveryState::Compensated,
+            "recovered_no_net_effect" => FileWriteRecoveryState::RecoveredNoNetEffect,
+            _ => return Err(integrity_failure()),
+        },
         ("succeeded", "succeeded") => {
             if row.result_artifact_id.is_none()
                 || row.result_artifact_id != row.stdout_artifact_id
@@ -928,6 +1099,40 @@ fn load_file_write_snapshot(
         request_artifact: artifact.evidence_ref()?,
         state,
     })
+}
+
+fn file_write_terminal_outcome(row: &FileWriteRow) -> Result<String, PortError> {
+    let receipt = row
+        .external_receipt_json
+        .as_deref()
+        .ok_or_else(integrity_failure)?;
+    if row.completed_at.as_deref().is_none_or(str::is_empty)
+        || row.result_artifact_id.is_some()
+        || row.stdout_artifact_id.is_some()
+    {
+        return Err(integrity_failure());
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(receipt).map_err(|_| integrity_failure())?;
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some("file-write-terminal.v1") {
+        return Err(integrity_failure());
+    }
+    value
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(integrity_failure)
+}
+
+fn require_file_write_terminal_receipt(
+    row: &FileWriteRow,
+    expected_outcome: &str,
+) -> Result<(), PortError> {
+    if file_write_terminal_outcome(row)? == expected_outcome {
+        Ok(())
+    } else {
+        Err(integrity_failure())
+    }
 }
 
 fn verify_pre_image_bytes(

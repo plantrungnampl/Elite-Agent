@@ -1,9 +1,7 @@
 use std::fs;
 
 use git2::{Repository, Signature};
-use local_agent_terminal_application::{
-    AuthorizedGitDiff, AuthorizedGitStatus, CapabilityRootIdentity, StructuredGit,
-};
+use local_agent_terminal_application::{AuthorizedGitDiff, AuthorizedGitStatus, StructuredGit};
 use local_agent_terminal_domain::{CapabilityRef, GitObjectId, TaskId};
 use local_agent_terminal_repository_git::{
     GitRepositoryGateway, GitStructuredTools, GitWorktreeRegistration,
@@ -32,7 +30,7 @@ fn scoped_credential_proxy_ssh_and_protocol_configuration_fail_closed() {
             .status(AuthorizedGitStatus {
                 task_id: task(),
                 worktree: worktree(),
-                root_identity: root("worktree-root"),
+                root_identity: tools.root_identity(&task()).unwrap().clone(),
             })
             .unwrap_err();
 
@@ -83,7 +81,7 @@ fn gitlink_lfs_response_nested_repository_and_symlink_modes_fail_closed() {
             .status(AuthorizedGitStatus {
                 task_id: task(),
                 worktree: worktree(),
-                root_identity: root("worktree-root"),
+                root_identity: tools.root_identity(&task()).unwrap().clone(),
             })
             .unwrap_err();
 
@@ -110,7 +108,7 @@ fn mutation_after_initial_capture_is_stopped_at_the_work_bound_before_generation
         .status(AuthorizedGitStatus {
             task_id: task(),
             worktree: worktree(),
-            root_identity: root("worktree-root"),
+            root_identity: tools.root_identity(&task()).unwrap().clone(),
         })
         .unwrap_err();
 
@@ -136,7 +134,7 @@ fn configuration_enumeration_allows_the_boundary_and_denies_one_over() {
         let result = tools.status(AuthorizedGitStatus {
             task_id: task(),
             worktree: worktree(),
-            root_identity: root("worktree-root"),
+            root_identity: tools.root_identity(&task()).unwrap().clone(),
         });
 
         if should_allow {
@@ -192,7 +190,7 @@ fn attributes_at_nested_info_and_committed_scopes_fail_closed() {
             .status(AuthorizedGitStatus {
                 task_id: task(),
                 worktree: worktree(),
-                root_identity: root("worktree-root"),
+                root_identity: tools.root_identity(&task()).unwrap().clone(),
             })
             .unwrap_err();
 
@@ -220,7 +218,7 @@ fn repository_hook_is_rejected_without_executing_the_canary() {
         .status(AuthorizedGitStatus {
             task_id: task(),
             worktree: worktree(),
-            root_identity: root("worktree-root"),
+            root_identity: tools.root_identity(&task()).unwrap().clone(),
         })
         .unwrap_err();
 
@@ -254,7 +252,7 @@ fn textconv_is_rejected_without_executing_the_canary() {
         .diff(AuthorizedGitDiff {
             task_id: task(),
             worktree: worktree(),
-            root_identity: root("worktree-root"),
+            root_identity: tools.root_identity(&task()).unwrap().clone(),
         })
         .unwrap_err();
 
@@ -280,8 +278,7 @@ fn coherent_snapshot_fails_closed_for_head_index_or_worktree_mutation() {
         let locator = gateway.locate(fixture.path()).unwrap();
         let head = GitObjectId::new(first_locator_head(fixture.path()).to_string()).unwrap();
         let repository_path = fixture.path().to_owned();
-        let tools = GitStructuredTools::new(vec![GitWorktreeRegistration::new(
-            root("worktree-root"),
+        let tools = GitStructuredTools::new(vec![GitWorktreeRegistration::validate(
             task(),
             locator,
             head,
@@ -294,7 +291,7 @@ fn coherent_snapshot_fails_closed_for_head_index_or_worktree_mutation() {
             .status(AuthorizedGitStatus {
                 task_id: task(),
                 worktree: worktree(),
-                root_identity: root("worktree-root"),
+                root_identity: tools.root_identity(&task()).unwrap().clone(),
             })
             .unwrap_err();
 
@@ -316,24 +313,19 @@ fn registered_root_task_and_locator_binding_cannot_be_cross_paired() {
     let second_locator = gateway.locate(second.path()).unwrap();
     let first_head = GitObjectId::new(first_locator_head(first.path()).to_string()).unwrap();
     let second_head = GitObjectId::new(first_locator_head(second.path()).to_string()).unwrap();
-    let tools = GitStructuredTools::new(vec![
-        GitWorktreeRegistration::new(root("first-root"), task(), first_locator, first_head)
-            .unwrap(),
-        GitWorktreeRegistration::new(
-            root("second-root"),
-            TaskId::new("task-2").unwrap(),
-            second_locator,
-            second_head,
-        )
-        .unwrap(),
-    ])
-    .unwrap();
+    let second_task = TaskId::new("task-2").unwrap();
+    let first_registration =
+        GitWorktreeRegistration::validate(task(), first_locator, first_head).unwrap();
+    let second_registration =
+        GitWorktreeRegistration::validate(second_task, second_locator, second_head).unwrap();
+    let second_root = second_registration.root_identity().clone();
+    let tools = GitStructuredTools::new(vec![first_registration, second_registration]).unwrap();
 
     let error = tools
         .status(AuthorizedGitStatus {
             task_id: task(),
             worktree: worktree(),
-            root_identity: root("second-root"),
+            root_identity: second_root,
         })
         .unwrap_err();
 
@@ -341,6 +333,87 @@ fn registered_root_task_and_locator_binding_cannot_be_cross_paired() {
         error.safe_classification(),
         local_agent_terminal_application::SafeErrorClassification::PermissionDenied
     );
+}
+
+#[test]
+fn validated_registration_derives_root_from_task_repository_and_revision() {
+    let first = initialized_repository("first");
+    let second = initialized_repository("second");
+    let managed = TempDir::new().unwrap();
+    let gateway = GitRepositoryGateway::open(managed.path(), &[]).unwrap();
+    let first_locator = gateway.locate(first.path()).unwrap();
+    let second_locator = gateway.locate(second.path()).unwrap();
+    let first_head = GitObjectId::new(first_locator_head(first.path()).to_string()).unwrap();
+    let second_head = GitObjectId::new(first_locator_head(second.path()).to_string()).unwrap();
+
+    let first_registration =
+        GitWorktreeRegistration::validate(task(), first_locator, first_head).unwrap();
+    let second_registration = GitWorktreeRegistration::validate(
+        TaskId::new("task-2").unwrap(),
+        second_locator,
+        second_head,
+    )
+    .unwrap();
+
+    assert_ne!(
+        first_registration.root_identity(),
+        second_registration.root_identity()
+    );
+    let first_root = first_registration.root_identity().clone();
+    let tools = GitStructuredTools::new(vec![first_registration, second_registration]).unwrap();
+    let result = tools
+        .status(AuthorizedGitStatus {
+            task_id: task(),
+            worktree: worktree(),
+            root_identity: first_root,
+        })
+        .unwrap();
+    assert_eq!(result.path_scope, worktree());
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn canonical_worktree_rebind_is_rejected_before_git_bytes_are_generated() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let parent = TempDir::new().unwrap();
+    let first_path = parent.path().join("first");
+    let second_path = parent.path().join("second");
+    fs::create_dir(&first_path).unwrap();
+    fs::create_dir(&second_path).unwrap();
+    initialize_repository_at(&first_path, "first");
+    initialize_repository_at(&second_path, "second");
+    let managed = TempDir::new().unwrap();
+    let gateway = GitRepositoryGateway::open(managed.path(), &[]).unwrap();
+    let locator = gateway.locate(&first_path).unwrap();
+    let head = GitObjectId::new(first_locator_head(&first_path).to_string()).unwrap();
+    let registration = GitWorktreeRegistration::validate(task(), locator, head).unwrap();
+    let root_identity = registration.root_identity().clone();
+    let generation_count = Arc::new(AtomicUsize::new(0));
+    let observed_generation_count = generation_count.clone();
+    let tools = GitStructuredTools::new(vec![registration])
+        .unwrap()
+        .with_before_generation_hook_for_test(move || {
+            observed_generation_count.fetch_add(1, Ordering::SeqCst);
+        });
+    let displaced = parent.path().join("displaced");
+    fs::rename(&first_path, &displaced).unwrap();
+    fs::rename(&second_path, &first_path).unwrap();
+
+    let error = tools
+        .status(AuthorizedGitStatus {
+            task_id: task(),
+            worktree: worktree(),
+            root_identity,
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::PermissionDenied
+    );
+    assert_eq!(generation_count.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -372,8 +445,7 @@ fn status_and_diff_are_in_process_and_fail_closed_for_hostile_configuration() {
     let managed = fixture.path().join("managed");
     fs::create_dir(&managed).unwrap();
     let gateway = GitRepositoryGateway::open(&managed, &[]).unwrap();
-    let tools = GitStructuredTools::new(vec![GitWorktreeRegistration::new(
-        root("worktree-root"),
+    let tools = GitStructuredTools::new(vec![GitWorktreeRegistration::validate(
         task(),
         gateway.locate(fixture.path()).unwrap(),
         GitObjectId::new(commit.to_string()).unwrap(),
@@ -385,14 +457,14 @@ fn status_and_diff_are_in_process_and_fail_closed_for_hostile_configuration() {
             .status(AuthorizedGitStatus {
                 task_id: task(),
                 worktree: worktree(),
-                root_identity: root("worktree-root"),
+                root_identity: tools.root_identity(&task()).unwrap().clone(),
             })
             .map(|_| ()),
         tools
             .diff(AuthorizedGitDiff {
                 task_id: task(),
                 worktree: worktree(),
-                root_identity: root("worktree-root"),
+                root_identity: tools.root_identity(&task()).unwrap().clone(),
             })
             .map(|_| ()),
     ] {
@@ -429,8 +501,7 @@ fn status_binds_the_repository_revision_and_scope() {
     fs::create_dir(&managed).unwrap();
     let gateway = GitRepositoryGateway::open(&managed, &[]).unwrap();
     let locator = gateway.locate(fixture.path()).unwrap();
-    let tools = GitStructuredTools::new(vec![GitWorktreeRegistration::new(
-        root("worktree-root"),
+    let tools = GitStructuredTools::new(vec![GitWorktreeRegistration::validate(
         task(),
         locator.clone(),
         GitObjectId::new(commit.to_string()).unwrap(),
@@ -442,7 +513,7 @@ fn status_binds_the_repository_revision_and_scope() {
         .status(AuthorizedGitStatus {
             task_id: task(),
             worktree: worktree(),
-            root_identity: root("worktree-root"),
+            root_identity: tools.root_identity(&task()).unwrap().clone(),
         })
         .unwrap();
 
@@ -464,14 +535,15 @@ fn worktree() -> CapabilityRef {
     CapabilityRef::worktree(task(), ".").unwrap()
 }
 
-fn root(value: &str) -> CapabilityRootIdentity {
-    CapabilityRootIdentity::new(value).unwrap()
-}
-
 fn initialized_repository(contents: &str) -> TempDir {
     let fixture = TempDir::new().unwrap();
-    let repository = Repository::init(fixture.path()).unwrap();
-    fs::write(fixture.path().join("README.md"), contents).unwrap();
+    initialize_repository_at(fixture.path(), contents);
+    fixture
+}
+
+fn initialize_repository_at(path: &std::path::Path, contents: &str) {
+    let repository = Repository::init(path).unwrap();
+    fs::write(path.join("README.md"), contents).unwrap();
     let mut index = repository.index().unwrap();
     index.add_path(std::path::Path::new("README.md")).unwrap();
     index.write().unwrap();
@@ -488,7 +560,6 @@ fn initialized_repository(contents: &str) -> TempDir {
         )
         .unwrap();
     drop(repository);
-    fixture
 }
 
 fn commit_all(repository: &Repository, message: &str) -> git2::Oid {
@@ -552,8 +623,7 @@ fn structured_tools(fixture: &TempDir) -> GitStructuredTools {
     let gateway = GitRepositoryGateway::open(managed.path(), &[]).unwrap();
     let locator = gateway.locate(fixture.path()).unwrap();
     let head = GitObjectId::new(first_locator_head(fixture.path()).to_string()).unwrap();
-    GitStructuredTools::new(vec![GitWorktreeRegistration::new(
-        root("worktree-root"),
+    GitStructuredTools::new(vec![GitWorktreeRegistration::validate(
         task(),
         locator,
         head,

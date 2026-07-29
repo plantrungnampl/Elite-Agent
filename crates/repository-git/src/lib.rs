@@ -18,6 +18,7 @@ use local_agent_terminal_application::{
     WorktreeSnapshot,
 };
 use local_agent_terminal_domain::{GitObjectId, TaskId};
+use sha2::{Digest, Sha256};
 
 pub struct GitStructuredTools {
     registrations: Vec<GitWorktreeRegistration>,
@@ -32,6 +33,7 @@ pub struct GitWorktreeRegistration {
     task_id: TaskId,
     locator: RepositoryLocator,
     revision: GitObjectId,
+    worktree_identity: Vec<u8>,
 }
 
 impl GitStructuredTools {
@@ -51,6 +53,9 @@ impl GitStructuredTools {
         {
             return Err(paths::invalid());
         }
+        for registration in &registrations {
+            registration.verify_current()?;
+        }
         Ok(Self {
             registrations,
             #[cfg(feature = "test-seams")]
@@ -58,6 +63,13 @@ impl GitStructuredTools {
             #[cfg(feature = "test-seams")]
             before_generation_hook: None,
         })
+    }
+
+    pub fn root_identity(&self, task_id: &TaskId) -> Option<&CapabilityRootIdentity> {
+        self.registrations
+            .iter()
+            .find(|registration| &registration.task_id == task_id)
+            .map(|registration| &registration.root_identity)
     }
 
     #[cfg(feature = "test-seams")]
@@ -77,19 +89,72 @@ impl GitStructuredTools {
 }
 
 impl GitWorktreeRegistration {
-    pub fn new(
-        root_identity: CapabilityRootIdentity,
+    pub fn validate(
         task_id: TaskId,
         locator: RepositoryLocator,
         revision: GitObjectId,
     ) -> Result<Self, PortError> {
+        let (repository, _) = paths::open_for_locator(&locator)?;
+        tools::verify_revision(&repository, &revision)?;
+        let worktree_identity = paths::directory_binding_identity(&locator.canonical_workdir)?;
+        let root_identity =
+            derive_worktree_root(&task_id, &locator, &revision, &worktree_identity)?;
         Ok(Self {
             root_identity,
             task_id,
             locator,
             revision,
+            worktree_identity,
         })
     }
+
+    pub const fn root_identity(&self) -> &CapabilityRootIdentity {
+        &self.root_identity
+    }
+
+    fn verify_current(&self) -> Result<(), PortError> {
+        let (repository, _) = paths::open_for_locator(&self.locator)?;
+        self.verify_opened(&repository)
+    }
+
+    fn verify_opened(&self, repository: &git2::Repository) -> Result<(), PortError> {
+        tools::verify_revision(repository, &self.revision)?;
+        let current_identity = paths::directory_binding_identity(&self.locator.canonical_workdir)?;
+        let expected_root = derive_worktree_root(
+            &self.task_id,
+            &self.locator,
+            &self.revision,
+            &current_identity,
+        )?;
+        if current_identity != self.worktree_identity || expected_root != self.root_identity {
+            return Err(paths::conflict());
+        }
+        Ok(())
+    }
+}
+
+fn derive_worktree_root(
+    task_id: &TaskId,
+    locator: &RepositoryLocator,
+    revision: &GitObjectId,
+    worktree_identity: &[u8],
+) -> Result<CapabilityRootIdentity, PortError> {
+    let mut hasher = Sha256::new();
+    for part in [
+        task_id.as_str().as_bytes(),
+        locator.repository_id.as_str().as_bytes(),
+        locator.stable_identity.as_bytes(),
+        revision.as_str().as_bytes(),
+        worktree_identity,
+    ] {
+        hasher.update(
+            u64::try_from(part.len())
+                .map_err(|_| paths::invalid())?
+                .to_le_bytes(),
+        );
+        hasher.update(part);
+    }
+    CapabilityRootIdentity::new(format!("git-root-{:x}", hasher.finalize()))
 }
 
 pub struct GitRepositoryGateway {

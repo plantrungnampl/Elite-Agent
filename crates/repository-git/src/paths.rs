@@ -279,6 +279,28 @@ impl DirectoryGuard {
         Ok(())
     }
 
+    pub(crate) fn binding_identity(&self) -> Result<Vec<u8>, PortError> {
+        #[cfg(windows)]
+        {
+            Ok(self.identity.binding_bytes().to_vec())
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = self.handle.metadata().map_err(|_| permission())?;
+            let mut identity = Vec::with_capacity(16);
+            identity.extend_from_slice(&metadata.dev().to_le_bytes());
+            identity.extend_from_slice(&metadata.ino().to_le_bytes());
+            Ok(identity)
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            Err(PortError::unavailable(
+                "stable directory identity is unavailable on this platform",
+            ))
+        }
+    }
+
     pub(crate) fn rename_to(
         &mut self,
         parent: &Self,
@@ -304,6 +326,12 @@ impl DirectoryGuard {
         fs::remove_dir_all(&self.path).map_err(|_| conflict())?;
         Ok(())
     }
+}
+
+pub(crate) fn directory_binding_identity(path: &Path) -> Result<Vec<u8>, PortError> {
+    let guard = DirectoryGuard::open(path)?;
+    guard.verify()?;
+    guard.binding_identity()
 }
 
 fn child_leaf<'a>(parent: &DirectoryGuard, path: &'a Path) -> Result<&'a OsStr, PortError> {

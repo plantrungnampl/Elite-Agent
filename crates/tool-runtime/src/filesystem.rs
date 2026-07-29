@@ -3,9 +3,9 @@ use local_agent_terminal_application::{
     CapabilityFileWriteSessionFactory, CapabilityFilesystem, CapabilityResolver,
     CaptureFileWritePostEvidence, CaptureFileWritePreEvidence, ExecutorLeaseStore, FileReadRequest,
     FileWriteEvidenceStore, FileWritePolicyBinding, FileWritePostExpectation, FileWritePreImage,
-    FileWriteRecoveryCompletion, FileWriteRecoveryIntent, FileWriteRecoverySnapshot,
-    FileWriteRecoveryState, FileWriteRecoveryStore, FileWriteRequest, ObservedFileImage,
-    OpenFileWriteSession, PortError, ResolvedCapabilityTarget, Retryability,
+    FileWriteRecoveryCompletion, FileWriteRecoveryFailure, FileWriteRecoveryIntent,
+    FileWriteRecoverySnapshot, FileWriteRecoveryState, FileWriteRecoveryStore, FileWriteRequest,
+    ObservedFileImage, OpenFileWriteSession, PortError, ResolvedCapabilityTarget, Retryability,
     SafeErrorClassification, VerifiedBytes, VerifiedFileWriteCompensation, VerifiedWrite,
     WorkspaceWriteCoordinator,
 };
@@ -114,6 +114,119 @@ pub(crate) fn write(
     effect_result.map_err(|error| {
         compensate_after_effect(session.as_mut(), recovery, &intent, &pre_image, error)
     })
+}
+
+pub(crate) fn recover(
+    sessions: &dyn CapabilityFileWriteSessionFactory,
+    evidence: &dyn FileWriteEvidenceStore,
+    recovery: &dyn FileWriteRecoveryStore,
+) -> Result<Vec<FileWriteRecoverySnapshot>, PortError> {
+    recovery
+        .recover()?
+        .into_iter()
+        .map(|snapshot| match snapshot.state {
+            FileWriteRecoveryState::Prepared => {
+                let terminal = recovery.fail(
+                    &snapshot.request.execution_id,
+                    FileWriteRecoveryFailure::NotStarted,
+                )?;
+                validate_recovery_transition(&snapshot, &terminal, FileWriteRecoveryState::Failed)?;
+                Ok(terminal)
+            }
+            FileWriteRecoveryState::Started => {
+                recover_started_write(sessions, evidence, recovery, &snapshot)
+            }
+            FileWriteRecoveryState::Indeterminate
+            | FileWriteRecoveryState::Failed
+            | FileWriteRecoveryState::RecoveredNoNetEffect
+            | FileWriteRecoveryState::Compensated
+            | FileWriteRecoveryState::Completed => Ok(snapshot),
+        })
+        .collect()
+}
+
+fn recover_started_write(
+    sessions: &dyn CapabilityFileWriteSessionFactory,
+    evidence: &dyn FileWriteEvidenceStore,
+    recovery: &dyn FileWriteRecoveryStore,
+    snapshot: &FileWriteRecoverySnapshot,
+) -> Result<FileWriteRecoverySnapshot, PortError> {
+    let observed = match sessions.observe_recovery_target(&snapshot.request) {
+        Ok(observed) => observed,
+        Err(_) => return mark_recovery_indeterminate(recovery, snapshot),
+    };
+    if pre_image_matches(&snapshot.request, &observed) {
+        let terminal = recovery.fail(
+            &snapshot.request.execution_id,
+            FileWriteRecoveryFailure::RecoveredNoNetEffect(compensation_evidence(&observed)),
+        )?;
+        validate_recovery_transition(
+            snapshot,
+            &terminal,
+            FileWriteRecoveryState::RecoveredNoNetEffect,
+        )?;
+        return Ok(terminal);
+    }
+    let Some(post_image) = observed.present_bytes() else {
+        return mark_recovery_indeterminate(recovery, snapshot);
+    };
+    if post_image.digest != snapshot.request.expected_post_digest
+        || u64::try_from(post_image.bytes.len()).ok() != Some(snapshot.request.expected_post_size)
+    {
+        return mark_recovery_indeterminate(recovery, snapshot);
+    }
+    let verified = VerifiedWrite {
+        digest: post_image.digest.clone(),
+        size_bytes: snapshot.request.expected_post_size,
+    };
+    let completion = CaptureFileWritePostEvidence::new(snapshot.request.clone(), verified)
+        .and_then(|capture| evidence.capture_post_write(capture));
+    let completed = completion.and_then(|completion| recovery.complete(completion));
+    match completed {
+        Ok(completed) => {
+            validate_recovery_transition(snapshot, &completed, FileWriteRecoveryState::Completed)?;
+            Ok(completed)
+        }
+        Err(_) => mark_recovery_indeterminate(recovery, snapshot),
+    }
+}
+
+fn mark_recovery_indeterminate(
+    recovery: &dyn FileWriteRecoveryStore,
+    snapshot: &FileWriteRecoverySnapshot,
+) -> Result<FileWriteRecoverySnapshot, PortError> {
+    let indeterminate = recovery.mark_indeterminate(&snapshot.request.execution_id)?;
+    validate_recovery_transition(
+        snapshot,
+        &indeterminate,
+        FileWriteRecoveryState::Indeterminate,
+    )?;
+    Ok(indeterminate)
+}
+
+fn compensation_evidence(observed: &ObservedFileImage) -> VerifiedFileWriteCompensation {
+    observed
+        .present_bytes()
+        .map_or(VerifiedFileWriteCompensation::Absent, |observed| {
+            VerifiedFileWriteCompensation::Restored(VerifiedWrite {
+                digest: observed.digest.clone(),
+                size_bytes: observed.bytes.len() as u64,
+            })
+        })
+}
+
+fn validate_recovery_transition(
+    before: &FileWriteRecoverySnapshot,
+    after: &FileWriteRecoverySnapshot,
+    expected_state: FileWriteRecoveryState,
+) -> Result<(), PortError> {
+    if after.request != before.request
+        || after.request_artifact != before.request_artifact
+        || after.state != expected_state
+    {
+        return Err(integrity_failure());
+    }
+    Ok(())
 }
 
 fn digest(bytes: &[u8]) -> local_agent_terminal_domain::Sha256Digest {
@@ -240,11 +353,25 @@ fn compensate_after_effect(
     original_error: PortError,
 ) -> PortError {
     let compensation = session.restore_pre_image_and_verify();
-    if compensation
-        .as_ref()
-        .is_ok_and(|result| compensation_matches(pre_image, result))
-    {
-        return original_error;
+    if let Ok(compensation) = compensation {
+        if compensation_matches(pre_image, &compensation) {
+            return match recovery.fail(
+                &intent.request.execution_id,
+                FileWriteRecoveryFailure::Compensated(compensation),
+            ) {
+                Ok(snapshot)
+                    if validate_snapshot(
+                        &snapshot,
+                        intent,
+                        FileWriteRecoveryState::Compensated,
+                    )
+                    .is_ok() =>
+                {
+                    original_error
+                }
+                Ok(_) | Err(_) => integrity_failure(),
+            };
+        }
     }
 
     let mark_result = recovery

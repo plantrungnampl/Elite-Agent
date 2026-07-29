@@ -203,6 +203,15 @@ pub(crate) mod windows_directory {
         file_id: [u8; 16],
     }
 
+    impl DirectoryIdentity {
+        pub(crate) fn binding_bytes(self) -> [u8; 24] {
+            let mut bytes = [0_u8; 24];
+            bytes[..8].copy_from_slice(&self.volume.to_le_bytes());
+            bytes[8..].copy_from_slice(&self.file_id);
+            bytes
+        }
+    }
+
     pub(crate) fn create(parent: &File, leaf: &OsStr) -> Result<File, PortError> {
         open_relative(parent, leaf, FILE_CREATE, false, FILE_DIRECTORY_FILE)
     }

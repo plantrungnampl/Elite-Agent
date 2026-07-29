@@ -7,10 +7,11 @@ use local_agent_terminal_application::{
     canonical_approval_payload, canonical_file_write_recovery_request, parse_approval_payload,
     ApprovalClaim, ApprovalDigestPayload, ApprovalId, ApprovalResolution, ApprovalStore,
     CanonicalEvidenceRef, CapabilityRootIdentity, FileWritePolicyBinding, FileWritePreImage,
-    FileWriteRecoveryCompletion, FileWriteRecoveryIntent, FileWriteRecoveryRequest,
-    FileWriteRecoveryState, FileWriteRecoveryStore, NewApproval, NewToolExecution, NewToolIntent,
-    ProcessReceipt, RelativePathComponents, ToolExecutionCompletion, ToolExecutionId,
-    ToolExecutionStore, ToolRequestBindingDigest,
+    FileWriteRecoveryCompletion, FileWriteRecoveryFailure, FileWriteRecoveryIntent,
+    FileWriteRecoveryRequest, FileWriteRecoveryState, FileWriteRecoveryStore, NewApproval,
+    NewToolExecution, NewToolIntent, ProcessReceipt, RelativePathComponents,
+    ToolExecutionCompletion, ToolExecutionId, ToolExecutionStore, ToolRequestBindingDigest,
+    VerifiedFileWriteCompensation, VerifiedWrite,
 };
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, FencingToken, GitObjectId, LeaseClaim, PolicyEffect, ProjectId, RunId,
@@ -332,6 +333,115 @@ fn file_write_recovery_lifecycle_completes_with_workspace_mutation_atomically() 
             1,
         )
     );
+}
+
+#[test]
+fn verified_compensation_is_idempotently_terminal_across_restart() {
+    let database = TempDatabase::new();
+    let store = SqliteStore::open(&database.path).unwrap();
+    let (intent, _) = file_write_recovery(&database, "file-write-compensated");
+    let execution_id = intent.request.execution_id.clone();
+    let compensation = FileWriteRecoveryFailure::Compensated(
+        VerifiedFileWriteCompensation::Restored(VerifiedWrite {
+            digest: digest_bytes(b"old contents"),
+            size_bytes: b"old contents".len() as u64,
+        }),
+    );
+    store.prepare(intent).unwrap();
+    store.start(&execution_id).unwrap();
+
+    let terminal = store.fail(&execution_id, compensation.clone()).unwrap();
+
+    assert_eq!(terminal.state, FileWriteRecoveryState::Compensated);
+    assert_eq!(store.fail(&execution_id, compensation).unwrap(), terminal);
+    assert!(store.recover().unwrap().is_empty());
+    drop(store);
+
+    let reopened = SqliteStore::open(&database.path).unwrap();
+    assert!(reopened.recover().unwrap().is_empty());
+    let connection = configured_connection(&database.path);
+    let durable: (String, String, String, i64, String) = connection
+        .query_row(
+            "SELECT oi.status, te.status, oi.external_receipt_json,
+                    (SELECT COUNT(*) FROM events
+                     WHERE stream_id = 'task-1'
+                       AND event_type = 'tool.execution.completed'),
+                    (SELECT operation_state FROM tasks WHERE id = 'task-1')
+             FROM operation_intents oi
+             JOIN tool_executions te ON te.operation_intent_id = oi.id
+             WHERE oi.id = 'file-write-compensated'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(durable.0, "failed");
+    assert_eq!(durable.1, "failed");
+    assert_eq!(durable.3, 1);
+    assert_eq!(durable.4, "None");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&durable.2).unwrap(),
+        serde_json::json!({
+            "executionId": "file-write-compensated",
+            "outcome": "compensated",
+            "schema": "file-write-terminal.v1",
+        })
+    );
+}
+
+#[test]
+fn compensation_terminal_transaction_faults_leave_started_recoverable() {
+    let triggers = [
+        "CREATE TRIGGER injected BEFORE UPDATE ON operation_intents
+         WHEN NEW.status = 'failed'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE UPDATE ON tool_executions
+         WHEN NEW.status = 'failed'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE INSERT ON events
+         WHEN NEW.event_type = 'tool.execution.completed'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE UPDATE ON tasks
+         WHEN NEW.operation_state = 'None'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+    ];
+    for trigger in triggers {
+        let database = TempDatabase::new();
+        let store = SqliteStore::open(&database.path).unwrap();
+        let (intent, _) = file_write_recovery(&database, "file-write-compensation-fault");
+        let execution_id = intent.request.execution_id.clone();
+        store.prepare(intent).unwrap();
+        store.start(&execution_id).unwrap();
+        configured_connection(&database.path)
+            .execute_batch(trigger)
+            .unwrap();
+        let compensation = FileWriteRecoveryFailure::Compensated(
+            VerifiedFileWriteCompensation::Restored(VerifiedWrite {
+                digest: digest_bytes(b"old contents"),
+                size_bytes: b"old contents".len() as u64,
+            }),
+        );
+
+        assert!(
+            store.fail(&execution_id, compensation).is_err(),
+            "{trigger}"
+        );
+
+        let recoverable = store.recover().unwrap();
+        assert_eq!(recoverable.len(), 1, "{trigger}");
+        assert_eq!(
+            recoverable[0].state,
+            FileWriteRecoveryState::Started,
+            "{trigger}"
+        );
+    }
 }
 
 #[test]
@@ -1539,6 +1649,10 @@ fn workspace_fingerprint(
 
 fn digest_char(character: char) -> Sha256Digest {
     Sha256Digest::new(format!("sha256:{}", character.to_string().repeat(64))).unwrap()
+}
+
+fn digest_bytes(bytes: &[u8]) -> Sha256Digest {
+    Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
 }
 
 fn persist_output_artifact(database: &TempDatabase, bytes: &[u8]) -> Sha256Digest {

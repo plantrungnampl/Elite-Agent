@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(feature = "test-seams")]
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::process::Command;
 
@@ -20,6 +22,12 @@ use local_agent_terminal_domain::{
 use local_agent_terminal_platform_windows::{CapabilityRegistration, WindowsCapabilityAdapter};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+#[cfg(feature = "test-seams")]
+use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(feature = "test-seams")]
+use windows_sys::Win32::Storage::FileSystem::{
+    FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+};
 
 const MAX_READ_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 4_096;
@@ -1258,6 +1266,178 @@ fn post_rename_target_replacement_fails_exact_post_image_verification() {
     );
 }
 
+#[test]
+#[cfg(feature = "test-seams")]
+fn last_moment_present_apply_race_preserves_attacker_and_preimage() {
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("sentinel.txt"), b"outside").unwrap();
+    let root_dir = TempDir::new().unwrap();
+    let target = root_dir.path().join("target.txt");
+    let displaced = root_dir.path().join("displaced-preimage.txt");
+    let attacker_path = root_dir.path().join("attacker.bin");
+    fs::write(&target, b"preimage").unwrap();
+    fs::write(&attacker_path, b"attacker").unwrap();
+    let mut preimage_handle = fs::File::open(&target).unwrap();
+    let attacker_handle = fs::File::open(&attacker_path).unwrap();
+    let (adapter, request) = write_adapter_and_request(&root_dir, "present-apply-race");
+    let mut session = adapter
+        .open_write_session_with_pre_operation_hook(
+            request,
+            Box::new({
+                let target = target.clone();
+                move || {
+                    fs::rename(&target, displaced)?;
+                    fs::rename(attacker_path, target)
+                }
+            }),
+        )
+        .unwrap();
+
+    let error = session.apply(b"applied").unwrap_err();
+
+    assert_non_disclosing(error);
+    assert_eq!(
+        file_identity(&fs::File::open(&target).unwrap()),
+        file_identity(&attacker_handle)
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"attacker");
+    assert_handle_bytes(&mut preimage_handle, b"preimage");
+    assert_eq!(
+        fs::read(outside.path().join("sentinel.txt")).unwrap(),
+        b"outside"
+    );
+    assert_preserved_backup(root_dir.path(), &preimage_handle, b"preimage");
+    assert_no_staged_file(root_dir.path());
+}
+
+#[test]
+#[cfg(feature = "test-seams")]
+fn last_moment_absent_apply_race_preserves_attacker() {
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("sentinel.txt"), b"outside").unwrap();
+    let root_dir = TempDir::new().unwrap();
+    let target = root_dir.path().join("target.txt");
+    let attacker_path = root_dir.path().join("attacker.bin");
+    fs::write(&attacker_path, b"attacker").unwrap();
+    let attacker_handle = fs::File::open(&attacker_path).unwrap();
+    let (adapter, request) = write_adapter_and_request(&root_dir, "absent-apply-race");
+    let mut session = adapter
+        .open_write_session_with_pre_operation_hook(
+            request,
+            Box::new({
+                let target = target.clone();
+                move || fs::rename(attacker_path, target)
+            }),
+        )
+        .unwrap();
+
+    let error = session.apply(b"applied").unwrap_err();
+
+    assert_non_disclosing(error);
+    assert_eq!(
+        file_identity(&fs::File::open(&target).unwrap()),
+        file_identity(&attacker_handle)
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"attacker");
+    assert_eq!(
+        fs::read(outside.path().join("sentinel.txt")).unwrap(),
+        b"outside"
+    );
+    assert_no_staged_file(root_dir.path());
+}
+
+#[test]
+#[cfg(feature = "test-seams")]
+fn last_moment_present_compensation_race_preserves_attacker_and_both_images() {
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("sentinel.txt"), b"outside").unwrap();
+    let root_dir = TempDir::new().unwrap();
+    let target = root_dir.path().join("target.txt");
+    let displaced = root_dir.path().join("displaced-applied.txt");
+    fs::write(&target, b"preimage").unwrap();
+    let mut preimage_handle = fs::File::open(&target).unwrap();
+    let (adapter, request) = write_adapter_and_request(&root_dir, "present-compensation-race");
+    let attacker_path = root_dir.path().join("attacker.bin");
+    let hook_attacker_path = attacker_path.clone();
+    let mut session = adapter
+        .open_write_session_with_compensation_pre_operation_hook(
+            request,
+            Box::new({
+                let target = target.clone();
+                move || {
+                    fs::rename(&target, displaced)?;
+                    fs::rename(hook_attacker_path, target)
+                }
+            }),
+        )
+        .unwrap();
+    session.apply(b"applied").unwrap();
+    let mut applied_handle = fs::File::open(&target).unwrap();
+    fs::write(&attacker_path, b"attacker").unwrap();
+    let attacker_handle = fs::File::open(&attacker_path).unwrap();
+
+    let error = session.restore_pre_image_and_verify().unwrap_err();
+
+    assert_non_disclosing(error);
+    assert_eq!(
+        file_identity(&fs::File::open(&target).unwrap()),
+        file_identity(&attacker_handle)
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"attacker");
+    assert_handle_bytes(&mut preimage_handle, b"preimage");
+    assert_handle_bytes(&mut applied_handle, b"applied");
+    assert_eq!(
+        fs::read(outside.path().join("sentinel.txt")).unwrap(),
+        b"outside"
+    );
+    assert_preserved_backup(root_dir.path(), &applied_handle, b"applied");
+    assert_no_staged_file(root_dir.path());
+}
+
+#[test]
+#[cfg(feature = "test-seams")]
+fn last_moment_absent_compensation_race_preserves_attacker() {
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("sentinel.txt"), b"outside").unwrap();
+    let root_dir = TempDir::new().unwrap();
+    let target = root_dir.path().join("target.txt");
+    let displaced = root_dir.path().join("displaced-applied.txt");
+    let (adapter, request) = write_adapter_and_request(&root_dir, "absent-compensation-race");
+    let attacker_path = root_dir.path().join("attacker.bin");
+    let hook_attacker_path = attacker_path.clone();
+    let mut session = adapter
+        .open_write_session_with_compensation_pre_operation_hook(
+            request,
+            Box::new({
+                let target = target.clone();
+                move || {
+                    fs::rename(&target, displaced)?;
+                    fs::rename(hook_attacker_path, target)
+                }
+            }),
+        )
+        .unwrap();
+    session.apply(b"applied").unwrap();
+    let mut applied_handle = fs::File::open(&target).unwrap();
+    fs::write(&attacker_path, b"attacker").unwrap();
+    let attacker_handle = fs::File::open(&attacker_path).unwrap();
+
+    let error = session.restore_pre_image_and_verify().unwrap_err();
+
+    assert_non_disclosing(error);
+    assert_eq!(
+        file_identity(&fs::File::open(&target).unwrap()),
+        file_identity(&attacker_handle)
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"attacker");
+    assert_handle_bytes(&mut applied_handle, b"applied");
+    assert_eq!(
+        fs::read(outside.path().join("sentinel.txt")).unwrap(),
+        b"outside"
+    );
+    assert_no_staged_file(root_dir.path());
+}
+
 fn resolve_and_read(
     adapter: &WindowsCapabilityAdapter,
     task_id: &TaskId,
@@ -1306,6 +1486,82 @@ fn directory_names(path: &Path) -> Vec<String> {
         .collect::<Vec<_>>();
     names.sort();
     names
+}
+
+#[cfg(feature = "test-seams")]
+fn write_adapter_and_request(
+    root_dir: &TempDir,
+    execution_id: &str,
+) -> (WindowsCapabilityAdapter, OpenFileWriteSession) {
+    let owner = task("task-1");
+    let root_identity = root("worktree-root");
+    let adapter = WindowsCapabilityAdapter::new(vec![CapabilityRegistration::worktree(
+        root_identity.clone(),
+        owner.clone(),
+        root_dir.path(),
+    )
+    .unwrap()])
+    .unwrap();
+    let request = OpenFileWriteSession::new(
+        ToolExecutionId::new(execution_id).unwrap(),
+        owner.clone(),
+        root_identity,
+        components("target.txt"),
+        None,
+        LeaseClaim::new(
+            owner,
+            RunId::new("run-1").unwrap(),
+            FencingToken::new(7).unwrap(),
+        ),
+    )
+    .unwrap();
+    (adapter, request)
+}
+
+#[cfg(feature = "test-seams")]
+fn file_identity(file: &fs::File) -> (u64, [u8; 16]) {
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: `info` is a correctly sized writable output buffer.
+    let success = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            std::ptr::from_mut(&mut info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    assert_ne!(success, 0);
+    (info.VolumeSerialNumber, info.FileId.Identifier)
+}
+
+#[cfg(feature = "test-seams")]
+fn assert_handle_bytes(file: &mut fs::File, expected: &[u8]) {
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, expected);
+}
+
+#[cfg(feature = "test-seams")]
+fn assert_no_staged_file(path: &Path) {
+    assert!(
+        directory_names(path)
+            .iter()
+            .all(|name| !name.starts_with(".lat-write-") || name.ends_with(".bak")),
+        "only a preserved exact backup may remain after a failed operation"
+    );
+}
+
+#[cfg(feature = "test-seams")]
+fn assert_preserved_backup(path: &Path, expected: &fs::File, bytes: &[u8]) {
+    let backup = directory_names(path)
+        .into_iter()
+        .find(|name| name.starts_with(".lat-write-") && name.ends_with(".bak"))
+        .expect("the exact displaced target remains preserved after restore fails");
+    let backup_path = path.join(backup);
+    let backup = fs::File::open(&backup_path).unwrap();
+    assert_eq!(file_identity(&backup), file_identity(expected));
+    assert_eq!(fs::read(backup_path).unwrap(), bytes);
 }
 
 fn assert_non_disclosing(error: PortError) {
