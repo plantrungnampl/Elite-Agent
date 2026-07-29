@@ -448,7 +448,7 @@ git commit -m "feat: enforce classification and redaction policy"
 **Interfaces:**
 - `tool-runtime` implements `StructuredToolExecutor` for `file.read`, `file.write`, `git.status`, and `git.diff` by dispatching only to application ports. `repository-git` implements `StructuredGit` in-process. Capability resolution returns opaque root identity plus normalized relative components; it never returns a serializable OS path.
 
-- [ ] **Step 1 - Write failing capability and Git security tests**
+- [x] **Step 1 - Write failing capability and Git security tests**
 
 Use temporary repositories and an outside sentinel. Cover source/artifact/worktree/toolchain capability ownership, wrong task/revision, absolute paths, `..`, empty/dot components, drive-relative forms, UNC, device paths, ADS, reserved names, case collisions, long paths, static and swap-race junctions/symlinks, and replacement after validation. A denied read must not reveal bytes, filename, size, existence, or error detail. A stale-token write must leave bytes, Git state, workspace versions, approvals, and sentinel unchanged.
 
@@ -461,13 +461,13 @@ cargo test -p local-agent-terminal-repository-git --test structured_tools
 
 Expected RED: the tool-runtime crate, dispatch, and structured Git port implementation are absent.
 
-- [ ] **Step 2 - Implement typed dispatch and in-process Git tools**
+- [x] **Step 2 - Implement typed dispatch and in-process Git tools**
 
 Resolve logical capabilities from trusted records, normalize only relative components, evaluate policy, and pass an `AuthorizedFileRead`/`AuthorizedFileWrite` to the injected `CapabilityFilesystem`. Immediately before writes call `ExecutorLeaseStore::assert_current`; after an exact verified write, hash bytes and invoke the existing atomic workspace-mutation path so versions advance and stale approvals are invalidated.
 
 Implement Git status/diff through `git2` with configuration/environment includes disabled and callbacks that never invoke hooks, filters, helpers, LFS, submodules, external diff/textconv, or a shell. Bind every result to repository ID, base/revision object ID, path scope, content hash, truncation state, and policy decision ID. Do not add generic `git(args)` or `execute(name, Value)` entry points.
 
-- [ ] **Step 3 - Run focused Windows and regression checks**
+- [x] **Step 3 - Run focused Windows and regression checks**
 
 ```powershell
 cargo fmt --all -- --check
@@ -479,7 +479,7 @@ node scripts/check-architecture.mjs
 
 Expected GREEN: every capability escape and execution-capable Git fixture fails closed, allowed reads/diffs are content-bound, stale writes have zero effect, and the M1 Windows matrix remains green.
 
-- [ ] **Step 4 - Commit**
+- [x] **Step 4 - Commit**
 
 ```powershell
 git add Cargo.toml Cargo.lock crates/tool-runtime crates/repository-git
