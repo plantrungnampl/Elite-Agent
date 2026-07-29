@@ -4,9 +4,9 @@ use std::mem::size_of;
 use std::os::windows::io::FromRawHandle;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
 #[cfg(feature = "test-seams")]
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -52,6 +52,7 @@ struct ConfiguredJobCleanupFailure {
 #[cfg(feature = "test-seams")]
 #[derive(Default)]
 struct JobCleanupFailureState {
+    entries: usize,
     attempts: usize,
     fail_current_attempt: bool,
     allow_cleanup: bool,
@@ -83,6 +84,16 @@ pub fn block_next_job_cleanup_failure_for_test(
 
 #[cfg(feature = "test-seams")]
 impl JobCleanupFailureControlForTest {
+    pub fn wait_for_entry(&self, expected: usize, timeout: Duration) -> bool {
+        let (state, changed) = &*self.state;
+        let Ok(state) = state.lock() else {
+            return false;
+        };
+        changed
+            .wait_timeout_while(state, timeout, |state| state.entries < expected)
+            .is_ok_and(|(state, _)| state.entries >= expected)
+    }
+
     pub fn wait_for_attempt(&self, expected: usize, timeout: Duration) -> bool {
         let (state, changed) = &*self.state;
         let Ok(state) = state.lock() else {
@@ -115,6 +126,7 @@ pub(super) struct ActiveJob {
     process: OwnedHandle,
     root_pid: u32,
     job_id: String,
+    termination: Mutex<()>,
     terminated: AtomicBool,
     assigned: AtomicBool,
     configured_limits: OnceLock<ConfiguredJobLimits>,
@@ -138,6 +150,7 @@ impl ActiveJob {
             process,
             root_pid,
             job_id,
+            termination: Mutex::new(()),
             terminated: AtomicBool::new(false),
             assigned: AtomicBool::new(false),
             configured_limits: OnceLock::new(),
@@ -186,26 +199,30 @@ impl ActiveJob {
     }
 
     pub(super) fn terminate(&self) -> Result<(), PortError> {
+        if !self.assigned.load(Ordering::Acquire) {
+            // Unassigned jobs are never published, so this pre-configuration
+            // fallback has no concurrent termination caller to serialize with.
+            if !self.terminated.load(Ordering::Acquire) {
+                terminate_process(&self.process);
+                self.terminated.store(true, Ordering::Release);
+            }
+            return Ok(());
+        }
+        #[cfg(feature = "test-seams")]
+        record_termination_entry(&self.job_id);
+        let _termination = self.termination.lock().map_err(|_| platform_error())?;
+        if self.terminated.load(Ordering::Acquire) {
+            return Ok(());
+        }
         #[cfg(feature = "test-seams")]
         if controlled_cleanup_failure(&self.job_id, JobCleanupFailurePointForTest::Terminate) {
             return Err(platform_error());
         }
-        if self
-            .terminated
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(());
-        }
-        if !self.assigned.load(Ordering::Acquire) {
-            terminate_process(&self.process);
-            return Ok(());
-        }
         // SAFETY: the Job Object handle remains owned by self for this call.
         if unsafe { TerminateJobObject(self.job.as_raw(), TERMINATED_EXIT_CODE) } == 0 {
-            self.terminated.store(false, Ordering::Release);
             return Err(platform_error());
         }
+        self.terminated.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -395,13 +412,21 @@ impl ActiveJob {
 }
 
 #[cfg(feature = "test-seams")]
+fn record_termination_entry(job_id: &str) {
+    let state = cleanup_failure_state(job_id, JobCleanupFailurePointForTest::Terminate);
+    let Some(state) = state else {
+        return;
+    };
+    let (state, changed) = &*state;
+    if let Ok(mut state) = state.lock() {
+        state.entries += 1;
+        changed.notify_all();
+    };
+}
+
+#[cfg(feature = "test-seams")]
 fn controlled_cleanup_failure(job_id: &str, point: JobCleanupFailurePointForTest) -> bool {
-    let state = JOB_CLEANUP_FAILURE.lock().ok().and_then(|configured| {
-        configured
-            .as_ref()
-            .filter(|failure| failure.execution_id == job_id && failure.point == point)
-            .map(|failure| Arc::clone(&failure.state))
-    });
+    let state = cleanup_failure_state(job_id, point);
     let Some(state) = state else {
         return false;
     };
@@ -426,6 +451,19 @@ fn controlled_cleanup_failure(job_id: &str, point: JobCleanupFailurePointForTest
         state.fail_current_attempt = false;
         true
     }
+}
+
+#[cfg(feature = "test-seams")]
+fn cleanup_failure_state(
+    job_id: &str,
+    point: JobCleanupFailurePointForTest,
+) -> Option<Arc<(Mutex<JobCleanupFailureState>, Condvar)>> {
+    JOB_CLEANUP_FAILURE.lock().ok().and_then(|configured| {
+        configured
+            .as_ref()
+            .filter(|failure| failure.execution_id == job_id && failure.point == point)
+            .map(|failure| Arc::clone(&failure.state))
+    })
 }
 
 impl Drop for ActiveJob {

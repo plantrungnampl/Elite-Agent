@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "test-seams")]
 use std::sync::mpsc;
 use std::sync::Arc;
+#[cfg(feature = "test-seams")]
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 #[cfg(feature = "test-seams")]
@@ -111,6 +113,9 @@ use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
+#[cfg(feature = "test-seams")]
+static JOB_CLEANUP_FAILURE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn executable_registry_rejects_path_lookup_version_drift_and_replacement() {
     let root = TempDir::new().unwrap();
@@ -204,6 +209,351 @@ fn unrepresentable_cpu_limit_is_rejected_before_boundary_preparation() {
 
     assert!(launcher.execute(request).is_err());
     assert_eq!(prepare_calls.load(Ordering::Acquire), 0);
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn cancellation_during_boundary_preparation_is_retained_without_creating_a_child() {
+    let root = TempDir::new().unwrap();
+    let marker = root.path().join("pending-cancel-must-not-run");
+    let (prepare_block, prepare_entered, release_prepare) = BoundaryBlock::new();
+    let mut boundary = TestOnlyBoundary::valid(root.path().to_owned());
+    boundary.prepare_block = Some(prepare_block);
+    let cleanup_count = boundary.cleanup_count.clone();
+    let launcher = Arc::new(WindowsProcessLauncher::with_isolated_worker_boundary(
+        Arc::new(boundary),
+        boundary_binding(),
+    ));
+    let request = lpac_marker_request("execution-pending-cancel", &marker);
+    let retry_request = request.clone();
+    let execution_id = request.execution_id.clone();
+    let executing = Arc::clone(&launcher);
+    let execution = thread::spawn(move || executing.execute(request));
+
+    prepare_entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("boundary preparation must reach the deterministic block");
+    let cancellation = launcher.cancel(&execution_id);
+    release_prepare.send(()).unwrap();
+    let cancellation = cancellation.expect("pending cancellation must be retained");
+
+    assert_eq!(cancellation.execution_id, execution_id);
+    assert_eq!(cancellation.status, ProcessStatus::Terminated);
+    assert!(cancellation.cancelled);
+    assert_eq!(cancellation.job_receipt, None);
+    let error = execution
+        .join()
+        .unwrap()
+        .expect_err("the retained cancellation must stop execution");
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::PermissionDenied
+    );
+    assert_eq!(
+        error.retryability(),
+        local_agent_terminal_application::Retryability::NonRetryable
+    );
+    assert_eq!(
+        lpac_lifecycle_counts_for_test(&execution_id),
+        LpacLifecycleCountsForTest::default()
+    );
+    assert_eq!(output_reader_counts_for_test(&execution_id), (0, 0));
+    assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    assert!(!marker.exists());
+
+    let receipt = launcher
+        .execute(retry_request)
+        .expect("the execution ID must be reusable after cleanup");
+    assert_eq!(receipt.status, ProcessStatus::Exited);
+    assert!(marker.exists());
+    assert_eq!(cleanup_count.load(Ordering::Acquire), 2);
+    assert_eq!(output_reader_counts_for_test(&execution_id), (2, 2));
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn cancellation_after_suspended_child_creation_prevents_resume_and_returns_job_receipt() {
+    let root = TempDir::new().unwrap();
+    let marker = root.path().join("active-pre-resume-cancel-must-not-run");
+    let (verification_block, verification_entered, release_verification) = BoundaryBlock::new();
+    let mut boundary = TestOnlyBoundary::valid(root.path().to_owned());
+    boundary.verification_block = Some(verification_block);
+    let cleanup_count = boundary.cleanup_count.clone();
+    let launcher = Arc::new(WindowsProcessLauncher::with_isolated_worker_boundary(
+        Arc::new(boundary),
+        boundary_binding(),
+    ));
+    let request = lpac_marker_request("execution-active-pre-resume-cancel", &marker);
+    let retry_request = request.clone();
+    let execution_id = request.execution_id.clone();
+    let executing = Arc::clone(&launcher);
+    let execution = thread::spawn(move || executing.execute(request));
+
+    verification_entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("verification must block after suspended-child creation");
+    assert_eq!(
+        lpac_lifecycle_counts_for_test(&execution_id).suspended_children_created,
+        1
+    );
+    let cancellation = launcher.cancel(&execution_id);
+    release_verification.send(()).unwrap();
+    let cancellation = cancellation.expect("active pre-resume cancellation must terminate the Job");
+
+    assert_eq!(cancellation.execution_id, execution_id);
+    assert_eq!(cancellation.status, ProcessStatus::Terminated);
+    assert!(cancellation.cancelled);
+    let job_receipt = cancellation
+        .job_receipt
+        .expect("active cancellation must return authoritative Job evidence");
+    assert!(job_receipt.kill_on_close);
+    assert!(job_receipt.no_breakaway);
+    assert!(job_receipt.tree_terminated);
+    let error = execution
+        .join()
+        .unwrap()
+        .expect_err("cancelled suspended child must not resume");
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::PermissionDenied
+    );
+    let lifecycle = lpac_lifecycle_counts_for_test(&execution_id);
+    assert_eq!(lifecycle.suspended_children_created, 1);
+    assert_eq!(lifecycle.resumes_succeeded, 0);
+    assert_eq!(output_reader_counts_for_test(&execution_id), (2, 2));
+    assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    assert!(!marker.exists());
+    assert!(launcher.cancel(&execution_id).is_err());
+
+    let receipt = launcher
+        .execute(retry_request)
+        .expect("the execution ID must be reusable after active cleanup");
+    assert_eq!(receipt.status, ProcessStatus::Exited);
+    assert!(marker.exists());
+    let lifecycle = lpac_lifecycle_counts_for_test(&execution_id);
+    assert_eq!(lifecycle.suspended_children_created, 2);
+    assert_eq!(lifecycle.resumes_succeeded, 1);
+    assert_eq!(cleanup_count.load(Ordering::Acquire), 2);
+    assert_eq!(output_reader_counts_for_test(&execution_id), (4, 4));
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn pre_resume_cancellation_cleanup_retries_before_joining_output_readers() {
+    let _cleanup_failure_test = JOB_CLEANUP_FAILURE_TEST_LOCK.lock().unwrap();
+    for (point, execution_name) in [
+        (
+            JobCleanupFailurePointForTest::Terminate,
+            "execution-pre-resume-terminate-retry",
+        ),
+        (
+            JobCleanupFailurePointForTest::TreeWait,
+            "execution-pre-resume-tree-wait-retry",
+        ),
+    ] {
+        let root = TempDir::new().unwrap();
+        let marker = root.path().join(format!("{execution_name}-must-not-run"));
+        let retry_marker = root.path().join(format!("{execution_name}-retry"));
+        let (verification_block, verification_entered, release_verification) = BoundaryBlock::new();
+        let mut boundary = TestOnlyBoundary::valid(root.path().to_owned());
+        boundary.verification_block = Some(verification_block);
+        let cleanup_count = boundary.cleanup_count.clone();
+        let leases = Arc::new(ReplaceableLeaseStore::new(7));
+        let authority =
+            ProcessFenceAuthority::new(leases, Arc::new(WorkspaceWriteCoordinator::new()));
+        let launcher = Arc::new(WindowsProcessLauncher::with_isolated_worker_boundary(
+            Arc::new(boundary),
+            boundary_binding(),
+        ));
+        let mut request = lpac_marker_request(execution_name, &marker);
+        request.executor_fence = authority.binding();
+        let execution_id = request.execution_id.clone();
+        let retry_request = lpac_marker_request(execution_name, &retry_marker);
+        let cleanup_failure = block_next_job_cleanup_failure_for_test(execution_id.clone(), point);
+        let executing = Arc::clone(&launcher);
+        let execution = thread::spawn(move || executing.execute(request));
+
+        verification_entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("verification must block after suspended-child creation");
+        let cancelling = Arc::clone(&launcher);
+        let cancelled_execution_id = execution_id.clone();
+        let cancellation = thread::spawn(move || cancelling.cancel(&cancelled_execution_id));
+        let first_attempt_observed = cleanup_failure.wait_for_attempt(1, Duration::from_secs(5));
+        cleanup_failure.fail_current_attempt();
+        let first_cancellation = cancellation.join().unwrap();
+        release_verification.send(()).unwrap();
+
+        let execution_cleanup_retried = cleanup_failure.wait_for_attempt(2, Duration::from_secs(5));
+        let boundary_held_until_retry = cleanup_count.load(Ordering::Acquire) == 0;
+        let (mutation_started_tx, mutation_started_rx) = mpsc::channel();
+        let (mutation_tx, mutation_rx) = mpsc::channel();
+        let mutating_authority = authority.clone();
+        let mutation = thread::spawn(move || {
+            mutation_started_tx.send(()).unwrap();
+            let result = mutating_authority.revoke_lease(RevokeLease {
+                claim: LeaseClaim::new(
+                    TaskId::new("task-1").unwrap(),
+                    RunId::new("run-1").unwrap(),
+                    FencingToken::new(7).unwrap(),
+                ),
+                revoked_at: "2026-07-30T00:30:00Z".to_owned(),
+            });
+            mutation_tx.send(result).unwrap();
+        });
+        mutation_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let fence_held_until_retry = matches!(
+            mutation_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+
+        cleanup_failure.allow_cleanup();
+        let rescue_cancellation =
+            (!execution_cleanup_retried).then(|| launcher.cancel(&execution_id));
+        let execution_result = execution.join().unwrap();
+        let mutation_result = mutation_rx.recv_timeout(Duration::from_secs(5));
+        mutation.join().unwrap();
+
+        assert!(first_attempt_observed);
+        assert!(first_cancellation.is_err());
+        assert!(execution_cleanup_retried);
+        assert!(boundary_held_until_retry);
+        assert!(fence_held_until_retry);
+        assert!(rescue_cancellation.is_none());
+        assert!(execution_result.is_err());
+        assert!(mutation_result.unwrap().is_ok());
+        let lifecycle = lpac_lifecycle_counts_for_test(&execution_id);
+        assert_eq!(lifecycle.suspended_children_created, 1);
+        assert_eq!(lifecycle.resumes_succeeded, 0);
+        assert_eq!(output_reader_counts_for_test(&execution_id), (2, 2));
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+        assert!(!marker.exists());
+        assert!(launcher.cancel(&execution_id).is_err());
+
+        let receipt = launcher
+            .execute(retry_request)
+            .expect("the execution ID must be reusable after cleanup retry");
+        assert_eq!(receipt.status, ProcessStatus::Exited);
+        assert!(retry_marker.exists());
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 2);
+        assert_eq!(output_reader_counts_for_test(&execution_id), (4, 4));
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn concurrent_pre_resume_termination_waits_for_in_flight_attempt() {
+    let _cleanup_failure_test = JOB_CLEANUP_FAILURE_TEST_LOCK.lock().unwrap();
+    let root = TempDir::new().unwrap();
+    let marker = root.path().join("overlapping-termination-must-not-run");
+    let retry_marker = root.path().join("overlapping-termination-retry");
+    let (verification_block, verification_entered, release_verification) = BoundaryBlock::new();
+    let mut boundary = TestOnlyBoundary::valid(root.path().to_owned());
+    boundary.verification_block = Some(verification_block);
+    let cleanup_count = boundary.cleanup_count.clone();
+    let leases = Arc::new(ReplaceableLeaseStore::new(7));
+    let authority = ProcessFenceAuthority::new(leases, Arc::new(WorkspaceWriteCoordinator::new()));
+    let launcher = Arc::new(WindowsProcessLauncher::with_isolated_worker_boundary(
+        Arc::new(boundary),
+        boundary_binding(),
+    ));
+    let mut request = lpac_marker_request("execution-overlapping-termination", &marker);
+    request.executor_fence = authority.binding();
+    let execution_id = request.execution_id.clone();
+    let retry_request = lpac_marker_request("execution-overlapping-termination", &retry_marker);
+    let cleanup_failure = block_next_job_cleanup_failure_for_test(
+        execution_id.clone(),
+        JobCleanupFailurePointForTest::Terminate,
+    );
+    let executing = Arc::clone(&launcher);
+    let execution = thread::spawn(move || executing.execute(request));
+
+    verification_entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("verification must block after suspended-child creation");
+    let cancelling = Arc::clone(&launcher);
+    let cancelled_execution_id = execution_id.clone();
+    let (cancellation_tx, cancellation_rx) = mpsc::channel();
+    let cancellation = thread::spawn(move || {
+        cancellation_tx
+            .send(cancelling.cancel(&cancelled_execution_id))
+            .unwrap();
+    });
+    let first_attempt_observed = cleanup_failure.wait_for_attempt(1, Duration::from_secs(5));
+    release_verification.send(()).unwrap();
+    let second_entry_observed = cleanup_failure.wait_for_entry(2, Duration::from_secs(5));
+    let cleanup_attempts_overlapped =
+        second_entry_observed && cleanup_failure.wait_for_attempt(2, Duration::from_millis(100));
+    cleanup_failure.fail_current_attempt();
+    let first_cancellation_before_retry = if cleanup_attempts_overlapped {
+        None
+    } else {
+        cancellation_rx.recv_timeout(Duration::from_secs(5)).ok()
+    };
+    let execution_cleanup_retried = !cleanup_attempts_overlapped
+        && first_cancellation_before_retry.is_some()
+        && cleanup_failure.wait_for_attempt(2, Duration::from_secs(5));
+    let boundary_held_until_retry = cleanup_count.load(Ordering::Acquire) == 0;
+    let (mutation_started_tx, mutation_started_rx) = mpsc::channel();
+    let (mutation_tx, mutation_rx) = mpsc::channel();
+    let mutating_authority = authority.clone();
+    let mutation = thread::spawn(move || {
+        mutation_started_tx.send(()).unwrap();
+        let result = mutating_authority.revoke_lease(RevokeLease {
+            claim: LeaseClaim::new(
+                TaskId::new("task-1").unwrap(),
+                RunId::new("run-1").unwrap(),
+                FencingToken::new(7).unwrap(),
+            ),
+            revoked_at: "2026-07-30T00:30:00Z".to_owned(),
+        });
+        mutation_tx.send(result).unwrap();
+    });
+    mutation_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    let fence_held_until_retry = matches!(
+        mutation_rx.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    );
+
+    cleanup_failure.allow_cleanup();
+    let rescue_cancellation = (cleanup_attempts_overlapped || !execution_cleanup_retried)
+        .then(|| launcher.cancel(&execution_id));
+    let first_cancellation = first_cancellation_before_retry
+        .or_else(|| cancellation_rx.recv_timeout(Duration::from_secs(5)).ok());
+    cancellation.join().unwrap();
+    let execution_result = execution.join().unwrap();
+    let mutation_result = mutation_rx.recv_timeout(Duration::from_secs(5));
+    mutation.join().unwrap();
+
+    assert!(first_attempt_observed);
+    assert!(second_entry_observed);
+    assert!(!cleanup_attempts_overlapped);
+    assert!(first_cancellation.is_some_and(|result| result.is_err()));
+    assert!(execution_cleanup_retried);
+    assert!(boundary_held_until_retry);
+    assert!(fence_held_until_retry);
+    assert!(rescue_cancellation.is_none());
+    assert!(execution_result.is_err());
+    assert!(mutation_result.unwrap().is_ok());
+    let lifecycle = lpac_lifecycle_counts_for_test(&execution_id);
+    assert_eq!(lifecycle.suspended_children_created, 1);
+    assert_eq!(lifecycle.resumes_succeeded, 0);
+    assert_eq!(output_reader_counts_for_test(&execution_id), (2, 2));
+    assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    assert!(!marker.exists());
+    assert!(launcher.cancel(&execution_id).is_err());
+
+    let receipt = launcher
+        .execute(retry_request)
+        .expect("the execution ID must be reusable after serialized termination");
+    assert_eq!(receipt.status, ProcessStatus::Exited);
+    assert!(retry_marker.exists());
+    assert_eq!(cleanup_count.load(Ordering::Acquire), 2);
+    assert_eq!(output_reader_counts_for_test(&execution_id), (4, 4));
 }
 
 #[cfg(feature = "test-seams")]
@@ -1583,6 +1933,7 @@ fn write_capable_process_blocks_lease_acquire_and_revoke_until_cancellation_comp
 #[cfg(feature = "test-seams")]
 #[test]
 fn post_resume_cleanup_fault_keeps_fence_until_job_exit_is_retried() {
+    let _cleanup_failure_test = JOB_CLEANUP_FAILURE_TEST_LOCK.lock().unwrap();
     for (point, execution_name) in [
         (
             JobCleanupFailurePointForTest::Terminate,
@@ -2900,8 +3251,47 @@ struct TestOnlyBoundary {
     acl_receipt: String,
     claims_mismatch: Option<BoundaryMismatch>,
     prepare_calls: Arc<AtomicUsize>,
+    prepare_block: Option<Arc<BoundaryBlock>>,
+    verification_block: Option<Arc<BoundaryBlock>>,
+    cleanup_count: Arc<AtomicUsize>,
     allow_expected_writes: bool,
     observed_writes: Vec<ObservedProcessWrite>,
+}
+
+#[cfg(feature = "test-seams")]
+struct BoundaryBlock {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    blocked: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "test-seams")]
+impl BoundaryBlock {
+    fn new() -> (Arc<Self>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, entered_receiver) = mpsc::channel();
+        let (release_sender, release) = mpsc::channel();
+        (
+            Arc::new(Self {
+                entered,
+                release: Mutex::new(release),
+                blocked: std::sync::atomic::AtomicBool::new(false),
+            }),
+            entered_receiver,
+            release_sender,
+        )
+    }
+
+    fn wait_once(&self) {
+        if self
+            .blocked
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.entered.send(()).unwrap();
+        self.release.lock().unwrap().recv().unwrap();
+    }
 }
 
 #[cfg(feature = "test-seams")]
@@ -3076,6 +3466,9 @@ impl TestOnlyBoundary {
             acl_receipt: "test-only-acl".to_owned(),
             claims_mismatch: None,
             prepare_calls: Arc::new(AtomicUsize::new(0)),
+            prepare_block: None,
+            verification_block: None,
+            cleanup_count: Arc::new(AtomicUsize::new(0)),
             allow_expected_writes: false,
             observed_writes: Vec::new(),
         }
@@ -3089,6 +3482,9 @@ impl IsolatedWorkerBoundaryAdapter for TestOnlyBoundary {
         request: &AuthorizedProcessRequest,
     ) -> Result<PreparedIsolatedWorkerBoundary, local_agent_terminal_application::PortError> {
         self.prepare_calls.fetch_add(1, Ordering::AcqRel);
+        if let Some(block) = &self.prepare_block {
+            block.wait_once();
+        }
         if !request.expected_writes.is_empty() && !self.allow_expected_writes {
             return Err(local_agent_terminal_application::PortError::failure(
                 local_agent_terminal_application::SafeErrorClassification::PermissionDenied,
@@ -3106,6 +3502,7 @@ impl IsolatedWorkerBoundaryAdapter for TestOnlyBoundary {
             (!request.expected_writes.is_empty()).then(|| "test-only-write-scope".to_owned()),
             claims,
         )
+        .map(|prepared| prepared.with_cleanup_counter_for_test(self.cleanup_count.clone()))
     }
 
     fn verify_before_resume(
@@ -3113,6 +3510,9 @@ impl IsolatedWorkerBoundaryAdapter for TestOnlyBoundary {
         _request: &AuthorizedProcessRequest,
         _prepared: &PreparedIsolatedWorkerBoundary,
     ) -> Result<(), local_agent_terminal_application::PortError> {
+        if let Some(block) = &self.verification_block {
+            block.wait_once();
+        }
         if self.fail_before_resume {
             Err(local_agent_terminal_application::PortError::failure(
                 local_agent_terminal_application::SafeErrorClassification::PermissionDenied,

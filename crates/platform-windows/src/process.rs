@@ -12,6 +12,8 @@ use std::path::Path;
 #[cfg(feature = "test-seams")]
 use std::path::PathBuf;
 use std::ptr;
+#[cfg(feature = "test-seams")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
@@ -271,6 +273,7 @@ pub struct PreparedIsolatedWorkerBoundary {
     acl_receipt: String,
     write_scope_receipt: Option<String>,
     claims: IsolatedWorkerBoundaryClaims,
+    cleanup_count: Option<Arc<AtomicUsize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,7 +366,14 @@ impl PreparedIsolatedWorkerBoundary {
             acl_receipt,
             write_scope_receipt,
             claims,
+            cleanup_count: None,
         })
+    }
+
+    #[doc(hidden)]
+    pub fn with_cleanup_counter_for_test(mut self, cleanup_count: Arc<AtomicUsize>) -> Self {
+        self.cleanup_count = Some(cleanup_count);
+        self
     }
 
     pub fn launch_cwd(&self) -> &Path {
@@ -380,6 +390,19 @@ impl PreparedIsolatedWorkerBoundary {
 
     pub fn write_scope_receipt(&self) -> Option<&str> {
         self.write_scope_receipt.as_deref()
+    }
+
+    fn cleanup(&mut self) {
+        if let Some(cleanup_count) = self.cleanup_count.take() {
+            cleanup_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+#[cfg(feature = "test-seams")]
+impl Drop for PreparedIsolatedWorkerBoundary {
+    fn drop(&mut self) {
+        self.cleanup();
     }
 }
 
@@ -417,7 +440,16 @@ pub trait IsolatedWorkerBoundaryAdapter: Send + Sync {
 
 pub struct WindowsProcessLauncher {
     boundary: Option<ConfiguredProcessBoundary>,
-    active: Mutex<BTreeMap<ToolExecutionId, Arc<ActiveJob>>>,
+    registrations: Mutex<BTreeMap<ToolExecutionId, ExecutionRegistration>>,
+}
+
+enum ExecutionRegistration {
+    Pending,
+    CancelRequested,
+    Active {
+        job: Arc<ActiveJob>,
+        cancel_requested: bool,
+    },
 }
 
 #[cfg(feature = "test-seams")]
@@ -526,7 +558,10 @@ impl PreparedProcessBoundary {
         match self {
             Self::Lpac(prepared) => prepared.cleanup(),
             #[cfg(feature = "test-seams")]
-            Self::ClaimOnly(_) => Ok(()),
+            Self::ClaimOnly(prepared) => {
+                prepared.cleanup();
+                Ok(())
+            }
         }
     }
 }
@@ -536,7 +571,7 @@ impl WindowsProcessLauncher {
     pub fn fail_closed() -> Self {
         Self {
             boundary: None,
-            active: Mutex::new(BTreeMap::new()),
+            registrations: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -556,7 +591,7 @@ impl WindowsProcessLauncher {
                     binding,
                 },
             )),
-            active: Mutex::new(BTreeMap::new()),
+            registrations: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -567,7 +602,7 @@ impl WindowsProcessLauncher {
             boundary: Some(ConfiguredProcessBoundary::Lpac(LpacBoundary::new(
                 registrations,
             )?)),
-            active: Mutex::new(BTreeMap::new()),
+            registrations: Mutex::new(BTreeMap::new()),
         })
     }
 }
@@ -583,17 +618,17 @@ impl ProcessLauncher for WindowsProcessLauncher {
         let configured = self.boundary.as_ref().ok_or_else(permission_denied)?;
         validate_request(&request)?;
         let _executable_guard = verify_executable_and_retain(&request.executable)?;
-        let prepared = configured.prepare(&request)?;
+        let mut registration =
+            ExecutionRegistrationGuard::register(self, request.execution_id.clone())?;
+        let mut prepared = configured.prepare(&request)?;
 
         let started_at = Instant::now();
-        let child = create_suspended_process(&request, &prepared)?;
-        let mut cleanup = ExecutionCleanupGuard::new(
-            self,
-            request.execution_id.clone(),
-            child.active.clone(),
-            prepared,
-        );
-        child.active.configure_and_assign(&request)?;
+        let Some(child) = registration.activate(&request, &prepared)? else {
+            prepared.cleanup()?;
+            registration.finish()?;
+            return Err(permission_denied());
+        };
+        let mut cleanup = ExecutionCleanupGuard::new(registration, child.active.clone(), prepared);
         configured.verify_before_resume(
             &request,
             cleanup.prepared(),
@@ -617,8 +652,6 @@ impl ProcessLauncher for WindowsProcessLauncher {
             &request.execution_id,
             OutputStream::Stderr,
         )?;
-        cleanup.register()?;
-
         let workspace_permit = match request
             .executor_fence
             .monitor_permit(request.executor_claim.clone())
@@ -636,16 +669,13 @@ impl ProcessLauncher for WindowsProcessLauncher {
         };
         cleanup.hold_permit(workspace_permit);
 
-        // SAFETY: the primary thread handle is owned and remains valid here. The
-        // process is already assigned to the configured kill-on-close Job Object.
-        let resume_result = unsafe { ResumeThread(child.primary_thread.as_raw()) };
-        if resume_result == FAILED_THREAD_RESUME {
-            child.active.terminate()?;
-            child.active.wait_process(INFINITE);
-            child.active.wait_tree_exit()?;
-            return Err(platform_error());
+        if !cleanup.resume_unless_cancelled(child.primary_thread.as_raw())? {
+            cleanup.ensure_tree_exit();
+            join_output(stdout_reader)?;
+            join_output(stderr_reader)?;
+            cleanup.finish()?;
+            return Err(permission_denied());
         }
-        record_resume_succeeded(&request.execution_id);
         #[cfg(feature = "test-seams")]
         if take_after_resume_failure(&request.execution_id) {
             return Err(platform_error());
@@ -700,13 +730,29 @@ impl ProcessLauncher for WindowsProcessLauncher {
     }
 
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
-        let active = self
-            .active
-            .lock()
-            .map_err(|_| internal_error())?
-            .get(execution_id)
-            .cloned()
-            .ok_or_else(permission_denied)?;
+        let active = {
+            let mut registrations = self.registrations.lock().map_err(|_| internal_error())?;
+            let registration = registrations
+                .get_mut(execution_id)
+                .ok_or_else(permission_denied)?;
+            match registration {
+                ExecutionRegistration::Pending => {
+                    *registration = ExecutionRegistration::CancelRequested;
+                    None
+                }
+                ExecutionRegistration::CancelRequested => None,
+                ExecutionRegistration::Active {
+                    job,
+                    cancel_requested,
+                } => {
+                    *cancel_requested = true;
+                    Some(job.clone())
+                }
+            }
+        };
+        let Some(active) = active else {
+            return Ok(pending_cancellation_receipt(execution_id));
+        };
         active.terminate()?;
         if active.wait_process(INFINITE) != WAIT_OBJECT_0 {
             return Err(platform_error());
@@ -722,42 +768,167 @@ impl ProcessLauncher for WindowsProcessLauncher {
 }
 
 impl WindowsProcessLauncher {
-    fn remove_active(&self, execution_id: &ToolExecutionId, completed: &Arc<ActiveJob>) {
-        if let Ok(mut active) = self.active.lock() {
-            let should_remove = active
-                .get(execution_id)
-                .is_some_and(|registered| Arc::ptr_eq(registered, completed));
-            if should_remove {
-                active.remove(execution_id);
+    fn remove_registration(
+        &self,
+        execution_id: &ToolExecutionId,
+        expected_active: Option<&Arc<ActiveJob>>,
+    ) -> Result<(), PortError> {
+        let mut registrations = self.registrations.lock().map_err(|_| internal_error())?;
+        let should_remove = match (registrations.get(execution_id), expected_active) {
+            (
+                Some(ExecutionRegistration::Pending | ExecutionRegistration::CancelRequested),
+                None,
+            ) => true,
+            (Some(ExecutionRegistration::Active { job, .. }), Some(expected)) => {
+                Arc::ptr_eq(job, expected)
             }
+            _ => false,
+        };
+        if should_remove {
+            registrations.remove(execution_id);
+            Ok(())
+        } else {
+            Err(integrity_failure())
         }
     }
 }
 
-struct ExecutionCleanupGuard<'launcher, 'permit> {
+struct ExecutionRegistrationGuard<'launcher> {
     launcher: &'launcher WindowsProcessLauncher,
     execution_id: ToolExecutionId,
+    active: Option<Arc<ActiveJob>>,
+    armed: bool,
+}
+
+impl<'launcher> ExecutionRegistrationGuard<'launcher> {
+    fn register(
+        launcher: &'launcher WindowsProcessLauncher,
+        execution_id: ToolExecutionId,
+    ) -> Result<Self, PortError> {
+        let mut registrations = launcher
+            .registrations
+            .lock()
+            .map_err(|_| internal_error())?;
+        if registrations.contains_key(&execution_id) {
+            return Err(integrity_failure());
+        }
+        registrations.insert(execution_id.clone(), ExecutionRegistration::Pending);
+        drop(registrations);
+        Ok(Self {
+            launcher,
+            execution_id,
+            active: None,
+            armed: true,
+        })
+    }
+
+    fn activate(
+        &mut self,
+        request: &AuthorizedProcessRequest,
+        prepared: &PreparedProcessBoundary,
+    ) -> Result<Option<SuspendedChild>, PortError> {
+        let mut registrations = self
+            .launcher
+            .registrations
+            .lock()
+            .map_err(|_| internal_error())?;
+        match registrations.get(&self.execution_id) {
+            Some(ExecutionRegistration::Pending) => {}
+            Some(ExecutionRegistration::CancelRequested) => return Ok(None),
+            _ => return Err(integrity_failure()),
+        }
+        let child = create_suspended_process(request, prepared)?;
+        child.active.configure_and_assign(request)?;
+        registrations.insert(
+            self.execution_id.clone(),
+            ExecutionRegistration::Active {
+                job: child.active.clone(),
+                cancel_requested: false,
+            },
+        );
+        self.active = Some(child.active.clone());
+        Ok(Some(child))
+    }
+
+    fn resume_unless_cancelled(&self, primary_thread: HANDLE) -> Result<bool, PortError> {
+        let registrations = self
+            .launcher
+            .registrations
+            .lock()
+            .map_err(|_| internal_error())?;
+        let Some(ExecutionRegistration::Active {
+            job,
+            cancel_requested,
+        }) = registrations.get(&self.execution_id)
+        else {
+            return Err(integrity_failure());
+        };
+        if self
+            .active
+            .as_ref()
+            .is_none_or(|expected| !Arc::ptr_eq(job, expected))
+        {
+            return Err(integrity_failure());
+        }
+        if *cancel_requested {
+            return Ok(false);
+        }
+        // SAFETY: the primary thread handle is owned and remains valid here. The
+        // process is already assigned to the configured kill-on-close Job Object.
+        let resume_result = unsafe { ResumeThread(primary_thread) };
+        if resume_result == FAILED_THREAD_RESUME {
+            return Err(platform_error());
+        }
+        record_resume_succeeded(&self.execution_id);
+        Ok(true)
+    }
+
+    fn finish(mut self) -> Result<(), PortError> {
+        self.launcher
+            .remove_registration(&self.execution_id, self.active.as_ref())?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for ExecutionRegistrationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self
+                .launcher
+                .remove_registration(&self.execution_id, self.active.as_ref());
+        }
+    }
+}
+
+fn pending_cancellation_receipt(execution_id: &ToolExecutionId) -> CancellationReceipt {
+    CancellationReceipt {
+        execution_id: execution_id.clone(),
+        status: ProcessStatus::Terminated,
+        job_receipt: None,
+        cancelled: true,
+    }
+}
+
+struct ExecutionCleanupGuard<'launcher, 'permit> {
+    registration: Option<ExecutionRegistrationGuard<'launcher>>,
     active: Arc<ActiveJob>,
     boundary: Option<PreparedProcessBoundary>,
     permit: Option<WorkspaceWritePermit<'permit>>,
-    registered: bool,
     armed: bool,
 }
 
 impl<'launcher, 'permit> ExecutionCleanupGuard<'launcher, 'permit> {
     fn new(
-        launcher: &'launcher WindowsProcessLauncher,
-        execution_id: ToolExecutionId,
+        registration: ExecutionRegistrationGuard<'launcher>,
         active: Arc<ActiveJob>,
         boundary: PreparedProcessBoundary,
     ) -> Self {
         Self {
-            launcher,
-            execution_id,
+            registration: Some(registration),
             active,
             boundary: Some(boundary),
             permit: None,
-            registered: false,
             armed: true,
         }
     }
@@ -772,14 +943,23 @@ impl<'launcher, 'permit> ExecutionCleanupGuard<'launcher, 'permit> {
             .expect("prepared boundary remains owned until cleanup completes")
     }
 
-    fn register(&mut self) -> Result<(), PortError> {
-        let mut active = self.launcher.active.lock().map_err(|_| internal_error())?;
-        if active.contains_key(&self.execution_id) {
-            return Err(integrity_failure());
+    fn resume_unless_cancelled(&self, primary_thread: HANDLE) -> Result<bool, PortError> {
+        self.registration
+            .as_ref()
+            .ok_or_else(integrity_failure)?
+            .resume_unless_cancelled(primary_thread)
+    }
+
+    fn ensure_tree_exit(&self) {
+        loop {
+            let tree_exited = self.active.terminate().is_ok()
+                && self.active.wait_process(INFINITE) == WAIT_OBJECT_0
+                && self.active.wait_tree_exit().is_ok();
+            if tree_exited {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        active.insert(self.execution_id.clone(), self.active.clone());
-        self.registered = true;
-        Ok(())
     }
 
     fn finish(mut self) -> Result<(), PortError> {
@@ -787,10 +967,8 @@ impl<'launcher, 'permit> ExecutionCleanupGuard<'launcher, 'permit> {
             boundary.cleanup()?;
         }
         self.boundary.take();
-        if self.registered {
-            self.launcher
-                .remove_active(&self.execution_id, &self.active);
-            self.registered = false;
+        if let Some(registration) = self.registration.take() {
+            registration.finish()?;
         }
         self.armed = false;
         Ok(())
@@ -804,15 +982,7 @@ impl Drop for ExecutionCleanupGuard<'_, '_> {
             .as_ref()
             .is_some_and(PreparedProcessBoundary::requires_proven_tree_exit);
         if self.armed && (self.permit.is_some() || boundary_requires_tree_exit) {
-            loop {
-                let tree_exited = self.active.terminate().is_ok()
-                    && self.active.wait_process(INFINITE) == WAIT_OBJECT_0
-                    && self.active.wait_tree_exit().is_ok();
-                if tree_exited {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+            self.ensure_tree_exit();
         } else if self.armed && self.active.terminate().is_ok() {
             self.active.wait_process(INFINITE);
             let _ = self.active.wait_tree_exit();
@@ -825,22 +995,29 @@ impl Drop for ExecutionCleanupGuard<'_, '_> {
             }
             self.boundary.take();
         }
-        if self.registered {
-            self.launcher
-                .remove_active(&self.execution_id, &self.active);
-        }
+        self.registration.take();
     }
 }
 
 impl Drop for WindowsProcessLauncher {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.active.lock() {
-            for job in active.values() {
-                let _ = job.terminate();
-                job.wait_process(INFINITE);
-                let _ = job.wait_tree_exit();
-            }
-            active.clear();
+        let active = if let Ok(mut registrations) = self.registrations.lock() {
+            let active = registrations
+                .values()
+                .filter_map(|registration| match registration {
+                    ExecutionRegistration::Active { job, .. } => Some(job.clone()),
+                    ExecutionRegistration::Pending | ExecutionRegistration::CancelRequested => None,
+                })
+                .collect::<Vec<_>>();
+            registrations.clear();
+            active
+        } else {
+            Vec::new()
+        };
+        for job in active {
+            let _ = job.terminate();
+            job.wait_process(INFINITE);
+            let _ = job.wait_tree_exit();
         }
     }
 }
