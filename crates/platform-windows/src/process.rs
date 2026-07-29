@@ -1482,7 +1482,7 @@ fn internal_error() -> PortError {
 
 #[cfg(all(test, feature = "test-seams"))]
 mod tests {
-    use super::StderrMarkerObservationState;
+    use super::{observe_stderr_marker_for_test, StderrMarkerObservationState, ToolExecutionId};
 
     #[test]
     fn stderr_marker_observation_matches_across_read_chunks() {
@@ -1503,5 +1503,30 @@ mod tests {
 
         assert!(!observation.observed());
         assert!(observation.buffered_len() < marker.len());
+    }
+
+    #[test]
+    fn stderr_marker_registration_enforces_length_boundaries_and_releases_keys() {
+        let empty_marker_id = ToolExecutionId::new("stderr-observation-empty-marker").unwrap();
+        let oversized_marker_id =
+            ToolExecutionId::new("stderr-observation-oversized-marker").unwrap();
+        let maximum_marker = [b'x'; 64];
+        let oversized_marker = [b'x'; 65];
+
+        assert!(observe_stderr_marker_for_test(empty_marker_id.clone(), b"").is_none());
+        let empty_key_observation =
+            observe_stderr_marker_for_test(empty_marker_id, &maximum_marker).unwrap();
+        assert!(
+            observe_stderr_marker_for_test(oversized_marker_id.clone(), &oversized_marker)
+                .is_none()
+        );
+        assert!(observe_stderr_marker_for_test(oversized_marker_id, &maximum_marker).is_some());
+
+        drop(empty_key_observation);
+        assert!(observe_stderr_marker_for_test(
+            ToolExecutionId::new("stderr-observation-empty-marker").unwrap(),
+            &maximum_marker
+        )
+        .is_some());
     }
 }

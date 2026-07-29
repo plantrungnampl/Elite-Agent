@@ -1301,11 +1301,26 @@ fn bounded_inert_helper_outlives_a_short_real_lpac_timeout() {
         )]),
     );
     request.execution_id = ToolExecutionId::new("execution-lpac-bounded-inert-timeout").unwrap();
-    request.timeout_ms = 100;
+    request.timeout_ms = 1_000;
 
     let receipt = launcher.execute(request).unwrap();
 
     assert_eq!(receipt.status, ProcessStatus::Terminated);
+    assert_eq!(receipt.exit_code, None);
+    assert!(receipt
+        .stderr
+        .bytes
+        .windows(b"bounded-inert-started".len())
+        .any(|window| window == b"bounded-inert-started"));
+    assert!(!receipt.stderr.truncated);
+    assert!(receipt.job_receipt.kill_on_close);
+    assert!(receipt.job_receipt.no_breakaway);
+    assert!(receipt.job_receipt.job_memory_limit);
+    assert!(receipt.job_receipt.job_cpu_time_limit);
+    assert_eq!(receipt.job_receipt.memory_limit_bytes, 256 * 1024 * 1024);
+    assert_eq!(receipt.job_receipt.cpu_time_limit_ms, 5_000);
+    assert_eq!(receipt.job_receipt.max_active_processes, 8);
+    assert!(!receipt.job_receipt.resource_limit_terminated);
     assert!(receipt.job_receipt.tree_terminated);
 }
 
@@ -2205,7 +2220,7 @@ fn process_child_helper() {
         Some("stderr-flood") => eprintln!("{}", "x".repeat(128 * 1024)),
         Some("bounded-inert-wait") => {
             eprintln!("bounded-inert-started");
-            thread::park_timeout(Duration::from_secs(30));
+            thread::sleep(Duration::from_secs(30));
         }
         Some("canary-read") => {
             let read_status = if fs::read(std::env::var_os("LAT_PROCESS_CANARY").unwrap()).is_ok() {
