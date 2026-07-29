@@ -55,14 +55,15 @@ use local_agent_terminal_platform_windows::{
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use windows_sys::core::GUID;
 #[cfg(feature = "test-seams")]
 use windows_sys::Win32::Foundation::STILL_ACTIVE;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION, ERROR_NOT_FOUND, ERROR_NOT_SUPPORTED,
-    ERROR_NOT_SUPPORTED_IN_APPCONTAINER, ERROR_NO_SUCH_LOGON_SESSION, ERROR_PIPE_CONNECTED,
-    ERROR_PIPE_LISTENING, ERROR_SUCCESS, FILETIME, GENERIC_READ, GENERIC_WRITE,
-    INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
+    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION, ERROR_NOT_FOUND,
+    ERROR_NOT_SUPPORTED, ERROR_NOT_SUPPORTED_IN_APPCONTAINER, ERROR_NO_SUCH_LOGON_SESSION,
+    ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_SUCCESS, FILETIME, GENERIC_READ,
+    GENERIC_WRITE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Networking::WinSock::{
     closesocket, connect, getsockopt, ioctlsocket, socket, WSACleanup, WSAGetLastError, WSAPoll,
@@ -71,13 +72,19 @@ use windows_sys::Win32::Networking::WinSock::{
     WSAEACCES, WSAEINPROGRESS, WSAEPROVIDERFAILEDINIT, WSAEWOULDBLOCK, WSAPOLLFD,
     WSASYSCALLFAILURE,
 };
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_KERNEL_OBJECT,
+};
 use windows_sys::Win32::Security::Credentials::{
     CredDeleteW, CredEnumerateW, CredFree, CredReadW, CredWriteW, CREDENTIALW,
     CRED_PERSIST_SESSION, CRED_TYPE_GENERIC,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenCapabilities, TokenIsAppContainer, SID_AND_ATTRIBUTES, TOKEN_GROUPS,
-    TOKEN_QUERY,
+    AclSizeInformation, GetAce, GetAclInformation, GetTokenInformation, TokenCapabilities,
+    TokenIsAppContainer, TokenUser, ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION,
+    DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY,
+    TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
@@ -90,7 +97,9 @@ use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
     HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_BINARY, REG_CREATED_NEW_KEY, RRF_RT_REG_BINARY,
 };
-use windows_sys::Win32::System::Rpc::RPC_S_INVALID_BINDING;
+use windows_sys::Win32::System::Rpc::{
+    UuidCreate, RPC_S_INVALID_BINDING, RPC_S_OK, RPC_S_UUID_LOCAL_ONLY,
+};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessTimes, OpenProcessToken, CREATE_BREAKAWAY_FROM_JOB,
 };
@@ -401,10 +410,11 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
         DeniedCanary::new("sibling", &sibling),
     ];
     let registry = RegistryFixture::new();
-    let credentials = CredentialFixture::new();
+    let mut credentials = CredentialFixture::new();
     let pipe = NamedPipeFixture::new();
-    pipe.prove_parent_connection();
-    let child_pipe_server = pipe.server();
+    pipe.prove_parent_connections();
+    let child_pipe_read_server = pipe.server(&pipe.read_name);
+    let child_pipe_write_server = pipe.server(&pipe.write_name);
 
     let junction = container.path().join("junction-escape");
     create_junction(repository_owner.path(), &junction);
@@ -478,7 +488,8 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
             "LAT_D2B_CREDENTIAL_FILTER".to_owned(),
             credentials.filter.clone(),
         ),
-        ("LAT_D2B_PIPE".to_owned(), pipe.name.clone()),
+        ("LAT_D2B_PIPE_READ".to_owned(), pipe.read_name.clone()),
+        ("LAT_D2B_PIPE_WRITE".to_owned(), pipe.write_name.clone()),
     ]);
     for (index, canary) in canaries.iter().enumerate() {
         environment.insert(format!("LAT_D2A_READ_{index}"), path_text(&canary.read));
@@ -502,6 +513,7 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
     let execution_id = request.execution_id.clone();
 
     let receipt = launcher.execute(request).unwrap();
+    credentials.observe_child_ownership();
     let stdout = String::from_utf8(receipt.stdout.bytes).unwrap();
     let stderr = String::from_utf8(receipt.stderr.bytes).unwrap();
     let observed = stdout
@@ -533,7 +545,8 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
         "credential-read=rpc-invalid-binding",
         "credential-enumerate=rpc-invalid-binding",
         "credential-write=rpc-invalid-binding",
-        "pipe-connect=denied",
+        "pipe-read=not-found",
+        "pipe-write=not-found",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -570,8 +583,10 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
     assert!(!stdout.contains(&credentials.parent_target));
     assert!(!stdout.contains(&credentials.child_target));
     assert!(!stdout.contains(std::str::from_utf8(CREDENTIAL_BLOB).unwrap()));
-    assert!(!child_pipe_server.accepted_connection());
-    assert!(!stdout.contains(&pipe.name));
+    assert!(!child_pipe_read_server.accepted_connection());
+    assert!(!child_pipe_write_server.accepted_connection());
+    assert!(!stdout.contains(&pipe.read_name));
+    assert!(!stdout.contains(&pipe.write_name));
     assert!(!stdout.contains("alternate stream canary"));
     assert_no_pending_connection(&loopback_listener);
     assert_no_pending_connection(&lan_listener);
@@ -592,7 +607,45 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
     let _ = execution_id;
     registry.cleanup();
     credentials.cleanup();
-    pipe.cleanup(child_pipe_server);
+    pipe.cleanup(child_pipe_read_server, child_pipe_write_server);
+}
+
+#[test]
+fn named_pipe_fixture_uses_local_namespace_parent_only_dacl_and_minimal_accesses() {
+    let pipe = NamedPipeFixture::new();
+
+    assert!(pipe.read_name.starts_with(r"\\.\pipe\LOCAL\"));
+    assert!(pipe.write_name.starts_with(r"\\.\pipe\LOCAL\"));
+    assert_ne!(pipe.read_name, pipe.write_name);
+    let server = pipe.server(&pipe.read_name);
+    assert_eq!(
+        server.allowed_sid_strings(),
+        vec![current_user_sid_string()]
+    );
+    drop(server);
+    pipe.prove_parent_connections();
+}
+
+#[test]
+fn credential_fixture_preserves_preexisting_parent_and_child_targets() {
+    for suffix in ["parent", "child"] {
+        let nonce = credential_nonce();
+        let target = format!("LocalAgentTerminal/Task7/{nonce}/{suffix}");
+        let stale = OwnedTestCredential::new(target.clone(), b"preexisting inert blob");
+
+        let construction = CredentialFixture::try_new_with_nonce(&nonce);
+
+        assert!(
+            matches!(construction, Err(ERROR_ALREADY_EXISTS)),
+            "{suffix}"
+        );
+        assert_eq!(
+            read_credential(&target).unwrap(),
+            b"preexisting inert blob",
+            "{suffix}"
+        );
+        stale.cleanup();
+    }
 }
 
 #[cfg(feature = "test-seams")]
@@ -2123,8 +2176,18 @@ fn run_lpac_hostile_d2a_probe() {
         credential_write_status(&std::env::var("LAT_D2B_CREDENTIAL_CHILD").unwrap_or_default())
     );
     println!(
-        "d2a-pipe-connect={}",
-        pipe_connect_status(&std::env::var("LAT_D2B_PIPE").unwrap_or_default())
+        "d2a-pipe-read={}",
+        pipe_connect_status(
+            &std::env::var("LAT_D2B_PIPE_READ").unwrap_or_default(),
+            GENERIC_READ,
+        )
+    );
+    println!(
+        "d2a-pipe-write={}",
+        pipe_connect_status(
+            &std::env::var("LAT_D2B_PIPE_WRITE").unwrap_or_default(),
+            GENERIC_WRITE,
+        )
     );
 }
 
@@ -2191,8 +2254,8 @@ fn protected_resource_status(status: u32) -> &'static str {
     }
 }
 
-fn pipe_connect_status(name: &str) -> &'static str {
-    match connect_pipe(name) {
+fn pipe_connect_status(name: &str, access: u32) -> &'static str {
+    match connect_pipe(name, access) {
         Ok(_) => "success",
         Err(status) => protected_resource_status(status),
     }
@@ -2858,7 +2921,6 @@ const REGISTRY_CHILD_MARKER: &str = "child-marker";
 const REGISTRY_CONTENTS: &[u8] = b"task7 inert registry fixture";
 static NEXT_REGISTRY_FIXTURE: AtomicU64 = AtomicU64::new(1);
 const CREDENTIAL_BLOB: &[u8] = b"task7 inert credential blob";
-static NEXT_CREDENTIAL_FIXTURE: AtomicU64 = AtomicU64::new(1);
 static NEXT_PIPE_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
 struct RegistryFixture {
@@ -2954,29 +3016,47 @@ struct CredentialFixture {
     parent_target: String,
     child_target: String,
     filter: String,
-    active: bool,
+    parent_owned: bool,
+    child_owned: bool,
+    child_target_was_absent: bool,
 }
 
 impl CredentialFixture {
     fn new() -> Self {
-        let prefix = format!(
-            "LocalAgentTerminal/Task7/{}/{}/",
-            std::process::id(),
-            NEXT_CREDENTIAL_FIXTURE.fetch_add(1, Ordering::Relaxed)
-        );
-        let fixture = Self {
+        let nonce = credential_nonce();
+        Self::try_new_with_nonce(&nonce).unwrap()
+    }
+
+    fn try_new_with_nonce(nonce: &str) -> Result<Self, u32> {
+        let prefix = format!("LocalAgentTerminal/Task7/{nonce}/");
+        let mut fixture = Self {
             parent_target: format!("{prefix}parent"),
             child_target: format!("{prefix}child"),
             filter: format!("{prefix}*"),
-            active: true,
+            parent_owned: false,
+            child_owned: false,
+            child_target_was_absent: false,
         };
-        write_credential(&fixture.parent_target, CREDENTIAL_BLOB).unwrap();
-        assert_eq!(
-            credential_write_status(&fixture.child_target),
-            "isolated-cleaned"
-        );
+        require_absent_credential(&fixture.parent_target)?;
+        require_absent_credential(&fixture.child_target)?;
+        fixture.child_target_was_absent = true;
+        write_credential(&fixture.parent_target, CREDENTIAL_BLOB)?;
+        fixture.parent_owned = true;
+        write_credential(&fixture.child_target, CREDENTIAL_BLOB)?;
+        fixture.child_owned = true;
+        delete_credential(&fixture.child_target)?;
+        fixture.child_owned = false;
         fixture.assert_unchanged();
-        fixture
+        Ok(fixture)
+    }
+
+    fn observe_child_ownership(&mut self) {
+        match read_credential(&self.child_target) {
+            Ok(_) if self.child_target_was_absent => self.child_owned = true,
+            Ok(_) => panic!("credential child target was not reserved by this fixture"),
+            Err(ERROR_NOT_FOUND) => {}
+            Err(status) => panic!("credential child observation failed with status {status}"),
+        }
     }
 
     fn assert_unchanged(&self) {
@@ -2990,41 +3070,233 @@ impl CredentialFixture {
     }
 
     fn cleanup(mut self) {
-        delete_credential(&self.parent_target).unwrap();
-        assert_eq!(delete_credential(&self.child_target), Err(ERROR_NOT_FOUND));
-        self.active = false;
+        self.observe_child_ownership();
+        self.remove_owned();
         assert_eq!(read_credential(&self.parent_target), Err(ERROR_NOT_FOUND));
+        assert_eq!(read_credential(&self.child_target), Err(ERROR_NOT_FOUND));
         assert_eq!(enumerate_credentials(&self.filter), Err(ERROR_NOT_FOUND));
+    }
+
+    fn remove_owned(&mut self) {
+        if self.parent_owned {
+            delete_credential(&self.parent_target).unwrap();
+            self.parent_owned = false;
+        }
+        if self.child_owned {
+            delete_credential(&self.child_target).unwrap();
+            self.child_owned = false;
+        }
+    }
+}
+
+struct OwnedTestCredential {
+    target: String,
+    active: bool,
+}
+
+impl OwnedTestCredential {
+    fn new(target: String, blob: &[u8]) -> Self {
+        assert_eq!(read_credential(&target), Err(ERROR_NOT_FOUND));
+        write_credential(&target, blob).unwrap();
+        Self {
+            target,
+            active: true,
+        }
+    }
+
+    fn cleanup(mut self) {
+        delete_credential(&self.target).unwrap();
+        self.active = false;
+        assert_eq!(read_credential(&self.target), Err(ERROR_NOT_FOUND));
+    }
+}
+
+impl Drop for OwnedTestCredential {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = delete_credential(&self.target);
+        }
     }
 }
 
 impl Drop for CredentialFixture {
     fn drop(&mut self) {
-        if self.active {
+        if self.child_target_was_absent
+            && !self.child_owned
+            && read_credential(&self.child_target).is_ok()
+        {
+            self.child_owned = true;
+        }
+        if self.parent_owned {
             let _ = delete_credential(&self.parent_target);
+        }
+        if self.child_owned {
             let _ = delete_credential(&self.child_target);
         }
     }
 }
 
+fn credential_nonce() -> String {
+    let mut nonce = GUID::from_u128(0);
+    // SAFETY: nonce points to writable GUID storage.
+    let status = unsafe { UuidCreate(&mut nonce) };
+    assert!(status == RPC_S_OK || status == RPC_S_UUID_LOCAL_ONLY);
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        nonce.data1,
+        nonce.data2,
+        nonce.data3,
+        nonce.data4[0],
+        nonce.data4[1],
+        nonce.data4[2],
+        nonce.data4[3],
+        nonce.data4[4],
+        nonce.data4[5],
+        nonce.data4[6],
+        nonce.data4[7],
+    )
+}
+
+fn require_absent_credential(target: &str) -> Result<(), u32> {
+    match read_credential(target) {
+        Err(ERROR_NOT_FOUND) => Ok(()),
+        Ok(_) => Err(ERROR_ALREADY_EXISTS),
+        Err(status) => Err(status),
+    }
+}
+
+struct PipeSecurityDescriptor(OwnedLocalAllocation);
+
+impl PipeSecurityDescriptor {
+    fn for_current_user() -> Self {
+        let user_sid = current_user_sid_string();
+        let sddl = wide_nul(&format!("D:P(A;;GA;;;{user_sid})"));
+        let mut descriptor = ptr::null_mut();
+        // SAFETY: sddl is live and NUL-terminated; descriptor points to writable
+        // storage that receives a LocalAlloc-owned security descriptor.
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        Self(OwnedLocalAllocation(descriptor))
+    }
+
+    fn attributes(&self) -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: self.0.as_ptr(),
+            bInheritHandle: 0,
+        }
+    }
+}
+
+struct OwnedLocalAllocation(*mut std::ffi::c_void);
+
+impl OwnedLocalAllocation {
+    fn as_ptr(&self) -> *mut std::ffi::c_void {
+        self.0
+    }
+}
+
+impl Drop for OwnedLocalAllocation {
+    fn drop(&mut self) {
+        // SAFETY: this pointer was allocated by a Windows API documented for LocalFree.
+        unsafe {
+            LocalFree(self.0);
+        }
+    }
+}
+
+struct OwnedTokenHandle(windows_sys::Win32::Foundation::HANDLE);
+
+impl Drop for OwnedTokenHandle {
+    fn drop(&mut self) {
+        // SAFETY: this token handle is owned here.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+fn current_user_sid_string() -> String {
+    let mut token = ptr::null_mut();
+    // SAFETY: the current-process pseudo-handle is valid and token is writable.
+    assert_ne!(
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+        0
+    );
+    let token = OwnedTokenHandle(token);
+    let mut required = 0;
+    // SAFETY: this sizing query intentionally supplies no buffer.
+    assert_eq!(
+        unsafe { GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut required) },
+        0
+    );
+    // SAFETY: GetTokenInformation failed on this thread.
+    assert_eq!(unsafe { GetLastError() }, ERROR_INSUFFICIENT_BUFFER);
+    let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
+    let mut buffer = vec![0_usize; words];
+    // SAFETY: buffer is aligned and writable for the requested TOKEN_USER bytes.
+    assert_ne!(
+        unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                required,
+                &mut required,
+            )
+        },
+        0
+    );
+    // SAFETY: the successful query returned an aligned TOKEN_USER structure.
+    let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    sid_string(user.User.Sid)
+}
+
+fn sid_string(sid: windows_sys::Win32::Security::PSID) -> String {
+    let mut sid_text = ptr::null_mut();
+    // SAFETY: sid is live for this call and sid_text is writable.
+    assert_ne!(unsafe { ConvertSidToStringSidW(sid, &mut sid_text) }, 0);
+    let sid_text = OwnedLocalAllocation(sid_text.cast());
+    // SAFETY: successful conversion returned a NUL-terminated UTF-16 string.
+    unsafe { wide_ptr_string(sid_text.as_ptr().cast()) }
+}
+
 struct NamedPipeFixture {
-    name: String,
+    read_name: String,
+    write_name: String,
+    security: PipeSecurityDescriptor,
 }
 
 impl NamedPipeFixture {
     fn new() -> Self {
+        let id = NEXT_PIPE_FIXTURE.fetch_add(1, Ordering::Relaxed);
         Self {
-            name: format!(
-                r"\\.\pipe\LocalAgentTerminal-Task7-{}-{}",
+            read_name: format!(
+                r"\\.\pipe\LOCAL\LocalAgentTerminal-Task7-{}-{id}-read",
                 std::process::id(),
-                NEXT_PIPE_FIXTURE.fetch_add(1, Ordering::Relaxed)
             ),
+            write_name: format!(
+                r"\\.\pipe\LOCAL\LocalAgentTerminal-Task7-{}-{id}-write",
+                std::process::id(),
+            ),
+            security: PipeSecurityDescriptor::for_current_user(),
         }
     }
 
-    fn server(&self) -> OwnedNamedPipe {
-        let name = wide_nul(&self.name);
-        // SAFETY: name is NUL-terminated; null security selects the parent token's default DACL.
+    fn server(&self, name: &str) -> OwnedNamedPipe {
+        let name = wide_nul(name);
+        let security = self.security.attributes();
+        // SAFETY: name is NUL-terminated and security points to the fixture-owned
+        // descriptor for the duration of this call.
         let handle = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
@@ -3034,24 +3306,37 @@ impl NamedPipeFixture {
                 0,
                 0,
                 0,
-                ptr::null(),
+                &security,
             )
         };
         assert_ne!(handle, INVALID_HANDLE_VALUE);
         OwnedNamedPipe(handle)
     }
 
-    fn prove_parent_connection(&self) {
-        let server = self.server();
-        let client = connect_pipe(&self.name).unwrap();
-        assert!(server.accepted_connection());
-        drop(client);
-        server.disconnect();
+    fn prove_parent_connections(&self) {
+        for (name, access) in [
+            (&self.read_name, GENERIC_READ),
+            (&self.write_name, GENERIC_WRITE),
+        ] {
+            let server = self.server(name);
+            let client = connect_pipe(name, access).unwrap();
+            assert!(server.accepted_connection());
+            drop(client);
+            server.disconnect();
+        }
     }
 
-    fn cleanup(self, server: OwnedNamedPipe) {
-        drop(server);
-        assert_eq!(connect_pipe(&self.name).unwrap_err(), ERROR_FILE_NOT_FOUND);
+    fn cleanup(self, read_server: OwnedNamedPipe, write_server: OwnedNamedPipe) {
+        drop(read_server);
+        drop(write_server);
+        assert_eq!(
+            connect_pipe(&self.read_name, GENERIC_READ).unwrap_err(),
+            ERROR_FILE_NOT_FOUND
+        );
+        assert_eq!(
+            connect_pipe(&self.write_name, GENERIC_WRITE).unwrap_err(),
+            ERROR_FILE_NOT_FOUND
+        );
     }
 }
 
@@ -3059,6 +3344,52 @@ impl NamedPipeFixture {
 struct OwnedNamedPipe(windows_sys::Win32::Foundation::HANDLE);
 
 impl OwnedNamedPipe {
+    fn allowed_sid_strings(&self) -> Vec<String> {
+        let mut dacl = ptr::null_mut();
+        let mut descriptor = ptr::null_mut();
+        // SAFETY: the pipe handle is live and all requested output pointers are writable.
+        assert_eq!(
+            unsafe {
+                GetSecurityInfo(
+                    self.0,
+                    SE_KERNEL_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut dacl,
+                    ptr::null_mut(),
+                    &mut descriptor,
+                )
+            },
+            ERROR_SUCCESS
+        );
+        let _descriptor = OwnedLocalAllocation(descriptor);
+        let mut information = ACL_SIZE_INFORMATION::default();
+        // SAFETY: dacl belongs to the live descriptor and information is writable.
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            },
+            0
+        );
+        (0..information.AceCount)
+            .map(|index| {
+                let mut raw_ace = ptr::null_mut();
+                // SAFETY: index is within the queried ACE count and raw_ace is writable.
+                assert_ne!(unsafe { GetAce(dacl, index, &mut raw_ace) }, 0);
+                // SAFETY: this test-owned DACL is expected to contain access-allowed ACEs.
+                let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+                assert_eq!(ace.Header.AceType, 0);
+                sid_string((&ace.SidStart as *const u32).cast_mut().cast())
+            })
+            .collect()
+    }
+
     fn accepted_connection(&self) -> bool {
         // SAFETY: the server handle is live; PIPE_NOWAIT makes this observation bounded.
         if unsafe { ConnectNamedPipe(self.0, ptr::null_mut()) } != 0 {
@@ -3099,13 +3430,13 @@ impl Drop for OwnedPipeClient {
     }
 }
 
-fn connect_pipe(name: &str) -> Result<OwnedPipeClient, u32> {
+fn connect_pipe(name: &str, access: u32) -> Result<OwnedPipeClient, u32> {
     let name = wide_nul(name);
     // SAFETY: name is NUL-terminated; optional security and template handles are null.
     let handle = unsafe {
         CreateFileW(
             name.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
+            access,
             0,
             ptr::null(),
             OPEN_EXISTING,
