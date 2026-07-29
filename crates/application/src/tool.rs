@@ -690,6 +690,7 @@ pub struct AuthorizedProcessRequest {
     pub limits: ProcessLimits,
     pub expected_writes: Vec<AuthorizedExpectedWrite>,
     pub executor_claim: LeaseClaim,
+    pub executor_fence: crate::workspace::ProcessFenceBinding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

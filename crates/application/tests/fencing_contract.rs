@@ -5,9 +5,9 @@ use std::thread;
 
 use local_agent_terminal_application::{
     AcquireLease, CreateWorktree, DiscardWorktree, ExecutorLeaseStore, InspectRepository,
-    LeaseSnapshot, LeaseState, ManagedWorktreePath, PortError, RepositoryGateway,
-    RepositoryLocator, RepositorySnapshot, RevokeLease, WorkspaceWriteCoordinator,
-    WorktreeSnapshot,
+    LeaseSnapshot, LeaseState, ManagedWorktreePath, PortError, ProcessFenceAuthority,
+    RepositoryGateway, RepositoryLocator, RepositorySnapshot, RevokeLease,
+    WorkspaceWriteCoordinator, WorktreeSnapshot,
 };
 use local_agent_terminal_domain::{
     FencingToken, GitObjectId, LeaseClaim, RepositoryId, RunId, TaskBranch, TaskId,
@@ -50,6 +50,17 @@ fn current_token_is_checked_immediately_before_the_repository_effect() {
         ["assert_current", "discard_worktree"]
     );
     assert_eq!(repositories.discard_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn process_fence_bindings_compare_authority_identity() {
+    let leases = Arc::new(TestLeaseStore::at_token(1));
+    let writes = Arc::new(WorkspaceWriteCoordinator::new());
+    let authority = ProcessFenceAuthority::new(leases.clone(), writes.clone());
+    let separately_minted = ProcessFenceAuthority::new(leases, writes);
+
+    assert_eq!(authority.binding(), authority.binding());
+    assert_ne!(authority.binding(), separately_minted.binding());
 }
 
 #[test]

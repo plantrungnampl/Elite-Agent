@@ -5,9 +5,13 @@ use std::os::windows::io::FromRawHandle;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+#[cfg(feature = "test-seams")]
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "test-seams")]
+use local_agent_terminal_application::ToolExecutionId;
 use local_agent_terminal_application::{
     AuthorizedProcessRequest, JobReceipt, PortError, Retryability, SafeErrorClassification,
 };
@@ -27,6 +31,84 @@ use windows_sys::Win32::System::Threading::{
 pub(super) const TERMINATED_EXIT_CODE: u32 = 0xC000_013A;
 const TREE_EXIT_DEADLINE: Duration = Duration::from_secs(5);
 const NATURAL_TREE_EXIT_GRACE: Duration = Duration::from_millis(50);
+
+#[cfg(feature = "test-seams")]
+static JOB_CLEANUP_FAILURE: Mutex<Option<ConfiguredJobCleanupFailure>> = Mutex::new(None);
+
+#[cfg(feature = "test-seams")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobCleanupFailurePointForTest {
+    Terminate,
+    TreeWait,
+}
+
+#[cfg(feature = "test-seams")]
+struct ConfiguredJobCleanupFailure {
+    execution_id: String,
+    point: JobCleanupFailurePointForTest,
+    state: Arc<(Mutex<JobCleanupFailureState>, Condvar)>,
+}
+
+#[cfg(feature = "test-seams")]
+#[derive(Default)]
+struct JobCleanupFailureState {
+    attempts: usize,
+    fail_current_attempt: bool,
+    allow_cleanup: bool,
+}
+
+#[cfg(feature = "test-seams")]
+pub struct JobCleanupFailureControlForTest {
+    state: Arc<(Mutex<JobCleanupFailureState>, Condvar)>,
+}
+
+#[cfg(feature = "test-seams")]
+pub fn block_next_job_cleanup_failure_for_test(
+    execution_id: ToolExecutionId,
+    point: JobCleanupFailurePointForTest,
+) -> JobCleanupFailureControlForTest {
+    let state = Arc::new((
+        Mutex::new(JobCleanupFailureState::default()),
+        Condvar::new(),
+    ));
+    if let Ok(mut configured) = JOB_CLEANUP_FAILURE.lock() {
+        *configured = Some(ConfiguredJobCleanupFailure {
+            execution_id: execution_id.as_str().to_owned(),
+            point,
+            state: Arc::clone(&state),
+        });
+    }
+    JobCleanupFailureControlForTest { state }
+}
+
+#[cfg(feature = "test-seams")]
+impl JobCleanupFailureControlForTest {
+    pub fn wait_for_attempt(&self, expected: usize, timeout: Duration) -> bool {
+        let (state, changed) = &*self.state;
+        let Ok(state) = state.lock() else {
+            return false;
+        };
+        changed
+            .wait_timeout_while(state, timeout, |state| state.attempts < expected)
+            .is_ok_and(|(state, _)| state.attempts >= expected)
+    }
+
+    pub fn fail_current_attempt(&self) {
+        let (state, changed) = &*self.state;
+        if let Ok(mut state) = state.lock() {
+            state.fail_current_attempt = true;
+            changed.notify_all();
+        }
+    }
+
+    pub fn allow_cleanup(&self) {
+        let (state, changed) = &*self.state;
+        if let Ok(mut state) = state.lock() {
+            state.allow_cleanup = true;
+            changed.notify_all();
+        }
+    }
+}
 
 pub(super) struct ActiveJob {
     job: OwnedHandle,
@@ -104,6 +186,10 @@ impl ActiveJob {
     }
 
     pub(super) fn terminate(&self) -> Result<(), PortError> {
+        #[cfg(feature = "test-seams")]
+        if controlled_cleanup_failure(&self.job_id, JobCleanupFailurePointForTest::Terminate) {
+            return Err(platform_error());
+        }
         if self
             .terminated
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -141,6 +227,10 @@ impl ActiveJob {
     }
 
     pub(super) fn wait_tree_exit(&self) -> Result<(), PortError> {
+        #[cfg(feature = "test-seams")]
+        if controlled_cleanup_failure(&self.job_id, JobCleanupFailurePointForTest::TreeWait) {
+            return Err(platform_error());
+        }
         let deadline = Instant::now() + TREE_EXIT_DEADLINE;
         loop {
             if self.active_process_count()? == 0 {
@@ -297,6 +387,40 @@ impl ActiveJob {
     fn terminate_unassigned(&self) {
         terminate_process(&self.process);
         self.terminated.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "test-seams")]
+fn controlled_cleanup_failure(job_id: &str, point: JobCleanupFailurePointForTest) -> bool {
+    let state = JOB_CLEANUP_FAILURE.lock().ok().and_then(|configured| {
+        configured
+            .as_ref()
+            .filter(|failure| failure.execution_id == job_id && failure.point == point)
+            .map(|failure| Arc::clone(&failure.state))
+    });
+    let Some(state) = state else {
+        return false;
+    };
+    let (state, changed) = &*state;
+    let Ok(mut state) = state.lock() else {
+        return false;
+    };
+    if state.allow_cleanup {
+        return false;
+    }
+    state.attempts += 1;
+    changed.notify_all();
+    while !state.fail_current_attempt && !state.allow_cleanup {
+        let Ok(next) = changed.wait(state) else {
+            return false;
+        };
+        state = next;
+    }
+    if state.allow_cleanup {
+        false
+    } else {
+        state.fail_current_attempt = false;
+        true
     }
 }
 

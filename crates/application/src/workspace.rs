@@ -1,4 +1,5 @@
-use std::sync::{Mutex, MutexGuard};
+use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, Condition, EventId, FencingToken, GitObjectId, LeaseClaim, OperationState,
@@ -538,6 +539,78 @@ pub struct WorkspaceWriteCoordinator {
 pub struct WorkspaceWritePermit<'a> {
     _guard: MutexGuard<'a, ()>,
 }
+
+#[derive(Clone)]
+pub struct ProcessFenceAuthority {
+    inner: Arc<ProcessFenceAuthorityInner>,
+}
+
+struct ProcessFenceAuthorityInner {
+    leases: Arc<dyn ExecutorLeaseStore>,
+    writes: Arc<WorkspaceWriteCoordinator>,
+}
+
+#[derive(Clone)]
+pub struct ProcessFenceBinding {
+    inner: Arc<ProcessFenceAuthorityInner>,
+}
+
+impl ProcessFenceAuthority {
+    pub fn new(
+        leases: Arc<dyn ExecutorLeaseStore>,
+        writes: Arc<WorkspaceWriteCoordinator>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ProcessFenceAuthorityInner { leases, writes }),
+        }
+    }
+
+    pub fn binding(&self) -> ProcessFenceBinding {
+        ProcessFenceBinding {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    pub fn assert_current(&self, claim: LeaseClaim) -> Result<(), PortError> {
+        self.inner.leases.assert_current(claim)
+    }
+
+    pub fn acquire_lease(&self, request: AcquireLease) -> Result<LeaseSnapshot, PortError> {
+        self.inner
+            .writes
+            .acquire_lease(self.inner.leases.as_ref(), request)
+    }
+
+    pub fn revoke_lease(&self, request: RevokeLease) -> Result<(), PortError> {
+        self.inner
+            .writes
+            .revoke_lease(self.inner.leases.as_ref(), request)
+    }
+}
+
+impl ProcessFenceBinding {
+    pub fn monitor_permit(&self, claim: LeaseClaim) -> Result<WorkspaceWritePermit<'_>, PortError> {
+        self.inner
+            .writes
+            .monitor_permit(self.inner.leases.as_ref(), claim)
+    }
+}
+
+impl fmt::Debug for ProcessFenceBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessFenceBinding")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ProcessFenceBinding {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Eq for ProcessFenceBinding {}
 
 impl WorkspaceWriteCoordinator {
     pub const fn new() -> Self {

@@ -1,15 +1,16 @@
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use local_agent_terminal_application::{
     AcquireLease, ApprovedExecutableIdentity, ApprovedProcessRequest, AuthorizedProcessRequest,
     BoundedOutput, CancellationReceipt, CapabilityRequest, CapabilityResolver,
     CapabilityRootIdentity, ExecutorLeaseStore, JobReceipt, LeaseSnapshot, ObservedProcessWrite,
-    PortError, ProcessLauncher, ProcessReceipt, ProcessStatus, ProcessWorkingDirectory,
-    RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget, Retryability,
-    RevokeLease, SafeErrorClassification, ToolExecutionId, VerifiedWrite,
+    PortError, ProcessFenceAuthority, ProcessLauncher, ProcessReceipt, ProcessStatus,
+    ProcessWorkingDirectory, RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget,
+    Retryability, RevokeLease, SafeErrorClassification, ToolExecutionId, VerifiedWrite,
+    WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken, LeaseClaim, NetworkProfile,
@@ -21,7 +22,10 @@ use local_agent_terminal_platform_core::{
     NetworkPolicyAdapter, TrustedEnvironmentProfile, TrustedExecutableRegistration,
     TrustedNetworkProfile,
 };
-use local_agent_terminal_platform_windows::WindowsExecutableInspector;
+use local_agent_terminal_platform_windows::{
+    IsolatedWorkerBoundaryAdapter, IsolatedWorkerBoundaryBinding, IsolatedWorkerBoundaryClaims,
+    PreparedIsolatedWorkerBoundary, WindowsExecutableInspector, WindowsProcessLauncher,
+};
 use local_agent_terminal_tool_runtime::ProcessRuntime;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -179,6 +183,136 @@ fn old_approval_executable_identity_replacement_never_reaches_launcher() {
         );
         assert_eq!(outcome.launcher_calls, 0, "{replacement:?}");
         assert!(outcome.request.is_none(), "{replacement:?}");
+    }
+}
+
+#[test]
+fn runtime_initial_check_cannot_bypass_final_windows_resume_fence() {
+    let root = TempDir::new().unwrap();
+    let marker = root.path().join("must-not-run-after-runtime-check.txt");
+    let executable_path = std::env::current_exe().unwrap();
+    let executables = executable_registry(&executable_path, "test-version");
+    let approved_executable = executables.resolve_registered("cargo").unwrap();
+    let environment_digest = Sha256Digest::new(
+        "sha256:c465e195c2dd90a8fc0317b7ba545d3fa5233faec2b1a216c4d205dc7be61c65",
+    )
+    .unwrap();
+    let environments = EnvironmentProfileRegistry::load(vec![TrustedEnvironmentProfile::new(
+        "rust-build",
+        vec![
+            ("CI".to_owned(), "1".to_owned()),
+            ("RUST_BACKTRACE".to_owned(), "0".to_owned()),
+        ],
+        false,
+    )
+    .unwrap()])
+    .unwrap();
+    let networks = NetworkPolicyAdapter::load(vec![TrustedNetworkProfile::new(
+        "offline",
+        NetworkProfile::Denied,
+        Vec::new(),
+        "firewall-rule-7",
+    )
+    .unwrap()])
+    .unwrap();
+    let enforced_network = networks
+        .prepare(
+            "offline",
+            NetworkProfile::Denied,
+            NetworkEnforcementEvidence::new("firewall-rule-7", true, true).unwrap(),
+        )
+        .unwrap();
+    let leases = Arc::new(AuthoritativeReplacingLeaseStore::new());
+    let writes = Arc::new(WorkspaceWriteCoordinator::new());
+    let authority = ProcessFenceAuthority::new(leases.clone(), writes);
+    let boundary = Arc::new(RuntimeLeaseReplacingBoundary {
+        cwd: root.path().to_owned(),
+        leases: Arc::clone(&leases),
+        authority: authority.clone(),
+    });
+    let launcher = WindowsProcessLauncher::with_isolated_worker_boundary(
+        boundary,
+        IsolatedWorkerBoundaryBinding::new("runtime-test-identity", "runtime-test-acl").unwrap(),
+    );
+    let resolver = WorktreeResolver {
+        mutation: CaseMutation::None,
+    };
+    let runtime = ProcessRuntime::new(
+        &executables,
+        &environments,
+        &networks,
+        vec![enforced_network],
+        &resolver,
+        &authority,
+        &launcher,
+    )
+    .unwrap();
+    let task_id = TaskId::new("task-1").unwrap();
+    let run_id = RunId::new("run-1").unwrap();
+    let process = ProcessToolRequest::new(
+        ProcessBinding::new(
+            task_id.clone(),
+            run_id,
+            PlanStepId::new("step-1").unwrap(),
+            Phase::Implementation,
+            WorkspaceVersion::new(4),
+            EnvironmentProfile::new("rust-build", environment_digest).unwrap(),
+            5_000,
+        )
+        .unwrap(),
+        ProcessInvocation::new(
+            CapabilityRef::toolchain("cargo").unwrap(),
+            vec![
+                "--exact".to_owned(),
+                "process_runtime_final_fence_child_helper".to_owned(),
+                "--nocapture".to_owned(),
+                "--skip".to_owned(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            CapabilityRef::worktree(task_id, ".").unwrap(),
+            ProcessTrustTier::IsolatedWorker,
+            NetworkProfile::Denied,
+            Vec::new(),
+            Some(FencingToken::new(7).unwrap()),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let execution_id = ToolExecutionId::new("runtime-final-fence-race").unwrap();
+
+    let error = runtime
+        .execute(
+            execution_id.clone(),
+            ApprovedProcessRequest {
+                approved_executable,
+                process,
+                expected_reads: Vec::new(),
+                memory_limit_bytes: Some(64 * 1024 * 1024),
+                cpu_time_limit_ms: Some(2_000),
+            },
+        )
+        .expect_err("replacement after the runtime check must deny resume");
+
+    assert!(matches!(
+        error,
+        PortError::StaleLease { current, supplied }
+            if current.get() == 8 && supplied.get() == 7
+    ));
+    assert_eq!(leases.assertions.load(Ordering::SeqCst), 2);
+    assert_eq!(leases.acquisitions.load(Ordering::SeqCst), 1);
+    assert!(!marker.exists());
+    assert!(launcher.cancel(&execution_id).is_err());
+}
+
+#[test]
+fn process_runtime_final_fence_child_helper() {
+    let arguments = std::env::args().collect::<Vec<_>>();
+    if let Some(marker) = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--skip")
+        .map(|pair| &pair[1])
+    {
+        fs::write(marker, b"child-ran").unwrap();
     }
 }
 
@@ -370,10 +504,12 @@ fn execute_with_registry(
         FencingToken::new(7).unwrap(),
     );
     let resolver = WorktreeResolver { mutation };
-    let leases = CurrentLease {
+    let leases = Arc::new(CurrentLease {
         expected: claim.clone(),
         stale: mutation == CaseMutation::StaleLease,
-    };
+    });
+    let executor_fence =
+        ProcessFenceAuthority::new(leases, Arc::new(WorkspaceWriteCoordinator::new()));
     let launcher = CapturingLauncher {
         omit_write_evidence: mutation == CaseMutation::LauncherMissingWriteEvidence,
         ..CapturingLauncher::default()
@@ -384,7 +520,7 @@ fn execute_with_registry(
         &networks,
         vec![enforced_network],
         &resolver,
-        &leases,
+        &executor_fence,
         &launcher,
     )
     .unwrap();
@@ -616,6 +752,94 @@ impl CapabilityResolver for WorktreeResolver {
 struct CurrentLease {
     expected: LeaseClaim,
     stale: bool,
+}
+
+struct RuntimeLeaseReplacingBoundary {
+    cwd: std::path::PathBuf,
+    leases: Arc<AuthoritativeReplacingLeaseStore>,
+    authority: ProcessFenceAuthority,
+}
+
+impl IsolatedWorkerBoundaryAdapter for RuntimeLeaseReplacingBoundary {
+    fn prepare(
+        &self,
+        request: &AuthorizedProcessRequest,
+    ) -> Result<PreparedIsolatedWorkerBoundary, PortError> {
+        PreparedIsolatedWorkerBoundary::new(
+            &self.cwd,
+            "runtime-test-identity",
+            "runtime-test-acl",
+            None,
+            IsolatedWorkerBoundaryClaims::from_request(request),
+        )
+    }
+
+    fn verify_before_resume(
+        &self,
+        request: &AuthorizedProcessRequest,
+        _prepared: &PreparedIsolatedWorkerBoundary,
+    ) -> Result<(), PortError> {
+        assert_eq!(self.leases.assertions.load(Ordering::SeqCst), 1);
+        self.authority.acquire_lease(AcquireLease {
+            task_id: request.executor_claim.task_id().clone(),
+            holder_run_id: RunId::new("run-2").unwrap(),
+            expected_fencing_epoch: 7,
+            acquired_at: "2026-07-29T00:00:00Z".to_owned(),
+            expires_at: "2026-07-29T01:00:00Z".to_owned(),
+        })?;
+        Ok(())
+    }
+}
+
+struct AuthoritativeReplacingLeaseStore {
+    current: AtomicU64,
+    assertions: AtomicUsize,
+    acquisitions: AtomicUsize,
+}
+
+impl AuthoritativeReplacingLeaseStore {
+    const fn new() -> Self {
+        Self {
+            current: AtomicU64::new(7),
+            assertions: AtomicUsize::new(0),
+            acquisitions: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ExecutorLeaseStore for AuthoritativeReplacingLeaseStore {
+    fn acquire(&self, request: AcquireLease) -> Result<LeaseSnapshot, PortError> {
+        self.acquisitions.fetch_add(1, Ordering::SeqCst);
+        self.current.store(8, Ordering::SeqCst);
+        Ok(LeaseSnapshot {
+            task_id: request.task_id,
+            holder_run_id: request.holder_run_id,
+            token: FencingToken::new(8).unwrap(),
+            state: local_agent_terminal_application::LeaseState::Active,
+            acquired_at: request.acquired_at,
+            expires_at: request.expires_at,
+            released_at: None,
+        })
+    }
+
+    fn revoke(&self, _request: RevokeLease) -> Result<(), PortError> {
+        unreachable!()
+    }
+
+    fn fence_stale(&self) -> Result<Vec<LeaseSnapshot>, PortError> {
+        unreachable!()
+    }
+
+    fn assert_current(&self, claim: LeaseClaim) -> Result<(), PortError> {
+        self.assertions.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(claim.task_id(), &TaskId::new("task-1").unwrap());
+        let current = FencingToken::new(self.current.load(Ordering::SeqCst)).unwrap();
+        if current == claim.token() {
+            Ok(())
+        } else {
+            Err(PortError::stale_lease(current, claim.token()))
+        }
+    }
 }
 
 impl ExecutorLeaseStore for CurrentLease {

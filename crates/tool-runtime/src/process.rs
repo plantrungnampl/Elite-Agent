@@ -2,7 +2,7 @@ use local_agent_terminal_application::{
     validate_and_order_process_writes, ApprovedProcessExecutor, ApprovedProcessRequest,
     AuthorizedExpectedWrite, AuthorizedProcessRequest, CancellationReceipt, CapabilityRequest,
     CapabilityResolver, EnforcedNetworkProfile, EnvironmentProfileResolver,
-    ExecutableProfileResolver, ExecutorLeaseStore, NetworkProfileVerifier, PortError,
+    ExecutableProfileResolver, NetworkProfileVerifier, PortError, ProcessFenceAuthority,
     ProcessLauncher, ProcessLimits, ProcessReceipt, ProcessWorkingDirectory, Retryability,
     SafeErrorClassification, ToolExecutionId,
 };
@@ -21,7 +21,7 @@ pub struct ProcessRuntime<'a> {
     networks: &'a dyn NetworkProfileVerifier,
     enforced_networks: Vec<EnforcedNetworkProfile>,
     resolver: &'a dyn CapabilityResolver,
-    leases: &'a dyn ExecutorLeaseStore,
+    executor_fence: &'a ProcessFenceAuthority,
     launcher: &'a dyn ProcessLauncher,
 }
 
@@ -32,7 +32,7 @@ impl<'a> ProcessRuntime<'a> {
         networks: &'a dyn NetworkProfileVerifier,
         enforced_networks: Vec<EnforcedNetworkProfile>,
         resolver: &'a dyn CapabilityResolver,
-        leases: &'a dyn ExecutorLeaseStore,
+        executor_fence: &'a ProcessFenceAuthority,
         launcher: &'a dyn ProcessLauncher,
     ) -> Result<Self, PortError> {
         for (index, profile) in enforced_networks.iter().enumerate() {
@@ -50,7 +50,7 @@ impl<'a> ProcessRuntime<'a> {
             networks,
             enforced_networks,
             resolver,
-            leases,
+            executor_fence,
             launcher,
         })
     }
@@ -128,11 +128,12 @@ impl<'a> ProcessRuntime<'a> {
             limits,
             expected_writes,
             executor_claim: executor_claim.clone(),
+            executor_fence: self.executor_fence.binding(),
         };
 
         let _retained_executable = self.executables.verify_and_retain(&authorized.executable)?;
         self.networks.verify(&authorized.network)?;
-        self.leases.assert_current(executor_claim)?;
+        self.executor_fence.assert_current(executor_claim)?;
         let approved_writes = authorized.expected_writes.clone();
         let mut receipt = self.launcher.execute(authorized)?;
         receipt.observed_writes =

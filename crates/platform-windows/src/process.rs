@@ -14,9 +14,9 @@ use std::time::Instant;
 use local_agent_terminal_application::{
     validate_and_order_process_writes, AuthorizedExpectedWrite, AuthorizedProcessRequest,
     BoundedOutput, CancellationReceipt, EnforcedNetworkProfile, ObservedProcessWrite, PortError,
-    ProcessLauncher, ProcessLimits, ProcessReceipt, ProcessStatus, ProcessWorkingDirectory,
-    ResolvedEnvironmentProfile, ResolvedExecutable, Retryability, SafeErrorClassification,
-    ToolExecutionId,
+    ProcessFenceBinding, ProcessLauncher, ProcessLimits, ProcessReceipt, ProcessStatus,
+    ProcessWorkingDirectory, ResolvedEnvironmentProfile, ResolvedExecutable, Retryability,
+    SafeErrorClassification, ToolExecutionId, WorkspaceWritePermit,
 };
 use local_agent_terminal_domain::{LeaseClaim, ProcessTrustTier, Sha256Digest};
 use sha2::{Digest, Sha256};
@@ -43,11 +43,48 @@ const FAILED_THREAD_RESUME: u32 = u32::MAX;
 static FAIL_OUTPUT_READER_START: Mutex<Option<ToolExecutionId>> = Mutex::new(None);
 
 #[cfg(feature = "test-seams")]
+static FAIL_AFTER_RESUME: Mutex<Option<ToolExecutionId>> = Mutex::new(None);
+
+#[cfg(feature = "test-seams")]
+static OUTPUT_READER_COUNTS: Mutex<BTreeMap<ToolExecutionId, (usize, usize)>> =
+    Mutex::new(BTreeMap::new());
+
+#[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub fn fail_next_output_reader_start_for_test(execution_id: ToolExecutionId) {
     if let Ok(mut failure) = FAIL_OUTPUT_READER_START.lock() {
         *failure = Some(execution_id);
     }
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn fail_after_resume_for_test(execution_id: ToolExecutionId) {
+    if let Ok(mut failure) = FAIL_AFTER_RESUME.lock() {
+        *failure = Some(execution_id);
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn output_reader_counts_for_test(execution_id: &ToolExecutionId) -> (usize, usize) {
+    OUTPUT_READER_COUNTS
+        .lock()
+        .ok()
+        .and_then(|counts| counts.get(execution_id).copied())
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "test-seams")]
+fn take_after_resume_failure(execution_id: &ToolExecutionId) -> bool {
+    FAIL_AFTER_RESUME.lock().is_ok_and(|mut failure| {
+        if failure.as_ref() == Some(execution_id) {
+            failure.take();
+            true
+        } else {
+            false
+        }
+    })
 }
 
 /// Evidence supplied by a trusted OS-containment adapter and retained through launch.
@@ -77,6 +114,7 @@ pub struct IsolatedWorkerBoundaryClaims {
     pub limits: ProcessLimits,
     pub expected_writes: Vec<AuthorizedExpectedWrite>,
     pub executor_claim: LeaseClaim,
+    pub executor_fence: ProcessFenceBinding,
 }
 
 impl IsolatedWorkerBoundaryClaims {
@@ -93,6 +131,7 @@ impl IsolatedWorkerBoundaryClaims {
             limits: request.limits.clone(),
             expected_writes: request.expected_writes.clone(),
             executor_claim: request.executor_claim.clone(),
+            executor_fence: request.executor_fence.clone(),
         }
     }
 }
@@ -279,6 +318,23 @@ impl ProcessLauncher for WindowsProcessLauncher {
         )?;
         cleanup.register()?;
 
+        let workspace_permit = match request
+            .executor_fence
+            .monitor_permit(request.executor_claim.clone())
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                child.active.terminate()?;
+                child.active.wait_process(INFINITE);
+                child.active.wait_tree_exit()?;
+                join_output(stdout_reader)?;
+                join_output(stderr_reader)?;
+                cleanup.disarm();
+                return Err(error);
+            }
+        };
+        cleanup.hold_permit(workspace_permit);
+
         // SAFETY: the primary thread handle is owned and remains valid here. The
         // process is already assigned to the configured kill-on-close Job Object.
         let resume_result = unsafe { ResumeThread(child.primary_thread.as_raw()) };
@@ -286,6 +342,10 @@ impl ProcessLauncher for WindowsProcessLauncher {
             child.active.terminate()?;
             child.active.wait_process(INFINITE);
             child.active.wait_tree_exit()?;
+            return Err(platform_error());
+        }
+        #[cfg(feature = "test-seams")]
+        if take_after_resume_failure(&request.execution_id) {
             return Err(platform_error());
         }
         drop(child.primary_thread);
@@ -313,7 +373,6 @@ impl ProcessLauncher for WindowsProcessLauncher {
             Some(child.active.exit_code()?)
         };
         let observed_writes = boundary.observed_writes(&request, &prepared);
-        cleanup.disarm();
         let observed_writes =
             validate_and_order_process_writes(&request.expected_writes, observed_writes?)?;
 
@@ -323,8 +382,8 @@ impl ProcessLauncher for WindowsProcessLauncher {
             ProcessStatus::Exited
         };
         let job_receipt = child.active.receipt(terminated)?;
-        Ok(ProcessReceipt {
-            execution_id: request.execution_id,
+        let receipt = ProcessReceipt {
+            execution_id: request.execution_id.clone(),
             status,
             exit_code,
             output_digest: output_digest(&stdout.bytes, &stderr.bytes),
@@ -333,7 +392,9 @@ impl ProcessLauncher for WindowsProcessLauncher {
             duration_ms: elapsed_millis(started_at),
             job_receipt,
             observed_writes,
-        })
+        };
+        cleanup.disarm();
+        Ok(receipt)
     }
 
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
@@ -371,17 +432,18 @@ impl WindowsProcessLauncher {
     }
 }
 
-struct ExecutionCleanupGuard<'a> {
-    launcher: &'a WindowsProcessLauncher,
+struct ExecutionCleanupGuard<'launcher, 'permit> {
+    launcher: &'launcher WindowsProcessLauncher,
     execution_id: ToolExecutionId,
     active: Arc<ActiveJob>,
+    permit: Option<WorkspaceWritePermit<'permit>>,
     registered: bool,
     armed: bool,
 }
 
-impl<'a> ExecutionCleanupGuard<'a> {
+impl<'launcher, 'permit> ExecutionCleanupGuard<'launcher, 'permit> {
     fn new(
-        launcher: &'a WindowsProcessLauncher,
+        launcher: &'launcher WindowsProcessLauncher,
         execution_id: ToolExecutionId,
         active: Arc<ActiveJob>,
     ) -> Self {
@@ -389,9 +451,14 @@ impl<'a> ExecutionCleanupGuard<'a> {
             launcher,
             execution_id,
             active,
+            permit: None,
             registered: false,
             armed: true,
         }
+    }
+
+    fn hold_permit(&mut self, permit: WorkspaceWritePermit<'permit>) {
+        self.permit = Some(permit);
     }
 
     fn register(&mut self) -> Result<(), PortError> {
@@ -414,9 +481,19 @@ impl<'a> ExecutionCleanupGuard<'a> {
     }
 }
 
-impl Drop for ExecutionCleanupGuard<'_> {
+impl Drop for ExecutionCleanupGuard<'_, '_> {
     fn drop(&mut self) {
-        if self.armed && self.active.terminate().is_ok() {
+        if self.armed && self.permit.is_some() {
+            loop {
+                let tree_exited = self.active.terminate().is_ok()
+                    && self.active.wait_process(INFINITE) == WAIT_OBJECT_0
+                    && self.active.wait_tree_exit().is_ok();
+                if tree_exited {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        } else if self.armed && self.active.terminate().is_ok() {
             self.active.wait_process(INFINITE);
             let _ = self.active.wait_tree_exit();
         }
@@ -616,12 +693,18 @@ impl Drop for ThreadAttributeList {
     }
 }
 
+struct OutputReader {
+    handle: std::thread::JoinHandle<Result<BoundedOutput, PortError>>,
+    #[cfg(feature = "test-seams")]
+    execution_id: ToolExecutionId,
+}
+
 fn output_reader(
     handle: OwnedHandle,
     max_bytes: u64,
     active: Weak<ActiveJob>,
     execution_id: &ToolExecutionId,
-) -> Result<std::thread::JoinHandle<Result<BoundedOutput, PortError>>, PortError> {
+) -> Result<OutputReader, PortError> {
     #[cfg(not(feature = "test-seams"))]
     let _ = execution_id;
     #[cfg(feature = "test-seams")]
@@ -635,10 +718,19 @@ fn output_reader(
         }
     }
     let max_bytes = usize::try_from(max_bytes).map_err(|_| invalid_input())?;
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("bounded-process-output".to_owned())
         .spawn(move || read_bounded(handle.into_file(), max_bytes, &active))
-        .map_err(|_| internal_error())
+        .map_err(|_| internal_error())?;
+    #[cfg(feature = "test-seams")]
+    if let Ok(mut counts) = OUTPUT_READER_COUNTS.lock() {
+        counts.entry(execution_id.clone()).or_default().0 += 1;
+    }
+    Ok(OutputReader {
+        handle,
+        #[cfg(feature = "test-seams")]
+        execution_id: execution_id.clone(),
+    })
 }
 
 fn read_bounded(
@@ -666,10 +758,15 @@ fn read_bounded(
     Ok(BoundedOutput { bytes, truncated })
 }
 
-fn join_output(
-    reader: std::thread::JoinHandle<Result<BoundedOutput, PortError>>,
-) -> Result<BoundedOutput, PortError> {
-    reader.join().map_err(|_| internal_error())?
+fn join_output(reader: OutputReader) -> Result<BoundedOutput, PortError> {
+    #[cfg(feature = "test-seams")]
+    let execution_id = reader.execution_id.clone();
+    let result = reader.handle.join().map_err(|_| internal_error())?;
+    #[cfg(feature = "test-seams")]
+    if let Ok(mut counts) = OUTPUT_READER_COUNTS.lock() {
+        counts.entry(execution_id).or_default().1 += 1;
+    }
+    result
 }
 
 fn validate_request(request: &AuthorizedProcessRequest) -> Result<(), PortError> {
@@ -762,6 +859,7 @@ fn verify_prepared_boundary(
         || claims.executor_claim.task_id() != request.executor_claim.task_id()
         || claims.executor_claim.holder_run_id() != request.executor_claim.holder_run_id()
         || claims.executor_claim.token() != request.executor_claim.token()
+        || claims.executor_fence != request.executor_fence
         || claims.trust_tier != request.trust_tier
         || claims.executable.canonical_path != request.executable.canonical_path
         || claims.executable.toolchain_id != request.executable.toolchain_id

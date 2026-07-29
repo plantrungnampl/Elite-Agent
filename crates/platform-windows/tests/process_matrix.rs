@@ -5,17 +5,19 @@ use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use local_agent_terminal_application::{
-    validate_and_order_process_writes, AuthorizedExpectedWrite, AuthorizedProcessRequest,
-    CapabilityRootIdentity, EnforcedNetworkProfile, ExecutableFileIdentity,
-    NetworkEnforcementReceipt, ObservedProcessWrite, ProcessLauncher, ProcessLimits, ProcessStatus,
-    ProcessWorkingDirectory, RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget,
-    ResolvedEnvironmentProfile, ToolExecutionId, VerifiedWrite,
+    validate_and_order_process_writes, AcquireLease, AuthorizedExpectedWrite,
+    AuthorizedProcessRequest, CapabilityRootIdentity, EnforcedNetworkProfile,
+    ExecutableFileIdentity, ExecutorLeaseStore, LeaseSnapshot, LeaseState,
+    NetworkEnforcementReceipt, ObservedProcessWrite, PortError, ProcessFenceAuthority,
+    ProcessLauncher, ProcessLimits, ProcessStatus, ProcessWorkingDirectory, RelativePathComponents,
+    ResolvedCapability, ResolvedCapabilityTarget, ResolvedEnvironmentProfile, RevokeLease,
+    ToolExecutionId, VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, ExpectedWrite, FencingToken, LeaseClaim, NetworkProfile, ProcessTrustTier,
@@ -26,7 +28,11 @@ use local_agent_terminal_platform_core::{
     TrustedPrivateRuntimeDirectory,
 };
 #[cfg(feature = "test-seams")]
-use local_agent_terminal_platform_windows::fail_next_output_reader_start_for_test;
+use local_agent_terminal_platform_windows::{
+    block_next_job_cleanup_failure_for_test, fail_after_resume_for_test,
+    fail_next_output_reader_start_for_test, output_reader_counts_for_test,
+    JobCleanupFailurePointForTest,
+};
 use local_agent_terminal_platform_windows::{
     IsolatedWorkerBoundaryAdapter, IsolatedWorkerBoundaryBinding, IsolatedWorkerBoundaryClaims,
     PreparedIsolatedWorkerBoundary, WindowsExecutableInspector,
@@ -221,11 +227,61 @@ fn failed_boundary_reverification_never_resumes_child_code() {
 }
 
 #[test]
+fn lease_replacement_after_initial_check_is_denied_before_resume() {
+    let root = TempDir::new().unwrap();
+    let marker = root.path().join("must-not-run-after-lease-replacement");
+    let leases = Arc::new(ReplaceableLeaseStore::new(7));
+    let writes = Arc::new(WorkspaceWriteCoordinator::new());
+    let authority = ProcessFenceAuthority::new(leases.clone(), writes);
+    let boundary = Arc::new(LeaseReplacingBoundary {
+        inner: TestOnlyBoundary::valid(root.path().to_owned()),
+        authority: authority.clone(),
+    });
+    let launcher =
+        WindowsProcessLauncher::with_isolated_worker_boundary(boundary, boundary_binding());
+    let mut request = request(
+        vec![
+            "--exact".to_owned(),
+            "process_child_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        BTreeMap::from([
+            ("LAT_PROCESS_HELPER".to_owned(), "marker".to_owned()),
+            (
+                "LAT_PROCESS_MARKER".to_owned(),
+                marker.to_string_lossy().into_owned(),
+            ),
+        ]),
+    );
+    request.execution_id = ToolExecutionId::new("execution-stale-before-resume").unwrap();
+    request.executor_fence = authority.binding();
+    let execution_id = request.execution_id.clone();
+    leases
+        .assert_current(request.executor_claim.clone())
+        .expect("initial runtime check");
+
+    let error = launcher
+        .execute(request)
+        .expect_err("replacement must fence the suspended child");
+
+    assert!(matches!(
+        error,
+        PortError::StaleLease { current, supplied }
+            if current.get() == 8 && supplied.get() == 7
+    ));
+    #[cfg(feature = "test-seams")]
+    assert_eq!(output_reader_counts_for_test(&execution_id), (2, 2));
+    assert!(!marker.exists());
+    assert!(launcher.cancel(&execution_id).is_err());
+}
+
+#[test]
 fn every_boundary_receipt_mismatch_is_rejected_before_child_creation() {
     for mismatch in [
         BoundaryMismatch::Identity,
         BoundaryMismatch::Acl,
         BoundaryMismatch::Task,
+        BoundaryMismatch::ExecutorFence,
         BoundaryMismatch::Tier,
         BoundaryMismatch::CwdRootIdentity,
         BoundaryMismatch::NetworkEnforcement,
@@ -361,6 +417,186 @@ fn cancellation_terminates_descendants_and_breakaway_is_denied() {
     assert!(cancellation.job_receipt.unwrap().tree_terminated);
     assert_eq!(receipt.status, ProcessStatus::Terminated);
     assert!(!process_is_active(descendant_pid));
+}
+
+#[test]
+fn write_capable_process_blocks_lease_acquire_and_revoke_until_cancellation_completes() {
+    for change in [
+        CoordinatedLeaseChange::Acquire,
+        CoordinatedLeaseChange::Revoke,
+    ] {
+        let root = TempDir::new().unwrap();
+        let name = change.name();
+        let marker = root.path().join(format!("permit-held-{name}.txt"));
+        let scope = authorized_write(&format!("permit-held-{name}.txt"), "test-worktree");
+        let mut boundary = TestOnlyBoundary::valid(root.path().to_owned());
+        boundary.allow_expected_writes = true;
+        boundary.observed_writes = vec![observed_write(&scope, b"running")];
+        let authority = ProcessFenceAuthority::new(
+            Arc::new(ReplaceableLeaseStore::new(7)),
+            Arc::new(WorkspaceWriteCoordinator::new()),
+        );
+        let launcher = Arc::new(WindowsProcessLauncher::with_isolated_worker_boundary(
+            Arc::new(boundary),
+            boundary_binding(),
+        ));
+        let mut request = request(
+            vec![
+                "--exact".to_owned(),
+                "process_child_helper".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            BTreeMap::from([
+                ("LAT_PROCESS_HELPER".to_owned(), "marker-wait".to_owned()),
+                (
+                    "LAT_PROCESS_MARKER".to_owned(),
+                    marker.to_string_lossy().into_owned(),
+                ),
+            ]),
+        );
+        request.execution_id =
+            ToolExecutionId::new(format!("execution-permit-held-{name}")).unwrap();
+        request.expected_writes = vec![scope];
+        request.executor_fence = authority.binding();
+        request.timeout_ms = 30_000;
+        let execution_id = request.execution_id.clone();
+        let executing = Arc::clone(&launcher);
+        let execution = thread::spawn(move || executing.execute(request));
+        assert_eq!(wait_for_file(&marker), "running");
+
+        let (change_started_tx, change_started_rx) = mpsc::channel();
+        let (change_tx, change_rx) = mpsc::channel();
+        let changing_authority = authority.clone();
+        let changing = thread::spawn(move || {
+            change_started_tx.send(()).unwrap();
+            let result = change.execute(&changing_authority);
+            change_tx.send(result).unwrap();
+        });
+        change_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            change_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        let cancellation = launcher.cancel(&execution_id).unwrap();
+        let receipt = execution.join().unwrap().unwrap();
+        assert_eq!(
+            change_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("lease change must proceed after the Job exits")
+                .unwrap(),
+            8
+        );
+        changing.join().unwrap();
+
+        assert_eq!(cancellation.status, ProcessStatus::Terminated);
+        assert_eq!(receipt.status, ProcessStatus::Terminated);
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn post_resume_cleanup_fault_keeps_fence_until_job_exit_is_retried() {
+    for (point, execution_name) in [
+        (
+            JobCleanupFailurePointForTest::Terminate,
+            "execution-cleanup-terminate-fault",
+        ),
+        (
+            JobCleanupFailurePointForTest::TreeWait,
+            "execution-cleanup-tree-wait-fault",
+        ),
+    ] {
+        let root = TempDir::new().unwrap();
+        let marker = root.path().join(format!("{execution_name}.txt"));
+        let boundary = Arc::new(TestOnlyBoundary::valid(root.path().to_owned()));
+        let leases = Arc::new(ReplaceableLeaseStore::new(7));
+        let authority =
+            ProcessFenceAuthority::new(leases, Arc::new(WorkspaceWriteCoordinator::new()));
+        let launcher = Arc::new(WindowsProcessLauncher::with_isolated_worker_boundary(
+            boundary,
+            boundary_binding(),
+        ));
+        let mut request = request(
+            vec![
+                "--exact".to_owned(),
+                "process_child_helper".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            BTreeMap::from([
+                ("LAT_PROCESS_HELPER".to_owned(), "marker-wait".to_owned()),
+                (
+                    "LAT_PROCESS_MARKER".to_owned(),
+                    marker.to_string_lossy().into_owned(),
+                ),
+            ]),
+        );
+        request.execution_id = ToolExecutionId::new(execution_name).unwrap();
+        request.executor_fence = authority.binding();
+        let execution_id = request.execution_id.clone();
+        fail_after_resume_for_test(execution_id.clone());
+        let cleanup_failure = block_next_job_cleanup_failure_for_test(execution_id.clone(), point);
+        let executing = Arc::clone(&launcher);
+        let execution = thread::spawn(move || executing.execute(request));
+        assert!(cleanup_failure.wait_for_attempt(1, Duration::from_secs(5)));
+
+        let (mutation_started_tx, mutation_started_rx) = mpsc::channel();
+        let (mutation_tx, mutation_rx) = mpsc::channel();
+        let mutating_authority = authority.clone();
+        let mutation = thread::spawn(move || {
+            mutation_started_tx.send(()).unwrap();
+            let result = match point {
+                JobCleanupFailurePointForTest::Terminate => mutating_authority
+                    .acquire_lease(AcquireLease {
+                        task_id: TaskId::new("task-1").unwrap(),
+                        holder_run_id: RunId::new("run-2").unwrap(),
+                        expected_fencing_epoch: 7,
+                        acquired_at: "2026-07-29T00:00:00Z".to_owned(),
+                        expires_at: "2026-07-29T01:00:00Z".to_owned(),
+                    })
+                    .map(|snapshot| snapshot.token.get()),
+                JobCleanupFailurePointForTest::TreeWait => mutating_authority
+                    .revoke_lease(RevokeLease {
+                        claim: LeaseClaim::new(
+                            TaskId::new("task-1").unwrap(),
+                            RunId::new("run-1").unwrap(),
+                            FencingToken::new(7).unwrap(),
+                        ),
+                        revoked_at: "2026-07-29T00:30:00Z".to_owned(),
+                    })
+                    .map(|()| 8),
+            };
+            mutation_tx.send(result).unwrap();
+        });
+        mutation_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            mutation_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        cleanup_failure.fail_current_attempt();
+        assert!(cleanup_failure.wait_for_attempt(2, Duration::from_secs(5)));
+        assert!(matches!(
+            mutation_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        cleanup_failure.allow_cleanup();
+
+        assert!(execution.join().unwrap().is_err());
+        assert_eq!(
+            mutation_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            8
+        );
+        mutation.join().unwrap();
+        assert!(launcher.cancel(&execution_id).is_err());
+    }
 }
 
 #[test]
@@ -899,6 +1135,12 @@ fn process_child_helper() {
         Some("marker") => {
             fs::write(std::env::var_os("LAT_PROCESS_MARKER").unwrap(), b"ran").unwrap();
         }
+        Some("marker-wait") => {
+            fs::write(std::env::var_os("LAT_PROCESS_MARKER").unwrap(), b"running").unwrap();
+            loop {
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
         Some("tree-root") => {
             let marker = std::env::var_os("LAT_PROCESS_MARKER").unwrap();
             let mut breakaway = Command::new(std::env::current_exe().unwrap());
@@ -942,11 +1184,91 @@ struct TestOnlyBoundary {
     observed_writes: Vec<ObservedProcessWrite>,
 }
 
+struct LeaseReplacingBoundary {
+    inner: TestOnlyBoundary,
+    authority: ProcessFenceAuthority,
+}
+
+impl IsolatedWorkerBoundaryAdapter for LeaseReplacingBoundary {
+    fn prepare(
+        &self,
+        request: &AuthorizedProcessRequest,
+    ) -> Result<PreparedIsolatedWorkerBoundary, PortError> {
+        self.inner.prepare(request)
+    }
+
+    fn verify_before_resume(
+        &self,
+        request: &AuthorizedProcessRequest,
+        prepared: &PreparedIsolatedWorkerBoundary,
+    ) -> Result<(), PortError> {
+        self.inner.verify_before_resume(request, prepared)?;
+        self.authority.acquire_lease(AcquireLease {
+            task_id: request.executor_claim.task_id().clone(),
+            holder_run_id: RunId::new("run-2").unwrap(),
+            expected_fencing_epoch: 7,
+            acquired_at: "2026-07-29T00:00:00Z".to_owned(),
+            expires_at: "2026-07-29T01:00:00Z".to_owned(),
+        })?;
+        Ok(())
+    }
+}
+
+struct ReplaceableLeaseStore {
+    current: AtomicU64,
+}
+
+impl ReplaceableLeaseStore {
+    const fn new(token: u64) -> Self {
+        Self {
+            current: AtomicU64::new(token),
+        }
+    }
+}
+
+impl ExecutorLeaseStore for ReplaceableLeaseStore {
+    fn acquire(&self, request: AcquireLease) -> Result<LeaseSnapshot, PortError> {
+        self.current.store(8, Ordering::SeqCst);
+        Ok(LeaseSnapshot {
+            task_id: request.task_id,
+            holder_run_id: request.holder_run_id,
+            token: FencingToken::new(8).unwrap(),
+            state: LeaseState::Active,
+            acquired_at: request.acquired_at,
+            expires_at: request.expires_at,
+            released_at: None,
+        })
+    }
+
+    fn revoke(&self, request: RevokeLease) -> Result<(), PortError> {
+        let current = FencingToken::new(self.current.load(Ordering::SeqCst)).unwrap();
+        if current != request.claim.token() {
+            return Err(PortError::stale_lease(current, request.claim.token()));
+        }
+        self.current.store(8, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn fence_stale(&self) -> Result<Vec<LeaseSnapshot>, PortError> {
+        unreachable!()
+    }
+
+    fn assert_current(&self, claim: LeaseClaim) -> Result<(), PortError> {
+        let current = FencingToken::new(self.current.load(Ordering::SeqCst)).unwrap();
+        if current == claim.token() {
+            Ok(())
+        } else {
+            Err(PortError::stale_lease(current, claim.token()))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum BoundaryMismatch {
     Identity,
     Acl,
     Task,
+    ExecutorFence,
     Tier,
     CwdRootIdentity,
     NetworkEnforcement,
@@ -965,6 +1287,45 @@ enum BoundaryMismatch {
 enum LaunchMutation {
     BrokeredWorktree,
     ExpectedWrite,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CoordinatedLeaseChange {
+    Acquire,
+    Revoke,
+}
+
+impl CoordinatedLeaseChange {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Acquire => "acquire",
+            Self::Revoke => "revoke",
+        }
+    }
+
+    fn execute(self, authority: &ProcessFenceAuthority) -> Result<u64, PortError> {
+        match self {
+            Self::Acquire => authority
+                .acquire_lease(AcquireLease {
+                    task_id: TaskId::new("task-1").unwrap(),
+                    holder_run_id: RunId::new("run-2").unwrap(),
+                    expected_fencing_epoch: 7,
+                    acquired_at: "2026-07-29T00:00:00Z".to_owned(),
+                    expires_at: "2026-07-29T01:00:00Z".to_owned(),
+                })
+                .map(|snapshot| snapshot.token.get()),
+            Self::Revoke => authority
+                .revoke_lease(RevokeLease {
+                    claim: LeaseClaim::new(
+                        TaskId::new("task-1").unwrap(),
+                        RunId::new("run-1").unwrap(),
+                        FencingToken::new(7).unwrap(),
+                    ),
+                    revoked_at: "2026-07-29T00:30:00Z".to_owned(),
+                })
+                .map(|()| 8),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1061,6 +1422,13 @@ fn mutate_claims(claims: &mut IsolatedWorkerBoundaryClaims, mismatch: BoundaryMi
                 claims.executor_claim.token(),
             );
         }
+        BoundaryMismatch::ExecutorFence => {
+            claims.executor_fence = ProcessFenceAuthority::new(
+                Arc::new(ReplaceableLeaseStore::new(7)),
+                Arc::new(WorkspaceWriteCoordinator::new()),
+            )
+            .binding();
+        }
         BoundaryMismatch::Tier => claims.trust_tier = ProcessTrustTier::BrokeredProcess,
         BoundaryMismatch::CwdRootIdentity => {
             let ProcessWorkingDirectory::IsolatedWorktree(resolved) = &mut claims.cwd else {
@@ -1153,6 +1521,11 @@ fn request(argv: Vec<String>, environment: BTreeMap<String, String>) -> Authoriz
             RunId::new("run-1").unwrap(),
             FencingToken::new(7).unwrap(),
         ),
+        executor_fence: ProcessFenceAuthority::new(
+            Arc::new(ReplaceableLeaseStore::new(7)),
+            Arc::new(WorkspaceWriteCoordinator::new()),
+        )
+        .binding(),
     }
 }
 

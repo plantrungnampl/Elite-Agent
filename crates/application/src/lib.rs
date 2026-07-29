@@ -90,10 +90,11 @@ pub use tool::{
 pub use workspace::{
     ArtifactRootMode, GetWorkspaceDashboard, IdempotencyClass, IntentTransition, NewProject,
     NewTask, ObserveWorkspaceMutation, OperationIntent, OperationIntentStatus,
-    PrepareTaskWorkspace, ProjectSettings, ProjectSnapshot, ReconcileWorkspaces, RecoveryAction,
-    RecoveryCandidate, RecoveryEvidence, RecoveryOperationIntent, RecoveryProject, RecoveryReason,
-    RepositoryInspectionRecord, RiskLevel, StartedRecovery, TaskLeaseState, TaskSnapshot,
-    WorkspaceMutationRequest, WorkspaceMutationResult, WorkspaceObservationLossRequest,
-    WorkspaceRecoveryStore, WorkspaceStateStore, WorkspaceWriteCoordinator, WorkspaceWritePermit,
-    WorktreeIntent, WorktreeMatch,
+    PrepareTaskWorkspace, ProcessFenceAuthority, ProcessFenceBinding, ProjectSettings,
+    ProjectSnapshot, ReconcileWorkspaces, RecoveryAction, RecoveryCandidate, RecoveryEvidence,
+    RecoveryOperationIntent, RecoveryProject, RecoveryReason, RepositoryInspectionRecord,
+    RiskLevel, StartedRecovery, TaskLeaseState, TaskSnapshot, WorkspaceMutationRequest,
+    WorkspaceMutationResult, WorkspaceObservationLossRequest, WorkspaceRecoveryStore,
+    WorkspaceStateStore, WorkspaceWriteCoordinator, WorkspaceWritePermit, WorktreeIntent,
+    WorktreeMatch,
 };
