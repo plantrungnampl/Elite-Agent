@@ -36,7 +36,7 @@ pub use dto::{
     WorkspaceDashboardDto, WorkspaceDashboardRequestDto,
 };
 pub use error::{PortError, Retryability, SafeErrorClassification};
-pub use execute_tool::ExecuteApprovedTool;
+pub use execute_tool::{ExecuteApprovedTool, ExecuteDurableTool};
 pub use lease::{
     AcquireExecutorLease, AcquireLease, ExecutorLeaseStore, LeaseSnapshot, LeaseState, RevokeLease,
 };
@@ -69,23 +69,26 @@ pub use tool::{
     BoundedOutput, CancellationReceipt, CanonicalFileWriteRecoveryRequest,
     CapabilityFileWriteSession, CapabilityFileWriteSessionFactory, CapabilityFilesystem,
     CapabilityRequest, CapabilityResolver, CapabilityRootIdentity, CaptureFileWritePostEvidence,
-    CaptureFileWritePreEvidence, DirectoryFileIdentity, EnforcedNetworkProfile,
-    EnvironmentProfileResolver, ExecutableArtifactInspector, ExecutableFileIdentity,
-    ExecutableProfileResolver, ExecutableVerificationGuard, FileReadRequest,
-    FileWriteEvidenceStore, FileWritePolicyBinding, FileWritePostExpectation, FileWritePreImage,
-    FileWriteRecoveryCompletion, FileWriteRecoveryFailure, FileWriteRecoveryIntent,
-    FileWriteRecoveryRequest, FileWriteRecoverySnapshot, FileWriteRecoveryState,
-    FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest,
-    GitStatusResult, JobReceipt, NetworkEnforcementReceipt, NetworkProfileVerifier,
-    NewToolExecution, NewToolIntent, ObservedFileImage, ObservedProcessWrite, OpenFileWriteSession,
-    OperationIntentSnapshot, PrivateRuntimeDirectoryInspector,
-    PrivateRuntimeDirectoryVerificationGuard, ProcessLauncher, ProcessLimits, ProcessReceipt,
-    ProcessStatus, ProcessWorkingDirectory, RawGitDiffResult, RawGitStatusResult,
-    RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget,
-    ResolvedEnvironmentProfile, ResolvedExecutable, ResolvedPrivateRuntimeDirectory, StructuredGit,
-    StructuredToolExecutor, ToolExecutionCompletion, ToolExecutionId, ToolExecutionResult,
-    ToolExecutionSnapshot, ToolExecutionStore, ToolRequestBindingDigest, VerifiedBytes,
-    VerifiedFileWriteCompensation, VerifiedWrite,
+    CaptureFileWritePreEvidence, DirectoryFileIdentity, DurableToolExecutionArtifact,
+    DurableToolExecutionArtifacts, DurableToolExecutionOutcome, DurableToolExecutionReceipt,
+    EnforcedNetworkProfile, EnvironmentProfileResolver, ExecutableArtifactInspector,
+    ExecutableFileIdentity, ExecutableProfileResolver, ExecutableVerificationGuard,
+    FileReadRequest, FileWriteEvidenceStore, FileWritePolicyBinding, FileWritePostExpectation,
+    FileWritePreImage, FileWriteRecoveryCompletion, FileWriteRecoveryFailure,
+    FileWriteRecoveryIntent, FileWriteRecoveryRequest, FileWriteRecoverySnapshot,
+    FileWriteRecoveryState, FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest,
+    GitDiffResult, GitStatusRequest, GitStatusResult, IncompleteToolExecution, JobReceipt,
+    NetworkEnforcementReceipt, NetworkProfileVerifier, NewToolExecution, NewToolIntent,
+    ObservedFileImage, ObservedProcessWrite, OpenFileWriteSession, OperationIntentSnapshot,
+    PrivateRuntimeDirectoryInspector, PrivateRuntimeDirectoryVerificationGuard, ProcessLauncher,
+    ProcessLimits, ProcessReceipt, ProcessStatus, ProcessWorkingDirectory, RawGitDiffResult,
+    RawGitStatusResult, RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget,
+    ResolvedEnvironmentProfile, ResolvedExecutable, ResolvedPrivateRuntimeDirectory,
+    SafeToolExecutionError, StructuredGit, StructuredToolExecutor, ToolExecutionClaim,
+    ToolExecutionClaimAuthority, ToolExecutionId, ToolExecutionOutput,
+    ToolExecutionRecoveryEvidence, ToolExecutionResolution, ToolExecutionResult,
+    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolRequestBindingDigest,
+    VerifiedBytes, VerifiedFileWriteCompensation, VerifiedWrite,
 };
 pub use workspace::{
     ArtifactRootMode, GetWorkspaceDashboard, IdempotencyClass, IntentTransition, NewProject,

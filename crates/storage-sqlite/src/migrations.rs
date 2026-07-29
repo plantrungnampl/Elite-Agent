@@ -3,7 +3,7 @@ use std::fmt;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-const SUPPORTED_SCHEMA_VERSION: i64 = 3;
+const SUPPORTED_SCHEMA_VERSION: i64 = 4;
 const NORMATIVE_SQL: &str =
     include_str!("../../../docs/multi-agent-terminal-design/schemas/sqlite-v1.sql");
 const V1_ADAPTER_HARDENING_SQL: &str = r#"
@@ -158,6 +158,84 @@ ON tool_executions(approval_id)
 WHERE approval_id IS NOT NULL;
 "#;
 
+const V4_TOOL_EXECUTION_LIFECYCLE_SQL: &str = r#"
+DROP TRIGGER tool_execution_status_forward_only;
+DROP INDEX tool_execution_approval_single_use;
+
+CREATE TABLE tool_executions_v4 (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+    run_id TEXT REFERENCES agent_runs(id) ON DELETE RESTRICT,
+    request_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    arguments_artifact_id TEXT NOT NULL
+        REFERENCES artifacts(id) ON DELETE RESTRICT,
+    policy_decision_id TEXT NOT NULL
+        REFERENCES policy_decisions(id) ON DELETE RESTRICT,
+    approval_id TEXT REFERENCES approvals(id) ON DELETE RESTRICT,
+    operation_intent_id TEXT NOT NULL UNIQUE
+        REFERENCES operation_intents(id) ON DELETE RESTRICT,
+    executor_fencing_token INTEGER CHECK (
+        executor_fencing_token IS NULL OR executor_fencing_token >= 1
+    ),
+    status TEXT NOT NULL CHECK (
+        status IN (
+            'pending',
+            'running',
+            'succeeded',
+            'failed',
+            'cancelled',
+            'terminated',
+            'interrupted',
+            'indeterminate',
+            'denied'
+        )
+    ),
+    started_at TEXT,
+    completed_at TEXT,
+    exit_code INTEGER,
+    stdout_artifact_id TEXT REFERENCES artifacts(id) ON DELETE RESTRICT,
+    stderr_artifact_id TEXT REFERENCES artifacts(id) ON DELETE RESTRICT,
+    UNIQUE (run_id, request_id)
+) STRICT;
+
+INSERT INTO tool_executions_v4 (
+    id, task_id, run_id, request_id, tool_name, arguments_artifact_id,
+    policy_decision_id, approval_id, operation_intent_id, executor_fencing_token,
+    status, started_at, completed_at, exit_code, stdout_artifact_id,
+    stderr_artifact_id
+)
+SELECT
+    id, task_id, run_id, request_id, tool_name, arguments_artifact_id,
+    policy_decision_id, approval_id, operation_intent_id, executor_fencing_token,
+    status, started_at, completed_at, exit_code, stdout_artifact_id,
+    stderr_artifact_id
+FROM tool_executions;
+
+DROP TABLE tool_executions;
+ALTER TABLE tool_executions_v4 RENAME TO tool_executions;
+
+CREATE TRIGGER tool_execution_status_forward_only
+BEFORE UPDATE OF status ON tool_executions
+FOR EACH ROW
+WHEN OLD.status <> NEW.status
+    AND NOT (
+        (OLD.status = 'pending' AND NEW.status IN ('running', 'denied'))
+        OR (OLD.status = 'running'
+            AND NEW.status IN (
+                'succeeded', 'failed', 'cancelled', 'terminated', 'interrupted',
+                'indeterminate', 'denied'
+            ))
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'tool execution status must move forward');
+END;
+
+CREATE UNIQUE INDEX tool_execution_approval_single_use
+ON tool_executions(approval_id)
+WHERE approval_id IS NOT NULL;
+"#;
+
 #[derive(Debug)]
 pub enum OpenError {
     Database(rusqlite::Error),
@@ -197,7 +275,7 @@ impl From<rusqlite::Error> for OpenError {
 }
 
 pub fn migration_checksum() -> String {
-    checksum(V3_POLICY_TOOL_HARDENING_SQL)
+    checksum(V4_TOOL_EXECUTION_LIFECYCLE_SQL)
 }
 
 fn v1_migration_checksum() -> String {
@@ -206,6 +284,10 @@ fn v1_migration_checksum() -> String {
 
 fn v2_migration_checksum() -> String {
     checksum(V2_UPGRADE_SQL)
+}
+
+fn v3_migration_checksum() -> String {
+    checksum(V3_POLICY_TOOL_HARDENING_SQL)
 }
 
 fn checksum(sql: &str) -> String {
@@ -257,16 +339,25 @@ pub(crate) fn validate_or_migrate(connection: &mut Connection) -> Result<(), Ope
             validate_checksum(connection, 1, v1_migration_checksum())?;
             apply_v2_migration(connection)?;
             apply_v3_migration(connection)?;
+            apply_v4_migration(connection)?;
         }
         2 => {
             validate_checksum(connection, 1, v1_migration_checksum())?;
             validate_checksum(connection, 2, v2_migration_checksum())?;
             apply_v3_migration(connection)?;
+            apply_v4_migration(connection)?;
+        }
+        3 => {
+            validate_checksum(connection, 1, v1_migration_checksum())?;
+            validate_checksum(connection, 2, v2_migration_checksum())?;
+            validate_checksum(connection, 3, v3_migration_checksum())?;
+            apply_v4_migration(connection)?;
         }
         SUPPORTED_SCHEMA_VERSION => {
             validate_checksum(connection, 1, v1_migration_checksum())?;
             validate_checksum(connection, 2, v2_migration_checksum())?;
-            validate_checksum(connection, 3, migration_checksum())?;
+            validate_checksum(connection, 3, v3_migration_checksum())?;
+            validate_checksum(connection, 4, migration_checksum())?;
         }
         _ => {
             return Err(OpenError::UnsupportedSchema {
@@ -337,6 +428,18 @@ fn apply_initial_migration(connection: &mut Connection) -> Result<(), OpenError>
             3,
             "policy_tool_hardening_v3",
             env!("CARGO_PKG_VERSION"),
+            v3_migration_checksum()
+        ],
+    )?;
+    transaction.execute_batch(V4_TOOL_EXECUTION_LIFECYCLE_SQL)?;
+    transaction.execute(
+        "INSERT INTO schema_migrations (
+            version, name, applied_at, application_version, checksum
+         ) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4)",
+        params![
+            4,
+            "tool_execution_lifecycle_v4",
+            env!("CARGO_PKG_VERSION"),
             migration_checksum()
         ],
     )?;
@@ -372,6 +475,24 @@ fn apply_v3_migration(connection: &mut Connection) -> Result<(), OpenError> {
         params![
             3,
             "policy_tool_hardening_v3",
+            env!("CARGO_PKG_VERSION"),
+            v3_migration_checksum()
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn apply_v4_migration(connection: &mut Connection) -> Result<(), OpenError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(V4_TOOL_EXECUTION_LIFECYCLE_SQL)?;
+    transaction.execute(
+        "INSERT INTO schema_migrations (
+            version, name, applied_at, application_version, checksum
+         ) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4)",
+        params![
+            4,
+            "tool_execution_lifecycle_v4",
             env!("CARGO_PKG_VERSION"),
             migration_checksum()
         ],

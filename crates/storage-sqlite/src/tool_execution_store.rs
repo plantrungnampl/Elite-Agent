@@ -3,16 +3,19 @@ use std::path::{Component, Path, PathBuf};
 
 use local_agent_terminal_application::{
     canonical_file_write_recovery_request, parse_file_write_recovery_request,
-    ApprovalDigestPayload, CanonicalEvidenceRef, FileWritePreImage, FileWriteRecoveryCompletion,
-    FileWriteRecoveryFailure, FileWriteRecoveryIntent, FileWriteRecoveryRequest,
-    FileWriteRecoverySnapshot, FileWriteRecoveryState, FileWriteRecoveryStore, NewToolExecution,
-    NewToolIntent, ObservedProcessWrite, OperationIntentSnapshot, PortError, ProcessReceipt,
-    ProcessStatus, ResolvedCapabilityTarget, Retryability, SafeErrorClassification,
-    ToolExecutionCompletion, ToolExecutionId, ToolExecutionSnapshot, ToolExecutionStore,
+    ApprovalDigestPayload, CanonicalEvidenceRef, DurableToolExecutionArtifact,
+    DurableToolExecutionArtifacts, DurableToolExecutionReceipt, FileWritePreImage,
+    FileWriteRecoveryCompletion, FileWriteRecoveryFailure, FileWriteRecoveryIntent,
+    FileWriteRecoveryRequest, FileWriteRecoverySnapshot, FileWriteRecoveryState,
+    FileWriteRecoveryStore, IdempotencyClass, IncompleteToolExecution, NewToolExecution,
+    NewToolIntent, OperationIntentSnapshot, PortError, Retryability, SafeErrorClassification,
+    SafeToolExecutionError, ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionId,
+    ToolExecutionOutput, ToolExecutionRecoveryEvidence, ToolExecutionResolution,
+    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
     VerifiedFileWriteCompensation, WorkspaceMutationRequest,
 };
 use local_agent_terminal_domain::{
-    ArtifactId, CapabilityRef, PolicyEffect, ProjectId, Sequence, Sha256Digest, TaskId,
+    ArtifactId, FencingToken, PolicyEffect, ProjectId, RunId, Sequence, Sha256Digest, TaskId,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
@@ -26,17 +29,19 @@ use crate::workspace_store::{
 use crate::SqliteStore;
 
 #[derive(Debug)]
-struct PersistedExecutionCompletion {
+struct PersistedToolExecution {
     task_id: String,
-    execution_status: String,
+    run_id: Option<String>,
+    request_id: String,
+    tool_name: String,
+    arguments_artifact_id: String,
+    operation_intent_id: String,
+    executor_fencing_token: Option<i64>,
+    status: String,
     exit_code: Option<i32>,
     stdout_artifact_id: Option<String>,
     stderr_artifact_id: Option<String>,
     completed_at: Option<String>,
-    intent_id: String,
-    intent_status: String,
-    result_artifact_id: Option<String>,
-    external_receipt_json: Option<String>,
 }
 
 #[derive(Debug)]
@@ -551,24 +556,51 @@ impl ToolExecutionStore for SqliteStore {
         })
     }
 
-    fn begin(&self, request: NewToolExecution) -> Result<ToolExecutionSnapshot, PortError> {
+    fn begin(&self, request: NewToolExecution) -> Result<ToolExecutionClaim, PortError> {
         let mut connection = self.connection().map_err(open_error_to_port)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
         let intent = load_intent(&transaction, &request.execution_id)?;
-        if intent.status == "started" {
-            if execution_matches(&transaction, &request.execution_id, &intent)? {
-                transaction.rollback().map_err(sqlite_error_to_port)?;
-                return Ok(ToolExecutionSnapshot {
-                    execution_id: request.execution_id,
-                    completed: false,
-                });
-            }
+        validate_tool_intent(&transaction, &request.execution_id, &intent)?;
+        if intent.operation_digest != request.operation_digest.as_str() {
             return Err(conflict());
         }
-        if intent.status != "pending" {
-            return Err(conflict());
+        match intent.status.as_str() {
+            "started" => {
+                let execution = load_tool_execution(&transaction, &request.execution_id)?;
+                validate_tool_execution_identity(&request.execution_id, &intent, &execution)?;
+                if execution.status != "running" {
+                    return Err(integrity_failure());
+                }
+                let evidence = recovery_evidence(&request.execution_id, &intent)?;
+                transaction.rollback().map_err(sqlite_error_to_port)?;
+                return Ok(ToolExecutionClaim::InFlight(evidence));
+            }
+            "succeeded" | "failed" | "cancelled" | "interrupted" => {
+                let receipt = load_terminal_receipt(&transaction, &request.execution_id, &intent)?;
+                transaction.rollback().map_err(sqlite_error_to_port)?;
+                return Ok(ToolExecutionClaim::Completed(receipt));
+            }
+            "indeterminate" if intent.external_receipt_json.is_some() => {
+                let receipt = load_terminal_receipt(&transaction, &request.execution_id, &intent)?;
+                transaction.rollback().map_err(sqlite_error_to_port)?;
+                return Ok(ToolExecutionClaim::Completed(receipt));
+            }
+            "indeterminate" => {
+                let execution = load_tool_execution(&transaction, &request.execution_id)?;
+                validate_tool_execution_identity(&request.execution_id, &intent, &execution)?;
+                if execution.status != "indeterminate"
+                    || execution.completed_at.as_deref().is_some_and(str::is_empty)
+                {
+                    return Err(integrity_failure());
+                }
+                let evidence = recovery_evidence(&request.execution_id, &intent)?;
+                transaction.rollback().map_err(sqlite_error_to_port)?;
+                return Ok(ToolExecutionClaim::Indeterminate(evidence));
+            }
+            "pending" => {}
+            _ => return Err(integrity_failure()),
         }
         verify_current_lease(&transaction, &intent)?;
         let (policy_decision_id, policy_effect, policy_snapshot_digest): (String, String, String) =
@@ -634,6 +666,12 @@ impl ToolExecutionStore for SqliteStore {
         if changed != 1 {
             return Err(conflict());
         }
+        let attempt = intent
+            .attempt_count
+            .checked_add(1)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(integrity_failure)?;
+        let authority = claim_authority(&request.execution_id, &intent, attempt)?;
         transaction
             .execute(
                 "INSERT INTO tool_executions (
@@ -667,131 +705,87 @@ impl ToolExecutionStore for SqliteStore {
                 "policyDecisionId": policy_decision_id,
                 "approvalId": approval_id,
                 "executorFencingToken": intent.fencing_token,
+                "ownerRunId": authority.owner_run_id().as_str(),
+                "attempt": authority.attempt(),
             }),
         )?;
         transaction.commit().map_err(sqlite_error_to_port)?;
-        Ok(ToolExecutionSnapshot {
-            execution_id: request.execution_id,
-            completed: false,
-        })
+        Ok(ToolExecutionClaim::Claimed(authority))
     }
 
-    fn finish(
+    fn resolve_terminal(
         &self,
-        completion: ToolExecutionCompletion,
-    ) -> Result<ToolExecutionSnapshot, PortError> {
-        if completion.execution_id != completion.receipt.execution_id {
-            return Err(invalid_input());
-        }
-        let outcome = durable_process_outcome(&completion.receipt);
-        let lookup: Option<(String, String, Option<String>)> = self
-            .connection()
-            .map_err(open_error_to_port)?
-            .query_row(
-                "SELECT te.task_id, te.status, oi.result_artifact_id
-                 FROM tool_executions te
-                 JOIN operation_intents oi ON oi.id = te.operation_intent_id
-                 WHERE te.id = ?1",
-                [completion.execution_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(sqlite_error_to_port)?;
-        let Some((lookup_task_id, lookup_status, result_artifact_id)) = lookup else {
-            return Err(not_found());
-        };
-        let output = if lookup_status == outcome.execution_status {
-            let artifact_id = result_artifact_id.ok_or_else(integrity_failure)?;
-            self.artifact_by_id(
-                &artifact_id,
-                &completion.receipt.output_digest,
-                None,
-                Some(&lookup_task_id),
-            )?
-        } else {
-            self.artifact_by_digest(
-                &completion.receipt.output_digest,
-                None,
-                Some(&lookup_task_id),
-            )?
-        };
-        let expected_receipt = receipt_json(&completion);
+        resolution: ToolExecutionResolution,
+    ) -> Result<DurableToolExecutionReceipt, PortError> {
         let mut connection = self.connection().map_err(open_error_to_port)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
-        let persisted: Option<PersistedExecutionCompletion> = transaction
-            .query_row(
-                "SELECT te.task_id, te.status, te.exit_code, te.stdout_artifact_id,
-                        te.stderr_artifact_id, te.completed_at, te.operation_intent_id,
-                        oi.status, oi.result_artifact_id, oi.external_receipt_json
-                 FROM tool_executions te
-                 JOIN operation_intents oi ON oi.id = te.operation_intent_id
-                 WHERE te.id = ?1",
-                [completion.execution_id.as_str()],
-                |row| {
-                    Ok(PersistedExecutionCompletion {
-                        task_id: row.get(0)?,
-                        execution_status: row.get(1)?,
-                        exit_code: row.get(2)?,
-                        stdout_artifact_id: row.get(3)?,
-                        stderr_artifact_id: row.get(4)?,
-                        completed_at: row.get(5)?,
-                        intent_id: row.get(6)?,
-                        intent_status: row.get(7)?,
-                        result_artifact_id: row.get(8)?,
-                        external_receipt_json: row.get(9)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(sqlite_error_to_port)?;
-        let Some(persisted) = persisted else {
-            return Err(not_found());
-        };
-        if output.task_id != persisted.task_id {
-            return Err(integrity_failure());
+        let execution_id = resolution.authority().execution_id().clone();
+        let intent = load_intent(&transaction, &execution_id).map_err(|error| {
+            if error.safe_classification() == SafeErrorClassification::NotFound {
+                conflict()
+            } else {
+                error
+            }
+        })?;
+        let persisted_authority = authority_from_intent(&execution_id, &intent)?;
+        if resolution.authority() != &persisted_authority {
+            return Err(conflict());
         }
-        if persisted.execution_status == outcome.execution_status {
-            if persisted.intent_status == outcome.intent_status
-                && persisted.exit_code == completion.receipt.exit_code
-                && persisted.stdout_artifact_id.as_deref() == Some(output.id.as_str())
-                && persisted.stderr_artifact_id.is_none()
-                && persisted
-                    .completed_at
-                    .as_deref()
-                    .is_some_and(|value| !value.is_empty())
-                && persisted.result_artifact_id.as_deref() == Some(output.id.as_str())
-                && persisted.external_receipt_json.as_deref() == Some(expected_receipt.as_str())
-                && completion_audit_matches(
-                    &transaction,
-                    &persisted.task_id,
-                    &completion,
-                    &output.id,
-                )?
-            {
+        validate_tool_intent(&transaction, &execution_id, &intent)?;
+        if matches!(
+            intent.status.as_str(),
+            "succeeded" | "failed" | "cancelled" | "interrupted"
+        ) || (intent.status == "indeterminate" && intent.external_receipt_json.is_some())
+        {
+            let persisted = load_terminal_receipt(&transaction, &execution_id, &intent)?;
+            if persisted == *resolution.receipt() {
                 transaction.rollback().map_err(sqlite_error_to_port)?;
-                return Ok(ToolExecutionSnapshot {
-                    execution_id: completion.execution_id,
-                    completed: true,
-                });
+                return Ok(persisted);
             }
             return Err(conflict());
         }
-        if persisted.execution_status != "running" || persisted.intent_status != "started" {
+        if intent.status != "started" {
             return Err(conflict());
         }
+        let execution = load_tool_execution(&transaction, &execution_id)?;
+        validate_tool_execution_identity(&execution_id, &intent, &execution)?;
+        if execution.status != "running" {
+            return Err(integrity_failure());
+        }
+        validate_terminal_artifacts(
+            &transaction,
+            &intent.task_id,
+            resolution.receipt().terminal(),
+        )?;
+        let outcome = terminal_outcome(resolution.receipt().terminal());
+        let expected_receipt = terminal_receipt_json(resolution.receipt());
+        let result_artifact_id = primary_artifact_id(resolution.receipt().terminal());
+        let stdout_artifact_id =
+            artifact_id(resolution.receipt().terminal(), ToolArtifactSlot::Stdout);
+        let stderr_artifact_id =
+            artifact_id(resolution.receipt().terminal(), ToolArtifactSlot::Stderr);
+        let exit_code = resolution
+            .receipt()
+            .terminal()
+            .output()
+            .and_then(|output| output.exit_code);
+        let error_json = terminal_error_json(resolution.receipt().terminal());
         let intent_changed = transaction
             .execute(
                 "UPDATE operation_intents
                  SET status = ?1, result_artifact_id = ?2, external_receipt_json = ?3,
-                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE id = ?4 AND status = 'started'",
+                     error_json = ?4,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE id = ?5 AND status = 'started' AND attempt_count = ?6",
                 params![
                     outcome.intent_status,
-                    output.id,
+                    result_artifact_id,
                     expected_receipt,
-                    persisted.intent_id,
+                    error_json,
+                    execution_id.as_str(),
+                    persisted_authority.attempt(),
                 ],
             )
             .map_err(sqlite_error_to_port)?;
@@ -800,13 +794,14 @@ impl ToolExecutionStore for SqliteStore {
                 "UPDATE tool_executions
                  SET status = ?1,
                       completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                      exit_code = ?2, stdout_artifact_id = ?3
-                 WHERE id = ?4 AND status = 'running'",
+                      exit_code = ?2, stdout_artifact_id = ?3, stderr_artifact_id = ?4
+                 WHERE id = ?5 AND status = 'running'",
                 params![
                     outcome.execution_status,
-                    completion.receipt.exit_code,
-                    output.id,
-                    completion.execution_id.as_str()
+                    exit_code,
+                    stdout_artifact_id,
+                    stderr_artifact_id,
+                    execution_id.as_str(),
                 ],
             )
             .map_err(sqlite_error_to_port)?;
@@ -815,101 +810,79 @@ impl ToolExecutionStore for SqliteStore {
         }
         append_tool_event(
             &transaction,
-            &persisted.task_id,
-            completion.execution_id.as_str(),
+            &intent.task_id,
+            execution_id.as_str(),
             "tool.execution.completed",
-            "None",
-            json!({
-                "executionId": completion.execution_id.as_str(),
-                "status": outcome.event_status,
-                "exitCode": completion.receipt.exit_code,
-                "outputArtifactId": output.id,
-                "outputDigest": completion.receipt.output_digest.as_str(),
-                "receipt": receipt_value(&completion),
-            }),
+            terminal_operation_state(resolution.receipt().terminal().kind()),
+            terminal_event_payload(resolution.receipt()),
         )?;
         transaction.commit().map_err(sqlite_error_to_port)?;
-        Ok(ToolExecutionSnapshot {
-            execution_id: completion.execution_id,
-            completed: true,
-        })
+        Ok(resolution.into_receipt())
     }
 
-    fn incomplete(&self) -> Result<Vec<ToolExecutionSnapshot>, PortError> {
-        let mut connection = self.connection().map_err(open_error_to_port)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sqlite_error_to_port)?;
-        let rows = {
-            let mut statement = transaction
-                .prepare(
-                    "SELECT te.id, te.task_id, oi.idempotency_class
-                     FROM tool_executions te
-                     JOIN operation_intents oi ON oi.id = te.operation_intent_id
-                     WHERE te.status = 'running' AND oi.status = 'started'
-                     ORDER BY te.id",
-                )
-                .map_err(sqlite_error_to_port)?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })
-                .map_err(sqlite_error_to_port)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(sqlite_error_to_port)?;
-            rows
-        };
-        let mut snapshots = Vec::with_capacity(rows.len());
-        for (execution_id, task_id, idempotency_class) in rows {
-            let execution_id =
-                ToolExecutionId::new(execution_id).map_err(|_| integrity_failure())?;
-            if idempotency_class == "non_repeatable" {
-                let intent_changed = transaction
-                    .execute(
-                        "UPDATE operation_intents
-                         SET status = 'indeterminate',
-                             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                             error_json = '{\"classification\":\"crash_without_authoritative_receipt\"}'
-                         WHERE id = ?1 AND status = 'started'",
-                        [execution_id.as_str()],
-                    )
-                    .map_err(sqlite_error_to_port)?;
-                let execution_changed = transaction
-                    .execute(
-                        "UPDATE tool_executions
-                         SET status = 'indeterminate',
-                             completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                         WHERE id = ?1 AND status = 'running'",
-                        [execution_id.as_str()],
-                    )
-                    .map_err(sqlite_error_to_port)?;
-                if intent_changed != 1 || execution_changed != 1 {
-                    return Err(conflict());
-                }
-                append_tool_event(
-                    &transaction,
-                    &task_id,
-                    execution_id.as_str(),
-                    "tool.execution.indeterminate",
-                    "Indeterminate",
-                    json!({
-                        "executionId": execution_id.as_str(),
-                        "reason": "crash_without_authoritative_receipt",
-                    }),
-                )?;
-            }
-            snapshots.push(ToolExecutionSnapshot {
-                execution_id,
-                completed: false,
-            });
-        }
-        transaction.commit().map_err(sqlite_error_to_port)?;
-        Ok(snapshots)
+    fn incomplete(&self) -> Result<Vec<IncompleteToolExecution>, PortError> {
+        incomplete_with_checkpoint(self, || {})
     }
+}
+
+fn incomplete_with_checkpoint(
+    store: &SqliteStore,
+    after_candidate_read: impl FnOnce(),
+) -> Result<Vec<IncompleteToolExecution>, PortError> {
+    let mut connection = store.connection().map_err(open_error_to_port)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(sqlite_error_to_port)?;
+    let execution_ids = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT oi.id
+                 FROM operation_intents oi
+                 JOIN tool_executions te ON te.operation_intent_id = oi.id
+                 WHERE NOT (
+                     oi.operation_kind = 'file.write'
+                     AND te.tool_name = 'file.write'
+                 )
+                 ORDER BY oi.id",
+            )
+            .map_err(sqlite_error_to_port)?;
+        let execution_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sqlite_error_to_port)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_error_to_port)?;
+        execution_ids
+    };
+    after_candidate_read();
+    let mut incomplete = Vec::with_capacity(execution_ids.len());
+    for execution_id in execution_ids {
+        let execution_id = ToolExecutionId::new(execution_id).map_err(|_| integrity_failure())?;
+        let intent = load_intent(&transaction, &execution_id)?;
+        validate_tool_intent(&transaction, &execution_id, &intent)?;
+        let execution = load_tool_execution(&transaction, &execution_id)?;
+        validate_tool_execution_identity(&execution_id, &intent, &execution)?;
+        match (intent.status.as_str(), execution.status.as_str()) {
+            ("started", "running") => {
+                incomplete.push(IncompleteToolExecution::InFlight(recovery_evidence(
+                    &execution_id,
+                    &intent,
+                )?));
+            }
+            ("indeterminate", "indeterminate") if intent.external_receipt_json.is_none() => {
+                incomplete.push(IncompleteToolExecution::Indeterminate(recovery_evidence(
+                    &execution_id,
+                    &intent,
+                )?));
+            }
+            ("succeeded" | "failed" | "cancelled" | "interrupted", _)
+            | ("indeterminate", "indeterminate") => {
+                load_terminal_receipt(&transaction, &execution_id, &intent)?;
+            }
+            _ => return Err(integrity_failure()),
+        }
+    }
+    transaction.rollback().map_err(sqlite_error_to_port)?;
+    Ok(incomplete)
 }
 
 struct FileWriteFailureTransition {
@@ -1469,7 +1442,7 @@ impl SqliteStore {
     ) -> Result<ToolRequestEvidence, PortError> {
         let artifact = self.artifact_by_digest(digest, None, None)?;
         let ApprovalDigestPayload::Tool(payload) =
-            parse_canonical_approval_payload(&artifact.bytes)?
+            parse_canonical_approval_payload(&artifact.bytes).map_err(|_| integrity_failure())?
         else {
             return Err(invalid_input());
         };
@@ -1601,20 +1574,29 @@ struct IntentRow {
     task_id: String,
     run_id: String,
     operation_kind: String,
+    idempotency_class: String,
+    idempotency_key: String,
     artifact_id: String,
     operation_digest: String,
     status: String,
     fencing_token: Option<i64>,
+    lease_owner: Option<String>,
+    attempt_count: i64,
+    result_artifact_id: Option<String>,
+    external_receipt_json: Option<String>,
+    error_json: Option<String>,
 }
 
 fn load_intent(
-    transaction: &Transaction<'_>,
+    connection: &rusqlite::Connection,
     execution_id: &ToolExecutionId,
 ) -> Result<IntentRow, PortError> {
-    transaction
+    connection
         .query_row(
-            "SELECT task_id, run_id, operation_kind, canonical_request_artifact_id,
-                    operation_digest, status, executor_fencing_token
+            "SELECT task_id, run_id, operation_kind, idempotency_class, idempotency_key,
+                    canonical_request_artifact_id, operation_digest, status,
+                    executor_fencing_token, lease_owner, attempt_count, result_artifact_id,
+                    external_receipt_json, error_json
              FROM operation_intents WHERE id = ?1",
             [execution_id.as_str()],
             |row| {
@@ -1624,10 +1606,17 @@ fn load_intent(
                         .get::<_, Option<String>>(1)?
                         .ok_or(rusqlite::Error::InvalidQuery)?,
                     operation_kind: row.get(2)?,
-                    artifact_id: row.get(3)?,
-                    operation_digest: row.get(4)?,
-                    status: row.get(5)?,
-                    fencing_token: row.get(6)?,
+                    idempotency_class: row.get(3)?,
+                    idempotency_key: row.get(4)?,
+                    artifact_id: row.get(5)?,
+                    operation_digest: row.get(6)?,
+                    status: row.get(7)?,
+                    fencing_token: row.get(8)?,
+                    lease_owner: row.get(9)?,
+                    attempt_count: row.get(10)?,
+                    result_artifact_id: row.get(11)?,
+                    external_receipt_json: row.get(12)?,
+                    error_json: row.get(13)?,
                 })
             },
         )
@@ -1664,171 +1653,894 @@ fn verify_current_lease(
     }
 }
 
-fn execution_matches(
-    transaction: &Transaction<'_>,
+fn validate_tool_intent(
+    connection: &rusqlite::Connection,
     execution_id: &ToolExecutionId,
     intent: &IntentRow,
-) -> Result<bool, PortError> {
-    transaction
+) -> Result<(), PortError> {
+    let operation_digest =
+        Sha256Digest::new(intent.operation_digest.clone()).map_err(|_| integrity_failure())?;
+    TaskId::new(intent.task_id.clone()).map_err(|_| integrity_failure())?;
+    RunId::new(intent.run_id.clone()).map_err(|_| integrity_failure())?;
+    ArtifactId::new(intent.artifact_id.clone()).map_err(|_| integrity_failure())?;
+    if IdempotencyClass::parse(&intent.idempotency_class) != Some(IdempotencyClass::NonRepeatable)
+        || intent.idempotency_key != format!("tool:{}:{}", intent.run_id, execution_id.as_str())
+        || intent.attempt_count < 0
+    {
+        return Err(integrity_failure());
+    }
+    let artifact = artifact_by_id_on_connection(
+        connection,
+        &intent.artifact_id,
+        &operation_digest,
+        &intent.task_id,
+    )?;
+    let ApprovalDigestPayload::Tool(payload) = parse_canonical_approval_payload(&artifact.bytes)?
+    else {
+        return Err(integrity_failure());
+    };
+    let persisted_fencing_token = intent
+        .fencing_token
+        .map(|value| u64::try_from(value).map_err(|_| integrity_failure()))
+        .transpose()?;
+    if payload.task_id != intent.task_id
+        || payload.operation.run_id != intent.run_id
+        || payload.operation.tool != intent.operation_kind
+        || payload.operation.executor_fencing_token != persisted_fencing_token
+    {
+        return Err(integrity_failure());
+    }
+    match intent.status.as_str() {
+        "pending"
+            if intent.attempt_count == 0
+                && intent.lease_owner.is_none()
+                && intent.result_artifact_id.is_none()
+                && intent.external_receipt_json.is_none()
+                && intent.error_json.is_none() =>
+        {
+            Ok(())
+        }
+        "started" | "succeeded" | "failed" | "cancelled" | "interrupted" | "indeterminate"
+            if intent.attempt_count > 0
+                && intent.lease_owner.as_deref() == Some(intent.run_id.as_str()) =>
+        {
+            validate_started_event(connection, execution_id, intent)
+        }
+        _ => Err(integrity_failure()),
+    }
+}
+
+fn validate_started_event(
+    connection: &rusqlite::Connection,
+    execution_id: &ToolExecutionId,
+    intent: &IntentRow,
+) -> Result<(), PortError> {
+    let valid: bool = connection
         .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM tool_executions
-                WHERE id = ?1 AND operation_intent_id = ?1 AND task_id = ?2
-                  AND run_id = ?3 AND arguments_artifact_id = ?4 AND status = 'running'
-            )",
+            "SELECT COUNT(*) = 1
+             FROM events
+             WHERE stream_id = ?1 AND event_type = 'tool.execution.started'
+               AND json_extract(payload_json, '$.executionId') = ?2
+               AND json_extract(payload_json, '$.operationDigest') = ?3
+               AND (
+                   (
+                       json_extract(payload_json, '$.ownerRunId') = ?4
+                       AND json_extract(payload_json, '$.attempt') = ?5
+                   )
+                   OR (
+                       json_type(payload_json, '$.ownerRunId') IS NULL
+                       AND json_type(payload_json, '$.attempt') IS NULL
+                   )
+               )
+               AND (
+                   (?6 IS NULL
+                       AND json_type(payload_json, '$.executorFencingToken') = 'null')
+                   OR json_extract(payload_json, '$.executorFencingToken') = ?6
+               )",
             params![
-                execution_id.as_str(),
                 intent.task_id,
+                execution_id.as_str(),
+                intent.operation_digest,
                 intent.run_id,
-                intent.artifact_id
+                intent.attempt_count,
+                intent.fencing_token,
             ],
             |row| row.get(0),
         )
-        .map_err(sqlite_error_to_port)
-}
-
-fn receipt_json(completion: &ToolExecutionCompletion) -> String {
-    receipt_value(completion).to_string()
-}
-
-fn receipt_value(completion: &ToolExecutionCompletion) -> serde_json::Value {
-    let receipt = &completion.receipt;
-    json!({
-        "schemaVersion": 1,
-        "executionId": completion.execution_id.as_str(),
-        "status": process_status(receipt.status),
-        "exitCode": receipt.exit_code,
-        "outputDigest": receipt.output_digest.as_str(),
-        "stdout": {
-            "byteCount": receipt.stdout.bytes.len(),
-            "truncated": receipt.stdout.truncated,
-        },
-        "stderr": {
-            "byteCount": receipt.stderr.bytes.len(),
-            "truncated": receipt.stderr.truncated,
-        },
-        "durationMs": receipt.duration_ms,
-        "job": {
-            "rootPid": receipt.job_receipt.root_pid,
-            "jobId": receipt.job_receipt.job_id,
-            "killOnClose": receipt.job_receipt.kill_on_close,
-            "noBreakaway": receipt.job_receipt.no_breakaway,
-            "jobMemoryLimit": receipt.job_receipt.job_memory_limit,
-            "jobCpuTimeLimit": receipt.job_receipt.job_cpu_time_limit,
-            "memoryLimitBytes": receipt.job_receipt.memory_limit_bytes,
-            "cpuTimeLimitMs": receipt.job_receipt.cpu_time_limit_ms,
-            "maxActiveProcesses": receipt.job_receipt.max_active_processes,
-            "totalUserTimeMs": receipt.job_receipt.total_user_time_ms,
-            "resourceLimitTerminated": receipt.job_receipt.resource_limit_terminated,
-            "treeTerminated": receipt.job_receipt.tree_terminated,
-        },
-        "observedWrites": receipt.observed_writes.iter().map(process_write_value).collect::<Vec<_>>(),
-    })
-}
-
-fn process_write_value(write: &ObservedProcessWrite) -> serde_json::Value {
-    json!({
-        "capability": process_capability_value(write.capability()),
-        "rootIdentity": write.root_identity().as_str(),
-        "target": process_write_target_value(write.target()),
-        "digest": write.write().digest.as_str(),
-        "sizeBytes": write.write().size_bytes,
-    })
-}
-
-fn process_capability_value(capability: &CapabilityRef) -> serde_json::Value {
-    match capability {
-        CapabilityRef::Source(source) => json!({
-            "kind": "source",
-            "revision": source.revision(),
-            "path": source.path(),
-        }),
-        CapabilityRef::Artifact(artifact) => json!({
-            "kind": "artifact",
-            "artifactId": artifact.artifact_id().as_str(),
-        }),
-        CapabilityRef::Worktree(worktree) => json!({
-            "kind": "worktree",
-            "taskId": worktree.task_id().as_str(),
-            "path": worktree.path(),
-        }),
-        CapabilityRef::Toolchain(toolchain) => json!({
-            "kind": "toolchain",
-            "name": toolchain.name(),
-        }),
+        .map_err(sqlite_error_to_port)?;
+    if valid {
+        Ok(())
+    } else {
+        Err(integrity_failure())
     }
 }
 
-fn process_write_target_value(target: &ResolvedCapabilityTarget) -> serde_json::Value {
-    match target {
-        ResolvedCapabilityTarget::Root => json!({ "kind": "root" }),
-        ResolvedCapabilityTarget::Relative(components) => json!({
-            "kind": "relative",
-            "components": components.as_slice(),
-        }),
-    }
-}
-
-fn completion_audit_matches(
-    transaction: &Transaction<'_>,
+fn artifact_by_id_on_connection(
+    connection: &rusqlite::Connection,
+    artifact_id: &str,
+    digest: &Sha256Digest,
     task_id: &str,
-    completion: &ToolExecutionCompletion,
-    output_artifact_id: &str,
-) -> Result<bool, PortError> {
-    let outcome = durable_process_outcome(&completion.receipt);
-    let payload = json!({
-        "executionId": completion.execution_id.as_str(),
-        "status": outcome.event_status,
-        "exitCode": completion.receipt.exit_code,
-        "outputArtifactId": output_artifact_id,
-        "outputDigest": completion.receipt.output_digest.as_str(),
-        "receipt": receipt_value(completion),
-    })
-    .to_string();
-    transaction
+) -> Result<StoredArtifact, PortError> {
+    let row: Option<StoredArtifactRow> = connection
         .query_row(
-            "SELECT
-                (SELECT COUNT(*) FROM events
-                 WHERE stream_id = ?1 AND event_type = 'tool.execution.completed'
-                   AND payload_json = ?2) = 1
-                AND (SELECT operation_state FROM tasks WHERE id = ?1) = 'None'",
-            params![task_id, payload],
+            "SELECT a.id, a.task_id, a.project_id, p.artifact_root_path, a.storage_key,
+                    a.size_bytes, a.content_hash
+             FROM artifacts a
+             JOIN projects p ON p.id = a.project_id
+             WHERE a.id = ?1 AND a.content_hash = ?2 AND a.availability = 'available'
+               AND a.verification_state IN (
+                   'hash_verified', 'tool_verified', 'user_approved'
+               )
+               AND a.task_id = ?3",
+            params![artifact_id, digest.as_str(), task_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error_to_port)?;
+    stored_artifact(row.ok_or_else(integrity_failure)?)
+}
+
+fn load_tool_execution(
+    connection: &rusqlite::Connection,
+    execution_id: &ToolExecutionId,
+) -> Result<PersistedToolExecution, PortError> {
+    connection
+        .query_row(
+            "SELECT task_id, run_id, request_id, tool_name, arguments_artifact_id,
+                    operation_intent_id, executor_fencing_token, status, exit_code,
+                    stdout_artifact_id, stderr_artifact_id, completed_at
+             FROM tool_executions WHERE id = ?1",
+            [execution_id.as_str()],
+            |row| {
+                Ok(PersistedToolExecution {
+                    task_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    request_id: row.get(2)?,
+                    tool_name: row.get(3)?,
+                    arguments_artifact_id: row.get(4)?,
+                    operation_intent_id: row.get(5)?,
+                    executor_fencing_token: row.get(6)?,
+                    status: row.get(7)?,
+                    exit_code: row.get(8)?,
+                    stdout_artifact_id: row.get(9)?,
+                    stderr_artifact_id: row.get(10)?,
+                    completed_at: row.get(11)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(sqlite_error_to_port)?
+        .ok_or_else(integrity_failure)
+}
+
+fn validate_tool_execution_identity(
+    execution_id: &ToolExecutionId,
+    intent: &IntentRow,
+    execution: &PersistedToolExecution,
+) -> Result<(), PortError> {
+    if execution.task_id != intent.task_id
+        || execution.run_id.as_deref() != Some(intent.run_id.as_str())
+        || execution.request_id != execution_id.as_str()
+        || execution.tool_name != intent.operation_kind
+        || execution.arguments_artifact_id != intent.artifact_id
+        || execution.operation_intent_id != execution_id.as_str()
+        || execution.executor_fencing_token != intent.fencing_token
+    {
+        return Err(integrity_failure());
+    }
+    Ok(())
+}
+
+fn claim_authority(
+    execution_id: &ToolExecutionId,
+    intent: &IntentRow,
+    attempt: u32,
+) -> Result<ToolExecutionClaimAuthority, PortError> {
+    ToolExecutionClaimAuthority::from_persisted(
+        execution_id.clone(),
+        Sha256Digest::new(intent.operation_digest.clone()).map_err(|_| integrity_failure())?,
+        RunId::new(intent.run_id.clone()).map_err(|_| integrity_failure())?,
+        attempt,
+        intent
+            .fencing_token
+            .map(|value| FencingToken::try_from(value).map_err(|_| integrity_failure()))
+            .transpose()?,
+    )
+    .map_err(|_| integrity_failure())
+}
+
+fn authority_from_intent(
+    execution_id: &ToolExecutionId,
+    intent: &IntentRow,
+) -> Result<ToolExecutionClaimAuthority, PortError> {
+    let attempt = u32::try_from(intent.attempt_count).map_err(|_| integrity_failure())?;
+    claim_authority(execution_id, intent, attempt)
+}
+
+fn recovery_evidence(
+    execution_id: &ToolExecutionId,
+    intent: &IntentRow,
+) -> Result<ToolExecutionRecoveryEvidence, PortError> {
+    Ok(ToolExecutionRecoveryEvidence {
+        authority: authority_from_intent(execution_id, intent)?,
+        task_id: TaskId::new(intent.task_id.clone()).map_err(|_| integrity_failure())?,
+        canonical_request_artifact_id: ArtifactId::new(intent.artifact_id.clone())
+            .map_err(|_| integrity_failure())?,
+        idempotency_class: IdempotencyClass::parse(&intent.idempotency_class)
+            .ok_or_else(integrity_failure)?,
+    })
+}
+
+struct TerminalOutcome {
+    intent_status: &'static str,
+    execution_status: &'static str,
+}
+
+fn terminal_outcome(terminal: &ToolExecutionTerminal) -> TerminalOutcome {
+    match terminal.kind() {
+        ToolExecutionTerminalKind::Succeeded => TerminalOutcome {
+            intent_status: "succeeded",
+            execution_status: "succeeded",
+        },
+        ToolExecutionTerminalKind::Failed => TerminalOutcome {
+            intent_status: "failed",
+            execution_status: "failed",
+        },
+        ToolExecutionTerminalKind::Cancelled => TerminalOutcome {
+            intent_status: "cancelled",
+            execution_status: "cancelled",
+        },
+        ToolExecutionTerminalKind::Terminated => TerminalOutcome {
+            intent_status: "failed",
+            execution_status: "terminated",
+        },
+        ToolExecutionTerminalKind::Interrupted => TerminalOutcome {
+            intent_status: "interrupted",
+            execution_status: "interrupted",
+        },
+        ToolExecutionTerminalKind::Indeterminate => TerminalOutcome {
+            intent_status: "indeterminate",
+            execution_status: "indeterminate",
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ToolArtifactSlot {
+    Stdout,
+    Stderr,
+}
+
+fn artifact_id(terminal: &ToolExecutionTerminal, slot: ToolArtifactSlot) -> Option<&str> {
+    let artifacts = &terminal.output()?.artifacts;
+    let artifact = match slot {
+        ToolArtifactSlot::Stdout => artifacts.stdout(),
+        ToolArtifactSlot::Stderr => artifacts.stderr(),
+    };
+    match artifact {
+        DurableToolExecutionArtifact::Available(id) => Some(id.as_str()),
+        DurableToolExecutionArtifact::Unavailable => None,
+    }
+}
+
+fn primary_artifact_id(terminal: &ToolExecutionTerminal) -> Option<&str> {
+    artifact_id(terminal, ToolArtifactSlot::Stdout)
+        .or_else(|| artifact_id(terminal, ToolArtifactSlot::Stderr))
+        .or_else(|| {
+            terminal
+                .output()?
+                .artifacts
+                .observed_writes()
+                .iter()
+                .find_map(|artifact| match artifact {
+                    DurableToolExecutionArtifact::Available(id) => Some(id.as_str()),
+                    DurableToolExecutionArtifact::Unavailable => None,
+                })
+        })
+}
+
+fn validate_terminal_artifacts(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    terminal: &ToolExecutionTerminal,
+) -> Result<(), PortError> {
+    let Some(output) = terminal.output() else {
+        return Ok(());
+    };
+    for artifact in std::iter::once(output.artifacts.stdout())
+        .chain(std::iter::once(output.artifacts.stderr()))
+        .chain(output.artifacts.observed_writes())
+    {
+        let DurableToolExecutionArtifact::Available(artifact_id) = artifact else {
+            continue;
+        };
+        let content_hash: Option<String> = connection
+            .query_row(
+                "SELECT content_hash FROM artifacts WHERE id = ?1 AND task_id = ?2",
+                params![artifact_id.as_str(), task_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?;
+        let digest = Sha256Digest::new(content_hash.ok_or_else(integrity_failure)?)
+            .map_err(|_| integrity_failure())?;
+        artifact_by_id_on_connection(connection, artifact_id.as_str(), &digest, task_id)?;
+    }
+    Ok(())
+}
+
+const fn terminal_operation_state(kind: ToolExecutionTerminalKind) -> &'static str {
+    match kind {
+        ToolExecutionTerminalKind::Indeterminate => "Indeterminate",
+        ToolExecutionTerminalKind::Succeeded
+        | ToolExecutionTerminalKind::Failed
+        | ToolExecutionTerminalKind::Cancelled
+        | ToolExecutionTerminalKind::Terminated
+        | ToolExecutionTerminalKind::Interrupted => "None",
+    }
+}
+
+fn terminal_receipt_json(receipt: &DurableToolExecutionReceipt) -> String {
+    terminal_receipt_value(receipt).to_string()
+}
+
+fn terminal_receipt_value(receipt: &DurableToolExecutionReceipt) -> serde_json::Value {
+    let authority = receipt.authority();
+    json!({
+        "authority": {
+            "attempt": authority.attempt(),
+            "executionId": authority.execution_id().as_str(),
+            "executorFencingToken": authority.executor_fencing_token().map(FencingToken::get),
+            "operationDigest": authority.operation_digest().as_str(),
+            "ownerRunId": authority.owner_run_id().as_str(),
+        },
+        "schema": "tool-execution-terminal.v1",
+        "terminal": terminal_value(receipt.terminal()),
+    })
+}
+
+fn terminal_value(terminal: &ToolExecutionTerminal) -> serde_json::Value {
+    match terminal.kind() {
+        ToolExecutionTerminalKind::Succeeded
+        | ToolExecutionTerminalKind::Failed
+        | ToolExecutionTerminalKind::Terminated => {
+            let output = terminal
+                .output()
+                .expect("output-bearing terminal kind has output");
+            json!({
+                "kind": terminal_kind_name(terminal.kind()),
+                "output": {
+                    "artifacts": {
+                        "observedWrites": output
+                            .artifacts
+                            .observed_writes()
+                            .iter()
+                            .map(artifact_value)
+                            .collect::<Vec<_>>(),
+                        "stderr": artifact_value(output.artifacts.stderr()),
+                        "stdout": artifact_value(output.artifacts.stdout()),
+                    },
+                    "durationMs": output.duration_ms,
+                    "exitCode": output.exit_code,
+                    "outputDigest": output.output_digest.as_str(),
+                },
+            })
+        }
+        ToolExecutionTerminalKind::Indeterminate => {
+            let error = terminal
+                .error()
+                .expect("indeterminate terminal kind has an error");
+            json!({
+                "error": {
+                    "classification": error_classification_name(error.classification),
+                    "retryability": retryability_name(error.retryability),
+                },
+                "kind": terminal_kind_name(terminal.kind()),
+            })
+        }
+        ToolExecutionTerminalKind::Cancelled | ToolExecutionTerminalKind::Interrupted => {
+            json!({ "kind": terminal_kind_name(terminal.kind()) })
+        }
+    }
+}
+
+fn artifact_value(artifact: &DurableToolExecutionArtifact) -> serde_json::Value {
+    match artifact {
+        DurableToolExecutionArtifact::Available(id) => json!({
+            "artifactId": id.as_str(),
+            "availability": "available",
+        }),
+        DurableToolExecutionArtifact::Unavailable => json!({
+            "availability": "unavailable",
+        }),
+    }
+}
+
+const fn terminal_kind_name(kind: ToolExecutionTerminalKind) -> &'static str {
+    match kind {
+        ToolExecutionTerminalKind::Succeeded => "succeeded",
+        ToolExecutionTerminalKind::Failed => "failed",
+        ToolExecutionTerminalKind::Cancelled => "cancelled",
+        ToolExecutionTerminalKind::Terminated => "terminated",
+        ToolExecutionTerminalKind::Interrupted => "interrupted",
+        ToolExecutionTerminalKind::Indeterminate => "indeterminate",
+    }
+}
+
+const fn error_classification_name(classification: SafeErrorClassification) -> &'static str {
+    match classification {
+        SafeErrorClassification::Conflict => "conflict",
+        SafeErrorClassification::Unavailable => "unavailable",
+        SafeErrorClassification::PermissionDenied => "permission_denied",
+        SafeErrorClassification::NotFound => "not_found",
+        SafeErrorClassification::InvalidInput => "invalid_input",
+        SafeErrorClassification::IntegrityFailure => "integrity_failure",
+        SafeErrorClassification::StorageFull => "storage_full",
+        SafeErrorClassification::Internal => "internal",
+    }
+}
+
+const fn retryability_name(retryability: Retryability) -> &'static str {
+    match retryability {
+        Retryability::Retryable => "retryable",
+        Retryability::NonRetryable => "non_retryable",
+    }
+}
+
+fn terminal_error_json(terminal: &ToolExecutionTerminal) -> Option<String> {
+    terminal.error().map(|error| {
+        json!({
+            "classification": error_classification_name(error.classification),
+            "retryability": retryability_name(error.retryability),
+        })
+        .to_string()
+    })
+}
+
+fn terminal_event_payload(receipt: &DurableToolExecutionReceipt) -> serde_json::Value {
+    json!({
+        "attempt": receipt.authority().attempt(),
+        "executionId": receipt.authority().execution_id().as_str(),
+        "operationDigest": receipt.authority().operation_digest().as_str(),
+        "ownerRunId": receipt.authority().owner_run_id().as_str(),
+        "receipt": terminal_receipt_value(receipt),
+    })
+}
+
+fn parse_terminal_receipt(value: &str) -> Result<DurableToolExecutionReceipt, PortError> {
+    let value: serde_json::Value = serde_json::from_str(value).map_err(|_| integrity_failure())?;
+    if required_string(&value, "schema")? != "tool-execution-terminal.v1" {
+        return Err(integrity_failure());
+    }
+    let authority = required_object(&value, "authority")?;
+    let execution_id = ToolExecutionId::new(required_string(authority, "executionId")?)
+        .map_err(|_| integrity_failure())?;
+    let operation_digest = Sha256Digest::new(required_string(authority, "operationDigest")?)
+        .map_err(|_| integrity_failure())?;
+    let owner_run_id =
+        RunId::new(required_string(authority, "ownerRunId")?).map_err(|_| integrity_failure())?;
+    let attempt =
+        u32::try_from(required_u64(authority, "attempt")?).map_err(|_| integrity_failure())?;
+    let executor_fencing_token = match authority.get("executorFencingToken") {
+        Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            FencingToken::new(value.as_u64().ok_or_else(integrity_failure)?)
+                .map_err(|_| integrity_failure())?,
+        ),
+        None => return Err(integrity_failure()),
+    };
+    let authority = ToolExecutionClaimAuthority::from_persisted(
+        execution_id,
+        operation_digest,
+        owner_run_id,
+        attempt,
+        executor_fencing_token,
+    )
+    .map_err(|_| integrity_failure())?;
+
+    let terminal = required_object(&value, "terminal")?;
+    let kind = required_string(terminal, "kind")?;
+    let terminal = match kind {
+        "succeeded" => ToolExecutionTerminal::succeeded(parse_terminal_output(terminal)?),
+        "failed" => ToolExecutionTerminal::failed(parse_terminal_output(terminal)?),
+        "terminated" => ToolExecutionTerminal::terminated(parse_terminal_output(terminal)?),
+        "cancelled" => Ok(ToolExecutionTerminal::cancelled()),
+        "interrupted" => Ok(ToolExecutionTerminal::interrupted()),
+        "indeterminate" => {
+            let error = required_object(terminal, "error")?;
+            Ok(ToolExecutionTerminal::indeterminate(
+                SafeToolExecutionError {
+                    classification: parse_error_classification(required_string(
+                        error,
+                        "classification",
+                    )?)?,
+                    retryability: parse_retryability(required_string(error, "retryability")?)?,
+                },
+            ))
+        }
+        _ => Err(integrity_failure()),
+    }
+    .map_err(|_| integrity_failure())?;
+    Ok(DurableToolExecutionReceipt::new(authority, terminal))
+}
+
+struct ParsedPersistedReceipt {
+    receipt: DurableToolExecutionReceipt,
+    audit_payload: serde_json::Value,
+    current_schema: bool,
+}
+
+fn parse_persisted_terminal_receipt(
+    connection: &rusqlite::Connection,
+    receipt_json: &str,
+    execution_id: &ToolExecutionId,
+    intent: &IntentRow,
+    execution: &PersistedToolExecution,
+) -> Result<ParsedPersistedReceipt, PortError> {
+    let value: serde_json::Value =
+        serde_json::from_str(receipt_json).map_err(|_| integrity_failure())?;
+    if value.get("schema").is_some() {
+        let receipt = parse_terminal_receipt(receipt_json)?;
+        let audit_payload = terminal_event_payload(&receipt);
+        return Ok(ParsedPersistedReceipt {
+            receipt,
+            audit_payload,
+            current_schema: true,
+        });
+    }
+    if value
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return Err(integrity_failure());
+    }
+    let receipt =
+        parse_legacy_terminal_receipt(connection, &value, execution_id, intent, execution)?;
+    let output = receipt.terminal().output().ok_or_else(integrity_failure)?;
+    let output_artifact_id = execution
+        .stdout_artifact_id
+        .as_deref()
+        .ok_or_else(integrity_failure)?;
+    let audit_payload = json!({
+        "executionId": execution_id.as_str(),
+        "status": legacy_event_status(receipt.terminal().kind())?,
+        "exitCode": output.exit_code,
+        "outputArtifactId": output_artifact_id,
+        "outputDigest": output.output_digest.as_str(),
+        "receipt": value,
+    });
+    Ok(ParsedPersistedReceipt {
+        receipt,
+        audit_payload,
+        current_schema: false,
+    })
+}
+
+fn parse_legacy_terminal_receipt(
+    connection: &rusqlite::Connection,
+    value: &serde_json::Value,
+    execution_id: &ToolExecutionId,
+    intent: &IntentRow,
+    execution: &PersistedToolExecution,
+) -> Result<DurableToolExecutionReceipt, PortError> {
+    if required_string(value, "executionId")? != execution_id.as_str() {
+        return Err(integrity_failure());
+    }
+    validate_legacy_bounded_output(required_object(value, "stdout")?)?;
+    validate_legacy_bounded_output(required_object(value, "stderr")?)?;
+    validate_legacy_job_receipt(required_object(value, "job")?)?;
+    let writes = value
+        .get("observedWrites")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(integrity_failure)?;
+    for write in writes {
+        validate_legacy_observed_write(write)?;
+    }
+    let exit_code = match value.get("exitCode") {
+        Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            i32::try_from(value.as_i64().ok_or_else(integrity_failure)?)
+                .map_err(|_| integrity_failure())?,
+        ),
+        None => return Err(integrity_failure()),
+    };
+    let legacy_output_digest = Sha256Digest::new(required_string(value, "outputDigest")?)
+        .map_err(|_| integrity_failure())?;
+    let stdout_artifact = execution
+        .stdout_artifact_id
+        .as_deref()
+        .ok_or_else(integrity_failure)?;
+    let persisted_output_digest: String = connection
+        .query_row(
+            "SELECT content_hash FROM artifacts
+             WHERE id = ?1 AND task_id = ?2 AND availability = 'available'",
+            params![stdout_artifact, intent.task_id],
             |row| row.get(0),
         )
-        .map_err(sqlite_error_to_port)
+        .optional()
+        .map_err(sqlite_error_to_port)?
+        .ok_or_else(integrity_failure)?;
+    let output_digest =
+        Sha256Digest::new(persisted_output_digest).map_err(|_| integrity_failure())?;
+    if legacy_output_digest != output_digest {
+        return Err(integrity_failure());
+    }
+    let stdout_artifact_id =
+        ArtifactId::new(stdout_artifact.to_owned()).map_err(|_| integrity_failure())?;
+    if execution.stderr_artifact_id.is_some() {
+        return Err(integrity_failure());
+    }
+    let output = ToolExecutionOutput {
+        exit_code,
+        output_digest,
+        duration_ms: required_u64(value, "durationMs")?,
+        artifacts: DurableToolExecutionArtifacts::new(
+            DurableToolExecutionArtifact::Available(stdout_artifact_id),
+            DurableToolExecutionArtifact::Unavailable,
+            writes
+                .iter()
+                .map(|_| DurableToolExecutionArtifact::Unavailable)
+                .collect(),
+        ),
+    };
+    let terminal = match required_string(value, "status")? {
+        "exited" if exit_code == Some(0) => ToolExecutionTerminal::succeeded(output),
+        "exited" => ToolExecutionTerminal::failed(output),
+        "terminated" => ToolExecutionTerminal::terminated(output),
+        _ => Err(integrity_failure()),
+    }
+    .map_err(|_| integrity_failure())?;
+    Ok(DurableToolExecutionReceipt::new(
+        authority_from_intent(execution_id, intent)?,
+        terminal,
+    ))
 }
 
-struct DurableProcessOutcome {
-    execution_status: &'static str,
-    intent_status: &'static str,
-    event_status: &'static str,
+fn validate_legacy_bounded_output(value: &serde_json::Value) -> Result<(), PortError> {
+    required_u64(value, "byteCount")?;
+    required_bool(value, "truncated")?;
+    Ok(())
 }
 
-fn durable_process_outcome(receipt: &ProcessReceipt) -> DurableProcessOutcome {
-    match (receipt.status, receipt.exit_code) {
-        (ProcessStatus::Exited, Some(0)) => DurableProcessOutcome {
-            execution_status: "succeeded",
-            intent_status: "succeeded",
-            event_status: "succeeded",
-        },
-        (ProcessStatus::Exited, _) => DurableProcessOutcome {
-            execution_status: "failed",
-            intent_status: "failed",
-            event_status: "failed",
-        },
-        (ProcessStatus::Terminated, _) => DurableProcessOutcome {
-            execution_status: "terminated",
-            intent_status: "failed",
-            event_status: "terminated",
-        },
+fn validate_legacy_job_receipt(value: &serde_json::Value) -> Result<(), PortError> {
+    for field in [
+        "rootPid",
+        "memoryLimitBytes",
+        "cpuTimeLimitMs",
+        "maxActiveProcesses",
+        "totalUserTimeMs",
+    ] {
+        required_u64(value, field)?;
+    }
+    required_string(value, "jobId")?;
+    for field in [
+        "killOnClose",
+        "noBreakaway",
+        "jobMemoryLimit",
+        "jobCpuTimeLimit",
+        "resourceLimitTerminated",
+        "treeTerminated",
+    ] {
+        required_bool(value, field)?;
+    }
+    Ok(())
+}
+
+fn validate_legacy_observed_write(value: &serde_json::Value) -> Result<(), PortError> {
+    required_object(value, "capability")?;
+    required_string(value, "rootIdentity")?;
+    required_object(value, "target")?;
+    Sha256Digest::new(required_string(value, "digest")?).map_err(|_| integrity_failure())?;
+    required_u64(value, "sizeBytes")?;
+    Ok(())
+}
+
+fn legacy_event_status(kind: ToolExecutionTerminalKind) -> Result<&'static str, PortError> {
+    match kind {
+        ToolExecutionTerminalKind::Succeeded => Ok("succeeded"),
+        ToolExecutionTerminalKind::Failed => Ok("failed"),
+        ToolExecutionTerminalKind::Terminated => Ok("terminated"),
+        ToolExecutionTerminalKind::Cancelled
+        | ToolExecutionTerminalKind::Interrupted
+        | ToolExecutionTerminalKind::Indeterminate => Err(integrity_failure()),
     }
 }
 
-fn process_status(status: ProcessStatus) -> &'static str {
-    match status {
-        ProcessStatus::Exited => "exited",
-        ProcessStatus::Terminated => "terminated",
+fn parse_terminal_output(terminal: &serde_json::Value) -> Result<ToolExecutionOutput, PortError> {
+    let output = required_object(terminal, "output")?;
+    let exit_code = match output.get("exitCode") {
+        Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            i32::try_from(value.as_i64().ok_or_else(integrity_failure)?)
+                .map_err(|_| integrity_failure())?,
+        ),
+        None => return Err(integrity_failure()),
+    };
+    let output_digest = Sha256Digest::new(required_string(output, "outputDigest")?)
+        .map_err(|_| integrity_failure())?;
+    let duration_ms = required_u64(output, "durationMs")?;
+    let artifacts = required_object(output, "artifacts")?;
+    let observed_writes = artifacts
+        .get("observedWrites")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(integrity_failure)?
+        .iter()
+        .map(parse_terminal_artifact)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ToolExecutionOutput {
+        exit_code,
+        output_digest,
+        duration_ms,
+        artifacts: DurableToolExecutionArtifacts::new(
+            parse_terminal_artifact(artifacts.get("stdout").ok_or_else(integrity_failure)?)?,
+            parse_terminal_artifact(artifacts.get("stderr").ok_or_else(integrity_failure)?)?,
+            observed_writes,
+        ),
+    })
+}
+
+fn parse_terminal_artifact(
+    value: &serde_json::Value,
+) -> Result<DurableToolExecutionArtifact, PortError> {
+    match required_string(value, "availability")? {
+        "available" => Ok(DurableToolExecutionArtifact::Available(
+            ArtifactId::new(required_string(value, "artifactId")?)
+                .map_err(|_| integrity_failure())?,
+        )),
+        "unavailable" => Ok(DurableToolExecutionArtifact::Unavailable),
+        _ => Err(integrity_failure()),
     }
+}
+
+fn required_object<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a serde_json::Value, PortError> {
+    value
+        .get(field)
+        .filter(|value| value.is_object())
+        .ok_or_else(integrity_failure)
+}
+
+fn required_string<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str, PortError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(integrity_failure)
+}
+
+fn required_u64(value: &serde_json::Value, field: &str) -> Result<u64, PortError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(integrity_failure)
+}
+
+fn required_bool(value: &serde_json::Value, field: &str) -> Result<bool, PortError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(integrity_failure)
+}
+
+fn parse_error_classification(value: &str) -> Result<SafeErrorClassification, PortError> {
+    match value {
+        "conflict" => Ok(SafeErrorClassification::Conflict),
+        "unavailable" => Ok(SafeErrorClassification::Unavailable),
+        "permission_denied" => Ok(SafeErrorClassification::PermissionDenied),
+        "not_found" => Ok(SafeErrorClassification::NotFound),
+        "invalid_input" => Ok(SafeErrorClassification::InvalidInput),
+        "integrity_failure" => Ok(SafeErrorClassification::IntegrityFailure),
+        "storage_full" => Ok(SafeErrorClassification::StorageFull),
+        "internal" => Ok(SafeErrorClassification::Internal),
+        _ => Err(integrity_failure()),
+    }
+}
+
+fn parse_retryability(value: &str) -> Result<Retryability, PortError> {
+    match value {
+        "retryable" => Ok(Retryability::Retryable),
+        "non_retryable" => Ok(Retryability::NonRetryable),
+        _ => Err(integrity_failure()),
+    }
+}
+
+fn load_terminal_receipt(
+    connection: &rusqlite::Connection,
+    execution_id: &ToolExecutionId,
+    intent: &IntentRow,
+) -> Result<DurableToolExecutionReceipt, PortError> {
+    let execution = load_tool_execution(connection, execution_id)?;
+    validate_tool_execution_identity(execution_id, intent, &execution)?;
+    let receipt_json = intent
+        .external_receipt_json
+        .as_deref()
+        .ok_or_else(integrity_failure)?;
+    let parsed = parse_persisted_terminal_receipt(
+        connection,
+        receipt_json,
+        execution_id,
+        intent,
+        &execution,
+    )?;
+    let receipt = parsed.receipt;
+    if (parsed.current_schema && terminal_receipt_json(&receipt) != receipt_json)
+        || receipt.authority() != &authority_from_intent(execution_id, intent)?
+    {
+        return Err(integrity_failure());
+    }
+    validate_terminal_artifacts(connection, &intent.task_id, receipt.terminal())?;
+    let outcome = terminal_outcome(receipt.terminal());
+    let expected_error = terminal_error_json(receipt.terminal());
+    if intent.status != outcome.intent_status
+        || execution.status != outcome.execution_status
+        || execution.completed_at.as_deref().is_none_or(str::is_empty)
+        || execution.exit_code
+            != receipt
+                .terminal()
+                .output()
+                .and_then(|output| output.exit_code)
+        || execution.stdout_artifact_id.as_deref()
+            != artifact_id(receipt.terminal(), ToolArtifactSlot::Stdout)
+        || execution.stderr_artifact_id.as_deref()
+            != artifact_id(receipt.terminal(), ToolArtifactSlot::Stderr)
+        || intent.result_artifact_id.as_deref() != primary_artifact_id(receipt.terminal())
+        || intent.error_json != expected_error
+    {
+        return Err(integrity_failure());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, payload_json FROM events
+             WHERE stream_id = ?1 AND event_type = 'tool.execution.completed'
+               AND json_extract(payload_json, '$.executionId') = ?2",
+        )
+        .map_err(sqlite_error_to_port)?;
+    let audit_payloads = statement
+        .query_map(params![intent.task_id, execution_id.as_str()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sqlite_error_to_port)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error_to_port)?;
+    if audit_payloads.len() != 1
+        || serde_json::from_str::<serde_json::Value>(&audit_payloads[0].1)
+            .map_err(|_| integrity_failure())?
+            != parsed.audit_payload
+    {
+        return Err(integrity_failure());
+    }
+    let (current_sequence, task_operation_state, latest_event_sequence): (i64, String, i64) =
+        connection
+            .query_row(
+                "SELECT t.current_sequence, t.operation_state,
+                        COALESCE(
+                            (SELECT MAX(e.sequence) FROM events e WHERE e.stream_id = t.id),
+                            0
+                        )
+                 FROM tasks t WHERE t.id = ?1",
+                [&intent.task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(sqlite_error_to_port)?;
+    if current_sequence != latest_event_sequence
+        || (audit_payloads[0].0 == current_sequence
+            && task_operation_state != terminal_operation_state(receipt.terminal().kind()))
+    {
+        return Err(integrity_failure());
+    }
+    Ok(receipt)
 }
 
 fn append_tool_event(
@@ -1928,4 +2640,210 @@ fn permission_denied() -> PortError {
         SafeErrorClassification::PermissionDenied,
         Retryability::NonRetryable,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+
+    use local_agent_terminal_application::{
+        canonical_approval_payload, parse_approval_payload, ToolExecutionTerminal,
+    };
+
+    use super::*;
+
+    const TOOL_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/contracts/fixtures/m2/tool-approval-valid.json"
+    ));
+    static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn incomplete_reads_candidates_and_rows_from_one_snapshot() {
+        let directory = std::env::temp_dir().join(format!(
+            "tool-incomplete-snapshot-{}-{}",
+            std::process::id(),
+            NEXT_DATABASE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("state.sqlite3");
+        let store = SqliteStore::open(&path).unwrap();
+        let operation_digest = seed_tool_context(&store, &directory);
+        let execution_id = ToolExecutionId::new("snapshot-execution").unwrap();
+        store
+            .reserve(NewToolIntent {
+                execution_id: execution_id.clone(),
+                operation_digest: operation_digest.clone(),
+            })
+            .unwrap();
+        let ToolExecutionClaim::Claimed(authority) = store
+            .begin(NewToolExecution {
+                execution_id,
+                operation_digest,
+            })
+            .unwrap()
+        else {
+            panic!("fresh execution must be claimed");
+        };
+        let receipt =
+            DurableToolExecutionReceipt::new(authority, ToolExecutionTerminal::cancelled());
+        let (start_tx, start_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let listed = std::thread::scope(|scope| {
+            let writer = store.clone();
+            let terminal = scope.spawn(move || {
+                start_rx.recv().unwrap();
+                let result = writer.resolve_terminal(ToolExecutionResolution::new(receipt.clone()));
+                done_tx.send(()).unwrap();
+                result
+            });
+            let listed = incomplete_with_checkpoint(&store, || {
+                start_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+            });
+            terminal.join().unwrap().unwrap();
+            listed
+        });
+
+        assert!(matches!(
+            listed.unwrap().as_slice(),
+            [IncompleteToolExecution::InFlight(_)]
+        ));
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn seed_tool_context(store: &SqliteStore, artifact_root: &Path) -> Sha256Digest {
+        let connection = store.connection().unwrap();
+        let seed_hash = format!("sha256:{}", "d".repeat(64));
+        connection
+            .execute(
+                "INSERT INTO projects (
+                    id, name, repository_path, repository_identity, created_at, updated_at,
+                    policy_profile_id, artifact_root_mode, artifact_root_path
+                 ) VALUES ('project-1', 'Project', 'C:/repo', 'repo-1',
+                    '2026-07-23T00:00:00Z', '2026-07-23T00:00:00Z',
+                    'policy-1', 'application_data', ?1)",
+                [artifact_root.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks (
+                    id, project_id, title, objective, phase, condition, operation_state,
+                    risk_level, base_branch, base_commit, workspace_version, fencing_epoch,
+                    created_at, updated_at
+                 ) VALUES ('task-1', 'project-1', 'Task', 'Objective', 'Implementation',
+                    'Active', 'None', 'high', 'main', ?1, 4, 19,
+                    '2026-07-23T00:00:00Z', '2026-07-23T00:00:00Z')",
+                ["a".repeat(40)],
+            )
+            .unwrap();
+        for (id, logical_path) in [
+            ("manifest", "seed/manifest"),
+            ("effective", "seed/effective"),
+            ("run-config", "seed/run-config"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO artifacts (
+                        id, task_id, project_id, artifact_type, logical_path, content_hash,
+                        storage_key, size_bytes, mime_type, availability, created_by_type,
+                        created_by_id, created_at, supersedes, verification_state
+                     ) VALUES (?1, 'task-1', 'project-1', 'seed', ?2, ?3, ?1, 0, NULL,
+                        'available', 'core', 'core', '2026-07-23T00:00:00Z',
+                        NULL, 'hash_verified')",
+                    params![id, logical_path, seed_hash],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO agent_descriptors (
+                    id, display_name, transport_type, trust_tier, manifest_json, manifest_digest,
+                    executable_digest, enabled, containment_verified, last_health_status, updated_at
+                 ) VALUES ('agent-1', 'Agent', 'in_process', 'core_adapter', '{}', ?1,
+                    NULL, 1, 1, 'healthy', '2026-07-23T00:00:00Z')",
+                [&seed_hash],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO context_packages (
+                    id, task_id, agent_id, role, objective, manifest_artifact_id,
+                    effective_content_artifact_id, content_hash, policy_snapshot_digest,
+                    prompt_template_version, retrieval_pipeline_version, created_at
+                 ) VALUES ('context-1', 'task-1', 'agent-1', 'executor', 'execute',
+                    'manifest', 'effective', ?1, ?2, 'v1', 'v1',
+                    '2026-07-23T00:00:00Z')",
+                params![seed_hash, format!("sha256:{}", "0".repeat(64))],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_runs (
+                    id, task_id, agent_id, role, phase, status, context_package_id,
+                    idempotency_key, connection_binding_digest, run_config_artifact_id, started_at
+                 ) VALUES ('run-1', 'task-1', 'agent-1', 'executor', 'Implementation',
+                    'running', 'context-1', 'run-1-key', ?1, 'run-config',
+                    '2026-07-23T00:00:00Z')",
+                [format!("sha256:{}", "e".repeat(64))],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO executor_leases (
+                    task_id, holder_run_id, fencing_token, status, acquired_at, expires_at
+                 ) VALUES ('task-1', 'run-1', 19, 'active',
+                    '2026-07-23T00:00:00Z', '2026-08-23T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        let payload = parse_approval_payload(TOOL_FIXTURE).unwrap();
+        let canonical = canonical_approval_payload(&payload).unwrap();
+        let storage_key = format!("objects/{}", &canonical.operation_digest.as_str()[7..]);
+        let request_path = artifact_root.join(&storage_key);
+        fs::create_dir_all(request_path.parent().unwrap()).unwrap();
+        fs::write(request_path, &canonical.canonical_bytes).unwrap();
+        connection
+            .execute(
+                "INSERT INTO artifacts (
+                    id, task_id, project_id, artifact_type, logical_path, content_hash,
+                    storage_key, size_bytes, mime_type, availability, created_by_type,
+                    created_by_id, created_at, supersedes, verification_state
+                 ) VALUES ('request-artifact', 'task-1', 'project-1', 'tool-request',
+                    'tool-requests/snapshot.json', ?1, ?2, ?3, NULL, 'available',
+                    'tool', 'snapshot-execution', '2026-07-23T12:00:00Z',
+                    NULL, 'hash_verified')",
+                params![
+                    canonical.operation_digest.as_str(),
+                    storage_key,
+                    canonical.canonical_bytes.len() as i64,
+                ],
+            )
+            .unwrap();
+        let ApprovalDigestPayload::Tool(tool_payload) = payload else {
+            unreachable!();
+        };
+        connection
+            .execute(
+                "INSERT INTO policy_decisions (
+                    id, task_id, actor_json, actor_binding_digest, action, resource_json,
+                    resource_digest, purpose, workflow_phase, effect, matched_rules_json,
+                    policy_snapshot_digest, operation_digest, created_at, expires_at, approval_id
+                 ) VALUES ('policy-1', 'task-1', '{}', ?1, 'process.exec', '{}', ?1,
+                    'test', 'Implementation', 'allow', '[]', ?2, ?3,
+                    '2026-07-23T12:00:00Z', NULL, NULL)",
+                params![
+                    format!("sha256:{}", "0".repeat(64)),
+                    tool_payload.policy_snapshot_digest,
+                    canonical.operation_digest.as_str(),
+                ],
+            )
+            .unwrap();
+        canonical.operation_digest
+    }
 }

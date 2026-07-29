@@ -810,18 +810,346 @@ pub struct OperationIntentSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewToolExecution {
     pub execution_id: ToolExecutionId,
+    pub operation_digest: Sha256Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolExecutionCompletion {
-    pub execution_id: ToolExecutionId,
-    pub receipt: ProcessReceipt,
+pub enum DurableToolExecutionArtifact {
+    Available(ArtifactId),
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolExecutionSnapshot {
-    pub execution_id: ToolExecutionId,
-    pub completed: bool,
+pub struct DurableToolExecutionArtifacts {
+    stdout: DurableToolExecutionArtifact,
+    stderr: DurableToolExecutionArtifact,
+    observed_writes: Vec<DurableToolExecutionArtifact>,
+}
+
+impl DurableToolExecutionArtifacts {
+    pub fn new(
+        stdout: DurableToolExecutionArtifact,
+        stderr: DurableToolExecutionArtifact,
+        observed_writes: Vec<DurableToolExecutionArtifact>,
+    ) -> Self {
+        Self {
+            stdout,
+            stderr,
+            observed_writes,
+        }
+    }
+
+    pub const fn stdout(&self) -> &DurableToolExecutionArtifact {
+        &self.stdout
+    }
+
+    pub const fn stderr(&self) -> &DurableToolExecutionArtifact {
+        &self.stderr
+    }
+
+    pub fn observed_writes(&self) -> &[DurableToolExecutionArtifact] {
+        &self.observed_writes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionOutput {
+    pub exit_code: Option<i32>,
+    pub output_digest: Sha256Digest,
+    pub duration_ms: u64,
+    pub artifacts: DurableToolExecutionArtifacts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SafeToolExecutionError {
+    pub classification: SafeErrorClassification,
+    pub retryability: Retryability,
+}
+
+impl SafeToolExecutionError {
+    pub(crate) fn from_error(error: &PortError) -> Self {
+        Self {
+            classification: error.safe_classification(),
+            retryability: error.retryability(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExecutionTerminalKind {
+    Succeeded,
+    Failed,
+    Cancelled,
+    Terminated,
+    Interrupted,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolExecutionTerminalState {
+    Succeeded(ToolExecutionOutput),
+    Failed(ToolExecutionOutput),
+    Cancelled,
+    Terminated(ToolExecutionOutput),
+    Interrupted,
+    Indeterminate(SafeToolExecutionError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionTerminal {
+    state: ToolExecutionTerminalState,
+}
+
+impl ToolExecutionTerminal {
+    pub fn succeeded(output: ToolExecutionOutput) -> Result<Self, PortError> {
+        if output.exit_code != Some(0) {
+            return Err(invalid_input());
+        }
+        Ok(Self {
+            state: ToolExecutionTerminalState::Succeeded(output),
+        })
+    }
+
+    pub fn failed(output: ToolExecutionOutput) -> Result<Self, PortError> {
+        if output.exit_code == Some(0) {
+            return Err(invalid_input());
+        }
+        Ok(Self {
+            state: ToolExecutionTerminalState::Failed(output),
+        })
+    }
+
+    pub fn terminated(output: ToolExecutionOutput) -> Result<Self, PortError> {
+        if output.exit_code == Some(0) {
+            return Err(invalid_input());
+        }
+        Ok(Self {
+            state: ToolExecutionTerminalState::Terminated(output),
+        })
+    }
+
+    pub const fn cancelled() -> Self {
+        Self {
+            state: ToolExecutionTerminalState::Cancelled,
+        }
+    }
+
+    pub const fn interrupted() -> Self {
+        Self {
+            state: ToolExecutionTerminalState::Interrupted,
+        }
+    }
+
+    pub const fn indeterminate(error: SafeToolExecutionError) -> Self {
+        Self {
+            state: ToolExecutionTerminalState::Indeterminate(error),
+        }
+    }
+
+    pub const fn kind(&self) -> ToolExecutionTerminalKind {
+        match self.state {
+            ToolExecutionTerminalState::Succeeded(_) => ToolExecutionTerminalKind::Succeeded,
+            ToolExecutionTerminalState::Failed(_) => ToolExecutionTerminalKind::Failed,
+            ToolExecutionTerminalState::Cancelled => ToolExecutionTerminalKind::Cancelled,
+            ToolExecutionTerminalState::Terminated(_) => ToolExecutionTerminalKind::Terminated,
+            ToolExecutionTerminalState::Interrupted => ToolExecutionTerminalKind::Interrupted,
+            ToolExecutionTerminalState::Indeterminate(_) => {
+                ToolExecutionTerminalKind::Indeterminate
+            }
+        }
+    }
+
+    pub const fn output(&self) -> Option<&ToolExecutionOutput> {
+        match &self.state {
+            ToolExecutionTerminalState::Succeeded(output)
+            | ToolExecutionTerminalState::Failed(output)
+            | ToolExecutionTerminalState::Terminated(output) => Some(output),
+            ToolExecutionTerminalState::Cancelled
+            | ToolExecutionTerminalState::Interrupted
+            | ToolExecutionTerminalState::Indeterminate(_) => None,
+        }
+    }
+
+    pub const fn error(&self) -> Option<&SafeToolExecutionError> {
+        match &self.state {
+            ToolExecutionTerminalState::Indeterminate(error) => Some(error),
+            ToolExecutionTerminalState::Succeeded(_)
+            | ToolExecutionTerminalState::Failed(_)
+            | ToolExecutionTerminalState::Cancelled
+            | ToolExecutionTerminalState::Terminated(_)
+            | ToolExecutionTerminalState::Interrupted => None,
+        }
+    }
+
+    fn from_process(status: ProcessStatus, output: ToolExecutionOutput) -> Result<Self, PortError> {
+        match status {
+            ProcessStatus::Exited if output.exit_code == Some(0) => Self::succeeded(output),
+            ProcessStatus::Exited => Self::failed(output),
+            ProcessStatus::Terminated => Self::terminated(output),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableToolExecutionReceipt {
+    authority: ToolExecutionClaimAuthority,
+    terminal: ToolExecutionTerminal,
+}
+
+impl DurableToolExecutionReceipt {
+    pub fn new(authority: ToolExecutionClaimAuthority, terminal: ToolExecutionTerminal) -> Self {
+        Self {
+            authority,
+            terminal,
+        }
+    }
+
+    pub(crate) fn from_process_receipt(
+        authority: ToolExecutionClaimAuthority,
+        receipt: ProcessReceipt,
+    ) -> Result<Self, PortError> {
+        if authority.execution_id != receipt.execution_id {
+            return Err(invalid_input());
+        }
+        let ProcessReceipt {
+            status,
+            exit_code,
+            duration_ms,
+            output_digest,
+            observed_writes,
+            ..
+        } = receipt;
+        let artifacts = DurableToolExecutionArtifacts::new(
+            DurableToolExecutionArtifact::Unavailable,
+            DurableToolExecutionArtifact::Unavailable,
+            observed_writes
+                .into_iter()
+                .map(|_| DurableToolExecutionArtifact::Unavailable)
+                .collect(),
+        );
+        let output = ToolExecutionOutput {
+            exit_code,
+            output_digest,
+            duration_ms,
+            artifacts,
+        };
+        ToolExecutionTerminal::from_process(status, output)
+            .map(|terminal| Self::new(authority, terminal))
+    }
+
+    pub const fn authority(&self) -> &ToolExecutionClaimAuthority {
+        &self.authority
+    }
+
+    pub const fn terminal(&self) -> &ToolExecutionTerminal {
+        &self.terminal
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionClaimAuthority {
+    execution_id: ToolExecutionId,
+    operation_digest: Sha256Digest,
+    owner_run_id: RunId,
+    attempt: u32,
+    executor_fencing_token: Option<FencingToken>,
+}
+
+impl ToolExecutionClaimAuthority {
+    pub fn from_persisted(
+        execution_id: ToolExecutionId,
+        operation_digest: Sha256Digest,
+        owner_run_id: RunId,
+        attempt: u32,
+        executor_fencing_token: Option<FencingToken>,
+    ) -> Result<Self, PortError> {
+        if attempt == 0 {
+            return Err(invalid_input());
+        }
+        Ok(Self {
+            execution_id,
+            operation_digest,
+            owner_run_id,
+            attempt,
+            executor_fencing_token,
+        })
+    }
+
+    pub const fn execution_id(&self) -> &ToolExecutionId {
+        &self.execution_id
+    }
+
+    pub const fn operation_digest(&self) -> &Sha256Digest {
+        &self.operation_digest
+    }
+
+    pub const fn owner_run_id(&self) -> &RunId {
+        &self.owner_run_id
+    }
+
+    pub const fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    pub const fn executor_fencing_token(&self) -> Option<FencingToken> {
+        self.executor_fencing_token
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionRecoveryEvidence {
+    pub authority: ToolExecutionClaimAuthority,
+    pub task_id: TaskId,
+    pub canonical_request_artifact_id: ArtifactId,
+    pub idempotency_class: crate::IdempotencyClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncompleteToolExecution {
+    InFlight(ToolExecutionRecoveryEvidence),
+    Indeterminate(ToolExecutionRecoveryEvidence),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionResolution {
+    receipt: DurableToolExecutionReceipt,
+}
+
+impl ToolExecutionResolution {
+    pub fn new(receipt: DurableToolExecutionReceipt) -> Self {
+        Self { receipt }
+    }
+
+    pub const fn authority(&self) -> &ToolExecutionClaimAuthority {
+        self.receipt.authority()
+    }
+
+    pub const fn receipt(&self) -> &DurableToolExecutionReceipt {
+        &self.receipt
+    }
+
+    pub fn into_receipt(self) -> DurableToolExecutionReceipt {
+        self.receipt
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolExecutionClaim {
+    Claimed(ToolExecutionClaimAuthority),
+    InFlight(ToolExecutionRecoveryEvidence),
+    Completed(DurableToolExecutionReceipt),
+    Indeterminate(ToolExecutionRecoveryEvidence),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableToolExecutionOutcome {
+    InFlight(ToolExecutionRecoveryEvidence),
+    Completed(DurableToolExecutionReceipt),
+    Indeterminate(ToolExecutionRecoveryEvidence),
+    TerminalPersistenceUnresolved {
+        resolution: ToolExecutionResolution,
+        error: SafeToolExecutionError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1210,12 +1538,12 @@ pub trait ApprovedProcessExecutor: Send + Sync {
 
 pub trait ToolExecutionStore: Send + Sync {
     fn reserve(&self, request: NewToolIntent) -> Result<OperationIntentSnapshot, PortError>;
-    fn begin(&self, request: NewToolExecution) -> Result<ToolExecutionSnapshot, PortError>;
-    fn finish(
+    fn begin(&self, request: NewToolExecution) -> Result<ToolExecutionClaim, PortError>;
+    fn resolve_terminal(
         &self,
-        completion: ToolExecutionCompletion,
-    ) -> Result<ToolExecutionSnapshot, PortError>;
-    fn incomplete(&self) -> Result<Vec<ToolExecutionSnapshot>, PortError>;
+        resolution: ToolExecutionResolution,
+    ) -> Result<DurableToolExecutionReceipt, PortError>;
+    fn incomplete(&self) -> Result<Vec<IncompleteToolExecution>, PortError>;
 }
 
 pub trait StructuredToolExecutor: Send + Sync {

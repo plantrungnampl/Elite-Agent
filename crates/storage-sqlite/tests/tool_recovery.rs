@@ -6,17 +6,19 @@ use std::sync::{Arc, Barrier};
 use local_agent_terminal_application::{
     canonical_approval_payload, canonical_file_write_recovery_request, parse_approval_payload,
     ApprovalClaim, ApprovalDigestPayload, ApprovalId, ApprovalResolution, ApprovalStore,
-    BoundedOutput, CanonicalEvidenceRef, CapabilityRootIdentity, FileWritePolicyBinding,
+    CanonicalEvidenceRef, CapabilityRootIdentity, DurableToolExecutionArtifact,
+    DurableToolExecutionArtifacts, DurableToolExecutionReceipt, FileWritePolicyBinding,
     FileWritePreImage, FileWriteRecoveryCompletion, FileWriteRecoveryFailure,
     FileWriteRecoveryIntent, FileWriteRecoveryRequest, FileWriteRecoveryState,
-    FileWriteRecoveryStore, JobReceipt, NewApproval, NewToolExecution, NewToolIntent,
-    ObservedProcessWrite, ProcessReceipt, ProcessStatus, RelativePathComponents,
-    ResolvedCapabilityTarget, ToolExecutionCompletion, ToolExecutionId, ToolExecutionStore,
-    ToolRequestBindingDigest, VerifiedFileWriteCompensation, VerifiedWrite,
+    FileWriteRecoveryStore, IncompleteToolExecution, NewApproval, NewToolExecution, NewToolIntent,
+    RelativePathComponents, SafeToolExecutionError, ToolExecutionClaim,
+    ToolExecutionClaimAuthority, ToolExecutionId, ToolExecutionOutput, ToolExecutionResolution,
+    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolRequestBindingDigest,
+    VerifiedFileWriteCompensation, VerifiedWrite,
 };
 use local_agent_terminal_domain::{
-    ActorId, ArtifactId, CapabilityRef, FencingToken, GitObjectId, LeaseClaim, PolicyEffect,
-    ProjectId, RunId, Sequence, Sha256Digest, TaskId, WorkspaceFingerprint, WorkspaceVersion,
+    ActorId, ArtifactId, FencingToken, GitObjectId, LeaseClaim, PolicyEffect, ProjectId, RunId,
+    Sequence, Sha256Digest, TaskId, WorkspaceFingerprint, WorkspaceVersion,
 };
 use local_agent_terminal_storage_sqlite::SqliteStore;
 use rusqlite::{params, Connection};
@@ -94,334 +96,1345 @@ fn reserve_requires_authoritative_request_evidence() {
 }
 
 #[test]
-fn begin_and_finish_roll_back_at_statement_faults_and_reopen_exactly() {
+fn begin_rejects_a_digest_other_than_the_reserved_canonical_intent() {
     let database = TempDatabase::new();
-    let store = SqliteStore::open(&database.path).unwrap();
     let operation_digest = persist_request_artifact(&database);
     persist_policy_decision(&database.path, &operation_digest, "allow");
-    let execution_id = ToolExecutionId::new("execution-1").unwrap();
-    let intent = NewToolIntent {
-        execution_id: execution_id.clone(),
-        operation_digest: operation_digest.clone(),
-    };
-    assert_eq!(
-        store.reserve(intent.clone()).unwrap(),
-        store.reserve(intent).unwrap()
-    );
-
-    configured_connection(&database.path)
-        .execute_batch(
-            "CREATE TRIGGER fail_tool_execution_insert
-             BEFORE INSERT ON tool_executions BEGIN
-                 SELECT RAISE(ABORT, 'injected begin fault');
-             END;",
-        )
-        .unwrap();
-    assert!(store
-        .begin(NewToolExecution {
+    let execution_id = ToolExecutionId::new("execution-digest-mismatch").unwrap();
+    let store = SqliteStore::open(&database.path).unwrap();
+    store
+        .reserve(NewToolIntent {
             execution_id: execution_id.clone(),
+            operation_digest: operation_digest.clone(),
         })
-        .is_err());
+        .unwrap();
+
+    let error = store
+        .begin(NewToolExecution {
+            execution_id,
+            operation_digest: digest_char('0'),
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::Conflict
+    );
     let connection = configured_connection(&database.path);
     assert_eq!(
         connection
             .query_row(
-                "SELECT status FROM operation_intents WHERE id = 'execution-1'",
+                "SELECT status || ':' || attempt_count
+                 FROM operation_intents WHERE id = 'execution-digest-mismatch'",
                 [],
-                |row| row.get::<_, String>(0)
+                |row| row.get::<_, String>(0),
             )
             .unwrap(),
-        "pending"
+        "pending:0"
     );
     assert_eq!(
         connection
-            .query_row("SELECT COUNT(*) FROM tool_executions", [], |row| row
-                .get::<_, i64>(0))
+            .query_row("SELECT COUNT(*) FROM tool_executions", [], |row| {
+                row.get::<_, i64>(0)
+            })
             .unwrap(),
         0
     );
-    connection
-        .execute_batch("DROP TRIGGER fail_tool_execution_insert;")
-        .unwrap();
-    drop(connection);
+}
 
+#[test]
+fn concurrent_exact_begin_has_one_claimant_and_one_in_flight_observer() {
+    let database = TempDatabase::new();
+    let operation_digest = persist_request_artifact(&database);
+    persist_policy_decision(&database.path, &operation_digest, "allow");
+    let store = SqliteStore::open(&database.path).unwrap();
+    let execution_id = ToolExecutionId::new("execution-concurrent").unwrap();
     store
+        .reserve(NewToolIntent {
+            execution_id: execution_id.clone(),
+            operation_digest: operation_digest.clone(),
+        })
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+
+    let outcomes = std::thread::scope(|scope| {
+        let first_store = store.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first_id = execution_id.clone();
+        let first_digest = operation_digest.clone();
+        let first = scope.spawn(move || {
+            first_barrier.wait();
+            first_store.begin(NewToolExecution {
+                execution_id: first_id,
+                operation_digest: first_digest,
+            })
+        });
+        let second_store = store.clone();
+        let second_barrier = Arc::clone(&barrier);
+        let second_id = execution_id.clone();
+        let second_digest = operation_digest.clone();
+        let second = scope.spawn(move || {
+            second_barrier.wait();
+            second_store.begin(NewToolExecution {
+                execution_id: second_id,
+                operation_digest: second_digest,
+            })
+        });
+        [
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        ]
+    });
+
+    let claimed = outcomes
+        .iter()
+        .find_map(|outcome| match outcome {
+            ToolExecutionClaim::Claimed(authority) => Some(authority),
+            _ => None,
+        })
+        .expect("one caller must claim");
+    let in_flight = outcomes
+        .iter()
+        .find_map(|outcome| match outcome {
+            ToolExecutionClaim::InFlight(evidence) => Some(evidence),
+            _ => None,
+        })
+        .expect("one caller must observe the durable claim");
+    assert_eq!(claimed, &in_flight.authority);
+    assert_eq!(claimed.execution_id(), &execution_id);
+    assert_eq!(claimed.operation_digest(), &operation_digest);
+    assert_eq!(claimed.owner_run_id().as_str(), "run-1");
+    assert_eq!(claimed.attempt(), 1);
+    assert_eq!(claimed.executor_fencing_token().unwrap().get(), 19);
+    let connection = configured_connection(&database.path);
+    let durable: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM tool_executions
+                 WHERE id = 'execution-concurrent' AND status = 'running'),
+                (SELECT COUNT(*) FROM events
+                 WHERE event_type = 'tool.execution.started'),
+                (SELECT attempt_count FROM operation_intents
+                 WHERE id = 'execution-concurrent')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(durable, (1, 1, 1));
+}
+
+#[test]
+fn approval_required_begin_accepts_only_an_atomically_consumed_exact_grant() {
+    let database = TempDatabase::new();
+    let operation_digest = persist_request_artifact(&database);
+    persist_policy_decision(&database.path, &operation_digest, "require_approval");
+    let store = SqliteStore::open(&database.path).unwrap();
+    let execution_id = ToolExecutionId::new("execution-approved").unwrap();
+    store
+        .reserve(NewToolIntent {
+            execution_id: execution_id.clone(),
+            operation_digest: operation_digest.clone(),
+        })
+        .unwrap();
+    let error = store
         .begin(NewToolExecution {
             execution_id: execution_id.clone(),
+            operation_digest: operation_digest.clone(),
+        })
+        .unwrap_err();
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::PermissionDenied
+    );
+
+    seed_consumed_approval(&database.path, &operation_digest, "9999-12-31T23:59:59Z");
+    assert!(matches!(
+        store
+            .begin(NewToolExecution {
+                execution_id,
+                operation_digest,
+            })
+            .unwrap(),
+        ToolExecutionClaim::Claimed(_)
+    ));
+}
+
+#[test]
+fn one_publicly_claimed_approval_authorizes_exactly_one_execution() {
+    let database = TempDatabase::new();
+    let store = SqliteStore::open(&database.path).unwrap();
+    let ApprovalDigestPayload::Tool(mut payload) = parse_approval_payload(TOOL_FIXTURE).unwrap()
+    else {
+        unreachable!();
+    };
+    payload.requested_at = "2099-01-01T00:00:00Z".to_owned();
+    payload.expires_at = "2099-01-01T01:00:00Z".to_owned();
+    let canonical =
+        canonical_approval_payload(&ApprovalDigestPayload::Tool(payload.clone())).unwrap();
+    persist_artifact(
+        &database,
+        "approval-public",
+        "approvals/approval-public.json",
+        "tool-request",
+        &canonical.canonical_bytes,
+    );
+    let approval_id = ApprovalId::new("approval-public").unwrap();
+    let binding = ToolRequestBindingDigest::from_persisted(digest_char('f'));
+    store
+        .request(NewApproval {
+            approval_id: approval_id.clone(),
+            operation_digest: canonical.operation_digest.clone(),
+            task_id: TaskId::new("task-1").unwrap(),
+            workspace_version: WorkspaceVersion::new(payload.workspace_version),
+            policy_snapshot_digest: Sha256Digest::new(payload.policy_snapshot_digest.clone())
+                .unwrap(),
+            fencing_token: payload.operation.executor_fencing_token,
+            tool_request_binding_digest: Some(binding.clone()),
+            expires_at: payload.expires_at.clone(),
+            nonce: payload.nonce.clone(),
         })
         .unwrap();
-    let missing_output =
-        Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(b"not persisted"))).unwrap();
-    assert!(store
-        .finish(ToolExecutionCompletion {
-            execution_id: execution_id.clone(),
-            receipt: process_receipt(execution_id.clone(), Some(0), missing_output),
+    store
+        .resolve(ApprovalResolution {
+            approval_id: approval_id.clone(),
+            approved: true,
         })
-        .is_err());
-    let output_digest = persist_output_artifact(&database, b"exact output");
+        .unwrap();
+    store
+        .claim(ApprovalClaim {
+            approval_id,
+            expected_operation_digest: canonical.operation_digest.clone(),
+            task_id: TaskId::new("task-1").unwrap(),
+            workspace_version: WorkspaceVersion::new(payload.workspace_version),
+            policy_snapshot_digest: Sha256Digest::new(payload.policy_snapshot_digest).unwrap(),
+            fencing_token: payload.operation.executor_fencing_token,
+            tool_request_binding_digest: binding,
+            nonce: payload.nonce,
+            claimed_at: "2099-01-01T00:01:00Z".to_owned(),
+        })
+        .unwrap()
+        .expect("approval claim");
+    persist_policy_decision(
+        &database.path,
+        &canonical.operation_digest,
+        "require_approval",
+    );
+    let execution_ids = [
+        ToolExecutionId::new("execution-approved-first").unwrap(),
+        ToolExecutionId::new("execution-approved-second").unwrap(),
+    ];
+    for execution_id in &execution_ids {
+        store
+            .reserve(NewToolIntent {
+                execution_id: execution_id.clone(),
+                operation_digest: canonical.operation_digest.clone(),
+            })
+            .unwrap();
+    }
+    let barrier = Arc::new(Barrier::new(2));
+
+    let outcomes = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for execution_id in execution_ids {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            let operation_digest = canonical.operation_digest.clone();
+            handles.push(scope.spawn(move || {
+                barrier.wait();
+                store.begin(NewToolExecution {
+                    execution_id,
+                    operation_digest,
+                })
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Ok(ToolExecutionClaim::Claimed(_))))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| {
+                outcome.as_ref().is_err_and(|error| {
+                    error.safe_classification()
+                        == local_agent_terminal_application::SafeErrorClassification::PermissionDenied
+                })
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn expired_consumed_approval_cannot_begin() {
+    let database = TempDatabase::new();
+    let operation_digest = persist_request_artifact(&database);
+    persist_policy_decision(&database.path, &operation_digest, "require_approval");
+    seed_consumed_approval(&database.path, &operation_digest, "2000-01-01T00:00:00Z");
+    let store = SqliteStore::open(&database.path).unwrap();
+    let execution_id = ToolExecutionId::new("execution-expired-approval").unwrap();
+    store
+        .reserve(NewToolIntent {
+            execution_id: execution_id.clone(),
+            operation_digest: operation_digest.clone(),
+        })
+        .unwrap();
+
+    let error = store
+        .begin(NewToolExecution {
+            execution_id,
+            operation_digest,
+        })
+        .unwrap_err();
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::PermissionDenied
+    );
+}
+
+#[test]
+fn tool_execution_statuses_and_run_request_id_uniqueness_are_enforced() {
+    let allowed = [
+        ("pending", "running"),
+        ("pending", "denied"),
+        ("running", "succeeded"),
+        ("running", "failed"),
+        ("running", "cancelled"),
+        ("running", "terminated"),
+        ("running", "interrupted"),
+        ("running", "indeterminate"),
+        ("running", "denied"),
+    ];
+    let forbidden = [
+        ("pending", "succeeded"),
+        ("succeeded", "running"),
+        ("failed", "pending"),
+        ("cancelled", "running"),
+        ("denied", "running"),
+    ];
+    let database = TempDatabase::new();
+    let operation_digest = persist_request_artifact(&database);
+    persist_policy_decision(&database.path, &operation_digest, "allow");
+    let store = SqliteStore::open(&database.path).unwrap();
+    for (index, (from, to)) in allowed.into_iter().enumerate() {
+        insert_status_test_execution(
+            &database,
+            &store,
+            &operation_digest,
+            index,
+            from,
+            &format!("request-{index}"),
+        )
+        .unwrap();
+        assert!(configured_connection(&database.path)
+            .execute(
+                "UPDATE tool_executions SET status = ?1 WHERE id = ?2",
+                params![to, format!("status-execution-{index}")],
+            )
+            .is_ok());
+    }
+    for (offset, (from, to)) in forbidden.into_iter().enumerate() {
+        let index = allowed.len() + offset;
+        insert_status_test_execution(
+            &database,
+            &store,
+            &operation_digest,
+            index,
+            from,
+            &format!("request-{index}"),
+        )
+        .unwrap();
+        assert!(configured_connection(&database.path)
+            .execute(
+                "UPDATE tool_executions SET status = ?1 WHERE id = ?2",
+                params![to, format!("status-execution-{index}")],
+            )
+            .is_err());
+    }
+    let first_index = allowed.len() + forbidden.len();
+    insert_status_test_execution(
+        &database,
+        &store,
+        &operation_digest,
+        first_index,
+        "pending",
+        "duplicate-request",
+    )
+    .unwrap();
+    let duplicate = insert_status_test_execution(
+        &database,
+        &store,
+        &operation_digest,
+        first_index + 1,
+        "pending",
+        "duplicate-request",
+    );
+    assert!(duplicate.is_err());
+}
+
+#[test]
+fn every_terminal_form_round_trips_exactly_across_retry_and_reopen() {
+    for kind in [
+        ToolExecutionTerminalKind::Succeeded,
+        ToolExecutionTerminalKind::Failed,
+        ToolExecutionTerminalKind::Cancelled,
+        ToolExecutionTerminalKind::Terminated,
+        ToolExecutionTerminalKind::Interrupted,
+        ToolExecutionTerminalKind::Indeterminate,
+    ] {
+        let database = TempDatabase::new();
+        let execution_name = format!("execution-{}", terminal_kind_label(kind));
+        let (store, operation_digest, authority) = reserve_and_claim(&database, &execution_name);
+        let (artifact_id, output_digest) =
+            persist_durable_artifact(&database, &format!("artifact-{execution_name}"), b"output");
+        let terminal = terminal_fixture(kind, output_digest, Some(artifact_id));
+        let receipt = DurableToolExecutionReceipt::new(authority, terminal);
+        let resolution = ToolExecutionResolution::new(receipt.clone());
+
+        assert_eq!(store.resolve_terminal(resolution.clone()).unwrap(), receipt);
+        assert_eq!(store.resolve_terminal(resolution).unwrap(), receipt);
+        drop(store);
+
+        let reopened = SqliteStore::open(&database.path).unwrap();
+        assert_eq!(
+            reopened
+                .begin(NewToolExecution {
+                    execution_id: ToolExecutionId::new(execution_name.clone()).unwrap(),
+                    operation_digest,
+                })
+                .unwrap(),
+            ToolExecutionClaim::Completed(receipt)
+        );
+        let connection = configured_connection(&database.path);
+        let persisted: (i64, String) = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM events
+                     WHERE event_type = 'tool.execution.completed'),
+                    external_receipt_json
+                 FROM operation_intents WHERE id = ?1",
+                [execution_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted.0, 1);
+        for forbidden in ["rootPid", "jobId", "diagnostic", "canonicalPath"] {
+            assert!(!persisted.1.contains(forbidden));
+        }
+    }
+}
+
+#[test]
+fn terminal_retry_rejects_changed_terminal_or_any_changed_authority_field() {
+    let database = TempDatabase::new();
+    let (store, _, authority) = reserve_and_claim(&database, "execution-authority");
+    let (artifact_id, output_digest) =
+        persist_durable_artifact(&database, "authority-output", b"authority output");
+    let succeeded = terminal_fixture(
+        ToolExecutionTerminalKind::Succeeded,
+        output_digest.clone(),
+        Some(artifact_id.clone()),
+    );
+    let receipt = DurableToolExecutionReceipt::new(authority.clone(), succeeded);
+    store
+        .resolve_terminal(ToolExecutionResolution::new(receipt.clone()))
+        .unwrap();
+
+    let changed_terminal = DurableToolExecutionReceipt::new(
+        authority.clone(),
+        terminal_fixture(
+            ToolExecutionTerminalKind::Failed,
+            output_digest.clone(),
+            Some(artifact_id),
+        ),
+    );
+    assert_conflict(store.resolve_terminal(ToolExecutionResolution::new(changed_terminal)));
+    let changed_authorities = [
+        ToolExecutionClaimAuthority::from_persisted(
+            ToolExecutionId::new("wrong-execution").unwrap(),
+            authority.operation_digest().clone(),
+            authority.owner_run_id().clone(),
+            authority.attempt(),
+            authority.executor_fencing_token(),
+        )
+        .unwrap(),
+        ToolExecutionClaimAuthority::from_persisted(
+            authority.execution_id().clone(),
+            digest_char('0'),
+            authority.owner_run_id().clone(),
+            authority.attempt(),
+            authority.executor_fencing_token(),
+        )
+        .unwrap(),
+        ToolExecutionClaimAuthority::from_persisted(
+            authority.execution_id().clone(),
+            authority.operation_digest().clone(),
+            RunId::new("wrong-run").unwrap(),
+            authority.attempt(),
+            authority.executor_fencing_token(),
+        )
+        .unwrap(),
+        ToolExecutionClaimAuthority::from_persisted(
+            authority.execution_id().clone(),
+            authority.operation_digest().clone(),
+            authority.owner_run_id().clone(),
+            authority.attempt() + 1,
+            authority.executor_fencing_token(),
+        )
+        .unwrap(),
+        ToolExecutionClaimAuthority::from_persisted(
+            authority.execution_id().clone(),
+            authority.operation_digest().clone(),
+            authority.owner_run_id().clone(),
+            authority.attempt(),
+            Some(FencingToken::new(20).unwrap()),
+        )
+        .unwrap(),
+    ];
+    for changed_authority in changed_authorities {
+        let changed_receipt =
+            DurableToolExecutionReceipt::new(changed_authority, receipt.terminal().clone());
+        assert_conflict(store.resolve_terminal(ToolExecutionResolution::new(changed_receipt)));
+    }
+    assert_eq!(terminal_event_count(&database), 1);
+}
+
+#[test]
+fn stale_authority_after_attempt_advance_cannot_commit_a_terminal_state() {
+    let database = TempDatabase::new();
+    let (store, _, authority) = reserve_and_claim(&database, "execution-stale-attempt");
+    configured_connection(&database.path)
+        .execute(
+            "UPDATE operation_intents SET attempt_count = attempt_count + 1
+             WHERE id = 'execution-stale-attempt'",
+            [],
+        )
+        .unwrap();
+    let receipt = DurableToolExecutionReceipt::new(authority, ToolExecutionTerminal::interrupted());
+
+    assert_conflict(store.resolve_terminal(ToolExecutionResolution::new(receipt)));
+    assert_eq!(
+        lifecycle_state(&database, "execution-stale-attempt"),
+        "running:started"
+    );
+    assert_eq!(terminal_event_count(&database), 0);
+}
+
+#[test]
+fn terminal_artifact_references_must_be_available_and_owned_by_the_task() {
+    for case in ["missing", "unavailable", "cross-task"] {
+        let database = TempDatabase::new();
+        let (store, _, authority) =
+            reserve_and_claim(&database, &format!("execution-artifact-{case}"));
+        let artifact_id = match case {
+            "missing" => ArtifactId::new("missing-artifact").unwrap(),
+            "unavailable" => {
+                let (artifact_id, _) =
+                    persist_durable_artifact(&database, "unavailable-artifact", b"unavailable");
+                configured_connection(&database.path)
+                    .execute(
+                        "UPDATE artifacts SET availability = 'missing' WHERE id = ?1",
+                        [artifact_id.as_str()],
+                    )
+                    .unwrap();
+                artifact_id
+            }
+            "cross-task" => {
+                seed_other_task(&database);
+                let (artifact_id, _) =
+                    persist_durable_artifact(&database, "cross-task-artifact", b"cross-task");
+                configured_connection(&database.path)
+                    .execute(
+                        "UPDATE artifacts SET task_id = 'task-2' WHERE id = ?1",
+                        [artifact_id.as_str()],
+                    )
+                    .unwrap();
+                artifact_id
+            }
+            _ => unreachable!(),
+        };
+        let terminal = terminal_fixture(
+            ToolExecutionTerminalKind::Succeeded,
+            digest_bytes(case.as_bytes()),
+            Some(artifact_id.clone()),
+        );
+        let receipt = DurableToolExecutionReceipt::new(authority, terminal);
+
+        assert_integrity_failure(store.resolve_terminal(ToolExecutionResolution::new(receipt)));
+        assert_eq!(
+            lifecycle_state(&database, &format!("execution-artifact-{case}")),
+            "running:started"
+        );
+        assert_eq!(terminal_event_count(&database), 0);
+    }
+}
+
+#[test]
+fn terminal_artifacts_require_verified_trust_on_commit_and_replay() {
+    for verification_state in ["unverified", "rejected"] {
+        let database = TempDatabase::new();
+        let execution_id = format!("execution-{verification_state}-commit");
+        let (store, _, authority) = reserve_and_claim(&database, &execution_id);
+        let (artifact_id, output_digest) = persist_durable_artifact(
+            &database,
+            &format!("artifact-{verification_state}-commit"),
+            b"commit trust",
+        );
+        configured_connection(&database.path)
+            .execute(
+                "UPDATE artifacts SET verification_state = ?1 WHERE id = ?2",
+                params![verification_state, artifact_id.as_str()],
+            )
+            .unwrap();
+        let receipt = DurableToolExecutionReceipt::new(
+            authority,
+            terminal_fixture(
+                ToolExecutionTerminalKind::Succeeded,
+                output_digest,
+                Some(artifact_id),
+            ),
+        );
+
+        assert_integrity_failure(store.resolve_terminal(ToolExecutionResolution::new(receipt)));
+        assert_eq!(lifecycle_state(&database, &execution_id), "running:started");
+        assert_eq!(terminal_event_count(&database), 0);
+
+        let database = TempDatabase::new();
+        let execution_id = format!("execution-{verification_state}-replay");
+        let (store, operation_digest, authority) = reserve_and_claim(&database, &execution_id);
+        let (artifact_id, output_digest) = persist_durable_artifact(
+            &database,
+            &format!("artifact-{verification_state}-replay"),
+            b"replay trust",
+        );
+        let receipt = DurableToolExecutionReceipt::new(
+            authority,
+            terminal_fixture(
+                ToolExecutionTerminalKind::Succeeded,
+                output_digest,
+                Some(artifact_id.clone()),
+            ),
+        );
+        store
+            .resolve_terminal(ToolExecutionResolution::new(receipt))
+            .unwrap();
+        configured_connection(&database.path)
+            .execute(
+                "UPDATE artifacts SET verification_state = ?1 WHERE id = ?2",
+                params![verification_state, artifact_id.as_str()],
+            )
+            .unwrap();
+        let before = durable_read_fingerprint(&database);
+
+        assert_integrity_failure(store.begin(NewToolExecution {
+            execution_id: ToolExecutionId::new(execution_id).unwrap(),
+            operation_digest,
+        }));
+        assert_eq!(durable_read_fingerprint(&database), before);
+        assert_eq!(terminal_event_count(&database), 1);
+    }
+
+    for verification_state in ["hash_verified", "tool_verified", "user_approved"] {
+        let database = TempDatabase::new();
+        let execution_id = format!("execution-{verification_state}-accepted");
+        let (store, operation_digest, authority) = reserve_and_claim(&database, &execution_id);
+        let (artifact_id, output_digest) = persist_durable_artifact(
+            &database,
+            &format!("artifact-{verification_state}-accepted"),
+            b"accepted trust",
+        );
+        configured_connection(&database.path)
+            .execute(
+                "UPDATE artifacts SET verification_state = ?1 WHERE id = ?2",
+                params![verification_state, artifact_id.as_str()],
+            )
+            .unwrap();
+        let receipt = DurableToolExecutionReceipt::new(
+            authority,
+            terminal_fixture(
+                ToolExecutionTerminalKind::Succeeded,
+                output_digest,
+                Some(artifact_id),
+            ),
+        );
+
+        assert_eq!(
+            store
+                .resolve_terminal(ToolExecutionResolution::new(receipt.clone()))
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            store
+                .begin(NewToolExecution {
+                    execution_id: ToolExecutionId::new(execution_id).unwrap(),
+                    operation_digest,
+                })
+                .unwrap(),
+            ToolExecutionClaim::Completed(receipt)
+        );
+    }
+}
+
+#[test]
+fn incomplete_is_a_pure_read_for_running_and_explicitly_indeterminate_records() {
+    let database = TempDatabase::new();
+    let operation_digest = persist_request_artifact(&database);
+    persist_policy_decision(&database.path, &operation_digest, "allow");
+    let store = SqliteStore::open(&database.path).unwrap();
+    for execution_id in ["execution-in-flight", "execution-indeterminate"] {
+        let execution_id = ToolExecutionId::new(execution_id).unwrap();
+        store
+            .reserve(NewToolIntent {
+                execution_id: execution_id.clone(),
+                operation_digest: operation_digest.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            store
+                .begin(NewToolExecution {
+                    execution_id,
+                    operation_digest: operation_digest.clone(),
+                })
+                .unwrap(),
+            ToolExecutionClaim::Claimed(_)
+        ));
+    }
     configured_connection(&database.path)
         .execute_batch(
-            "CREATE TRIGGER fail_completion_event
-             BEFORE INSERT ON events
-             WHEN NEW.event_type = 'tool.execution.completed'
-             BEGIN
-                 SELECT RAISE(ABORT, 'injected finish fault');
-             END;",
+            "UPDATE operation_intents
+             SET status = 'indeterminate',
+                 error_json = '{\"classification\":\"crash_without_authoritative_receipt\"}'
+             WHERE id = 'execution-indeterminate';
+             UPDATE tool_executions
+             SET status = 'indeterminate',
+                 completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = 'execution-indeterminate';",
         )
         .unwrap();
-    let completion = ToolExecutionCompletion {
-        execution_id: execution_id.clone(),
-        receipt: process_receipt(execution_id.clone(), Some(0), output_digest),
-    };
-    assert!(store.finish(completion.clone()).is_err());
-    let connection = configured_connection(&database.path);
-    assert_eq!(
-        connection
-            .query_row(
-                "SELECT status FROM tool_executions WHERE id = 'execution-1'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-        "running"
-    );
-    assert_eq!(
-        connection
-            .query_row(
-                "SELECT status FROM operation_intents WHERE id = 'execution-1'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-        "started"
-    );
-    connection
-        .execute_batch("DROP TRIGGER fail_completion_event;")
-        .unwrap();
-    drop(connection);
+    let before = durable_read_fingerprint(&database);
 
-    assert!(store.finish(completion.clone()).unwrap().completed);
-    assert_eq!(
-        store.finish(completion.clone()).unwrap(),
-        store.finish(completion.clone()).unwrap()
-    );
-    let mut changed_completion = completion;
-    changed_completion.receipt.exit_code = Some(1);
-    assert!(store.finish(changed_completion).is_err());
+    let first = store.incomplete().unwrap();
+    let second = store.incomplete().unwrap();
     drop(store);
     let reopened = SqliteStore::open(&database.path).unwrap();
-    assert!(reopened.incomplete().unwrap().is_empty());
-    let connection = configured_connection(&database.path);
-    assert_eq!(
-        connection
-            .query_row(
-                "SELECT te.status || ':' || oi.status
-                 FROM tool_executions te
-                 JOIN operation_intents oi ON oi.id = te.operation_intent_id
-                 WHERE te.id = 'execution-1'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
+    let third = reopened.incomplete().unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(second, third);
+    assert!(matches!(first[0], IncompleteToolExecution::InFlight(_)));
+    assert!(matches!(
+        first[1],
+        IncompleteToolExecution::Indeterminate(_)
+    ));
+    assert_eq!(durable_read_fingerprint(&database), before);
+}
+
+#[test]
+fn historical_completed_receipt_replays_while_a_later_execution_is_running() {
+    let database = TempDatabase::new();
+    let operation_digest = persist_request_artifact(&database);
+    persist_policy_decision(&database.path, &operation_digest, "allow");
+    let store = SqliteStore::open(&database.path).unwrap();
+    let execution_a = ToolExecutionId::new("execution-history-a").unwrap();
+    store
+        .reserve(NewToolIntent {
+            execution_id: execution_a.clone(),
+            operation_digest: operation_digest.clone(),
+        })
+        .unwrap();
+    let ToolExecutionClaim::Claimed(authority_a) = store
+        .begin(NewToolExecution {
+            execution_id: execution_a.clone(),
+            operation_digest: operation_digest.clone(),
+        })
+        .unwrap()
+    else {
+        panic!("execution A must be claimed");
+    };
+    let (artifact_id, output_digest) =
+        persist_durable_artifact(&database, "history-a-output", b"history A");
+    let receipt_a = DurableToolExecutionReceipt::new(
+        authority_a,
+        terminal_fixture(
+            ToolExecutionTerminalKind::Succeeded,
+            output_digest,
+            Some(artifact_id),
+        ),
+    );
+    store
+        .resolve_terminal(ToolExecutionResolution::new(receipt_a.clone()))
+        .unwrap();
+
+    let execution_b = ToolExecutionId::new("execution-history-b").unwrap();
+    store
+        .reserve(NewToolIntent {
+            execution_id: execution_b.clone(),
+            operation_digest: operation_digest.clone(),
+        })
+        .unwrap();
+    assert!(matches!(
+        store
+            .begin(NewToolExecution {
+                execution_id: execution_b.clone(),
+                operation_digest: operation_digest.clone(),
+            })
             .unwrap(),
-        "succeeded:succeeded"
+        ToolExecutionClaim::Claimed(_)
+    ));
+
+    let incomplete = store.incomplete().unwrap();
+    assert_eq!(incomplete.len(), 1);
+    assert!(matches!(
+        &incomplete[0],
+        IncompleteToolExecution::InFlight(evidence)
+            if evidence.authority.execution_id() == &execution_b
+    ));
+    assert_eq!(
+        store
+            .begin(NewToolExecution {
+                execution_id: execution_a,
+                operation_digest,
+            })
+            .unwrap(),
+        ToolExecutionClaim::Completed(receipt_a)
     );
 }
 
 #[test]
-fn terminated_process_is_durable_non_success_with_complete_job_evidence() {
+fn corrupted_current_head_terminal_projection_still_fails_closed() {
+    for kind in [
+        ToolExecutionTerminalKind::Succeeded,
+        ToolExecutionTerminalKind::Indeterminate,
+    ] {
+        let database = TempDatabase::new();
+        let execution_id = format!("execution-head-{}", terminal_kind_label(kind));
+        let (store, operation_digest, authority) = reserve_and_claim(&database, &execution_id);
+        let (artifact_id, output_digest) =
+            persist_durable_artifact(&database, &format!("{execution_id}-output"), b"head");
+        let receipt = DurableToolExecutionReceipt::new(
+            authority,
+            terminal_fixture(kind, output_digest, Some(artifact_id)),
+        );
+        store
+            .resolve_terminal(ToolExecutionResolution::new(receipt))
+            .unwrap();
+        let corrupt_state = if kind == ToolExecutionTerminalKind::Indeterminate {
+            "None"
+        } else {
+            "Indeterminate"
+        };
+        configured_connection(&database.path)
+            .execute(
+                "UPDATE tasks SET operation_state = ?1 WHERE id = 'task-1'",
+                [corrupt_state],
+            )
+            .unwrap();
+        let before = durable_read_fingerprint(&database);
+
+        assert_integrity_failure(store.begin(NewToolExecution {
+            execution_id: ToolExecutionId::new(execution_id).unwrap(),
+            operation_digest,
+        }));
+        assert_eq!(durable_read_fingerprint(&database), before);
+    }
+}
+
+#[test]
+fn incomplete_fails_closed_when_candidate_idempotency_or_status_is_corrupt() {
+    for corruption in [
+        "UPDATE operation_intents SET idempotency_class = 'queryable'
+         WHERE id = 'execution-corrupt-incomplete'",
+        "DROP TRIGGER operation_intent_status_forward_only;
+         UPDATE operation_intents SET status = 'claimed'
+         WHERE id = 'execution-corrupt-incomplete'",
+    ] {
+        let database = TempDatabase::new();
+        let (store, _, _) = reserve_and_claim(&database, "execution-corrupt-incomplete");
+        configured_connection(&database.path)
+            .execute_batch(corruption)
+            .unwrap();
+        let before = durable_read_fingerprint(&database);
+
+        assert_integrity_failure(store.incomplete());
+        assert_eq!(durable_read_fingerprint(&database), before);
+    }
+}
+
+#[test]
+fn indeterminate_terminal_projects_and_replays_unknown_operation_state() {
     let database = TempDatabase::new();
-    let operation_digest = persist_request_artifact(&database);
+    let (store, operation_digest, authority) =
+        reserve_and_claim(&database, "execution-indeterminate-projection");
+    let receipt = DurableToolExecutionReceipt::new(
+        authority,
+        ToolExecutionTerminal::indeterminate(SafeToolExecutionError {
+            classification: local_agent_terminal_application::SafeErrorClassification::Unavailable,
+            retryability: local_agent_terminal_application::Retryability::Retryable,
+        }),
+    );
+
+    assert_eq!(
+        store
+            .resolve_terminal(ToolExecutionResolution::new(receipt.clone()))
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        configured_connection(&database.path)
+            .query_row(
+                "SELECT operation_state FROM tasks WHERE id = 'task-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "Indeterminate"
+    );
+    assert_eq!(
+        store
+            .begin(NewToolExecution {
+                execution_id: ToolExecutionId::new("execution-indeterminate-projection").unwrap(),
+                operation_digest,
+            })
+            .unwrap(),
+        ToolExecutionClaim::Completed(receipt)
+    );
+}
+
+#[test]
+fn missing_physical_artifact_file_rejects_terminal_commit_atomically() {
+    let database = TempDatabase::new();
+    let (store, _, authority) = reserve_and_claim(&database, "execution-missing-artifact-file");
+    let (artifact_id, output_digest) =
+        persist_durable_artifact(&database, "missing-file-artifact", b"missing file");
+    fs::remove_file(artifact_file_path(&database, &artifact_id)).unwrap();
+    let receipt = DurableToolExecutionReceipt::new(
+        authority,
+        terminal_fixture(
+            ToolExecutionTerminalKind::Succeeded,
+            output_digest,
+            Some(artifact_id),
+        ),
+    );
+
+    assert_integrity_failure(store.resolve_terminal(ToolExecutionResolution::new(receipt)));
+    assert_eq!(
+        lifecycle_state(&database, "execution-missing-artifact-file"),
+        "running:started"
+    );
+    assert_eq!(terminal_event_count(&database), 0);
+}
+
+#[test]
+fn tampered_physical_artifact_bytes_reject_terminal_commit_atomically() {
+    let database = TempDatabase::new();
+    let (store, _, authority) = reserve_and_claim(&database, "execution-tampered-artifact-commit");
+    let (artifact_id, output_digest) =
+        persist_durable_artifact(&database, "tampered-commit-artifact", b"original bytes");
+    fs::write(
+        artifact_file_path(&database, &artifact_id),
+        b"tampered bytes",
+    )
+    .unwrap();
+    let receipt = DurableToolExecutionReceipt::new(
+        authority,
+        terminal_fixture(
+            ToolExecutionTerminalKind::Succeeded,
+            output_digest,
+            Some(artifact_id),
+        ),
+    );
+
+    assert_integrity_failure(store.resolve_terminal(ToolExecutionResolution::new(receipt)));
+    assert_eq!(
+        lifecycle_state(&database, "execution-tampered-artifact-commit"),
+        "running:started"
+    );
+    assert_eq!(terminal_event_count(&database), 0);
+}
+
+#[test]
+fn tampered_physical_artifact_bytes_reject_terminal_replay() {
+    let database = TempDatabase::new();
+    let (store, operation_digest, authority) =
+        reserve_and_claim(&database, "execution-tampered-artifact-file");
+    let (artifact_id, output_digest) =
+        persist_durable_artifact(&database, "tampered-file-artifact", b"original bytes");
+    let receipt = DurableToolExecutionReceipt::new(
+        authority,
+        terminal_fixture(
+            ToolExecutionTerminalKind::Succeeded,
+            output_digest,
+            Some(artifact_id.clone()),
+        ),
+    );
+    store
+        .resolve_terminal(ToolExecutionResolution::new(receipt))
+        .unwrap();
+    fs::write(
+        artifact_file_path(&database, &artifact_id),
+        b"tampered bytes",
+    )
+    .unwrap();
+    let before = durable_read_fingerprint(&database);
+
+    assert_integrity_failure(store.begin(NewToolExecution {
+        execution_id: ToolExecutionId::new("execution-tampered-artifact-file").unwrap(),
+        operation_digest,
+    }));
+    assert_eq!(durable_read_fingerprint(&database), before);
+    assert_eq!(terminal_event_count(&database), 1);
+}
+
+#[test]
+fn corrupt_persisted_identity_and_evidence_fail_closed_without_mutation() {
+    let mutations = [
+        "UPDATE tool_executions SET request_id = 'wrong-request'
+         WHERE id = 'execution-corrupt'",
+        "UPDATE operation_intents
+         SET operation_digest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
+         WHERE id = 'execution-corrupt'",
+        "UPDATE operation_intents SET attempt_count = 0
+         WHERE id = 'execution-corrupt'",
+        "UPDATE operation_intents SET attempt_count = 2
+         WHERE id = 'execution-corrupt'",
+        "UPDATE operation_intents SET executor_fencing_token = 18
+         WHERE id = 'execution-corrupt'",
+        "UPDATE operation_intents SET idempotency_class = 'queryable'
+         WHERE id = 'execution-corrupt'",
+        "UPDATE operation_intents SET canonical_request_artifact_id = 'corrupt-artifact'
+         WHERE id = 'execution-corrupt'",
+    ];
+    for mutation in mutations {
+        let database = TempDatabase::new();
+        let (store, operation_digest, _) = reserve_and_claim(&database, "execution-corrupt");
+        persist_durable_artifact(&database, "corrupt-artifact", b"wrong request");
+        configured_connection(&database.path)
+            .execute_batch(mutation)
+            .unwrap();
+        let before = durable_read_fingerprint(&database);
+
+        assert_integrity_failure(store.begin(NewToolExecution {
+            execution_id: ToolExecutionId::new("execution-corrupt").unwrap(),
+            operation_digest,
+        }));
+        assert_eq!(durable_read_fingerprint(&database), before, "{mutation}");
+    }
+
+    let database = TempDatabase::new();
+    let (store, operation_digest, authority) =
+        reserve_and_claim(&database, "execution-corrupt-terminal");
+    let receipt = DurableToolExecutionReceipt::new(authority, ToolExecutionTerminal::cancelled());
+    store
+        .resolve_terminal(ToolExecutionResolution::new(receipt))
+        .unwrap();
+    configured_connection(&database.path)
+        .execute(
+            "UPDATE operation_intents SET external_receipt_json = '{}'
+             WHERE id = 'execution-corrupt-terminal'",
+            [],
+        )
+        .unwrap();
+    let before = durable_read_fingerprint(&database);
+    assert_integrity_failure(store.begin(NewToolExecution {
+        execution_id: ToolExecutionId::new("execution-corrupt-terminal").unwrap(),
+        operation_digest,
+    }));
+    assert_eq!(durable_read_fingerprint(&database), before);
+
+    let database = TempDatabase::new();
+    let (store, operation_digest, authority) =
+        reserve_and_claim(&database, "execution-corrupt-artifact-reference");
+    let (expected_artifact, output_digest) =
+        persist_durable_artifact(&database, "expected-artifact", b"expected");
+    let (wrong_artifact, _) = persist_durable_artifact(&database, "wrong-artifact", b"wrong");
+    let receipt = DurableToolExecutionReceipt::new(
+        authority,
+        terminal_fixture(
+            ToolExecutionTerminalKind::Succeeded,
+            output_digest,
+            Some(expected_artifact),
+        ),
+    );
+    store
+        .resolve_terminal(ToolExecutionResolution::new(receipt))
+        .unwrap();
+    configured_connection(&database.path)
+        .execute(
+            "UPDATE tool_executions SET stdout_artifact_id = ?1
+             WHERE id = 'execution-corrupt-artifact-reference'",
+            [wrong_artifact.as_str()],
+        )
+        .unwrap();
+    let before = durable_read_fingerprint(&database);
+    assert_integrity_failure(store.begin(NewToolExecution {
+        execution_id: ToolExecutionId::new("execution-corrupt-artifact-reference").unwrap(),
+        operation_digest,
+    }));
+    assert_eq!(durable_read_fingerprint(&database), before);
+}
+
+#[test]
+fn begin_and_terminal_statement_faults_leave_only_the_prior_durable_state() {
+    let begin_faults = [
+        "CREATE TRIGGER injected BEFORE UPDATE ON operation_intents
+         WHEN NEW.status = 'started' BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE INSERT ON tool_executions
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE INSERT ON events
+         WHEN NEW.event_type = 'tool.execution.started'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE UPDATE ON tasks
+         WHEN NEW.operation_state = 'Running'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+    ];
+    for trigger in begin_faults {
+        let database = TempDatabase::new();
+        let operation_digest = persist_request_artifact(&database);
+        persist_policy_decision(&database.path, &operation_digest, "allow");
+        let store = SqliteStore::open(&database.path).unwrap();
+        store
+            .reserve(NewToolIntent {
+                execution_id: ToolExecutionId::new("execution-begin-fault").unwrap(),
+                operation_digest: operation_digest.clone(),
+            })
+            .unwrap();
+        configured_connection(&database.path)
+            .execute_batch(trigger)
+            .unwrap();
+
+        assert!(store
+            .begin(NewToolExecution {
+                execution_id: ToolExecutionId::new("execution-begin-fault").unwrap(),
+                operation_digest,
+            })
+            .is_err());
+        drop(store);
+        let reopened = SqliteStore::open(&database.path).unwrap();
+        assert_eq!(
+            configured_connection(&database.path)
+                .query_row(
+                    "SELECT status || ':' || attempt_count
+                     FROM operation_intents WHERE id = 'execution-begin-fault'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "pending:0"
+        );
+        assert_eq!(reopened.incomplete().unwrap().len(), 0);
+    }
+
+    let terminal_faults = [
+        "CREATE TRIGGER injected BEFORE UPDATE ON operation_intents
+         WHEN NEW.status = 'succeeded' BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE UPDATE ON tool_executions
+         WHEN NEW.status = 'succeeded' BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE INSERT ON events
+         WHEN NEW.event_type = 'tool.execution.completed'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE UPDATE ON tasks
+         WHEN OLD.operation_state = 'Running' AND NEW.operation_state = 'None'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+    ];
+    for trigger in terminal_faults {
+        let database = TempDatabase::new();
+        let (store, _, authority) = reserve_and_claim(&database, "execution-terminal-fault");
+        let (artifact_id, digest) =
+            persist_durable_artifact(&database, "terminal-fault-artifact", b"fault output");
+        let receipt = DurableToolExecutionReceipt::new(
+            authority,
+            terminal_fixture(
+                ToolExecutionTerminalKind::Succeeded,
+                digest,
+                Some(artifact_id),
+            ),
+        );
+        configured_connection(&database.path)
+            .execute_batch(trigger)
+            .unwrap();
+
+        assert!(store
+            .resolve_terminal(ToolExecutionResolution::new(receipt))
+            .is_err());
+        drop(store);
+        SqliteStore::open(&database.path).unwrap();
+        assert_eq!(
+            lifecycle_state(&database, "execution-terminal-fault"),
+            "running:started"
+        );
+        assert_eq!(terminal_event_count(&database), 0);
+    }
+}
+
+fn reserve_and_claim(
+    database: &TempDatabase,
+    execution_id: &str,
+) -> (SqliteStore, Sha256Digest, ToolExecutionClaimAuthority) {
+    let operation_digest = persist_request_artifact(database);
     persist_policy_decision(&database.path, &operation_digest, "allow");
-    let output_digest = persist_output_artifact(&database, b"terminated output");
     let store = SqliteStore::open(&database.path).unwrap();
-    let execution_id = ToolExecutionId::new("execution-terminated").unwrap();
+    let execution_id = ToolExecutionId::new(execution_id).unwrap();
     store
         .reserve(NewToolIntent {
             execution_id: execution_id.clone(),
-            operation_digest,
+            operation_digest: operation_digest.clone(),
         })
         .unwrap();
-    store
+    let claim = store
         .begin(NewToolExecution {
-            execution_id: execution_id.clone(),
+            execution_id,
+            operation_digest: operation_digest.clone(),
         })
         .unwrap();
-    let mut receipt = process_receipt(execution_id.clone(), None, output_digest);
-    receipt.status = ProcessStatus::Terminated;
-    receipt.stdout.bytes = b"terminated output".to_vec();
-    receipt.stdout.truncated = true;
-    receipt.duration_ms = 275;
-    receipt.job_receipt.root_pid = 4242;
-    receipt.job_receipt.job_id = "job-execution-terminated".to_owned();
-    receipt.job_receipt.total_user_time_ms = 650;
-    receipt.job_receipt.resource_limit_terminated = true;
-    receipt.job_receipt.tree_terminated = true;
-    receipt.observed_writes = vec![observed_process_write(
-        "generated.txt",
-        "worktree-root",
-        b"observed write",
-    )];
-    let completion = ToolExecutionCompletion {
-        execution_id,
-        receipt,
+    let ToolExecutionClaim::Claimed(authority) = claim else {
+        panic!("fresh reserved execution must be claimed");
     };
+    (store, operation_digest, authority)
+}
 
-    assert!(store.finish(completion.clone()).unwrap().completed);
-    assert!(store.finish(completion).unwrap().completed);
-    drop(store);
+fn terminal_fixture(
+    kind: ToolExecutionTerminalKind,
+    output_digest: Sha256Digest,
+    available_artifact: Option<ArtifactId>,
+) -> ToolExecutionTerminal {
+    let available = available_artifact
+        .map(DurableToolExecutionArtifact::Available)
+        .unwrap_or(DurableToolExecutionArtifact::Unavailable);
+    let output = |exit_code| ToolExecutionOutput {
+        exit_code,
+        output_digest,
+        duration_ms: 42,
+        artifacts: DurableToolExecutionArtifacts::new(
+            available.clone(),
+            DurableToolExecutionArtifact::Unavailable,
+            vec![available],
+        ),
+    };
+    match kind {
+        ToolExecutionTerminalKind::Succeeded => {
+            ToolExecutionTerminal::succeeded(output(Some(0))).unwrap()
+        }
+        ToolExecutionTerminalKind::Failed => {
+            ToolExecutionTerminal::failed(output(Some(7))).unwrap()
+        }
+        ToolExecutionTerminalKind::Terminated => {
+            ToolExecutionTerminal::terminated(output(None)).unwrap()
+        }
+        ToolExecutionTerminalKind::Cancelled => ToolExecutionTerminal::cancelled(),
+        ToolExecutionTerminalKind::Interrupted => ToolExecutionTerminal::interrupted(),
+        ToolExecutionTerminalKind::Indeterminate => {
+            ToolExecutionTerminal::indeterminate(SafeToolExecutionError {
+                classification:
+                    local_agent_terminal_application::SafeErrorClassification::Unavailable,
+                retryability: local_agent_terminal_application::Retryability::Retryable,
+            })
+        }
+    }
+}
 
-    let reopened = SqliteStore::open(&database.path).unwrap();
-    assert!(reopened.incomplete().unwrap().is_empty());
-    let connection = configured_connection(&database.path);
-    let durable: (String, String, String, String) = connection
+fn terminal_kind_label(kind: ToolExecutionTerminalKind) -> &'static str {
+    match kind {
+        ToolExecutionTerminalKind::Succeeded => "succeeded",
+        ToolExecutionTerminalKind::Failed => "failed",
+        ToolExecutionTerminalKind::Cancelled => "cancelled",
+        ToolExecutionTerminalKind::Terminated => "terminated",
+        ToolExecutionTerminalKind::Interrupted => "interrupted",
+        ToolExecutionTerminalKind::Indeterminate => "indeterminate",
+    }
+}
+
+fn persist_durable_artifact(
+    database: &TempDatabase,
+    artifact_id: &str,
+    bytes: &[u8],
+) -> (ArtifactId, Sha256Digest) {
+    persist_artifact(
+        database,
+        artifact_id,
+        &format!("tool-output/{artifact_id}"),
+        "tool-output",
+        bytes,
+    );
+    (ArtifactId::new(artifact_id).unwrap(), digest_bytes(bytes))
+}
+
+fn artifact_file_path(database: &TempDatabase, artifact_id: &ArtifactId) -> PathBuf {
+    let storage_key: String = configured_connection(&database.path)
         .query_row(
-            "SELECT te.status, oi.status, oi.external_receipt_json,
-                    (SELECT payload_json FROM events
-                     WHERE event_type = 'tool.execution.completed'
-                       AND actor_id = 'execution-terminated')
+            "SELECT storage_key FROM artifacts WHERE id = ?1",
+            [artifact_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    database.directory.join(storage_key)
+}
+
+fn terminal_event_count(database: &TempDatabase) -> i64 {
+    configured_connection(&database.path)
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE event_type = 'tool.execution.completed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn lifecycle_state(database: &TempDatabase, execution_id: &str) -> String {
+    configured_connection(&database.path)
+        .query_row(
+            "SELECT te.status || ':' || oi.status
              FROM tool_executions te
              JOIN operation_intents oi ON oi.id = te.operation_intent_id
-             WHERE te.id = 'execution-terminated'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+             WHERE te.id = ?1",
+            [execution_id],
+            |row| row.get(0),
         )
-        .unwrap();
-    assert_eq!(durable.0, "terminated");
-    assert_eq!(durable.1, "failed");
-    let receipt: serde_json::Value = serde_json::from_str(&durable.2).unwrap();
-    assert_eq!(receipt["schemaVersion"], 1);
-    assert_eq!(receipt["status"], "terminated");
-    assert_eq!(receipt["job"]["rootPid"], 4242);
-    assert_eq!(receipt["job"]["treeTerminated"], true);
-    assert_eq!(receipt["job"]["jobMemoryLimit"], true);
-    assert_eq!(receipt["job"]["jobCpuTimeLimit"], true);
-    assert_eq!(receipt["job"]["resourceLimitTerminated"], true);
-    assert_eq!(receipt["stdout"]["truncated"], true);
-    assert_eq!(receipt["durationMs"], 275);
-    assert_eq!(receipt["observedWrites"][0]["sizeBytes"], 14);
-    let event: serde_json::Value = serde_json::from_str(&durable.3).unwrap();
-    assert_eq!(event["status"], "terminated");
+        .unwrap()
 }
 
-#[test]
-fn two_scope_process_write_receipt_reopens_with_exact_mapping() {
-    let database = TempDatabase::new();
-    let operation_digest = persist_request_artifact(&database);
-    persist_policy_decision(&database.path, &operation_digest, "allow");
-    let output_digest = persist_output_artifact(&database, b"two-scope output");
-    let store = SqliteStore::open(&database.path).unwrap();
-    let execution_id = ToolExecutionId::new("execution-two-scopes").unwrap();
-    store
-        .reserve(NewToolIntent {
-            execution_id: execution_id.clone(),
-            operation_digest,
-        })
-        .unwrap();
-    store
-        .begin(NewToolExecution {
-            execution_id: execution_id.clone(),
-        })
-        .unwrap();
-    let mut receipt = process_receipt(execution_id.clone(), Some(0), output_digest);
-    receipt.observed_writes = vec![
-        observed_process_write(".", "worktree-root", b"first"),
-        observed_process_write("generated/second.txt", "worktree-root", b"second"),
-    ];
-    let completion = ToolExecutionCompletion {
-        execution_id,
-        receipt,
-    };
-
-    assert!(store.finish(completion.clone()).unwrap().completed);
-    drop(store);
-
-    let connection = configured_connection(&database.path);
-    let (receipt_json, event_json): (String, String) = connection
+fn durable_read_fingerprint(database: &TempDatabase) -> (i64, String) {
+    configured_connection(&database.path)
         .query_row(
-            "SELECT oi.external_receipt_json,
-                    (SELECT payload_json FROM events
-                     WHERE event_type = 'tool.execution.completed'
-                       AND actor_id = 'execution-two-scopes')
-             FROM operation_intents oi WHERE oi.id = 'execution-two-scopes'",
+            "SELECT
+                (SELECT current_sequence FROM tasks WHERE id = 'task-1'),
+                group_concat(
+                    oi.id || ':' || oi.status || ':' || te.status || ':' || oi.attempt_count,
+                    '|'
+                )
+             FROM operation_intents oi
+             JOIN tool_executions te ON te.operation_intent_id = oi.id
+             ORDER BY oi.id",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .unwrap();
-    let receipt_value: serde_json::Value = serde_json::from_str(&receipt_json).unwrap();
-    let expected = serde_json::json!([
-        {
-            "capability": {
-                "kind": "worktree",
-                "taskId": "task-1",
-                "path": ".",
-            },
-            "rootIdentity": "worktree-root",
-            "target": {
-                "kind": "root",
-            },
-            "digest": digest_bytes(b"first").as_str(),
-            "sizeBytes": 5,
-        },
-        {
-            "capability": {
-                "kind": "worktree",
-                "taskId": "task-1",
-                "path": "generated/second.txt",
-            },
-            "rootIdentity": "worktree-root",
-            "target": {
-                "kind": "relative",
-                "components": ["generated", "second.txt"],
-            },
-            "digest": digest_bytes(b"second").as_str(),
-            "sizeBytes": 6,
-        },
-    ]);
-    assert_eq!(receipt_value["schemaVersion"], 1);
-    assert_eq!(receipt_value["observedWrites"], expected);
-    let event_value: serde_json::Value = serde_json::from_str(&event_json).unwrap();
-    assert_eq!(event_value["receipt"]["observedWrites"], expected);
-    drop(connection);
-
-    let reopened = SqliteStore::open(&database.path).unwrap();
-    assert!(reopened.finish(completion.clone()).unwrap().completed);
-    let mut reordered = completion;
-    reordered.receipt.observed_writes.reverse();
-    assert!(reopened.finish(reordered).is_err());
+        .unwrap()
 }
 
-#[test]
-fn reopen_marks_started_non_repeatable_execution_indeterminate_once() {
-    let database = TempDatabase::new();
-    let operation_digest = persist_request_artifact(&database);
-    persist_policy_decision(&database.path, &operation_digest, "allow");
-    let store = SqliteStore::open(&database.path).unwrap();
-    let execution_id = ToolExecutionId::new("execution-crashed").unwrap();
-    store
-        .reserve(NewToolIntent {
-            execution_id: execution_id.clone(),
-            operation_digest,
-        })
-        .unwrap();
-    store.begin(NewToolExecution { execution_id }).unwrap();
-    drop(store);
-
-    let reopened = SqliteStore::open(&database.path).unwrap();
-    assert_eq!(reopened.incomplete().unwrap().len(), 1);
-    assert!(reopened.incomplete().unwrap().is_empty());
-    let connection = configured_connection(&database.path);
+fn assert_conflict<T: std::fmt::Debug>(
+    result: Result<T, local_agent_terminal_application::PortError>,
+) {
     assert_eq!(
-        connection
-            .query_row(
-                "SELECT te.status || ':' || oi.status
-                 FROM tool_executions te
-                 JOIN operation_intents oi ON oi.id = te.operation_intent_id
-                 WHERE te.id = 'execution-crashed'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-        "indeterminate:indeterminate"
+        result.unwrap_err().safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::Conflict
+    );
+}
+
+fn assert_integrity_failure<T: std::fmt::Debug>(
+    result: Result<T, local_agent_terminal_application::PortError>,
+) {
+    assert_eq!(
+        result.unwrap_err().safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::IntegrityFailure
     );
 }
 
@@ -891,656 +1904,6 @@ fn file_write_prepare_rejects_policy_or_request_artifact_mismatch_without_rows()
     }
 }
 
-#[test]
-fn begin_rolls_back_at_every_sql_statement_boundary() {
-    let triggers = [
-        "CREATE TRIGGER injected BEFORE UPDATE ON operation_intents
-         WHEN NEW.status = 'started' BEGIN SELECT RAISE(ABORT, 'fault'); END;",
-        "CREATE TRIGGER injected BEFORE INSERT ON tool_executions
-         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
-        "CREATE TRIGGER injected BEFORE INSERT ON events
-         WHEN NEW.event_type = 'tool.execution.started'
-         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
-        "CREATE TRIGGER injected BEFORE UPDATE ON tasks
-         WHEN NEW.operation_state = 'Running'
-         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
-    ];
-    for trigger in triggers {
-        let database = TempDatabase::new();
-        let operation_digest = persist_request_artifact(&database);
-        persist_policy_decision(&database.path, &operation_digest, "allow");
-        let store = SqliteStore::open(&database.path).unwrap();
-        store
-            .reserve(NewToolIntent {
-                execution_id: ToolExecutionId::new("execution-boundary").unwrap(),
-                operation_digest,
-            })
-            .unwrap();
-        configured_connection(&database.path)
-            .execute_batch(trigger)
-            .unwrap();
-
-        assert!(store
-            .begin(NewToolExecution {
-                execution_id: ToolExecutionId::new("execution-boundary").unwrap(),
-            })
-            .is_err());
-        drop(store);
-        let connection = configured_connection(&database.path);
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT status FROM operation_intents WHERE id = 'execution-boundary'",
-                    [],
-                    |row| row.get::<_, String>(0)
-                )
-                .unwrap(),
-            "pending"
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM tool_executions", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT current_sequence FROM tasks WHERE id = 'task-1'",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            0
-        );
-    }
-}
-
-#[test]
-fn finish_rolls_back_at_every_sql_statement_boundary() {
-    let triggers = [
-        "CREATE TRIGGER injected BEFORE UPDATE ON operation_intents
-         WHEN NEW.status = 'succeeded' BEGIN SELECT RAISE(ABORT, 'fault'); END;",
-        "CREATE TRIGGER injected BEFORE UPDATE ON tool_executions
-         WHEN NEW.status = 'succeeded' BEGIN SELECT RAISE(ABORT, 'fault'); END;",
-        "CREATE TRIGGER injected BEFORE INSERT ON events
-         WHEN NEW.event_type = 'tool.execution.completed'
-         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
-        "CREATE TRIGGER injected BEFORE UPDATE ON tasks
-         WHEN OLD.operation_state = 'Running' AND NEW.operation_state = 'None'
-         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
-    ];
-    for trigger in triggers {
-        let database = TempDatabase::new();
-        let operation_digest = persist_request_artifact(&database);
-        persist_policy_decision(&database.path, &operation_digest, "allow");
-        let output_digest = persist_output_artifact(&database, b"boundary output");
-        let store = SqliteStore::open(&database.path).unwrap();
-        let execution_id = ToolExecutionId::new("execution-boundary").unwrap();
-        store
-            .reserve(NewToolIntent {
-                execution_id: execution_id.clone(),
-                operation_digest,
-            })
-            .unwrap();
-        store
-            .begin(NewToolExecution {
-                execution_id: execution_id.clone(),
-            })
-            .unwrap();
-        configured_connection(&database.path)
-            .execute_batch(trigger)
-            .unwrap();
-
-        assert!(store
-            .finish(ToolExecutionCompletion {
-                execution_id: execution_id.clone(),
-                receipt: process_receipt(execution_id, Some(0), output_digest),
-            })
-            .is_err());
-        drop(store);
-        let connection = configured_connection(&database.path);
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT te.status || ':' || oi.status
-                     FROM tool_executions te
-                     JOIN operation_intents oi ON oi.id = te.operation_intent_id
-                     WHERE te.id = 'execution-boundary'",
-                    [],
-                    |row| row.get::<_, String>(0)
-                )
-                .unwrap(),
-            "running:started"
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT current_sequence FROM tasks WHERE id = 'task-1'",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            1
-        );
-    }
-}
-
-#[test]
-fn approval_required_begin_accepts_only_an_atomically_consumed_grant() {
-    let database = TempDatabase::new();
-    let operation_digest = persist_request_artifact(&database);
-    persist_policy_decision(&database.path, &operation_digest, "require_approval");
-    let store = SqliteStore::open(&database.path).unwrap();
-    let execution_id = ToolExecutionId::new("execution-approved").unwrap();
-    store
-        .reserve(NewToolIntent {
-            execution_id: execution_id.clone(),
-            operation_digest: operation_digest.clone(),
-        })
-        .unwrap();
-    let error = store
-        .begin(NewToolExecution {
-            execution_id: execution_id.clone(),
-        })
-        .unwrap_err();
-    assert_eq!(
-        error.safe_classification(),
-        local_agent_terminal_application::SafeErrorClassification::PermissionDenied
-    );
-
-    seed_consumed_approval(&database.path, &operation_digest, "9999-12-31T23:59:59Z");
-    assert!(
-        !store
-            .begin(NewToolExecution { execution_id })
-            .unwrap()
-            .completed
-    );
-}
-
-#[test]
-fn one_publicly_claimed_approval_authorizes_exactly_one_execution() {
-    let database = TempDatabase::new();
-    let store = SqliteStore::open(&database.path).unwrap();
-    let ApprovalDigestPayload::Tool(mut payload) = parse_approval_payload(TOOL_FIXTURE).unwrap()
-    else {
-        unreachable!();
-    };
-    payload.requested_at = "2099-01-01T00:00:00Z".to_owned();
-    payload.expires_at = "2099-01-01T01:00:00Z".to_owned();
-    let canonical =
-        canonical_approval_payload(&ApprovalDigestPayload::Tool(payload.clone())).unwrap();
-    persist_artifact(
-        &database,
-        "approval-public",
-        "approvals/approval-public.json",
-        "tool-request",
-        &canonical.canonical_bytes,
-    );
-    let approval_id = ApprovalId::new("approval-public").unwrap();
-    let binding = ToolRequestBindingDigest::from_persisted(
-        Sha256Digest::new(format!("sha256:{}", "f".repeat(64))).unwrap(),
-    );
-    store
-        .request(NewApproval {
-            approval_id: approval_id.clone(),
-            operation_digest: canonical.operation_digest.clone(),
-            task_id: TaskId::new("task-1").unwrap(),
-            workspace_version: WorkspaceVersion::new(payload.workspace_version),
-            policy_snapshot_digest: Sha256Digest::new(payload.policy_snapshot_digest.clone())
-                .unwrap(),
-            fencing_token: payload.operation.executor_fencing_token,
-            tool_request_binding_digest: Some(binding.clone()),
-            expires_at: payload.expires_at.clone(),
-            nonce: payload.nonce.clone(),
-        })
-        .unwrap();
-    store
-        .resolve(ApprovalResolution {
-            approval_id: approval_id.clone(),
-            approved: true,
-        })
-        .unwrap();
-    store
-        .claim(ApprovalClaim {
-            approval_id,
-            expected_operation_digest: canonical.operation_digest.clone(),
-            task_id: TaskId::new("task-1").unwrap(),
-            workspace_version: WorkspaceVersion::new(payload.workspace_version),
-            policy_snapshot_digest: Sha256Digest::new(payload.policy_snapshot_digest).unwrap(),
-            fencing_token: payload.operation.executor_fencing_token,
-            tool_request_binding_digest: binding,
-            nonce: payload.nonce,
-            claimed_at: "2099-01-01T00:01:00Z".to_owned(),
-        })
-        .unwrap()
-        .expect("approval claim");
-    persist_policy_decision(
-        &database.path,
-        &canonical.operation_digest,
-        "require_approval",
-    );
-    let first_id = ToolExecutionId::new("execution-approved-first").unwrap();
-    let second_id = ToolExecutionId::new("execution-approved-second").unwrap();
-    for execution_id in [&first_id, &second_id] {
-        store
-            .reserve(NewToolIntent {
-                execution_id: execution_id.clone(),
-                operation_digest: canonical.operation_digest.clone(),
-            })
-            .unwrap();
-    }
-
-    let barrier = Arc::new(Barrier::new(2));
-    let outcomes = std::thread::scope(|scope| {
-        let first_store = store.clone();
-        let first_barrier = Arc::clone(&barrier);
-        let first = scope.spawn(move || {
-            first_barrier.wait();
-            first_store.begin(NewToolExecution {
-                execution_id: first_id.clone(),
-            })
-        });
-        let second_store = store.clone();
-        let second_barrier = Arc::clone(&barrier);
-        let second = scope.spawn(move || {
-            second_barrier.wait();
-            second_store.begin(NewToolExecution {
-                execution_id: second_id.clone(),
-            })
-        });
-        [first.join().unwrap(), second.join().unwrap()]
-    });
-    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
-    assert_eq!(
-        outcomes.iter().filter(|outcome| outcome.is_err()).count(),
-        1
-    );
-    drop(store);
-    let reopened = SqliteStore::open(&database.path).unwrap();
-    for execution_id in ["execution-approved-first", "execution-approved-second"] {
-        if configured_connection(&database.path)
-            .query_row(
-                "SELECT status FROM operation_intents WHERE id = ?1",
-                [execution_id],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap()
-            == "pending"
-        {
-            assert!(reopened
-                .begin(NewToolExecution {
-                    execution_id: ToolExecutionId::new(execution_id).unwrap(),
-                })
-                .is_err());
-        }
-    }
-}
-
-#[test]
-fn expired_consumed_approval_cannot_begin() {
-    let database = TempDatabase::new();
-    let operation_digest = persist_request_artifact(&database);
-    persist_policy_decision(&database.path, &operation_digest, "require_approval");
-    seed_consumed_approval(&database.path, &operation_digest, "2000-01-01T00:00:00Z");
-    let store = SqliteStore::open(&database.path).unwrap();
-    let execution_id = ToolExecutionId::new("execution-expired-approval").unwrap();
-    store
-        .reserve(NewToolIntent {
-            execution_id: execution_id.clone(),
-            operation_digest,
-        })
-        .unwrap();
-
-    assert!(store.begin(NewToolExecution { execution_id }).is_err());
-}
-
-#[test]
-fn completion_retry_rejects_any_inconsistent_persisted_result_field() {
-    let mutations = [
-        "UPDATE operation_intents SET status = 'indeterminate'
-         WHERE id = 'execution-tamper'",
-        "UPDATE operation_intents SET result_artifact_id = 'request-artifact'
-         WHERE id = 'execution-tamper'",
-        "UPDATE operation_intents SET external_receipt_json = '{}'
-         WHERE id = 'execution-tamper'",
-        "UPDATE tool_executions SET completed_at = NULL
-         WHERE id = 'execution-tamper'",
-        "UPDATE tool_executions SET stderr_artifact_id = 'request-artifact'
-         WHERE id = 'execution-tamper'",
-        "UPDATE tasks SET operation_state = 'Running' WHERE id = 'task-1'",
-    ];
-    for mutation in mutations {
-        let database = TempDatabase::new();
-        let (store, completion) = completed_execution(&database, "execution-tamper");
-        configured_connection(&database.path)
-            .execute_batch(mutation)
-            .unwrap();
-
-        assert!(
-            store.finish(completion).is_err(),
-            "retry accepted inconsistent state after {mutation}"
-        );
-    }
-}
-
-#[test]
-fn completion_scopes_duplicate_output_digests_to_the_execution_task() {
-    let database = TempDatabase::new();
-    let operation_digest = persist_request_artifact(&database);
-    persist_policy_decision(&database.path, &operation_digest, "allow");
-    let output_digest = persist_output_artifact(&database, b"shared output");
-    persist_duplicate_artifact_metadata(
-        &database,
-        "000-other-task-output",
-        "output-artifact",
-        true,
-    );
-    let store = SqliteStore::open(&database.path).unwrap();
-    let execution_id = ToolExecutionId::new("execution-cross-task-output").unwrap();
-    store
-        .reserve(NewToolIntent {
-            execution_id: execution_id.clone(),
-            operation_digest,
-        })
-        .unwrap();
-    store
-        .begin(NewToolExecution {
-            execution_id: execution_id.clone(),
-        })
-        .unwrap();
-
-    assert!(
-        store
-            .finish(ToolExecutionCompletion {
-                execution_id: execution_id.clone(),
-                receipt: process_receipt(execution_id, Some(0), output_digest),
-            })
-            .unwrap()
-            .completed
-    );
-    assert_eq!(
-        configured_connection(&database.path)
-            .query_row(
-                "SELECT stdout_artifact_id FROM tool_executions
-                 WHERE id = 'execution-cross-task-output'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-        "output-artifact"
-    );
-}
-
-#[test]
-fn exact_completion_retry_verifies_the_persisted_artifact_id() {
-    let database = TempDatabase::new();
-    let (store, completion) = completed_execution(&database, "execution-exact-artifact");
-    persist_duplicate_artifact_metadata(
-        &database,
-        "000-same-task-output",
-        "output-artifact",
-        false,
-    );
-
-    assert!(store.finish(completion).unwrap().completed);
-}
-
-#[test]
-fn tool_execution_statuses_and_run_request_id_uniqueness_are_enforced() {
-    let allowed = [
-        ("pending", "running"),
-        ("pending", "denied"),
-        ("running", "succeeded"),
-        ("running", "failed"),
-        ("running", "terminated"),
-        ("running", "interrupted"),
-        ("running", "indeterminate"),
-        ("running", "denied"),
-    ];
-    let forbidden = [
-        ("pending", "succeeded"),
-        ("succeeded", "running"),
-        ("failed", "pending"),
-        ("denied", "running"),
-    ];
-    let database = TempDatabase::new();
-    let operation_digest = persist_request_artifact(&database);
-    persist_policy_decision(&database.path, &operation_digest, "allow");
-    let store = SqliteStore::open(&database.path).unwrap();
-    for (index, (from, to)) in allowed.into_iter().enumerate() {
-        insert_tool_execution(
-            &database,
-            &store,
-            &operation_digest,
-            index,
-            from,
-            &format!("request-{index}"),
-        );
-        assert!(configured_connection(&database.path)
-            .execute(
-                "UPDATE tool_executions SET status = ?1 WHERE id = ?2",
-                params![to, format!("status-execution-{index}")],
-            )
-            .is_ok());
-    }
-    for (offset, (from, to)) in forbidden.into_iter().enumerate() {
-        let index = allowed.len() + offset;
-        insert_tool_execution(
-            &database,
-            &store,
-            &operation_digest,
-            index,
-            from,
-            &format!("request-{index}"),
-        );
-        assert!(configured_connection(&database.path)
-            .execute(
-                "UPDATE tool_executions SET status = ?1 WHERE id = ?2",
-                params![to, format!("status-execution-{index}")],
-            )
-            .is_err());
-    }
-    let first_index = allowed.len() + forbidden.len();
-    insert_tool_execution(
-        &database,
-        &store,
-        &operation_digest,
-        first_index,
-        "pending",
-        "duplicate-request",
-    );
-    let second_index = first_index + 1;
-    assert!(try_insert_tool_execution(
-        &database,
-        &store,
-        &operation_digest,
-        second_index,
-        "pending",
-        "duplicate-request",
-    )
-    .is_err());
-}
-
-fn completed_execution(
-    database: &TempDatabase,
-    execution_id: &str,
-) -> (SqliteStore, ToolExecutionCompletion) {
-    let operation_digest = persist_request_artifact(database);
-    persist_policy_decision(&database.path, &operation_digest, "allow");
-    let output_digest = persist_output_artifact(database, b"tamper output");
-    let store = SqliteStore::open(&database.path).unwrap();
-    let execution_id = ToolExecutionId::new(execution_id).unwrap();
-    store
-        .reserve(NewToolIntent {
-            execution_id: execution_id.clone(),
-            operation_digest,
-        })
-        .unwrap();
-    store
-        .begin(NewToolExecution {
-            execution_id: execution_id.clone(),
-        })
-        .unwrap();
-    let completion = ToolExecutionCompletion {
-        execution_id: execution_id.clone(),
-        receipt: process_receipt(execution_id, Some(0), output_digest),
-    };
-    store.finish(completion.clone()).unwrap();
-    (store, completion)
-}
-
-fn process_receipt(
-    execution_id: ToolExecutionId,
-    exit_code: Option<i32>,
-    output_digest: Sha256Digest,
-) -> ProcessReceipt {
-    ProcessReceipt {
-        execution_id,
-        status: ProcessStatus::Exited,
-        exit_code,
-        stdout: BoundedOutput {
-            bytes: Vec::new(),
-            truncated: false,
-        },
-        stderr: BoundedOutput {
-            bytes: Vec::new(),
-            truncated: false,
-        },
-        duration_ms: 0,
-        job_receipt: JobReceipt {
-            root_pid: 1,
-            job_id: "storage-test-job".to_owned(),
-            kill_on_close: true,
-            no_breakaway: true,
-            job_memory_limit: true,
-            job_cpu_time_limit: true,
-            memory_limit_bytes: 256 * 1024 * 1024,
-            cpu_time_limit_ms: 5_000,
-            max_active_processes: 8,
-            total_user_time_ms: 10,
-            resource_limit_terminated: false,
-            tree_terminated: false,
-        },
-        observed_writes: Vec::new(),
-        output_digest,
-    }
-}
-
-fn observed_process_write(path: &str, root_identity: &str, bytes: &[u8]) -> ObservedProcessWrite {
-    ObservedProcessWrite::new(
-        CapabilityRef::worktree(TaskId::new("task-1").unwrap(), path).unwrap(),
-        CapabilityRootIdentity::new(root_identity).unwrap(),
-        if path == "." {
-            ResolvedCapabilityTarget::Root
-        } else {
-            ResolvedCapabilityTarget::Relative(
-                RelativePathComponents::new(path.split(['/', '\\']).map(str::to_owned).collect())
-                    .unwrap(),
-            )
-        },
-        VerifiedWrite {
-            digest: digest_bytes(bytes),
-            size_bytes: bytes.len() as u64,
-        },
-    )
-}
-
-fn insert_tool_execution(
-    database: &TempDatabase,
-    store: &SqliteStore,
-    operation_digest: &Sha256Digest,
-    index: usize,
-    status: &str,
-    request_id: &str,
-) {
-    try_insert_tool_execution(database, store, operation_digest, index, status, request_id)
-        .unwrap();
-}
-
-fn try_insert_tool_execution(
-    database: &TempDatabase,
-    store: &SqliteStore,
-    operation_digest: &Sha256Digest,
-    index: usize,
-    status: &str,
-    request_id: &str,
-) -> rusqlite::Result<usize> {
-    let execution_id = format!("status-execution-{index}");
-    store
-        .reserve(NewToolIntent {
-            execution_id: ToolExecutionId::new(execution_id.clone()).unwrap(),
-            operation_digest: operation_digest.clone(),
-        })
-        .unwrap();
-    configured_connection(&database.path).execute(
-        "INSERT INTO tool_executions (
-            id, task_id, run_id, request_id, tool_name, arguments_artifact_id,
-            policy_decision_id, approval_id, operation_intent_id,
-            executor_fencing_token, status
-         ) VALUES (?1, 'task-1', 'run-1', ?2, 'process.exec', 'request-artifact',
-            'policy-1', NULL, ?1, 19, ?3)",
-        params![execution_id, request_id, status],
-    )
-}
-
-fn persist_duplicate_artifact_metadata(
-    database: &TempDatabase,
-    duplicate_id: &str,
-    source_id: &str,
-    cross_task: bool,
-) {
-    let connection = configured_connection(&database.path);
-    if cross_task {
-        connection
-            .execute(
-                "INSERT INTO projects (
-                    id, name, repository_path, repository_identity, created_at, updated_at,
-                    policy_profile_id, artifact_root_mode, artifact_root_path
-                 ) VALUES ('project-2', 'Other', 'C:/other', 'repo-2',
-                    '2026-07-23T00:00:00Z', '2026-07-23T00:00:00Z',
-                    'policy-1', 'application_data', ?1)",
-                [database.directory.to_string_lossy().as_ref()],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO tasks (
-                    id, project_id, title, objective, phase, condition, operation_state,
-                    risk_level, base_branch, base_commit, created_at, updated_at
-                 ) VALUES ('task-2', 'project-2', 'Other', 'Other', 'Implementation',
-                    'Active', 'None', 'low', 'main', ?1,
-                    '2026-07-23T00:00:00Z', '2026-07-23T00:00:00Z')",
-                ["b".repeat(40)],
-            )
-            .unwrap();
-    }
-    connection
-        .execute(
-            "INSERT INTO artifacts (
-                id, task_id, project_id, artifact_type, logical_path, content_hash, storage_key,
-                size_bytes, mime_type, availability, created_by_type, created_by_id, created_at,
-                supersedes, verification_state
-             )
-             SELECT ?1, ?2, ?3, artifact_type,
-                    CASE WHEN ?5 THEN logical_path ELSE logical_path || '.duplicate' END,
-                    content_hash, storage_key,
-                    size_bytes, mime_type, availability, created_by_type, created_by_id,
-                    created_at, supersedes, verification_state
-             FROM artifacts WHERE id = ?4",
-            params![
-                duplicate_id,
-                if cross_task { "task-2" } else { "task-1" },
-                if cross_task { "project-2" } else { "project-1" },
-                source_id,
-                cross_task,
-            ],
-        )
-        .unwrap();
-}
-
 fn seed_authoritative_context(path: &Path, artifact_root: &Path) {
     let connection = configured_connection(path);
     connection
@@ -1855,18 +2218,6 @@ fn digest_bytes(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
 }
 
-fn persist_output_artifact(database: &TempDatabase, bytes: &[u8]) -> Sha256Digest {
-    let digest = Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap();
-    persist_artifact(
-        database,
-        "output-artifact",
-        "tool-results/execution.stdout",
-        "tool-output",
-        bytes,
-    );
-    digest
-}
-
 fn persist_artifact(
     database: &TempDatabase,
     id: &str,
@@ -1955,7 +2306,7 @@ fn seed_consumed_approval(path: &Path, operation_digest: &Sha256Digest, expires_
                 "workspaceVersion": 4,
                 "policySnapshotDigest": payload.policy_snapshot_digest,
                 "fencingToken": 19,
-                "toolRequestBindingDigest": format!("sha256:{}", "f".repeat(64)),
+                "toolRequestBindingDigest": digest_char('f').as_str(),
             })
             .to_string()],
         )
@@ -1966,6 +2317,34 @@ fn seed_consumed_approval(path: &Path, operation_digest: &Sha256Digest, expires_
             [],
         )
         .unwrap();
+}
+
+fn insert_status_test_execution(
+    database: &TempDatabase,
+    store: &SqliteStore,
+    operation_digest: &Sha256Digest,
+    index: usize,
+    status: &str,
+    request_id: &str,
+) -> rusqlite::Result<()> {
+    let execution_id = format!("status-execution-{index}");
+    store
+        .reserve(NewToolIntent {
+            execution_id: ToolExecutionId::new(execution_id.clone()).unwrap(),
+            operation_digest: operation_digest.clone(),
+        })
+        .unwrap();
+    configured_connection(&database.path).execute(
+        "INSERT INTO tool_executions (
+            id, task_id, run_id, request_id, tool_name, arguments_artifact_id,
+            policy_decision_id, approval_id, operation_intent_id,
+            executor_fencing_token, status, started_at, completed_at, exit_code,
+            stdout_artifact_id, stderr_artifact_id
+         ) VALUES (?1, 'task-1', 'run-1', ?2, 'process.exec', 'request-artifact',
+            'policy-1', NULL, ?1, 19, ?3, NULL, NULL, NULL, NULL, NULL)",
+        params![execution_id, request_id, status],
+    )?;
+    Ok(())
 }
 
 fn configured_connection(path: &Path) -> Connection {
