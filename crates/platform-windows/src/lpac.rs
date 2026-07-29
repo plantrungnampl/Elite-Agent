@@ -17,7 +17,8 @@ use local_agent_terminal_application::{
 };
 use local_agent_terminal_domain::{CapabilityRef, NetworkProfile, ProcessTrustTier, TaskId};
 use windows_sys::Win32::Foundation::{
-    GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE,
+    GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_HANDLE_EOF, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_SUCCESS, HANDLE,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W,
@@ -44,9 +45,10 @@ use windows_sys::Win32::Security::{
 #[cfg(feature = "test-seams")]
 use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::Storage::FileSystem::{
-    GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, READ_CONTROL,
+    FileStreamInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_STREAM_INFO, READ_CONTROL,
     WRITE_DAC,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
@@ -57,6 +59,7 @@ use windows_sys::Win32::System::Threading::OpenProcessToken;
 use crate::job::OwnedHandle;
 
 const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00B7_u32 as i32;
+const STREAM_INFORMATION_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub struct TrustedLpacWorktreeRegistration {
@@ -454,7 +457,8 @@ impl LpacBoundary {
             })
             .ok_or_else(permission_denied)?;
         worktree.reverify()?;
-        ensure_empty_worktree(worktree)?;
+        ensure_empty_worktree(worktree, &request.execution_id)?;
+        let executable = open_retained_executable(&request.executable, &request.execution_id)?;
 
         let profile = AppContainerProfile::create(request.execution_id.clone())?;
         let environment = lpac_environment(request, profile.local_app_data());
@@ -465,7 +469,6 @@ impl LpacBoundary {
             root_handle,
             Arc::clone(&profile.package_sid),
         )?);
-        let executable = open_retained_executable(&request.executable)?;
         acl_grants.push(RetainedAclGrant::grant(
             request.execution_id.clone(),
             executable,
@@ -903,19 +906,25 @@ fn validate_lpac_request(request: &AuthorizedProcessRequest) -> Result<(), PortE
     Ok(())
 }
 
-fn ensure_empty_worktree(worktree: &RetainedLpacWorktree) -> Result<(), PortError> {
+fn ensure_empty_worktree(
+    worktree: &RetainedLpacWorktree,
+    execution_id: &ToolExecutionId,
+) -> Result<(), PortError> {
     let mut entries = std::fs::read_dir(&worktree.canonical_root).map_err(|_| denied())?;
     match entries.next() {
         None => {
             worktree.reverify()?;
-            Ok(())
+            ensure_directory_has_no_named_streams(&worktree.retained_root, execution_id)
         }
         Some(Ok(_)) => Err(permission_denied()),
         Some(Err(_)) => Err(permission_denied()),
     }
 }
 
-fn open_retained_executable(executable: &ResolvedExecutable) -> Result<File, PortError> {
+fn open_retained_executable(
+    executable: &ResolvedExecutable,
+    execution_id: &ToolExecutionId,
+) -> Result<File, PortError> {
     let metadata = std::fs::symlink_metadata(&executable.canonical_path).map_err(|_| denied())?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
@@ -937,7 +946,111 @@ fn open_retained_executable(executable: &ResolvedExecutable) -> Result<File, Por
     {
         return Err(integrity_failure());
     }
+    ensure_file_has_only_unnamed_data_stream(&handle, execution_id)?;
     Ok(handle)
+}
+
+fn ensure_directory_has_no_named_streams(
+    file: &File,
+    execution_id: &ToolExecutionId,
+) -> Result<(), PortError> {
+    inspect_stream_information(file, execution_id, true)
+}
+
+fn ensure_file_has_only_unnamed_data_stream(
+    file: &File,
+    execution_id: &ToolExecutionId,
+) -> Result<(), PortError> {
+    inspect_stream_information(file, execution_id, false)
+}
+
+fn inspect_stream_information(
+    file: &File,
+    execution_id: &ToolExecutionId,
+    empty_stream_list_allowed: bool,
+) -> Result<(), PortError> {
+    let buffer_element_count = STREAM_INFORMATION_BUFFER_BYTES.div_ceil(std::mem::size_of::<u64>());
+    let mut aligned_buffer = vec![0_u64; buffer_element_count];
+    // SAFETY: file is a retained live handle and aligned_buffer is writable,
+    // 8-byte aligned, and covers the fixed byte count passed to the API.
+    let queried = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileStreamInfo,
+            aligned_buffer.as_mut_ptr().cast(),
+            STREAM_INFORMATION_BUFFER_BYTES as u32,
+        )
+    };
+    if queried == 0 {
+        // SAFETY: this reads the calling thread's last error immediately after
+        // the failed file-information query.
+        let error = unsafe { GetLastError() };
+        if empty_stream_list_allowed && error == ERROR_HANDLE_EOF {
+            return Ok(());
+        }
+        record_windows_error(execution_id, error);
+        return Err(platform_error());
+    }
+    // SAFETY: aligned_buffer remains live and its allocation covers the fixed byte count.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            aligned_buffer.as_ptr().cast::<u8>(),
+            STREAM_INFORMATION_BUFFER_BYTES,
+        )
+    };
+    let stream_name_offset = std::mem::offset_of!(FILE_STREAM_INFO, StreamName);
+    let unnamed_data_stream = "::$DATA".encode_utf16().collect::<Vec<_>>();
+    let mut entry_offset = 0_usize;
+    let mut entry_count = 0_usize;
+    loop {
+        let next_entry_offset = read_u32(bytes, entry_offset).ok_or_else(integrity_failure)?;
+        let stream_name_length = read_u32(bytes, entry_offset + std::mem::size_of::<u32>())
+            .ok_or_else(integrity_failure)? as usize;
+        if stream_name_length == 0 || !stream_name_length.is_multiple_of(std::mem::size_of::<u16>())
+        {
+            return Err(integrity_failure());
+        }
+        let stream_name_start = entry_offset
+            .checked_add(stream_name_offset)
+            .ok_or_else(integrity_failure)?;
+        let stream_name_end = stream_name_start
+            .checked_add(stream_name_length)
+            .ok_or_else(integrity_failure)?;
+        let stream_name_bytes = bytes
+            .get(stream_name_start..stream_name_end)
+            .ok_or_else(integrity_failure)?;
+        let stream_name = stream_name_bytes
+            .chunks_exact(std::mem::size_of::<u16>())
+            .map(|unit| u16::from_ne_bytes([unit[0], unit[1]]))
+            .collect::<Vec<_>>();
+        if stream_name != unnamed_data_stream {
+            return Err(permission_denied());
+        }
+        entry_count += 1;
+        if next_entry_offset == 0 {
+            return if entry_count == 1 {
+                Ok(())
+            } else {
+                Err(integrity_failure())
+            };
+        }
+        let next_entry_offset = next_entry_offset as usize;
+        if next_entry_offset < stream_name_offset + stream_name_length
+            || !next_entry_offset.is_multiple_of(std::mem::align_of::<u64>())
+        {
+            return Err(integrity_failure());
+        }
+        entry_offset = entry_offset
+            .checked_add(next_entry_offset)
+            .filter(|offset| *offset < bytes.len())
+            .ok_or_else(integrity_failure)?;
+    }
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(std::mem::size_of::<u32>())?;
+    let value = bytes.get(offset..end)?;
+    Some(u32::from_ne_bytes(value.try_into().ok()?))
 }
 
 fn open_acl_handle(path: &Path, directory: bool) -> Result<File, PortError> {
@@ -1278,7 +1391,7 @@ static TOKEN_VERIFICATION_MISMATCH: Mutex<Option<(String, LpacTokenVerificationM
     Mutex::new(None);
 
 #[cfg(feature = "test-seams")]
-static BYPASS_AAP_ATTESTATION: Mutex<Option<String>> = Mutex::new(None);
+static BYPASS_AAP_ATTESTATION: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 #[cfg(feature = "test-seams")]
 pub fn lpac_lifecycle_counts_for_test(
@@ -1304,20 +1417,15 @@ pub fn fail_lpac_token_verification_for_test(
 #[cfg(feature = "test-seams")]
 pub fn bypass_aap_attestation_for_test(execution_id: ToolExecutionId) {
     if let Ok(mut configured) = BYPASS_AAP_ATTESTATION.lock() {
-        *configured = Some(execution_id.as_str().to_owned());
+        configured.insert(execution_id.as_str().to_owned());
     }
 }
 
 #[cfg(feature = "test-seams")]
 fn take_aap_attestation_bypass(execution_id: &ToolExecutionId) -> bool {
-    BYPASS_AAP_ATTESTATION.lock().is_ok_and(|mut configured| {
-        if configured.as_deref() == Some(execution_id.as_str()) {
-            configured.take();
-            true
-        } else {
-            false
-        }
-    })
+    BYPASS_AAP_ATTESTATION
+        .lock()
+        .is_ok_and(|mut configured| configured.remove(execution_id.as_str()))
 }
 
 #[cfg(feature = "test-seams")]

@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(feature = "test-seams")]
+use std::collections::BTreeSet;
 use std::ffi::{c_void, OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
@@ -60,7 +62,8 @@ static FAIL_OUTPUT_READER_START: Mutex<Option<ToolExecutionId>> = Mutex::new(Non
 static FAIL_AFTER_RESUME: Mutex<Option<ToolExecutionId>> = Mutex::new(None);
 
 #[cfg(feature = "test-seams")]
-static OMIT_ALL_APPLICATION_PACKAGES_POLICY: Mutex<Option<ToolExecutionId>> = Mutex::new(None);
+static OMIT_ALL_APPLICATION_PACKAGES_POLICY: Mutex<BTreeSet<ToolExecutionId>> =
+    Mutex::new(BTreeSet::new());
 
 #[cfg(feature = "test-seams")]
 static OUTPUT_READER_COUNTS: Mutex<BTreeMap<ToolExecutionId, (usize, usize)>> =
@@ -86,7 +89,7 @@ pub fn fail_after_resume_for_test(execution_id: ToolExecutionId) {
 #[doc(hidden)]
 pub fn omit_all_application_packages_policy_for_test(execution_id: ToolExecutionId) {
     if let Ok(mut configured) = OMIT_ALL_APPLICATION_PACKAGES_POLICY.lock() {
-        *configured = Some(execution_id);
+        configured.insert(execution_id);
     }
 }
 
@@ -94,14 +97,7 @@ pub fn omit_all_application_packages_policy_for_test(execution_id: ToolExecution
 fn take_omit_all_application_packages_policy(execution_id: &ToolExecutionId) -> bool {
     OMIT_ALL_APPLICATION_PACKAGES_POLICY
         .lock()
-        .is_ok_and(|mut configured| {
-            if configured.as_ref() == Some(execution_id) {
-                configured.take();
-                true
-            } else {
-                false
-            }
-        })
+        .is_ok_and(|mut configured| configured.remove(execution_id))
 }
 
 #[cfg(feature = "test-seams")]
