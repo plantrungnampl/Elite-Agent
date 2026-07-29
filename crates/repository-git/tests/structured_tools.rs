@@ -1,11 +1,18 @@
+use std::collections::BTreeMap;
 use std::fs;
+use std::path::PathBuf;
 
 use git2::{Repository, Signature};
-use local_agent_terminal_application::{AuthorizedGitDiff, AuthorizedGitStatus, StructuredGit};
-use local_agent_terminal_domain::{CapabilityRef, GitObjectId, TaskId};
-use local_agent_terminal_repository_git::{
-    GitRepositoryGateway, GitStructuredTools, GitWorktreeRegistration,
+use local_agent_terminal_application::{
+    AuthorizedGitDiff, AuthorizedGitStatus, ExpectedPresence, PortError, Retryability, RiskLevel,
+    SafeErrorClassification, StructuredGit, TaskLeaseState, TaskQuery, TaskSnapshot,
+    WorktreeSnapshot, WorktreeState,
 };
+use local_agent_terminal_domain::{
+    CapabilityRef, Condition, GitObjectId, OperationState, Phase, ProjectId, Sequence, TaskBranch,
+    TaskId, WorkspaceFingerprint, WorkspaceVersion, WorktreeId,
+};
+use local_agent_terminal_repository_git::{GitRepositoryGateway, GitStructuredTools};
 use tempfile::TempDir;
 
 #[test]
@@ -273,19 +280,9 @@ fn coherent_snapshot_fails_closed_for_head_index_or_worktree_mutation() {
         SnapshotMutation::Worktree,
     ] {
         let fixture = initialized_repository("one\n");
-        let managed = TempDir::new().unwrap();
-        let gateway = GitRepositoryGateway::open(managed.path(), &[]).unwrap();
-        let locator = gateway.locate(fixture.path()).unwrap();
-        let head = GitObjectId::new(first_locator_head(fixture.path()).to_string()).unwrap();
         let repository_path = fixture.path().to_owned();
-        let tools = GitStructuredTools::new(vec![GitWorktreeRegistration::validate(
-            task(),
-            locator,
-            head,
-        )
-        .unwrap()])
-        .unwrap()
-        .with_snapshot_hook_for_test(move || mutate_repository(&repository_path, mutation));
+        let tools = structured_tools(&fixture)
+            .with_snapshot_hook_for_test(move || mutate_repository(&repository_path, mutation));
 
         let error = tools
             .status(AuthorizedGitStatus {
@@ -305,21 +302,18 @@ fn coherent_snapshot_fails_closed_for_head_index_or_worktree_mutation() {
 
 #[test]
 fn registered_root_task_and_locator_binding_cannot_be_cross_paired() {
-    let first = initialized_repository("first");
-    let second = initialized_repository("second");
-    let managed = TempDir::new().unwrap();
-    let gateway = GitRepositoryGateway::open(managed.path(), &[]).unwrap();
-    let first_locator = gateway.locate(first.path()).unwrap();
-    let second_locator = gateway.locate(second.path()).unwrap();
-    let first_head = GitObjectId::new(first_locator_head(first.path()).to_string()).unwrap();
-    let second_head = GitObjectId::new(first_locator_head(second.path()).to_string()).unwrap();
+    let fixture = OwnedGitFixture::with_tasks(&[
+        ("task-1", "worktree-1", "first"),
+        ("task-2", "worktree-2", "second"),
+    ]);
     let second_task = TaskId::new("task-2").unwrap();
-    let first_registration =
-        GitWorktreeRegistration::validate(task(), first_locator, first_head).unwrap();
-    let second_registration =
-        GitWorktreeRegistration::validate(second_task, second_locator, second_head).unwrap();
-    let second_root = second_registration.root_identity().clone();
-    let tools = GitStructuredTools::new(vec![first_registration, second_registration]).unwrap();
+    let tools = GitStructuredTools::from_owned_tasks(
+        &fixture.gateway,
+        &fixture.tasks,
+        &[task(), second_task.clone()],
+    )
+    .unwrap();
+    let second_root = tools.root_identity(&second_task).unwrap().clone();
 
     let error = tools
         .status(AuthorizedGitStatus {
@@ -337,30 +331,23 @@ fn registered_root_task_and_locator_binding_cannot_be_cross_paired() {
 
 #[test]
 fn validated_registration_derives_root_from_task_repository_and_revision() {
-    let first = initialized_repository("first");
-    let second = initialized_repository("second");
-    let managed = TempDir::new().unwrap();
-    let gateway = GitRepositoryGateway::open(managed.path(), &[]).unwrap();
-    let first_locator = gateway.locate(first.path()).unwrap();
-    let second_locator = gateway.locate(second.path()).unwrap();
-    let first_head = GitObjectId::new(first_locator_head(first.path()).to_string()).unwrap();
-    let second_head = GitObjectId::new(first_locator_head(second.path()).to_string()).unwrap();
-
-    let first_registration =
-        GitWorktreeRegistration::validate(task(), first_locator, first_head).unwrap();
-    let second_registration = GitWorktreeRegistration::validate(
-        TaskId::new("task-2").unwrap(),
-        second_locator,
-        second_head,
+    let fixture = OwnedGitFixture::with_tasks(&[
+        ("task-1", "worktree-1", "first"),
+        ("task-2", "worktree-2", "second"),
+    ]);
+    let second_task = TaskId::new("task-2").unwrap();
+    let tools = GitStructuredTools::from_owned_tasks(
+        &fixture.gateway,
+        &fixture.tasks,
+        &[task(), second_task.clone()],
     )
     .unwrap();
 
     assert_ne!(
-        first_registration.root_identity(),
-        second_registration.root_identity()
+        tools.root_identity(&task()),
+        tools.root_identity(&second_task)
     );
-    let first_root = first_registration.root_identity().clone();
-    let tools = GitStructuredTools::new(vec![first_registration, second_registration]).unwrap();
+    let first_root = tools.root_identity(&task()).unwrap().clone();
     let result = tools
         .status(AuthorizedGitStatus {
             task_id: task(),
@@ -377,27 +364,18 @@ fn canonical_worktree_rebind_is_rejected_before_git_bytes_are_generated() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    let parent = TempDir::new().unwrap();
-    let first_path = parent.path().join("first");
-    let second_path = parent.path().join("second");
-    fs::create_dir(&first_path).unwrap();
+    let fixture = OwnedGitFixture::new("first");
+    let first_path = fixture.workdir.clone();
+    let second_path = fixture._root.path().join("second");
     fs::create_dir(&second_path).unwrap();
-    initialize_repository_at(&first_path, "first");
     initialize_repository_at(&second_path, "second");
-    let managed = TempDir::new().unwrap();
-    let gateway = GitRepositoryGateway::open(managed.path(), &[]).unwrap();
-    let locator = gateway.locate(&first_path).unwrap();
-    let head = GitObjectId::new(first_locator_head(&first_path).to_string()).unwrap();
-    let registration = GitWorktreeRegistration::validate(task(), locator, head).unwrap();
-    let root_identity = registration.root_identity().clone();
     let generation_count = Arc::new(AtomicUsize::new(0));
     let observed_generation_count = generation_count.clone();
-    let tools = GitStructuredTools::new(vec![registration])
-        .unwrap()
-        .with_before_generation_hook_for_test(move || {
-            observed_generation_count.fetch_add(1, Ordering::SeqCst);
-        });
-    let displaced = parent.path().join("displaced");
+    let tools = structured_tools(&fixture).with_before_generation_hook_for_test(move || {
+        observed_generation_count.fetch_add(1, Ordering::SeqCst);
+    });
+    let root_identity = tools.root_identity(&task()).unwrap().clone();
+    let displaced = fixture._root.path().join("displaced");
     fs::rename(&first_path, &displaced).unwrap();
     fs::rename(&second_path, &first_path).unwrap();
 
@@ -417,41 +395,129 @@ fn canonical_worktree_rebind_is_rejected_before_git_bytes_are_generated() {
 }
 
 #[test]
-fn status_and_diff_are_in_process_and_fail_closed_for_hostile_configuration() {
-    let fixture = TempDir::new().unwrap();
-    let repository = Repository::init(fixture.path()).unwrap();
-    fs::write(fixture.path().join("README.md"), b"one\n").unwrap();
-    let mut index = repository.index().unwrap();
-    index.add_path(std::path::Path::new("README.md")).unwrap();
-    index.write().unwrap();
-    let tree_id = index.write_tree().unwrap();
-    let signature = Signature::now("test", "test@example.com").unwrap();
-    let commit = repository
-        .commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            "initial",
-            &repository.find_tree(tree_id).unwrap(),
-            &[],
+fn production_ownership_seam_rejects_an_unowned_or_cross_paired_task_record() {
+    let fixture = OwnedGitFixture::new("first\n");
+
+    let legitimate = GitStructuredTools::from_owned_tasks(
+        &fixture.gateway,
+        &fixture.tasks,
+        std::slice::from_ref(&task()),
+    );
+    assert!(legitimate.is_ok());
+
+    let unowned = GitStructuredTools::from_owned_tasks(
+        &fixture.gateway,
+        &fixture.tasks,
+        &[TaskId::new("task-2").unwrap()],
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        unowned.safe_classification(),
+        SafeErrorClassification::PermissionDenied
+    );
+
+    let mut cross_paired_tasks = fixture.tasks.clone();
+    cross_paired_tasks
+        .tasks
+        .get_mut(task().as_str())
+        .unwrap()
+        .worktree
+        .as_mut()
+        .unwrap()
+        .task_id = TaskId::new("task-2").unwrap();
+    let cross_paired = GitStructuredTools::from_owned_tasks(
+        &fixture.gateway,
+        &cross_paired_tasks,
+        std::slice::from_ref(&task()),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        cross_paired.safe_classification(),
+        SafeErrorClassification::PermissionDenied
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn rebind_after_initial_binding_check_denies_before_first_capture() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    for operation in [StructuredOperation::Status, StructuredOperation::Diff] {
+        let fixture = OwnedGitFixture::new("first\n");
+        let replacement = fixture._root.path().join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        initialize_repository_at(&replacement, "attacker\n");
+        let displaced = fixture._root.path().join("displaced");
+        let workdir = fixture.workdir.clone();
+        let generation_count = Arc::new(AtomicUsize::new(0));
+        let observed_generation_count = generation_count.clone();
+        let tools = GitStructuredTools::from_owned_tasks(
+            &fixture.gateway,
+            &fixture.tasks,
+            std::slice::from_ref(&task()),
         )
-        .unwrap();
+        .unwrap()
+        .with_after_initial_binding_hook_for_test(move || {
+            fs::rename(&workdir, &displaced).is_ok() && fs::rename(&replacement, &workdir).is_ok()
+        })
+        .with_before_generation_hook_for_test(move || {
+            observed_generation_count.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let error = run_structured_operation(&tools, operation).unwrap_err();
+
+        assert_eq!(
+            error.safe_classification(),
+            SafeErrorClassification::PermissionDenied,
+            "{operation:?}"
+        );
+        assert_eq!(generation_count.load(Ordering::SeqCst), 0, "{operation:?}");
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn rebind_after_output_before_return_denies_without_git_bytes() {
+    for operation in [StructuredOperation::Status, StructuredOperation::Diff] {
+        let fixture = OwnedGitFixture::new("first\n");
+        let replacement = fixture._root.path().join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        initialize_repository_at(&replacement, "attacker\n");
+        let displaced = fixture._root.path().join("displaced");
+        let workdir = fixture.workdir.clone();
+        let tools = GitStructuredTools::from_owned_tasks(
+            &fixture.gateway,
+            &fixture.tasks,
+            std::slice::from_ref(&task()),
+        )
+        .unwrap()
+        .with_before_return_hook_for_test(move || {
+            fs::rename(&workdir, &displaced).is_ok() && fs::rename(&replacement, &workdir).is_ok()
+        });
+
+        let error = run_structured_operation(&tools, operation).unwrap_err();
+
+        assert_eq!(
+            error.safe_classification(),
+            SafeErrorClassification::PermissionDenied,
+            "{operation:?}"
+        );
+    }
+}
+
+#[test]
+fn status_and_diff_are_in_process_and_fail_closed_for_hostile_configuration() {
+    let fixture = initialized_repository("one\n");
+    let repository = Repository::open(fixture.path()).unwrap();
     repository
         .config()
         .unwrap()
         .set_str("diff.external", "must-not-run")
         .unwrap();
-
-    let managed = fixture.path().join("managed");
-    fs::create_dir(&managed).unwrap();
-    let gateway = GitRepositoryGateway::open(&managed, &[]).unwrap();
-    let tools = GitStructuredTools::new(vec![GitWorktreeRegistration::validate(
-        task(),
-        gateway.locate(fixture.path()).unwrap(),
-        GitObjectId::new(commit.to_string()).unwrap(),
-    )
-    .unwrap()])
-    .unwrap();
+    let tools = structured_tools(&fixture);
     for result in [
         tools
             .status(AuthorizedGitStatus {
@@ -478,36 +544,11 @@ fn status_and_diff_are_in_process_and_fail_closed_for_hostile_configuration() {
 
 #[test]
 fn status_binds_the_repository_revision_and_scope() {
-    let fixture = TempDir::new().unwrap();
-    let repository = Repository::init(fixture.path()).unwrap();
-    fs::write(fixture.path().join("README.md"), b"one\n").unwrap();
-    let mut index = repository.index().unwrap();
-    index.add_path(std::path::Path::new("README.md")).unwrap();
-    index.write().unwrap();
-    let tree_id = index.write_tree().unwrap();
-    let signature = Signature::now("test", "test@example.com").unwrap();
-    let commit = repository
-        .commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            "initial",
-            &repository.find_tree(tree_id).unwrap(),
-            &[],
-        )
-        .unwrap();
+    let fixture = initialized_repository("one\n");
+    let commit = first_locator_head(fixture.path());
     fs::write(fixture.path().join("README.md"), b"two\n").unwrap();
-    let managed = fixture.path().join("managed");
-    fs::create_dir(&managed).unwrap();
-    let gateway = GitRepositoryGateway::open(&managed, &[]).unwrap();
-    let locator = gateway.locate(fixture.path()).unwrap();
-    let tools = GitStructuredTools::new(vec![GitWorktreeRegistration::validate(
-        task(),
-        locator.clone(),
-        GitObjectId::new(commit.to_string()).unwrap(),
-    )
-    .unwrap()])
-    .unwrap();
+    let locator = fixture.gateway.locate(fixture.path()).unwrap();
+    let tools = structured_tools(&fixture);
 
     let result = tools
         .status(AuthorizedGitStatus {
@@ -535,10 +576,8 @@ fn worktree() -> CapabilityRef {
     CapabilityRef::worktree(task(), ".").unwrap()
 }
 
-fn initialized_repository(contents: &str) -> TempDir {
-    let fixture = TempDir::new().unwrap();
-    initialize_repository_at(fixture.path(), contents);
-    fixture
+fn initialized_repository(contents: &str) -> OwnedGitFixture {
+    OwnedGitFixture::new(contents)
 }
 
 fn initialize_repository_at(path: &std::path::Path, contents: &str) {
@@ -618,18 +657,156 @@ fn first_locator_head(path: &std::path::Path) -> git2::Oid {
         .unwrap()
 }
 
-fn structured_tools(fixture: &TempDir) -> GitStructuredTools {
-    let managed = TempDir::new().unwrap();
-    let gateway = GitRepositoryGateway::open(managed.path(), &[]).unwrap();
-    let locator = gateway.locate(fixture.path()).unwrap();
-    let head = GitObjectId::new(first_locator_head(fixture.path()).to_string()).unwrap();
-    GitStructuredTools::new(vec![GitWorktreeRegistration::validate(
-        task(),
-        locator,
-        head,
+fn structured_tools(fixture: &OwnedGitFixture) -> GitStructuredTools {
+    let revision = GitObjectId::new(first_locator_head(fixture.path()).to_string()).unwrap();
+    let mut tasks = fixture.tasks.clone();
+    let task_snapshot = tasks.tasks.get_mut(task().as_str()).unwrap();
+    task_snapshot.base_commit = revision.clone();
+    task_snapshot.worktree.as_mut().unwrap().base_commit = revision;
+    GitStructuredTools::from_owned_tasks(&fixture.gateway, &tasks, std::slice::from_ref(&task()))
+        .unwrap()
+}
+
+struct OwnedGitFixture {
+    _root: TempDir,
+    workdir: PathBuf,
+    gateway: GitRepositoryGateway,
+    tasks: FakeTaskQuery,
+}
+
+impl OwnedGitFixture {
+    fn new(contents: &str) -> Self {
+        Self::with_tasks(&[("task-1", "worktree-1", contents)])
+    }
+
+    fn with_tasks(specifications: &[(&str, &str, &str)]) -> Self {
+        let root = TempDir::new().unwrap();
+        let gateway = GitRepositoryGateway::open(root.path(), &[]).unwrap();
+        let mut tasks = BTreeMap::new();
+        let mut first_workdir = None;
+        for (task_id, worktree_id, contents) in specifications {
+            let task_id = TaskId::new(*task_id).unwrap();
+            let worktree_id = WorktreeId::new(*worktree_id).unwrap();
+            let workdir = root.path().join(worktree_id.as_str());
+            fs::create_dir(&workdir).unwrap();
+            initialize_repository_at(&workdir, contents);
+            let locator = gateway.locate(&workdir).unwrap();
+            let revision = GitObjectId::new(first_locator_head(&workdir).to_string()).unwrap();
+            let snapshot = owned_task_snapshot(task_id, worktree_id, &locator, revision);
+            tasks.insert(snapshot.task_id.as_str().to_owned(), snapshot);
+            first_workdir.get_or_insert(workdir);
+        }
+        Self {
+            _root: root,
+            workdir: first_workdir.unwrap(),
+            gateway,
+            tasks: FakeTaskQuery { tasks },
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.workdir
+    }
+}
+
+#[derive(Clone)]
+struct FakeTaskQuery {
+    tasks: BTreeMap<String, TaskSnapshot>,
+}
+
+impl TaskQuery for FakeTaskQuery {
+    fn task(&self, task_id: &TaskId) -> Result<TaskSnapshot, PortError> {
+        self.tasks.get(task_id.as_str()).cloned().ok_or_else(|| {
+            PortError::failure(
+                SafeErrorClassification::NotFound,
+                Retryability::NonRetryable,
+            )
+        })
+    }
+
+    fn timeline(
+        &self,
+        _task_id: &TaskId,
+    ) -> Result<Vec<local_agent_terminal_application::TimelineEntryDto>, PortError> {
+        Ok(Vec::new())
+    }
+}
+
+fn owned_task_snapshot(
+    task_id: TaskId,
+    worktree_id: WorktreeId,
+    locator: &local_agent_terminal_application::RepositoryLocator,
+    revision: GitObjectId,
+) -> TaskSnapshot {
+    let fingerprint = WorkspaceFingerprint::new(
+        revision.clone(),
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     )
-    .unwrap()])
-    .unwrap()
+    .unwrap();
+    let branch = TaskBranch::new(format!("codex/{}", task_id.as_str())).unwrap();
+    let worktree = WorktreeSnapshot {
+        worktree_id: worktree_id.clone(),
+        repository_id: locator.repository_id.clone(),
+        repository_identity: locator.stable_identity.clone(),
+        task_id: task_id.clone(),
+        branch: branch.clone(),
+        base_commit: revision.clone(),
+        target_path_display: format!("<managed-workspace>/{}", worktree_id.as_str()),
+        state: WorktreeState::Present,
+        expected_presence: ExpectedPresence::Present,
+        fingerprint,
+    };
+    TaskSnapshot {
+        task_id,
+        project_id: ProjectId::new("project-1").unwrap(),
+        title: "Structured Git".to_owned(),
+        objective: "Keep Git output task-owned".to_owned(),
+        risk_level: RiskLevel::High,
+        phase: Phase::Intake,
+        condition: Condition::Active,
+        operation_state: OperationState::None,
+        base_branch: TaskBranch::new("main").unwrap(),
+        base_commit: revision,
+        task_branch: Some(branch),
+        worktree: Some(worktree),
+        current_sequence: Sequence::new(0),
+        workspace_version: WorkspaceVersion::new(0),
+        fencing_epoch: 1,
+        lease_state: TaskLeaseState::Active,
+        recovery_candidates: Vec::new(),
+        timeline: Vec::new(),
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[derive(Clone, Copy, Debug)]
+enum StructuredOperation {
+    Status,
+    Diff,
+}
+
+#[cfg(feature = "test-seams")]
+fn run_structured_operation(
+    tools: &GitStructuredTools,
+    operation: StructuredOperation,
+) -> Result<(), PortError> {
+    match operation {
+        StructuredOperation::Status => tools
+            .status(AuthorizedGitStatus {
+                task_id: task(),
+                worktree: worktree(),
+                root_identity: tools.root_identity(&task()).unwrap().clone(),
+            })
+            .map(|_| ()),
+        StructuredOperation::Diff => tools
+            .diff(AuthorizedGitDiff {
+                task_id: task(),
+                worktree: worktree(),
+                root_identity: tools.root_identity(&task()).unwrap().clone(),
+            })
+            .map(|_| ()),
+    }
 }
 
 #[cfg(feature = "test-seams")]

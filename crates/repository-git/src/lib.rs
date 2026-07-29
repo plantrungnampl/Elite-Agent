@@ -13,9 +13,10 @@ use std::sync::Mutex;
 use std::sync::{Arc, Barrier};
 
 use local_agent_terminal_application::{
-    CapabilityRootIdentity, CreateWorktree, DiscardWorktree, InspectRepository, InspectWorktree,
-    PortError, RepositoryGateway, RepositoryLocator, RepositorySnapshot, WorktreeObservation,
-    WorktreeSnapshot,
+    CapabilityRootIdentity, CreateWorktree, DiscardWorktree, ExpectedPresence, InspectRepository,
+    InspectWorktree, ManagedWorktreePath, PortError, RepositoryGateway, RepositoryLocator,
+    RepositorySnapshot, Retryability, SafeErrorClassification, TaskQuery, WorktreeObservation,
+    WorktreeSnapshot, WorktreeState,
 };
 use local_agent_terminal_domain::{GitObjectId, TaskId};
 use sha2::{Digest, Sha256};
@@ -26,18 +27,44 @@ pub struct GitStructuredTools {
     snapshot_hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     #[cfg(feature = "test-seams")]
     before_generation_hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(feature = "test-seams")]
+    after_initial_binding_hook: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    #[cfg(feature = "test-seams")]
+    before_return_hook: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
-pub struct GitWorktreeRegistration {
+struct GitWorktreeRegistration {
     root_identity: CapabilityRootIdentity,
     task_id: TaskId,
     locator: RepositoryLocator,
     revision: GitObjectId,
     worktree_identity: Vec<u8>,
+    common_dir_identity: Vec<u8>,
+}
+
+struct RepositoryBinding {
+    worktree: paths::DirectoryGuard,
+    common_dir: paths::DirectoryGuard,
 }
 
 impl GitStructuredTools {
-    pub fn new(registrations: Vec<GitWorktreeRegistration>) -> Result<Self, PortError> {
+    /// Loads task/worktree ownership from the authoritative application projection.
+    ///
+    /// Composition must supply its durable [`TaskQuery`] implementation; caller-provided
+    /// task, locator, revision, and root tuples are intentionally not accepted.
+    pub fn from_owned_tasks(
+        gateway: &GitRepositoryGateway,
+        tasks: &dyn TaskQuery,
+        task_ids: &[TaskId],
+    ) -> Result<Self, PortError> {
+        let registrations = task_ids
+            .iter()
+            .map(|task_id| GitWorktreeRegistration::from_owned_task(gateway, tasks, task_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new(registrations)
+    }
+
+    fn new(registrations: Vec<GitWorktreeRegistration>) -> Result<Self, PortError> {
         if registrations.is_empty()
             || registrations
                 .iter()
@@ -62,6 +89,10 @@ impl GitStructuredTools {
             snapshot_hook: None,
             #[cfg(feature = "test-seams")]
             before_generation_hook: None,
+            #[cfg(feature = "test-seams")]
+            after_initial_binding_hook: None,
+            #[cfg(feature = "test-seams")]
+            before_return_hook: None,
         })
     }
 
@@ -86,10 +117,61 @@ impl GitStructuredTools {
         self.before_generation_hook = Some(std::sync::Arc::new(hook));
         self
     }
+
+    #[cfg(feature = "test-seams")]
+    pub fn with_after_initial_binding_hook_for_test(
+        mut self,
+        hook: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.after_initial_binding_hook = Some(std::sync::Arc::new(hook));
+        self
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub fn with_before_return_hook_for_test(
+        mut self,
+        hook: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.before_return_hook = Some(std::sync::Arc::new(hook));
+        self
+    }
 }
 
 impl GitWorktreeRegistration {
-    pub fn validate(
+    fn from_owned_task(
+        gateway: &GitRepositoryGateway,
+        tasks: &dyn TaskQuery,
+        task_id: &TaskId,
+    ) -> Result<Self, PortError> {
+        let task = tasks.task(task_id).map_err(|_| denied())?;
+        let worktree = task.worktree.as_ref().ok_or_else(denied)?;
+        if &task.task_id != task_id
+            || &worktree.task_id != task_id
+            || worktree.state != WorktreeState::Present
+            || worktree.expected_presence != ExpectedPresence::Present
+            || task.task_branch.as_ref() != Some(&worktree.branch)
+            || task.base_commit != worktree.base_commit
+        {
+            return Err(denied());
+        }
+        let managed_path = ManagedWorktreePath {
+            trusted_root_id: gateway.trusted_root_id().to_owned(),
+            relative_leaf: PathBuf::from(worktree.worktree_id.as_str()),
+            redacted_display: worktree.target_path_display.clone(),
+        };
+        let expected_path = paths::recovery_path(gateway, &managed_path).map_err(|_| denied())?;
+        let locator = gateway
+            .locate_persisted(&expected_path)
+            .map_err(|_| denied())?;
+        if locator.repository_id != worktree.repository_id
+            || locator.stable_identity != worktree.repository_identity
+        {
+            return Err(denied());
+        }
+        Self::validate(task.task_id, locator, worktree.base_commit.clone()).map_err(|_| denied())
+    }
+
+    fn validate(
         task_id: TaskId,
         locator: RepositoryLocator,
         revision: GitObjectId,
@@ -97,40 +179,87 @@ impl GitWorktreeRegistration {
         let (repository, _) = paths::open_for_locator(&locator)?;
         tools::verify_revision(&repository, &revision)?;
         let worktree_identity = paths::directory_binding_identity(&locator.canonical_workdir)?;
-        let root_identity =
-            derive_worktree_root(&task_id, &locator, &revision, &worktree_identity)?;
+        let common_dir_identity = paths::directory_binding_identity(&locator.canonical_common_dir)?;
+        let root_identity = derive_worktree_root(
+            &task_id,
+            &locator,
+            &revision,
+            &worktree_identity,
+            &common_dir_identity,
+        )?;
         Ok(Self {
             root_identity,
             task_id,
             locator,
             revision,
             worktree_identity,
+            common_dir_identity,
         })
-    }
-
-    pub const fn root_identity(&self) -> &CapabilityRootIdentity {
-        &self.root_identity
     }
 
     fn verify_current(&self) -> Result<(), PortError> {
         let (repository, _) = paths::open_for_locator(&self.locator)?;
-        self.verify_opened(&repository)
+        let binding = self.retain_binding()?;
+        self.verify_opened(&repository, &binding)
     }
 
-    fn verify_opened(&self, repository: &git2::Repository) -> Result<(), PortError> {
+    fn verify_initial(&self, repository: &git2::Repository) -> Result<(), PortError> {
+        let binding = self.retain_binding()?;
+        self.verify_opened(repository, &binding)
+    }
+
+    fn retain_binding(&self) -> Result<RepositoryBinding, PortError> {
+        Ok(RepositoryBinding {
+            worktree: paths::DirectoryGuard::open(&self.locator.canonical_workdir)?,
+            common_dir: paths::DirectoryGuard::open(&self.locator.canonical_common_dir)?,
+        })
+    }
+
+    fn verify_opened(
+        &self,
+        repository: &git2::Repository,
+        binding: &RepositoryBinding,
+    ) -> Result<(), PortError> {
         tools::verify_revision(repository, &self.revision)?;
-        let current_identity = paths::directory_binding_identity(&self.locator.canonical_workdir)?;
+        binding.worktree.verify()?;
+        binding.common_dir.verify()?;
+        let retained_worktree_identity = binding.worktree.binding_identity()?;
+        let retained_common_dir_identity = binding.common_dir.binding_identity()?;
+        let current_worktree_identity =
+            paths::directory_binding_identity(&self.locator.canonical_workdir)?;
+        let current_common_dir_identity =
+            paths::directory_binding_identity(&self.locator.canonical_common_dir)?;
+        let repository_workdir = repository.workdir().ok_or_else(paths::conflict)?;
+        if paths::canonical_directory(repository_workdir)? != self.locator.canonical_workdir
+            || paths::canonical_directory(repository.commondir())?
+                != self.locator.canonical_common_dir
+        {
+            return Err(paths::conflict());
+        }
         let expected_root = derive_worktree_root(
             &self.task_id,
             &self.locator,
             &self.revision,
-            &current_identity,
+            &retained_worktree_identity,
+            &retained_common_dir_identity,
         )?;
-        if current_identity != self.worktree_identity || expected_root != self.root_identity {
+        if retained_worktree_identity != self.worktree_identity
+            || current_worktree_identity != self.worktree_identity
+            || retained_common_dir_identity != self.common_dir_identity
+            || current_common_dir_identity != self.common_dir_identity
+            || expected_root != self.root_identity
+        {
             return Err(paths::conflict());
         }
         Ok(())
     }
+}
+
+fn denied() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::PermissionDenied,
+        Retryability::NonRetryable,
+    )
 }
 
 fn derive_worktree_root(
@@ -138,6 +267,7 @@ fn derive_worktree_root(
     locator: &RepositoryLocator,
     revision: &GitObjectId,
     worktree_identity: &[u8],
+    common_dir_identity: &[u8],
 ) -> Result<CapabilityRootIdentity, PortError> {
     let mut hasher = Sha256::new();
     for part in [
@@ -146,6 +276,7 @@ fn derive_worktree_root(
         locator.stable_identity.as_bytes(),
         revision.as_str().as_bytes(),
         worktree_identity,
+        common_dir_identity,
     ] {
         hasher.update(
             u64::try_from(part.len())

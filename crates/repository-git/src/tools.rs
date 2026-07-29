@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use git2::{DiffLineType, DiffOptions, ObjectType, Oid, Patch};
+use git2::{Config, DiffLineType, DiffOptions, ObjectType, Oid, Patch, Repository};
 use local_agent_terminal_application::{
     AuthorizedGitDiff, AuthorizedGitStatus, PortError, RawGitDiffResult, RawGitStatusResult,
     Retryability, SafeErrorClassification, StructuredGit,
@@ -27,55 +27,107 @@ impl StructuredGit for GitStructuredTools {
     fn status(&self, request: AuthorizedGitStatus) -> Result<RawGitStatusResult, PortError> {
         let registration =
             self.authorize(&request.task_id, &request.worktree, &request.root_identity)?;
-        let (repository, config) =
-            paths::open_for_locator(&registration.locator).map_err(|_| denied())?;
-        registration
-            .verify_opened(&repository)
-            .map_err(|_| denied())?;
-        self.reject_hazards(&repository, &config)?;
-        let before = capture_repository(&repository)?;
-        self.run_before_generation_hook();
-        self.reject_hazards(&repository, &config)?;
-        let captured = capture_repository(&repository)?;
-        if captured != before {
-            return Err(denied());
-        }
+        let (repository, config, binding, captured) =
+            self.capture_bound_repository(registration)?;
         let output = bounded_status(&captured)?;
-        self.run_snapshot_hook();
-        self.reject_hazards(&repository, &config)?;
-        if capture_repository(&repository)? != captured {
-            return Err(denied());
-        }
+        self.verify_captured_binding_before_return(
+            registration,
+            &repository,
+            &config,
+            &binding,
+            &captured,
+        )?;
         self.status_result(request, registration, output)
     }
 
     fn diff(&self, request: AuthorizedGitDiff) -> Result<RawGitDiffResult, PortError> {
         let registration =
             self.authorize(&request.task_id, &request.worktree, &request.root_identity)?;
-        let (repository, config) =
-            paths::open_for_locator(&registration.locator).map_err(|_| denied())?;
-        registration
-            .verify_opened(&repository)
-            .map_err(|_| denied())?;
-        self.reject_hazards(&repository, &config)?;
-        let before = capture_repository(&repository)?;
-        self.run_before_generation_hook();
-        self.reject_hazards(&repository, &config)?;
-        let captured = capture_repository(&repository)?;
-        if captured != before {
-            return Err(denied());
-        }
+        let (repository, config, binding, captured) =
+            self.capture_bound_repository(registration)?;
         let output = bounded_diff(&captured)?;
-        self.run_snapshot_hook();
-        self.reject_hazards(&repository, &config)?;
-        if capture_repository(&repository)? != captured {
-            return Err(denied());
-        }
+        self.verify_captured_binding_before_return(
+            registration,
+            &repository,
+            &config,
+            &binding,
+            &captured,
+        )?;
         self.diff_result(request, registration, output)
     }
 }
 
 impl GitStructuredTools {
+    fn capture_bound_repository(
+        &self,
+        registration: &crate::GitWorktreeRegistration,
+    ) -> Result<
+        (
+            Repository,
+            Config,
+            crate::RepositoryBinding,
+            CapturedRepository,
+        ),
+        PortError,
+    > {
+        let (repository, config) =
+            paths::open_for_locator(&registration.locator).map_err(|_| denied())?;
+        registration
+            .verify_initial(&repository)
+            .map_err(|_| denied())?;
+        self.run_after_initial_binding_hook()?;
+        let binding = registration.retain_binding().map_err(|_| denied())?;
+        registration
+            .verify_opened(&repository, &binding)
+            .map_err(|_| denied())?;
+        self.reject_hazards(&repository, &config)?;
+        registration
+            .verify_opened(&repository, &binding)
+            .map_err(|_| denied())?;
+        let before = capture_repository(&repository)?;
+        registration
+            .verify_opened(&repository, &binding)
+            .map_err(|_| denied())?;
+        self.run_before_generation_hook();
+        registration
+            .verify_opened(&repository, &binding)
+            .map_err(|_| denied())?;
+        self.reject_hazards(&repository, &config)?;
+        registration
+            .verify_opened(&repository, &binding)
+            .map_err(|_| denied())?;
+        let captured = capture_repository(&repository)?;
+        if captured != before {
+            return Err(denied());
+        }
+        registration
+            .verify_opened(&repository, &binding)
+            .map_err(|_| denied())?;
+        Ok((repository, config, binding, captured))
+    }
+
+    fn verify_captured_binding_before_return(
+        &self,
+        registration: &crate::GitWorktreeRegistration,
+        repository: &Repository,
+        config: &Config,
+        binding: &crate::RepositoryBinding,
+        captured: &CapturedRepository,
+    ) -> Result<(), PortError> {
+        self.run_snapshot_hook();
+        registration
+            .verify_opened(repository, binding)
+            .map_err(|_| denied())?;
+        self.reject_hazards(repository, config)?;
+        if capture_repository(repository)? != *captured {
+            return Err(denied());
+        }
+        self.run_before_return_hook()?;
+        registration
+            .verify_opened(repository, binding)
+            .map_err(|_| denied())
+    }
+
     fn authorize<'a>(
         &'a self,
         task_id: &local_agent_terminal_domain::TaskId,
@@ -106,6 +158,26 @@ impl GitStructuredTools {
         if let Some(hook) = &self.before_generation_hook {
             hook();
         }
+    }
+
+    fn run_after_initial_binding_hook(&self) -> Result<(), PortError> {
+        #[cfg(feature = "test-seams")]
+        if let Some(hook) = &self.after_initial_binding_hook {
+            if !hook() {
+                return Err(denied());
+            }
+        }
+        Ok(())
+    }
+
+    fn run_before_return_hook(&self) -> Result<(), PortError> {
+        #[cfg(feature = "test-seams")]
+        if let Some(hook) = &self.before_return_hook {
+            if !hook() {
+                return Err(denied());
+            }
+        }
+        Ok(())
     }
 
     fn reject_hazards(
