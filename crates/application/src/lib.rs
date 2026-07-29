@@ -62,8 +62,9 @@ pub use repository::{
 };
 pub use tool::{
     bind_tool_approval_payload, canonical_file_write_recovery_request,
-    parse_file_write_recovery_request, ApprovedExecutableIdentity, ApprovedProcessExecutor,
-    ApprovedProcessRequest, AuthorizedFileRead, AuthorizedFileWrite, AuthorizedGitDiff,
+    parse_file_write_recovery_request, validate_and_order_process_writes,
+    ApprovedExecutableIdentity, ApprovedProcessExecutor, ApprovedProcessRequest,
+    AuthorizedExpectedWrite, AuthorizedFileRead, AuthorizedFileWrite, AuthorizedGitDiff,
     AuthorizedGitStatus, AuthorizedProcessRequest, AuthorizedToolRequest, BoundToolApproval,
     BoundedOutput, CancellationReceipt, CanonicalFileWriteRecoveryRequest,
     CapabilityFileWriteSession, CapabilityFileWriteSessionFactory, CapabilityFilesystem,
@@ -76,7 +77,7 @@ pub use tool::{
     FileWriteRecoveryRequest, FileWriteRecoverySnapshot, FileWriteRecoveryState,
     FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest,
     GitStatusResult, JobReceipt, NetworkEnforcementReceipt, NetworkProfileVerifier,
-    NewToolExecution, NewToolIntent, ObservedFileImage, OpenFileWriteSession,
+    NewToolExecution, NewToolIntent, ObservedFileImage, ObservedProcessWrite, OpenFileWriteSession,
     OperationIntentSnapshot, PrivateRuntimeDirectoryInspector,
     PrivateRuntimeDirectoryVerificationGuard, ProcessLauncher, ProcessLimits, ProcessReceipt,
     ProcessStatus, ProcessWorkingDirectory, RawGitDiffResult, RawGitStatusResult,

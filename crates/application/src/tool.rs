@@ -13,9 +13,10 @@ use crate::approval::{
     canonical_approval_payload, ApprovalDigestPayload, ApprovalId, ToolApprovalPayloadV1,
 };
 use crate::canonical_json::{invalid_input, sha256_digest};
-use crate::PortError;
+use crate::{PortError, Retryability, SafeErrorClassification};
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_PROCESS_WRITE_SCOPES: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutableFileIdentity(String);
@@ -499,6 +500,169 @@ pub struct ApprovedProcessRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedExpectedWrite {
+    capability: CapabilityRef,
+    root_identity: CapabilityRootIdentity,
+    target: ResolvedCapabilityTarget,
+}
+
+impl AuthorizedExpectedWrite {
+    pub fn new(
+        task_id: &TaskId,
+        expected: &ExpectedWrite,
+        resolved: ResolvedCapability,
+    ) -> Result<Self, PortError> {
+        let expected_target = expected_write_target(expected)?;
+        if expected.capability() != &resolved.capability
+            || expected.capability().worktree_task_id() != Some(task_id)
+            || resolved.capability.worktree_task_id() != Some(task_id)
+            || resolved.target != expected_target
+        {
+            return Err(invalid_input());
+        }
+        Ok(Self {
+            capability: resolved.capability,
+            root_identity: resolved.root_identity,
+            target: resolved.target,
+        })
+    }
+
+    pub const fn capability(&self) -> &CapabilityRef {
+        &self.capability
+    }
+
+    pub const fn root_identity(&self) -> &CapabilityRootIdentity {
+        &self.root_identity
+    }
+
+    pub const fn target(&self) -> &ResolvedCapabilityTarget {
+        &self.target
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedProcessWrite {
+    capability: CapabilityRef,
+    root_identity: CapabilityRootIdentity,
+    target: ResolvedCapabilityTarget,
+    write: VerifiedWrite,
+}
+
+impl ObservedProcessWrite {
+    pub const fn new(
+        capability: CapabilityRef,
+        root_identity: CapabilityRootIdentity,
+        target: ResolvedCapabilityTarget,
+        write: VerifiedWrite,
+    ) -> Self {
+        Self {
+            capability,
+            root_identity,
+            target,
+            write,
+        }
+    }
+
+    pub const fn capability(&self) -> &CapabilityRef {
+        &self.capability
+    }
+
+    pub const fn root_identity(&self) -> &CapabilityRootIdentity {
+        &self.root_identity
+    }
+
+    pub const fn target(&self) -> &ResolvedCapabilityTarget {
+        &self.target
+    }
+
+    pub const fn write(&self) -> &VerifiedWrite {
+        &self.write
+    }
+}
+
+/// Validates process write evidence as an exact set and returns it in approval order.
+pub fn validate_and_order_process_writes(
+    approved: &[AuthorizedExpectedWrite],
+    observed: Vec<ObservedProcessWrite>,
+) -> Result<Vec<ObservedProcessWrite>, PortError> {
+    if approved.len() > MAX_PROCESS_WRITE_SCOPES
+        || approved.len() != observed.len()
+        || has_duplicate_approved_scope(approved)
+        || has_duplicate_observed_scope(&observed)
+    {
+        return Err(process_write_integrity_failure());
+    }
+    let mut remaining = observed;
+    let ordered = approved
+        .iter()
+        .map(|scope| {
+            let index = remaining
+                .iter()
+                .position(|observation| observed_scope_matches(scope, observation))
+                .ok_or_else(process_write_integrity_failure)?;
+            Ok(remaining.remove(index))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !remaining.is_empty() {
+        return Err(process_write_integrity_failure());
+    }
+    Ok(ordered)
+}
+
+fn has_duplicate_approved_scope(approved: &[AuthorizedExpectedWrite]) -> bool {
+    approved.iter().enumerate().any(|(index, scope)| {
+        approved[..index].iter().any(|prior| {
+            prior.root_identity() == scope.root_identity() && prior.target() == scope.target()
+        })
+    })
+}
+
+fn has_duplicate_observed_scope(observed: &[ObservedProcessWrite]) -> bool {
+    observed.iter().enumerate().any(|(index, candidate)| {
+        observed[..index]
+            .iter()
+            .any(|prior| same_observed_scope(prior, candidate))
+    })
+}
+
+fn same_observed_scope(left: &ObservedProcessWrite, right: &ObservedProcessWrite) -> bool {
+    left.root_identity() == right.root_identity() && left.target() == right.target()
+}
+
+fn observed_scope_matches(
+    approved: &AuthorizedExpectedWrite,
+    observed: &ObservedProcessWrite,
+) -> bool {
+    observed.capability() == approved.capability()
+        && observed.root_identity() == approved.root_identity()
+        && observed.target() == approved.target()
+}
+
+fn process_write_integrity_failure() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::IntegrityFailure,
+        Retryability::NonRetryable,
+    )
+}
+
+fn expected_write_target(expected: &ExpectedWrite) -> Result<ResolvedCapabilityTarget, PortError> {
+    let CapabilityRef::Worktree(worktree) = expected.capability() else {
+        return Err(invalid_input());
+    };
+    if worktree.path() == "." {
+        return Ok(ResolvedCapabilityTarget::Root);
+    }
+    RelativePathComponents::new(
+        worktree
+            .path()
+            .split(['/', '\\'])
+            .map(str::to_owned)
+            .collect(),
+    )
+    .map(ResolvedCapabilityTarget::Relative)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessWorkingDirectory {
     PrivateRuntime(ResolvedPrivateRuntimeDirectory),
     IsolatedWorktree(ResolvedCapability),
@@ -524,7 +688,7 @@ pub struct AuthorizedProcessRequest {
     pub network: EnforcedNetworkProfile,
     pub timeout_ms: u64,
     pub limits: ProcessLimits,
-    pub expected_writes: Vec<ExpectedWrite>,
+    pub expected_writes: Vec<AuthorizedExpectedWrite>,
     pub executor_claim: LeaseClaim,
 }
 
@@ -571,7 +735,7 @@ pub struct ProcessReceipt {
     pub stderr: BoundedOutput,
     pub duration_ms: u64,
     pub job_receipt: JobReceipt,
-    pub observed_writes: Vec<VerifiedWrite>,
+    pub observed_writes: Vec<ObservedProcessWrite>,
     /// Retained for the existing durable receipt schema.
     pub output_digest: Sha256Digest,
 }

@@ -11,9 +11,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use local_agent_terminal_application::{
-    AuthorizedProcessRequest, CapabilityRootIdentity, EnforcedNetworkProfile,
-    ExecutableFileIdentity, NetworkEnforcementReceipt, ProcessLauncher, ProcessLimits,
-    ProcessStatus, ProcessWorkingDirectory, ResolvedCapability, ResolvedCapabilityTarget,
+    validate_and_order_process_writes, AuthorizedExpectedWrite, AuthorizedProcessRequest,
+    CapabilityRootIdentity, EnforcedNetworkProfile, ExecutableFileIdentity,
+    NetworkEnforcementReceipt, ObservedProcessWrite, ProcessLauncher, ProcessLimits, ProcessStatus,
+    ProcessWorkingDirectory, RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget,
     ResolvedEnvironmentProfile, ToolExecutionId, VerifiedWrite,
 };
 use local_agent_terminal_domain::{
@@ -473,10 +474,7 @@ fn brokered_worktree_and_unenforced_expected_writes_never_start_child_code() {
                 request.trust_tier = ProcessTrustTier::BrokeredProcess
             }
             LaunchMutation::ExpectedWrite => {
-                request.expected_writes = vec![ExpectedWrite::new(
-                    CapabilityRef::worktree(TaskId::new("task-1").unwrap(), "target").unwrap(),
-                )
-                .unwrap()]
+                request.expected_writes = vec![authorized_write("target", "test-worktree")]
             }
         }
 
@@ -488,12 +486,10 @@ fn brokered_worktree_and_unenforced_expected_writes_never_start_child_code() {
 #[test]
 fn enforced_expected_write_scope_is_bound_and_returns_observed_evidence() {
     let root = TempDir::new().unwrap();
+    let scope = authorized_write("generated.txt", "test-worktree");
     let mut boundary = TestOnlyBoundary::valid(root.path().to_owned());
     boundary.allow_expected_writes = true;
-    boundary.observed_writes = vec![VerifiedWrite {
-        digest: digest(b"observed write"),
-        size_bytes: 14,
-    }];
+    boundary.observed_writes = vec![observed_write(&scope, b"observed write")];
     let boundary = Arc::new(boundary);
     let launcher =
         WindowsProcessLauncher::with_isolated_worker_boundary(boundary, boundary_binding());
@@ -505,16 +501,221 @@ fn enforced_expected_write_scope_is_bound_and_returns_observed_evidence() {
         ],
         BTreeMap::from([("LAT_PROCESS_HELPER".to_owned(), "emit".to_owned())]),
     );
-    request.expected_writes = vec![ExpectedWrite::new(
-        CapabilityRef::worktree(TaskId::new("task-1").unwrap(), "generated.txt").unwrap(),
-    )
-    .unwrap()];
+    request.expected_writes = vec![scope];
 
     let receipt = launcher.execute(request).unwrap();
 
     assert_eq!(receipt.status, ProcessStatus::Exited);
     assert_eq!(receipt.observed_writes.len(), 1);
-    assert_eq!(receipt.observed_writes[0].size_bytes, 14);
+    assert_eq!(receipt.observed_writes[0].write().size_bytes, 14);
+}
+
+#[test]
+fn reversed_write_evidence_is_canonicalized_to_approved_scope_order() {
+    let root = TempDir::new().unwrap();
+    let first = authorized_write("generated/first.txt", "test-worktree");
+    let second = authorized_write("generated/second.txt", "test-worktree");
+    let mut boundary = TestOnlyBoundary::valid(root.path().to_owned());
+    boundary.allow_expected_writes = true;
+    boundary.observed_writes = vec![
+        observed_write(&second, b"second"),
+        observed_write(&first, b"first"),
+    ];
+    let boundary = Arc::new(boundary);
+    let launcher =
+        WindowsProcessLauncher::with_isolated_worker_boundary(boundary, boundary_binding());
+    let mut request = request(
+        vec![
+            "--exact".to_owned(),
+            "process_child_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        BTreeMap::from([("LAT_PROCESS_HELPER".to_owned(), "emit".to_owned())]),
+    );
+    request.expected_writes = vec![first, second];
+
+    let receipt = launcher.execute(request).unwrap();
+
+    assert_eq!(receipt.observed_writes.len(), 2);
+    assert_eq!(
+        receipt.observed_writes[0].capability(),
+        &CapabilityRef::worktree(TaskId::new("task-1").unwrap(), "generated/first.txt").unwrap()
+    );
+    assert_eq!(receipt.observed_writes[0].write().digest, digest(b"first"));
+    assert_eq!(
+        receipt.observed_writes[1].capability(),
+        &CapabilityRef::worktree(TaskId::new("task-1").unwrap(), "generated/second.txt").unwrap()
+    );
+    assert_eq!(receipt.observed_writes[1].write().digest, digest(b"second"));
+}
+
+#[test]
+fn logical_aliases_for_one_physical_write_scope_are_ambiguous() {
+    let root = TempDir::new().unwrap();
+    let slash = authorized_write("generated/alias.txt", "test-worktree");
+    let backslash = authorized_write("generated\\alias.txt", "test-worktree");
+    assert_ne!(slash.capability(), backslash.capability());
+    assert_eq!(slash.root_identity(), backslash.root_identity());
+    assert_eq!(slash.target(), backslash.target());
+    let mut boundary = TestOnlyBoundary::valid(root.path().to_owned());
+    boundary.allow_expected_writes = true;
+    boundary.observed_writes = vec![
+        observed_write(&slash, b"slash"),
+        observed_write(&backslash, b"backslash"),
+    ];
+    let boundary = Arc::new(boundary);
+    let launcher =
+        WindowsProcessLauncher::with_isolated_worker_boundary(boundary, boundary_binding());
+    let mut request = request(
+        vec![
+            "--exact".to_owned(),
+            "process_child_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        BTreeMap::from([("LAT_PROCESS_HELPER".to_owned(), "emit".to_owned())]),
+    );
+    request.expected_writes = vec![slash, backslash];
+
+    let error = launcher
+        .execute(request)
+        .expect_err("one physical scope must not have two logical labels");
+
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::IntegrityFailure
+    );
+}
+
+#[test]
+fn write_scope_matcher_rejects_more_than_the_approval_limit() {
+    let approved = (0..=1024)
+        .map(|index| authorized_write(&format!("generated/{index}.txt"), "test-worktree"))
+        .collect::<Vec<_>>();
+    let observed = approved
+        .iter()
+        .map(|scope| observed_write(scope, b"observed"))
+        .collect();
+
+    let error = validate_and_order_process_writes(&approved, observed)
+        .expect_err("unbounded scope sets must be denied before matching");
+
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::IntegrityFailure
+    );
+}
+
+#[test]
+fn write_evidence_must_match_approved_scopes_one_to_one() {
+    for mutation in [
+        WriteEvidenceMutation::Missing,
+        WriteEvidenceMutation::Extra,
+        WriteEvidenceMutation::Duplicate,
+        WriteEvidenceMutation::AmbiguousApproval,
+        WriteEvidenceMutation::Capability,
+        WriteEvidenceMutation::Root,
+        WriteEvidenceMutation::Path,
+    ] {
+        let root = TempDir::new().unwrap();
+        let first = authorized_write("generated/first.txt", "test-worktree");
+        let second = authorized_write("generated/second.txt", "test-worktree");
+        let first_observation = observed_write(&first, b"first");
+        let second_observation = observed_write(&second, b"second");
+        let (approved, observed) = match mutation {
+            WriteEvidenceMutation::Missing => (vec![first, second], vec![first_observation]),
+            WriteEvidenceMutation::Extra => {
+                let extra = authorized_write("generated/extra.txt", "test-worktree");
+                (
+                    vec![first, second],
+                    vec![
+                        first_observation,
+                        second_observation,
+                        observed_write(&extra, b"extra"),
+                    ],
+                )
+            }
+            WriteEvidenceMutation::Duplicate => (
+                vec![first, second],
+                vec![first_observation.clone(), first_observation],
+            ),
+            WriteEvidenceMutation::AmbiguousApproval => (
+                vec![first.clone(), first],
+                vec![first_observation, second_observation],
+            ),
+            WriteEvidenceMutation::Capability => (
+                vec![first.clone(), second],
+                vec![
+                    observed_evidence(
+                        CapabilityRef::worktree(
+                            TaskId::new("task-1").unwrap(),
+                            "generated/other.txt",
+                        )
+                        .unwrap(),
+                        first.root_identity().clone(),
+                        first.target().clone(),
+                        b"first",
+                    ),
+                    second_observation,
+                ],
+            ),
+            WriteEvidenceMutation::Root => (
+                vec![first.clone(), second],
+                vec![
+                    observed_evidence(
+                        first.capability().clone(),
+                        CapabilityRootIdentity::new("other-worktree").unwrap(),
+                        first.target().clone(),
+                        b"first",
+                    ),
+                    second_observation,
+                ],
+            ),
+            WriteEvidenceMutation::Path => (
+                vec![first.clone(), second],
+                vec![
+                    observed_evidence(
+                        first.capability().clone(),
+                        first.root_identity().clone(),
+                        ResolvedCapabilityTarget::Relative(
+                            RelativePathComponents::new(vec![
+                                "generated".to_owned(),
+                                "other.txt".to_owned(),
+                            ])
+                            .unwrap(),
+                        ),
+                        b"first",
+                    ),
+                    second_observation,
+                ],
+            ),
+        };
+        let mut boundary = TestOnlyBoundary::valid(root.path().to_owned());
+        boundary.allow_expected_writes = true;
+        boundary.observed_writes = observed;
+        let boundary = Arc::new(boundary);
+        let launcher =
+            WindowsProcessLauncher::with_isolated_worker_boundary(boundary, boundary_binding());
+        let mut request = request(
+            vec![
+                "--exact".to_owned(),
+                "process_child_helper".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            BTreeMap::from([("LAT_PROCESS_HELPER".to_owned(), "emit".to_owned())]),
+        );
+        request.expected_writes = approved;
+
+        let error = match launcher.execute(request) {
+            Ok(receipt) => panic!("{mutation:?} was accepted: {receipt:?}"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.safe_classification(),
+            local_agent_terminal_application::SafeErrorClassification::IntegrityFailure,
+            "{mutation:?}"
+        );
+    }
 }
 
 #[test]
@@ -738,7 +939,7 @@ struct TestOnlyBoundary {
     claims_mismatch: Option<BoundaryMismatch>,
     prepare_calls: Arc<AtomicUsize>,
     allow_expected_writes: bool,
-    observed_writes: Vec<VerifiedWrite>,
+    observed_writes: Vec<ObservedProcessWrite>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -764,6 +965,17 @@ enum BoundaryMismatch {
 enum LaunchMutation {
     BrokeredWorktree,
     ExpectedWrite,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WriteEvidenceMutation {
+    Missing,
+    Extra,
+    Duplicate,
+    AmbiguousApproval,
+    Capability,
+    Root,
+    Path,
 }
 
 impl TestOnlyBoundary {
@@ -825,7 +1037,7 @@ impl IsolatedWorkerBoundaryAdapter for TestOnlyBoundary {
         &self,
         request: &AuthorizedProcessRequest,
         _prepared: &PreparedIsolatedWorkerBoundary,
-    ) -> Result<Vec<VerifiedWrite>, local_agent_terminal_application::PortError> {
+    ) -> Result<Vec<ObservedProcessWrite>, local_agent_terminal_application::PortError> {
         if request.expected_writes.is_empty() {
             Ok(Vec::new())
         } else if self.allow_expected_writes {
@@ -881,12 +1093,9 @@ fn mutate_claims(claims: &mut IsolatedWorkerBoundaryClaims, mismatch: BoundaryMi
                 .insert("EXTRA".to_owned(), "1".to_owned());
         }
         BoundaryMismatch::Limits => claims.limits.memory_limit_bytes += 1,
-        BoundaryMismatch::ExpectedWrites => claims.expected_writes.push(
-            ExpectedWrite::new(
-                CapabilityRef::worktree(TaskId::new("task-1").unwrap(), "unexpected.txt").unwrap(),
-            )
-            .unwrap(),
-        ),
+        BoundaryMismatch::ExpectedWrites => claims
+            .expected_writes
+            .push(authorized_write("unexpected.txt", "test-worktree")),
         BoundaryMismatch::Argv => claims.argv.push("extra".to_owned()),
         BoundaryMismatch::Timeout => claims.timeout_ms += 1,
     }
@@ -945,6 +1154,57 @@ fn request(argv: Vec<String>, environment: BTreeMap<String, String>) -> Authoriz
             FencingToken::new(7).unwrap(),
         ),
     }
+}
+
+fn authorized_write(path: &str, root_identity: &str) -> AuthorizedExpectedWrite {
+    let task_id = TaskId::new("task-1").unwrap();
+    let capability = CapabilityRef::worktree(task_id.clone(), path).unwrap();
+    let expected = ExpectedWrite::new(capability.clone()).unwrap();
+    let target = if path == "." {
+        ResolvedCapabilityTarget::Root
+    } else {
+        ResolvedCapabilityTarget::Relative(
+            RelativePathComponents::new(path.split(['/', '\\']).map(str::to_owned).collect())
+                .unwrap(),
+        )
+    };
+    AuthorizedExpectedWrite::new(
+        &task_id,
+        &expected,
+        ResolvedCapability {
+            capability,
+            content_digest: None,
+            root_identity: CapabilityRootIdentity::new(root_identity).unwrap(),
+            target,
+        },
+    )
+    .unwrap()
+}
+
+fn observed_write(scope: &AuthorizedExpectedWrite, bytes: &[u8]) -> ObservedProcessWrite {
+    observed_evidence(
+        scope.capability().clone(),
+        scope.root_identity().clone(),
+        scope.target().clone(),
+        bytes,
+    )
+}
+
+fn observed_evidence(
+    capability: CapabilityRef,
+    root_identity: CapabilityRootIdentity,
+    target: ResolvedCapabilityTarget,
+    bytes: &[u8],
+) -> ObservedProcessWrite {
+    ObservedProcessWrite::new(
+        capability,
+        root_identity,
+        target,
+        VerifiedWrite {
+            digest: digest(bytes),
+            size_bytes: bytes.len() as u64,
+        },
+    )
 }
 
 fn digest(bytes: &[u8]) -> Sha256Digest {

@@ -12,12 +12,13 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use local_agent_terminal_application::{
-    AuthorizedProcessRequest, BoundedOutput, CancellationReceipt, EnforcedNetworkProfile,
-    PortError, ProcessLauncher, ProcessLimits, ProcessReceipt, ProcessStatus,
-    ProcessWorkingDirectory, ResolvedEnvironmentProfile, ResolvedExecutable, Retryability,
-    SafeErrorClassification, ToolExecutionId, VerifiedWrite,
+    validate_and_order_process_writes, AuthorizedExpectedWrite, AuthorizedProcessRequest,
+    BoundedOutput, CancellationReceipt, EnforcedNetworkProfile, ObservedProcessWrite, PortError,
+    ProcessLauncher, ProcessLimits, ProcessReceipt, ProcessStatus, ProcessWorkingDirectory,
+    ResolvedEnvironmentProfile, ResolvedExecutable, Retryability, SafeErrorClassification,
+    ToolExecutionId,
 };
-use local_agent_terminal_domain::{ExpectedWrite, LeaseClaim, ProcessTrustTier, Sha256Digest};
+use local_agent_terminal_domain::{LeaseClaim, ProcessTrustTier, Sha256Digest};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{
     SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -74,7 +75,7 @@ pub struct IsolatedWorkerBoundaryClaims {
     pub network: EnforcedNetworkProfile,
     pub timeout_ms: u64,
     pub limits: ProcessLimits,
-    pub expected_writes: Vec<ExpectedWrite>,
+    pub expected_writes: Vec<AuthorizedExpectedWrite>,
     pub executor_claim: LeaseClaim,
 }
 
@@ -187,7 +188,7 @@ pub trait IsolatedWorkerBoundaryAdapter: Send + Sync {
         &self,
         request: &AuthorizedProcessRequest,
         prepared: &PreparedIsolatedWorkerBoundary,
-    ) -> Result<Vec<VerifiedWrite>, PortError> {
+    ) -> Result<Vec<ObservedProcessWrite>, PortError> {
         if request.expected_writes.is_empty() {
             Ok(Vec::new())
         } else {
@@ -313,7 +314,8 @@ impl ProcessLauncher for WindowsProcessLauncher {
         };
         let observed_writes = boundary.observed_writes(&request, &prepared);
         cleanup.disarm();
-        let observed_writes = observed_writes?;
+        let observed_writes =
+            validate_and_order_process_writes(&request.expected_writes, observed_writes?)?;
 
         let status = if terminated {
             ProcessStatus::Terminated

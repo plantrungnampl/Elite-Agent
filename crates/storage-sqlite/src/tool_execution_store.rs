@@ -6,12 +6,13 @@ use local_agent_terminal_application::{
     ApprovalDigestPayload, CanonicalEvidenceRef, FileWritePreImage, FileWriteRecoveryCompletion,
     FileWriteRecoveryFailure, FileWriteRecoveryIntent, FileWriteRecoveryRequest,
     FileWriteRecoverySnapshot, FileWriteRecoveryState, FileWriteRecoveryStore, NewToolExecution,
-    NewToolIntent, OperationIntentSnapshot, PortError, ProcessReceipt, ProcessStatus, Retryability,
-    SafeErrorClassification, ToolExecutionCompletion, ToolExecutionId, ToolExecutionSnapshot,
-    ToolExecutionStore, VerifiedFileWriteCompensation, WorkspaceMutationRequest,
+    NewToolIntent, ObservedProcessWrite, OperationIntentSnapshot, PortError, ProcessReceipt,
+    ProcessStatus, ResolvedCapabilityTarget, Retryability, SafeErrorClassification,
+    ToolExecutionCompletion, ToolExecutionId, ToolExecutionSnapshot, ToolExecutionStore,
+    VerifiedFileWriteCompensation, WorkspaceMutationRequest,
 };
 use local_agent_terminal_domain::{
-    ArtifactId, PolicyEffect, ProjectId, Sequence, Sha256Digest, TaskId,
+    ArtifactId, CapabilityRef, PolicyEffect, ProjectId, Sequence, Sha256Digest, TaskId,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
@@ -1721,11 +1722,51 @@ fn receipt_value(completion: &ToolExecutionCompletion) -> serde_json::Value {
             "resourceLimitTerminated": receipt.job_receipt.resource_limit_terminated,
             "treeTerminated": receipt.job_receipt.tree_terminated,
         },
-        "observedWrites": receipt.observed_writes.iter().map(|write| json!({
-            "digest": write.digest.as_str(),
-            "sizeBytes": write.size_bytes,
-        })).collect::<Vec<_>>(),
+        "observedWrites": receipt.observed_writes.iter().map(process_write_value).collect::<Vec<_>>(),
     })
+}
+
+fn process_write_value(write: &ObservedProcessWrite) -> serde_json::Value {
+    json!({
+        "capability": process_capability_value(write.capability()),
+        "rootIdentity": write.root_identity().as_str(),
+        "target": process_write_target_value(write.target()),
+        "digest": write.write().digest.as_str(),
+        "sizeBytes": write.write().size_bytes,
+    })
+}
+
+fn process_capability_value(capability: &CapabilityRef) -> serde_json::Value {
+    match capability {
+        CapabilityRef::Source(source) => json!({
+            "kind": "source",
+            "revision": source.revision(),
+            "path": source.path(),
+        }),
+        CapabilityRef::Artifact(artifact) => json!({
+            "kind": "artifact",
+            "artifactId": artifact.artifact_id().as_str(),
+        }),
+        CapabilityRef::Worktree(worktree) => json!({
+            "kind": "worktree",
+            "taskId": worktree.task_id().as_str(),
+            "path": worktree.path(),
+        }),
+        CapabilityRef::Toolchain(toolchain) => json!({
+            "kind": "toolchain",
+            "name": toolchain.name(),
+        }),
+    }
+}
+
+fn process_write_target_value(target: &ResolvedCapabilityTarget) -> serde_json::Value {
+    match target {
+        ResolvedCapabilityTarget::Root => json!({ "kind": "root" }),
+        ResolvedCapabilityTarget::Relative(components) => json!({
+            "kind": "relative",
+            "components": components.as_slice(),
+        }),
+    }
 }
 
 fn completion_audit_matches(

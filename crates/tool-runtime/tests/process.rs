@@ -6,14 +6,15 @@ use std::sync::Mutex;
 use local_agent_terminal_application::{
     AcquireLease, ApprovedExecutableIdentity, ApprovedProcessRequest, AuthorizedProcessRequest,
     BoundedOutput, CancellationReceipt, CapabilityRequest, CapabilityResolver,
-    CapabilityRootIdentity, ExecutorLeaseStore, JobReceipt, LeaseSnapshot, PortError,
-    ProcessLauncher, ProcessReceipt, ProcessStatus, ProcessWorkingDirectory, ResolvedCapability,
-    ResolvedCapabilityTarget, RevokeLease, SafeErrorClassification, ToolExecutionId,
+    CapabilityRootIdentity, ExecutorLeaseStore, JobReceipt, LeaseSnapshot, ObservedProcessWrite,
+    PortError, ProcessLauncher, ProcessReceipt, ProcessStatus, ProcessWorkingDirectory,
+    RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget, Retryability,
+    RevokeLease, SafeErrorClassification, ToolExecutionId, VerifiedWrite,
 };
 use local_agent_terminal_domain::{
-    CapabilityRef, EnvironmentProfile, FencingToken, LeaseClaim, NetworkProfile, Phase, PlanStepId,
-    ProcessBinding, ProcessInvocation, ProcessToolRequest, ProcessTrustTier, RunId, Sha256Digest,
-    TaskId, WorkspaceVersion,
+    CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken, LeaseClaim, NetworkProfile,
+    Phase, PlanStepId, ProcessBinding, ProcessInvocation, ProcessToolRequest, ProcessTrustTier,
+    RunId, Sha256Digest, TaskId, WorkspaceVersion,
 };
 use local_agent_terminal_platform_core::{
     EnvironmentProfileRegistry, ExecutableRegistry, NetworkEnforcementEvidence,
@@ -62,6 +63,34 @@ fn typed_process_exec_resolves_profiles_and_preserves_argv_boundaries() {
 }
 
 #[test]
+fn expected_write_scopes_are_resolved_before_launch() {
+    let outcome = execute_case(vec!["test".to_owned()], CaseMutation::ExpectedWriteScopes);
+    let captured = outcome.request.expect("launcher request");
+
+    assert_eq!(captured.expected_writes.len(), 2);
+    for (scope, path) in captured
+        .expected_writes
+        .iter()
+        .zip([".", "target/second.txt"])
+    {
+        assert_eq!(
+            scope.capability(),
+            &CapabilityRef::worktree(TaskId::new("task-1").unwrap(), path).unwrap()
+        );
+        assert_eq!(scope.root_identity().as_str(), "worktree-root");
+        let expected_target = if path == "." {
+            ResolvedCapabilityTarget::Root
+        } else {
+            ResolvedCapabilityTarget::Relative(
+                RelativePathComponents::new(path.split('/').map(str::to_owned).collect::<Vec<_>>())
+                    .unwrap(),
+            )
+        };
+        assert_eq!(scope.target(), &expected_target);
+    }
+}
+
+#[test]
 fn response_file_arguments_are_denied_before_launch() {
     let outcome = execute_case(
         vec!["test".to_owned(), "@attacker.rsp".to_owned()],
@@ -88,6 +117,47 @@ fn unresolved_profiles_cwd_and_stale_lease_never_reach_the_launcher() {
         assert!(outcome.result.is_err(), "{mutation:?}");
         assert!(outcome.request.is_none(), "{mutation:?}");
     }
+}
+
+#[test]
+fn write_scope_resolution_failures_never_reach_launcher() {
+    for mutation in [
+        CaseMutation::WriteResolverFailure,
+        CaseMutation::WriteTaskEcho,
+        CaseMutation::WriteCapabilityEcho,
+        CaseMutation::WriteRootIdentity,
+        CaseMutation::WriteTarget,
+    ] {
+        let outcome = execute_case(vec!["test".to_owned()], mutation);
+
+        let error = match outcome.result {
+            Ok(receipt) => panic!("{mutation:?} reached launcher: {receipt:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.safe_classification(),
+            SafeErrorClassification::IntegrityFailure,
+            "{mutation:?}"
+        );
+        assert_eq!(outcome.launcher_calls, 0, "{mutation:?}");
+        assert!(outcome.request.is_none(), "{mutation:?}");
+    }
+}
+
+#[test]
+fn launcher_write_evidence_is_revalidated_by_runtime() {
+    let outcome = execute_case(
+        vec!["test".to_owned()],
+        CaseMutation::LauncherMissingWriteEvidence,
+    );
+
+    let error = outcome.result.expect_err("missing evidence must be denied");
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(outcome.launcher_calls, 1);
+    assert!(outcome.request.is_some());
 }
 
 #[test]
@@ -122,6 +192,13 @@ enum CaseMutation {
     StaleLease,
     MissingFencingToken,
     ExpectedReads,
+    ExpectedWriteScopes,
+    WriteResolverFailure,
+    WriteTaskEcho,
+    WriteCapabilityEcho,
+    WriteRootIdentity,
+    WriteTarget,
+    LauncherMissingWriteEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,14 +369,15 @@ fn execute_with_registry(
         run_id.clone(),
         FencingToken::new(7).unwrap(),
     );
-    let resolver = WorktreeResolver {
-        mismatched_echo: mutation == CaseMutation::ResolverEcho,
-    };
+    let resolver = WorktreeResolver { mutation };
     let leases = CurrentLease {
         expected: claim.clone(),
         stale: mutation == CaseMutation::StaleLease,
     };
-    let launcher = CapturingLauncher::default();
+    let launcher = CapturingLauncher {
+        omit_write_evidence: mutation == CaseMutation::LauncherMissingWriteEvidence,
+        ..CapturingLauncher::default()
+    };
     let runtime = ProcessRuntime::new(
         executables,
         &environments,
@@ -337,14 +415,33 @@ fn execute_with_registry(
             })
             .unwrap(),
             argv.clone(),
-            CapabilityRef::worktree(task_id, ".").unwrap(),
+            CapabilityRef::worktree(task_id.clone(), ".").unwrap(),
             ProcessTrustTier::IsolatedWorker,
             if mutation == CaseMutation::NetworkProfile {
                 NetworkProfile::ApprovedDestinations
             } else {
                 NetworkProfile::Denied
             },
-            Vec::new(),
+            if matches!(
+                mutation,
+                CaseMutation::ExpectedWriteScopes
+                    | CaseMutation::WriteResolverFailure
+                    | CaseMutation::WriteTaskEcho
+                    | CaseMutation::WriteCapabilityEcho
+                    | CaseMutation::WriteRootIdentity
+                    | CaseMutation::WriteTarget
+                    | CaseMutation::LauncherMissingWriteEvidence
+            ) {
+                [".", "target/second.txt"]
+                    .into_iter()
+                    .map(|path| {
+                        ExpectedWrite::new(CapabilityRef::worktree(task_id.clone(), path).unwrap())
+                            .unwrap()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
             (mutation != CaseMutation::MissingFencingToken).then(|| FencingToken::new(7).unwrap()),
         )
         .unwrap(),
@@ -381,12 +478,32 @@ fn execute_with_registry(
 struct CapturingLauncher {
     request: Mutex<Option<AuthorizedProcessRequest>>,
     calls: AtomicUsize,
+    omit_write_evidence: bool,
 }
 
 impl ProcessLauncher for CapturingLauncher {
     fn execute(&self, request: AuthorizedProcessRequest) -> Result<ProcessReceipt, PortError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let execution_id = request.execution_id.clone();
+        let observed_writes = if self.omit_write_evidence {
+            Vec::new()
+        } else {
+            request
+                .expected_writes
+                .iter()
+                .map(|scope| {
+                    ObservedProcessWrite::new(
+                        scope.capability().clone(),
+                        scope.root_identity().clone(),
+                        scope.target().clone(),
+                        VerifiedWrite {
+                            digest: digest(b"observed process write"),
+                            size_bytes: 22,
+                        },
+                    )
+                })
+                .collect()
+        };
         *self.request.lock().unwrap() = Some(request);
         Ok(ProcessReceipt {
             execution_id,
@@ -415,7 +532,7 @@ impl ProcessLauncher for CapturingLauncher {
                 resource_limit_terminated: false,
                 tree_terminated: false,
             },
-            observed_writes: Vec::new(),
+            observed_writes,
             output_digest: digest(b"ok"),
         })
     }
@@ -431,20 +548,67 @@ impl ProcessLauncher for CapturingLauncher {
 }
 
 struct WorktreeResolver {
-    mismatched_echo: bool,
+    mutation: CaseMutation,
 }
 
 impl CapabilityResolver for WorktreeResolver {
     fn resolve(&self, request: CapabilityRequest) -> Result<ResolvedCapability, PortError> {
+        let is_write_scope = matches!(
+            &request.capability,
+            CapabilityRef::Worktree(worktree) if worktree.path() != "."
+        );
+        if is_write_scope && self.mutation == CaseMutation::WriteResolverFailure {
+            return Err(PortError::failure(
+                SafeErrorClassification::IntegrityFailure,
+                Retryability::NonRetryable,
+            ));
+        }
+        let target = match &request.capability {
+            CapabilityRef::Worktree(_)
+                if is_write_scope && self.mutation == CaseMutation::WriteTarget =>
+            {
+                ResolvedCapabilityTarget::Relative(
+                    RelativePathComponents::new(vec!["different.txt".to_owned()]).unwrap(),
+                )
+            }
+            CapabilityRef::Worktree(worktree) if worktree.path() != "." => {
+                ResolvedCapabilityTarget::Relative(
+                    RelativePathComponents::new(
+                        worktree
+                            .path()
+                            .split('/')
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap(),
+                )
+            }
+            _ => ResolvedCapabilityTarget::Root,
+        };
         Ok(ResolvedCapability {
-            capability: if self.mismatched_echo {
+            capability: if is_write_scope && self.mutation == CaseMutation::WriteTaskEcho {
+                let CapabilityRef::Worktree(worktree) = &request.capability else {
+                    unreachable!();
+                };
+                CapabilityRef::worktree(TaskId::new("other-task").unwrap(), worktree.path())
+                    .unwrap()
+            } else if self.mutation == CaseMutation::ResolverEcho
+                || (is_write_scope && self.mutation == CaseMutation::WriteCapabilityEcho)
+            {
                 CapabilityRef::worktree(request.task_id, "src").unwrap()
             } else {
                 request.capability
             },
             content_digest: None,
-            root_identity: CapabilityRootIdentity::new("worktree-root").unwrap(),
-            target: ResolvedCapabilityTarget::Root,
+            root_identity: CapabilityRootIdentity::new(
+                if is_write_scope && self.mutation == CaseMutation::WriteRootIdentity {
+                    "other-root"
+                } else {
+                    "worktree-root"
+                },
+            )
+            .unwrap(),
+            target,
         })
     }
 }

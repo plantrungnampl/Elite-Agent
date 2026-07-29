@@ -10,13 +10,13 @@ use local_agent_terminal_application::{
     FileWritePreImage, FileWriteRecoveryCompletion, FileWriteRecoveryFailure,
     FileWriteRecoveryIntent, FileWriteRecoveryRequest, FileWriteRecoveryState,
     FileWriteRecoveryStore, JobReceipt, NewApproval, NewToolExecution, NewToolIntent,
-    ProcessReceipt, ProcessStatus, RelativePathComponents, ToolExecutionCompletion,
-    ToolExecutionId, ToolExecutionStore, ToolRequestBindingDigest, VerifiedFileWriteCompensation,
-    VerifiedWrite,
+    ObservedProcessWrite, ProcessReceipt, ProcessStatus, RelativePathComponents,
+    ResolvedCapabilityTarget, ToolExecutionCompletion, ToolExecutionId, ToolExecutionStore,
+    ToolRequestBindingDigest, VerifiedFileWriteCompensation, VerifiedWrite,
 };
 use local_agent_terminal_domain::{
-    ActorId, ArtifactId, FencingToken, GitObjectId, LeaseClaim, PolicyEffect, ProjectId, RunId,
-    Sequence, Sha256Digest, TaskId, WorkspaceFingerprint, WorkspaceVersion,
+    ActorId, ArtifactId, CapabilityRef, FencingToken, GitObjectId, LeaseClaim, PolicyEffect,
+    ProjectId, RunId, Sequence, Sha256Digest, TaskId, WorkspaceFingerprint, WorkspaceVersion,
 };
 use local_agent_terminal_storage_sqlite::SqliteStore;
 use rusqlite::{params, Connection};
@@ -256,10 +256,11 @@ fn terminated_process_is_durable_non_success_with_complete_job_evidence() {
     receipt.job_receipt.total_user_time_ms = 650;
     receipt.job_receipt.resource_limit_terminated = true;
     receipt.job_receipt.tree_terminated = true;
-    receipt.observed_writes = vec![VerifiedWrite {
-        digest: digest_bytes(b"observed write"),
-        size_bytes: 14,
-    }];
+    receipt.observed_writes = vec![observed_process_write(
+        "generated.txt",
+        "worktree-root",
+        b"observed write",
+    )];
     let completion = ToolExecutionCompletion {
         execution_id,
         receipt,
@@ -300,6 +301,93 @@ fn terminated_process_is_durable_non_success_with_complete_job_evidence() {
     assert_eq!(receipt["observedWrites"][0]["sizeBytes"], 14);
     let event: serde_json::Value = serde_json::from_str(&durable.3).unwrap();
     assert_eq!(event["status"], "terminated");
+}
+
+#[test]
+fn two_scope_process_write_receipt_reopens_with_exact_mapping() {
+    let database = TempDatabase::new();
+    let operation_digest = persist_request_artifact(&database);
+    persist_policy_decision(&database.path, &operation_digest, "allow");
+    let output_digest = persist_output_artifact(&database, b"two-scope output");
+    let store = SqliteStore::open(&database.path).unwrap();
+    let execution_id = ToolExecutionId::new("execution-two-scopes").unwrap();
+    store
+        .reserve(NewToolIntent {
+            execution_id: execution_id.clone(),
+            operation_digest,
+        })
+        .unwrap();
+    store
+        .begin(NewToolExecution {
+            execution_id: execution_id.clone(),
+        })
+        .unwrap();
+    let mut receipt = process_receipt(execution_id.clone(), Some(0), output_digest);
+    receipt.observed_writes = vec![
+        observed_process_write(".", "worktree-root", b"first"),
+        observed_process_write("generated/second.txt", "worktree-root", b"second"),
+    ];
+    let completion = ToolExecutionCompletion {
+        execution_id,
+        receipt,
+    };
+
+    assert!(store.finish(completion.clone()).unwrap().completed);
+    drop(store);
+
+    let connection = configured_connection(&database.path);
+    let (receipt_json, event_json): (String, String) = connection
+        .query_row(
+            "SELECT oi.external_receipt_json,
+                    (SELECT payload_json FROM events
+                     WHERE event_type = 'tool.execution.completed'
+                       AND actor_id = 'execution-two-scopes')
+             FROM operation_intents oi WHERE oi.id = 'execution-two-scopes'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let receipt_value: serde_json::Value = serde_json::from_str(&receipt_json).unwrap();
+    let expected = serde_json::json!([
+        {
+            "capability": {
+                "kind": "worktree",
+                "taskId": "task-1",
+                "path": ".",
+            },
+            "rootIdentity": "worktree-root",
+            "target": {
+                "kind": "root",
+            },
+            "digest": digest_bytes(b"first").as_str(),
+            "sizeBytes": 5,
+        },
+        {
+            "capability": {
+                "kind": "worktree",
+                "taskId": "task-1",
+                "path": "generated/second.txt",
+            },
+            "rootIdentity": "worktree-root",
+            "target": {
+                "kind": "relative",
+                "components": ["generated", "second.txt"],
+            },
+            "digest": digest_bytes(b"second").as_str(),
+            "sizeBytes": 6,
+        },
+    ]);
+    assert_eq!(receipt_value["schemaVersion"], 1);
+    assert_eq!(receipt_value["observedWrites"], expected);
+    let event_value: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+    assert_eq!(event_value["receipt"]["observedWrites"], expected);
+    drop(connection);
+
+    let reopened = SqliteStore::open(&database.path).unwrap();
+    assert!(reopened.finish(completion.clone()).unwrap().completed);
+    let mut reordered = completion;
+    reordered.receipt.observed_writes.reverse();
+    assert!(reopened.finish(reordered).is_err());
 }
 
 #[test]
@@ -1339,6 +1427,25 @@ fn process_receipt(
         observed_writes: Vec::new(),
         output_digest,
     }
+}
+
+fn observed_process_write(path: &str, root_identity: &str, bytes: &[u8]) -> ObservedProcessWrite {
+    ObservedProcessWrite::new(
+        CapabilityRef::worktree(TaskId::new("task-1").unwrap(), path).unwrap(),
+        CapabilityRootIdentity::new(root_identity).unwrap(),
+        if path == "." {
+            ResolvedCapabilityTarget::Root
+        } else {
+            ResolvedCapabilityTarget::Relative(
+                RelativePathComponents::new(path.split(['/', '\\']).map(str::to_owned).collect())
+                    .unwrap(),
+            )
+        },
+        VerifiedWrite {
+            digest: digest_bytes(bytes),
+            size_bytes: bytes.len() as u64,
+        },
+    )
 }
 
 fn insert_tool_execution(

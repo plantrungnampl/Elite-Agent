@@ -1,11 +1,14 @@
 use local_agent_terminal_application::{
-    ApprovedProcessExecutor, ApprovedProcessRequest, AuthorizedProcessRequest, CancellationReceipt,
-    CapabilityRequest, CapabilityResolver, EnforcedNetworkProfile, EnvironmentProfileResolver,
+    validate_and_order_process_writes, ApprovedProcessExecutor, ApprovedProcessRequest,
+    AuthorizedExpectedWrite, AuthorizedProcessRequest, CancellationReceipt, CapabilityRequest,
+    CapabilityResolver, EnforcedNetworkProfile, EnvironmentProfileResolver,
     ExecutableProfileResolver, ExecutorLeaseStore, NetworkProfileVerifier, PortError,
     ProcessLauncher, ProcessLimits, ProcessReceipt, ProcessWorkingDirectory, Retryability,
     SafeErrorClassification, ToolExecutionId,
 };
-use local_agent_terminal_domain::{CapabilityRef, LeaseClaim, ProcessTrustTier};
+use local_agent_terminal_domain::{
+    CapabilityRef, ExpectedWrite, LeaseClaim, ProcessTrustTier, TaskId,
+};
 
 const DEFAULT_MEMORY_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_OUTPUT_LIMIT_BYTES: u64 = 1024 * 1024;
@@ -108,6 +111,11 @@ impl<'a> ProcessRuntime<'a> {
             fencing_token,
         );
         let limits = process_limits(&approved, binding.timeout_ms())?;
+        let expected_writes = self.resolve_expected_writes(
+            binding.task_id(),
+            &resolved_cwd.root_identity,
+            process.expected_writes(),
+        )?;
         let authorized = AuthorizedProcessRequest {
             execution_id,
             trust_tier: process.trust_tier(),
@@ -118,18 +126,45 @@ impl<'a> ProcessRuntime<'a> {
             network,
             timeout_ms: binding.timeout_ms(),
             limits,
-            expected_writes: process.expected_writes().to_vec(),
+            expected_writes,
             executor_claim: executor_claim.clone(),
         };
 
         let _retained_executable = self.executables.verify_and_retain(&authorized.executable)?;
         self.networks.verify(&authorized.network)?;
         self.leases.assert_current(executor_claim)?;
-        self.launcher.execute(authorized)
+        let approved_writes = authorized.expected_writes.clone();
+        let mut receipt = self.launcher.execute(authorized)?;
+        receipt.observed_writes =
+            validate_and_order_process_writes(&approved_writes, receipt.observed_writes)?;
+        Ok(receipt)
     }
 
     pub fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
         self.launcher.cancel(execution_id)
+    }
+
+    fn resolve_expected_writes(
+        &self,
+        task_id: &TaskId,
+        cwd_root_identity: &local_agent_terminal_application::CapabilityRootIdentity,
+        expected_writes: &[ExpectedWrite],
+    ) -> Result<Vec<AuthorizedExpectedWrite>, PortError> {
+        expected_writes
+            .iter()
+            .map(|expected| {
+                let resolved = self.resolver.resolve(CapabilityRequest {
+                    task_id: task_id.clone(),
+                    capability: expected.capability().clone(),
+                })?;
+                let authorized = AuthorizedExpectedWrite::new(task_id, expected, resolved)
+                    .map_err(|_| integrity_failure())?;
+                if authorized.root_identity() != cwd_root_identity {
+                    return Err(integrity_failure());
+                }
+                Ok(authorized)
+            })
+            .collect()
     }
 }
 
