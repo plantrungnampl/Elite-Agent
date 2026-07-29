@@ -64,7 +64,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION, ERROR_NOT_FOUND,
     ERROR_NOT_SUPPORTED, ERROR_NOT_SUPPORTED_IN_APPCONTAINER, ERROR_NO_SUCH_LOGON_SESSION,
     ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_SUCCESS, FILETIME, GENERIC_READ,
-    GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    GENERIC_WRITE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Networking::WinSock::{
     closesocket, connect, getsockopt, ioctlsocket, socket, WSACleanup, WSAGetLastError, WSAPoll,
@@ -102,7 +102,9 @@ use windows_sys::Win32::System::Rpc::{
     UuidCreate, RPC_S_INVALID_BINDING, RPC_S_OK, RPC_S_UUID_LOCAL_ONLY,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessTimes, OpenProcessToken, CREATE_BREAKAWAY_FROM_JOB,
+    CreateProcessW, GetCurrentProcess, GetProcessTimes, OpenProcessToken, TerminateProcess,
+    WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP,
+    CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, PROCESS_INFORMATION, STARTUPINFOW,
 };
 #[cfg(feature = "test-seams")]
 use windows_sys::Win32::System::Threading::{
@@ -305,6 +307,50 @@ fn real_lpac_child_reports_less_privileged_appcontainer_identity() {
     );
     #[cfg(not(feature = "test-seams"))]
     let _ = execution_id;
+}
+
+#[test]
+fn real_lpac_denies_registered_descendant_creation_modes() {
+    let root = TempDir::new().unwrap();
+    let launcher = registered_lpac_launcher(root.path());
+    let mut request = request(
+        vec![
+            "--exact".to_owned(),
+            "process_child_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        BTreeMap::from([(
+            "LAT_PROCESS_HELPER".to_owned(),
+            "lpac-descendant-denial".to_owned(),
+        )]),
+    );
+    request.execution_id = ToolExecutionId::new("execution-lpac-descendant-denial").unwrap();
+    request.timeout_ms = 2_000;
+    let execution_id = request.execution_id.clone();
+
+    let receipt = launcher.execute(request).unwrap();
+    let stderr = String::from_utf8(receipt.stderr.bytes).unwrap();
+    let observed = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("d2d-descendant-"))
+        .collect::<BTreeSet<_>>();
+    let expected = BTreeSet::from([
+        "ordinary=access-denied",
+        "detached-new-process-group=access-denied",
+        "breakaway=access-denied",
+        "attempts=complete",
+    ]);
+
+    assert_eq!(observed, expected);
+    assert_eq!(receipt.status, ProcessStatus::Terminated);
+    assert_eq!(receipt.exit_code, None);
+    assert!(!receipt.stderr.truncated);
+    assert_ne!(receipt.job_receipt.root_pid, 0);
+    assert!(receipt.job_receipt.kill_on_close);
+    assert!(receipt.job_receipt.no_breakaway);
+    assert!(!receipt.job_receipt.resource_limit_terminated);
+    assert!(receipt.job_receipt.tree_terminated);
+    assert_real_lpac_lifecycle(&execution_id);
 }
 
 #[test]
@@ -2234,6 +2280,8 @@ fn process_child_helper() {
         }
         Some("lpac-hostile-d2a") => run_lpac_hostile_d2a_probe(),
         Some("lpac-network-d2a") => run_lpac_d2a_network_probe(),
+        Some("lpac-descendant-denial") => run_lpac_descendant_denial_probe(),
+        Some("lpac-descendant-child") => {}
         Some("marker") => {
             fs::write(std::env::var_os("LAT_PROCESS_MARKER").unwrap(), b"ran").unwrap();
         }
@@ -2272,6 +2320,97 @@ fn process_child_helper() {
                 .unwrap_or("missing")
         ),
         _ => {}
+    }
+}
+
+fn run_lpac_descendant_denial_probe() {
+    for (mode, creation_flags) in [
+        ("ordinary", 0),
+        (
+            "detached-new-process-group",
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        ),
+        ("breakaway", CREATE_BREAKAWAY_FROM_JOB),
+    ] {
+        eprintln!(
+            "d2d-descendant-{mode}={}",
+            attempt_registered_descendant(creation_flags)
+        );
+    }
+    eprintln!("d2d-descendant-attempts=complete");
+    thread::sleep(Duration::from_secs(30));
+}
+
+fn attempt_registered_descendant(creation_flags: u32) -> &'static str {
+    let executable = std::env::current_exe().unwrap();
+    let application = executable
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut command_line = vec![u16::from(b'"')];
+    command_line.extend(executable.as_os_str().encode_wide());
+    command_line.extend("\" --exact process_child_helper --nocapture\0".encode_utf16());
+    let environment = "LAT_PROCESS_HELPER=lpac-descendant-child\0\0"
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    let current_directory = std::env::current_dir()
+        .unwrap()
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..STARTUPINFOW::default()
+    };
+    let mut process_information = PROCESS_INFORMATION::default();
+
+    // SAFETY: all pointers reference live, correctly terminated buffers; startup has
+    // its documented size; process_information is writable; handles are not inherited.
+    let created = unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            creation_flags | CREATE_UNICODE_ENVIRONMENT,
+            environment.as_ptr().cast(),
+            current_directory.as_ptr(),
+            &startup,
+            &mut process_information,
+        )
+    };
+    if created == 0 {
+        // SAFETY: CreateProcessW failed on this thread, so GetLastError returns its status.
+        let error = unsafe { GetLastError() };
+        assert_eq!(process_information.dwProcessId, 0);
+        return match error {
+            ERROR_ACCESS_DENIED => "access-denied",
+            _ => "other-failure",
+        };
+    }
+
+    assert_ne!(process_information.dwProcessId, 0);
+    // SAFETY: CreateProcessW returned both owned handles. Every operation is
+    // best-effort so both handles are closed even if termination or waiting fails.
+    let cleanup_complete = unsafe {
+        let stopped = if WaitForSingleObject(process_information.hProcess, 250) == WAIT_OBJECT_0 {
+            true
+        } else {
+            let termination_requested = TerminateProcess(process_information.hProcess, 1) != 0;
+            let stopped = WaitForSingleObject(process_information.hProcess, 5_000) == WAIT_OBJECT_0;
+            termination_requested && stopped
+        };
+        let thread_closed = CloseHandle(process_information.hThread) != 0;
+        let process_closed = CloseHandle(process_information.hProcess) != 0;
+        stopped && thread_closed && process_closed
+    };
+    if cleanup_complete {
+        "started"
+    } else {
+        "started-cleanup-failed"
     }
 }
 
