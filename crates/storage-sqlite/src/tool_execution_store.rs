@@ -6,9 +6,9 @@ use local_agent_terminal_application::{
     ApprovalDigestPayload, CanonicalEvidenceRef, FileWritePreImage, FileWriteRecoveryCompletion,
     FileWriteRecoveryFailure, FileWriteRecoveryIntent, FileWriteRecoveryRequest,
     FileWriteRecoverySnapshot, FileWriteRecoveryState, FileWriteRecoveryStore, NewToolExecution,
-    NewToolIntent, OperationIntentSnapshot, PortError, Retryability, SafeErrorClassification,
-    ToolExecutionCompletion, ToolExecutionId, ToolExecutionSnapshot, ToolExecutionStore,
-    VerifiedFileWriteCompensation, WorkspaceMutationRequest,
+    NewToolIntent, OperationIntentSnapshot, PortError, ProcessReceipt, ProcessStatus, Retryability,
+    SafeErrorClassification, ToolExecutionCompletion, ToolExecutionId, ToolExecutionSnapshot,
+    ToolExecutionStore, VerifiedFileWriteCompensation, WorkspaceMutationRequest,
 };
 use local_agent_terminal_domain::{
     ArtifactId, PolicyEffect, ProjectId, Sequence, Sha256Digest, TaskId,
@@ -682,6 +682,7 @@ impl ToolExecutionStore for SqliteStore {
         if completion.execution_id != completion.receipt.execution_id {
             return Err(invalid_input());
         }
+        let outcome = durable_process_outcome(&completion.receipt);
         let lookup: Option<(String, String, Option<String>)> = self
             .connection()
             .map_err(open_error_to_port)?
@@ -698,7 +699,7 @@ impl ToolExecutionStore for SqliteStore {
         let Some((lookup_task_id, lookup_status, result_artifact_id)) = lookup else {
             return Err(not_found());
         };
-        let output = if lookup_status == "succeeded" {
+        let output = if lookup_status == outcome.execution_status {
             let artifact_id = result_artifact_id.ok_or_else(integrity_failure)?;
             self.artifact_by_id(
                 &artifact_id,
@@ -750,8 +751,8 @@ impl ToolExecutionStore for SqliteStore {
         if output.task_id != persisted.task_id {
             return Err(integrity_failure());
         }
-        if persisted.execution_status == "succeeded" {
-            if persisted.intent_status == "succeeded"
+        if persisted.execution_status == outcome.execution_status {
+            if persisted.intent_status == outcome.intent_status
                 && persisted.exit_code == completion.receipt.exit_code
                 && persisted.stdout_artifact_id.as_deref() == Some(output.id.as_str())
                 && persisted.stderr_artifact_id.is_none()
@@ -782,20 +783,26 @@ impl ToolExecutionStore for SqliteStore {
         let intent_changed = transaction
             .execute(
                 "UPDATE operation_intents
-                 SET status = 'succeeded', result_artifact_id = ?1, external_receipt_json = ?2,
-                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE id = ?3 AND status = 'started'",
-                params![output.id, expected_receipt, persisted.intent_id,],
+                 SET status = ?1, result_artifact_id = ?2, external_receipt_json = ?3,
+                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE id = ?4 AND status = 'started'",
+                params![
+                    outcome.intent_status,
+                    output.id,
+                    expected_receipt,
+                    persisted.intent_id,
+                ],
             )
             .map_err(sqlite_error_to_port)?;
         let execution_changed = transaction
             .execute(
                 "UPDATE tool_executions
-                 SET status = 'succeeded',
-                     completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                     exit_code = ?1, stdout_artifact_id = ?2
-                 WHERE id = ?3 AND status = 'running'",
+                 SET status = ?1,
+                      completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                      exit_code = ?2, stdout_artifact_id = ?3
+                 WHERE id = ?4 AND status = 'running'",
                 params![
+                    outcome.execution_status,
                     completion.receipt.exit_code,
                     output.id,
                     completion.execution_id.as_str()
@@ -813,10 +820,11 @@ impl ToolExecutionStore for SqliteStore {
             "None",
             json!({
                 "executionId": completion.execution_id.as_str(),
-                "status": "succeeded",
+                "status": outcome.event_status,
                 "exitCode": completion.receipt.exit_code,
                 "outputArtifactId": output.id,
                 "outputDigest": completion.receipt.output_digest.as_str(),
+                "receipt": receipt_value(&completion),
             }),
         )?;
         transaction.commit().map_err(sqlite_error_to_port)?;
@@ -1679,12 +1687,45 @@ fn execution_matches(
 }
 
 fn receipt_json(completion: &ToolExecutionCompletion) -> String {
+    receipt_value(completion).to_string()
+}
+
+fn receipt_value(completion: &ToolExecutionCompletion) -> serde_json::Value {
+    let receipt = &completion.receipt;
     json!({
+        "schemaVersion": 1,
         "executionId": completion.execution_id.as_str(),
-        "exitCode": completion.receipt.exit_code,
-        "outputDigest": completion.receipt.output_digest.as_str(),
+        "status": process_status(receipt.status),
+        "exitCode": receipt.exit_code,
+        "outputDigest": receipt.output_digest.as_str(),
+        "stdout": {
+            "byteCount": receipt.stdout.bytes.len(),
+            "truncated": receipt.stdout.truncated,
+        },
+        "stderr": {
+            "byteCount": receipt.stderr.bytes.len(),
+            "truncated": receipt.stderr.truncated,
+        },
+        "durationMs": receipt.duration_ms,
+        "job": {
+            "rootPid": receipt.job_receipt.root_pid,
+            "jobId": receipt.job_receipt.job_id,
+            "killOnClose": receipt.job_receipt.kill_on_close,
+            "noBreakaway": receipt.job_receipt.no_breakaway,
+            "jobMemoryLimit": receipt.job_receipt.job_memory_limit,
+            "jobCpuTimeLimit": receipt.job_receipt.job_cpu_time_limit,
+            "memoryLimitBytes": receipt.job_receipt.memory_limit_bytes,
+            "cpuTimeLimitMs": receipt.job_receipt.cpu_time_limit_ms,
+            "maxActiveProcesses": receipt.job_receipt.max_active_processes,
+            "totalUserTimeMs": receipt.job_receipt.total_user_time_ms,
+            "resourceLimitTerminated": receipt.job_receipt.resource_limit_terminated,
+            "treeTerminated": receipt.job_receipt.tree_terminated,
+        },
+        "observedWrites": receipt.observed_writes.iter().map(|write| json!({
+            "digest": write.digest.as_str(),
+            "sizeBytes": write.size_bytes,
+        })).collect::<Vec<_>>(),
     })
-    .to_string()
 }
 
 fn completion_audit_matches(
@@ -1693,12 +1734,14 @@ fn completion_audit_matches(
     completion: &ToolExecutionCompletion,
     output_artifact_id: &str,
 ) -> Result<bool, PortError> {
+    let outcome = durable_process_outcome(&completion.receipt);
     let payload = json!({
         "executionId": completion.execution_id.as_str(),
-        "status": "succeeded",
+        "status": outcome.event_status,
         "exitCode": completion.receipt.exit_code,
         "outputArtifactId": output_artifact_id,
         "outputDigest": completion.receipt.output_digest.as_str(),
+        "receipt": receipt_value(completion),
     })
     .to_string();
     transaction
@@ -1712,6 +1755,39 @@ fn completion_audit_matches(
             |row| row.get(0),
         )
         .map_err(sqlite_error_to_port)
+}
+
+struct DurableProcessOutcome {
+    execution_status: &'static str,
+    intent_status: &'static str,
+    event_status: &'static str,
+}
+
+fn durable_process_outcome(receipt: &ProcessReceipt) -> DurableProcessOutcome {
+    match (receipt.status, receipt.exit_code) {
+        (ProcessStatus::Exited, Some(0)) => DurableProcessOutcome {
+            execution_status: "succeeded",
+            intent_status: "succeeded",
+            event_status: "succeeded",
+        },
+        (ProcessStatus::Exited, _) => DurableProcessOutcome {
+            execution_status: "failed",
+            intent_status: "failed",
+            event_status: "failed",
+        },
+        (ProcessStatus::Terminated, _) => DurableProcessOutcome {
+            execution_status: "terminated",
+            intent_status: "failed",
+            event_status: "terminated",
+        },
+    }
+}
+
+fn process_status(status: ProcessStatus) -> &'static str {
+    match status {
+        ProcessStatus::Exited => "exited",
+        ProcessStatus::Terminated => "terminated",
+    }
 }
 
 fn append_tool_event(

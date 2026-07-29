@@ -1,0 +1,192 @@
+use local_agent_terminal_application::{
+    ApprovedProcessExecutor, ApprovedProcessRequest, AuthorizedProcessRequest, CancellationReceipt,
+    CapabilityRequest, CapabilityResolver, EnforcedNetworkProfile, EnvironmentProfileResolver,
+    ExecutableProfileResolver, ExecutorLeaseStore, NetworkProfileVerifier, PortError,
+    ProcessLauncher, ProcessLimits, ProcessReceipt, ProcessWorkingDirectory, Retryability,
+    SafeErrorClassification, ToolExecutionId,
+};
+use local_agent_terminal_domain::{CapabilityRef, LeaseClaim, ProcessTrustTier};
+
+const DEFAULT_MEMORY_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_OUTPUT_LIMIT_BYTES: u64 = 1024 * 1024;
+const DEFAULT_MAX_ACTIVE_PROCESSES: u32 = 64;
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+pub struct ProcessRuntime<'a> {
+    executables: &'a dyn ExecutableProfileResolver,
+    environments: &'a dyn EnvironmentProfileResolver,
+    networks: &'a dyn NetworkProfileVerifier,
+    enforced_networks: Vec<EnforcedNetworkProfile>,
+    resolver: &'a dyn CapabilityResolver,
+    leases: &'a dyn ExecutorLeaseStore,
+    launcher: &'a dyn ProcessLauncher,
+}
+
+impl<'a> ProcessRuntime<'a> {
+    pub fn new(
+        executables: &'a dyn ExecutableProfileResolver,
+        environments: &'a dyn EnvironmentProfileResolver,
+        networks: &'a dyn NetworkProfileVerifier,
+        enforced_networks: Vec<EnforcedNetworkProfile>,
+        resolver: &'a dyn CapabilityResolver,
+        leases: &'a dyn ExecutorLeaseStore,
+        launcher: &'a dyn ProcessLauncher,
+    ) -> Result<Self, PortError> {
+        for (index, profile) in enforced_networks.iter().enumerate() {
+            networks.verify(profile)?;
+            if enforced_networks[..index]
+                .iter()
+                .any(|registered| registered.profile == profile.profile)
+            {
+                return Err(invalid_input());
+            }
+        }
+        Ok(Self {
+            executables,
+            environments,
+            networks,
+            enforced_networks,
+            resolver,
+            leases,
+            launcher,
+        })
+    }
+
+    pub fn execute(
+        &self,
+        execution_id: ToolExecutionId,
+        approved: ApprovedProcessRequest,
+    ) -> Result<ProcessReceipt, PortError> {
+        let process = &approved.process;
+        if process.trust_tier() != ProcessTrustTier::IsolatedWorker
+            || !approved.expected_reads.is_empty()
+            || process
+                .argv()
+                .iter()
+                .any(|argument| argument.starts_with('@'))
+        {
+            return Err(permission_denied());
+        }
+
+        let executable_id = match process.executable() {
+            CapabilityRef::Toolchain(executable) => executable.name(),
+            _ => return Err(permission_denied()),
+        };
+        let executable = self.executables.resolve_registered(executable_id)?;
+        let binding = process.binding();
+        let environment = self.environments.resolve(
+            binding.environment_profile().name(),
+            binding.environment_profile().digest(),
+        )?;
+        let network = self
+            .enforced_networks
+            .iter()
+            .find(|profile| profile.profile == process.network())
+            .cloned()
+            .ok_or_else(permission_denied)?;
+        self.networks.verify(&network)?;
+
+        let resolved_cwd = self.resolver.resolve(CapabilityRequest {
+            task_id: binding.task_id().clone(),
+            capability: process.cwd().clone(),
+        })?;
+        if resolved_cwd.capability != *process.cwd()
+            || resolved_cwd.capability.worktree_task_id() != Some(binding.task_id())
+        {
+            return Err(integrity_failure());
+        }
+
+        let fencing_token = process
+            .executor_fencing_token()
+            .ok_or_else(permission_denied)?;
+        let executor_claim = LeaseClaim::new(
+            binding.task_id().clone(),
+            binding.run_id().clone(),
+            fencing_token,
+        );
+        let limits = process_limits(&approved, binding.timeout_ms())?;
+        let authorized = AuthorizedProcessRequest {
+            execution_id,
+            trust_tier: process.trust_tier(),
+            executable,
+            argv: process.argv().to_vec(),
+            cwd: ProcessWorkingDirectory::IsolatedWorktree(resolved_cwd),
+            environment,
+            network,
+            timeout_ms: binding.timeout_ms(),
+            limits,
+            expected_writes: process.expected_writes().to_vec(),
+            executor_claim: executor_claim.clone(),
+        };
+
+        let _retained_executable = self.executables.verify_and_retain(&authorized.executable)?;
+        self.networks.verify(&authorized.network)?;
+        self.leases.assert_current(executor_claim)?;
+        self.launcher.execute(authorized)
+    }
+
+    pub fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
+        self.launcher.cancel(execution_id)
+    }
+}
+
+impl ApprovedProcessExecutor for ProcessRuntime<'_> {
+    fn execute(
+        &self,
+        execution_id: ToolExecutionId,
+        request: ApprovedProcessRequest,
+    ) -> Result<ProcessReceipt, PortError> {
+        Self::execute(self, execution_id, request)
+    }
+
+    fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
+        Self::cancel(self, execution_id)
+    }
+}
+
+fn process_limits(
+    request: &ApprovedProcessRequest,
+    timeout_ms: u64,
+) -> Result<ProcessLimits, PortError> {
+    let limits = ProcessLimits {
+        memory_limit_bytes: request
+            .memory_limit_bytes
+            .unwrap_or(DEFAULT_MEMORY_LIMIT_BYTES),
+        cpu_time_limit_ms: request.cpu_time_limit_ms.unwrap_or(timeout_ms),
+        max_stdout_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
+        max_stderr_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
+        max_active_processes: DEFAULT_MAX_ACTIVE_PROCESSES,
+    };
+    if limits.memory_limit_bytes == 0
+        || limits.cpu_time_limit_ms == 0
+        || limits.max_stdout_bytes == 0
+        || limits.max_stderr_bytes == 0
+        || limits.max_active_processes == 0
+        || limits.memory_limit_bytes > MAX_SAFE_INTEGER
+        || limits.cpu_time_limit_ms > MAX_SAFE_INTEGER
+    {
+        return Err(invalid_input());
+    }
+    Ok(limits)
+}
+
+fn invalid_input() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::InvalidInput,
+        Retryability::NonRetryable,
+    )
+}
+
+fn permission_denied() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::PermissionDenied,
+        Retryability::NonRetryable,
+    )
+}
+
+fn integrity_failure() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::IntegrityFailure,
+        Retryability::NonRetryable,
+    )
+}

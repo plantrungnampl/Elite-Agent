@@ -6,7 +6,7 @@ use std::sync::{Arc, Barrier};
 use local_agent_terminal_application::{
     bind_tool_approval_payload, canonical_approval_payload, ApprovalCheck, ApprovalClaim,
     ApprovalDigestPayload, ApprovalId, ApprovalInvalidation, ApprovalResolution, ApprovalState,
-    ApprovalStore, AuthorizedProcessRequest, NewApproval, PolicyDecision, PolicyDecisionStore,
+    ApprovalStore, ApprovedProcessRequest, NewApproval, PolicyDecision, PolicyDecisionStore,
     RecordedPolicyDecision, ToolApprovalOperationV1, ToolApprovalPayloadV1,
 };
 use local_agent_terminal_domain::{
@@ -720,7 +720,7 @@ fn approval_payload() -> (
         1_000,
     )
     .unwrap();
-    let request = AuthorizedProcessRequest {
+    let request = ApprovedProcessRequest {
         process: ProcessToolRequest::new(
             binding,
             ProcessInvocation::new(

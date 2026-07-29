@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
 use local_agent_terminal_domain::{
-    ActorId, ArtifactId, CapabilityRef, FencingToken, GitObjectId, LeaseClaim, NetworkProfile,
-    PolicyEffect, ProcessToolRequest, ProcessTrustTier, ProjectId, RepositoryId, RunId, Sequence,
-    Sha256Digest, TaskId, WorkspaceFingerprint,
+    ActorId, ArtifactId, CapabilityRef, ExpectedWrite, FencingToken, GitObjectId, LeaseClaim,
+    NetworkProfile, PolicyEffect, ProcessToolRequest, ProcessTrustTier, ProjectId, RepositoryId,
+    RunId, Sequence, Sha256Digest, TaskId, WorkspaceFingerprint,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -13,6 +16,102 @@ use crate::canonical_json::{invalid_input, sha256_digest};
 use crate::PortError;
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutableFileIdentity(String);
+
+impl ExecutableFileIdentity {
+    pub fn new(value: impl Into<String>) -> Result<Self, PortError> {
+        let value = value.into();
+        if value.trim().is_empty() || value.len() > 256 || value.contains('\0') {
+            return Err(invalid_input());
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedExecutable {
+    pub canonical_path: PathBuf,
+    pub sha256: Sha256Digest,
+    pub file_identity: ExecutableFileIdentity,
+    pub toolchain_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryFileIdentity(String);
+
+impl DirectoryFileIdentity {
+    pub fn new(value: impl Into<String>) -> Result<Self, PortError> {
+        let value = value.into();
+        if value.trim().is_empty() || value.len() > 256 || value.contains('\0') {
+            return Err(invalid_input());
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPrivateRuntimeDirectory {
+    pub canonical_path: PathBuf,
+    pub file_identity: DirectoryFileIdentity,
+    pub registration_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEnvironmentProfile {
+    pub name: String,
+    pub values: BTreeMap<String, String>,
+    pub digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkEnforcementReceipt {
+    enforcement_id: String,
+    profile_digest: Sha256Digest,
+}
+
+impl NetworkEnforcementReceipt {
+    pub fn new(
+        enforcement_id: impl Into<String>,
+        profile_digest: Sha256Digest,
+    ) -> Result<Self, PortError> {
+        let enforcement_id = enforcement_id.into();
+        if enforcement_id.trim().is_empty()
+            || enforcement_id.len() > 256
+            || enforcement_id.contains(['\0', '\r', '\n'])
+        {
+            return Err(invalid_input());
+        }
+        Ok(Self {
+            enforcement_id,
+            profile_digest,
+        })
+    }
+
+    pub fn enforcement_id(&self) -> &str {
+        &self.enforcement_id
+    }
+
+    pub const fn profile_digest(&self) -> &Sha256Digest {
+        &self.profile_digest
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnforcedNetworkProfile {
+    pub profile: NetworkProfile,
+    pub profile_digest: Sha256Digest,
+    pub receipt: NetworkEnforcementReceipt,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityRequest {
@@ -356,11 +455,41 @@ pub struct GitDiffResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorizedProcessRequest {
+pub struct ApprovedProcessRequest {
     pub process: ProcessToolRequest,
     pub expected_reads: Vec<CapabilityRef>,
     pub memory_limit_bytes: Option<u64>,
     pub cpu_time_limit_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessWorkingDirectory {
+    PrivateRuntime(ResolvedPrivateRuntimeDirectory),
+    IsolatedWorktree(ResolvedCapability),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessLimits {
+    pub memory_limit_bytes: u64,
+    pub cpu_time_limit_ms: u64,
+    pub max_stdout_bytes: u64,
+    pub max_stderr_bytes: u64,
+    pub max_active_processes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedProcessRequest {
+    pub execution_id: ToolExecutionId,
+    pub trust_tier: ProcessTrustTier,
+    pub executable: ResolvedExecutable,
+    pub argv: Vec<String>,
+    pub cwd: ProcessWorkingDirectory,
+    pub environment: ResolvedEnvironmentProfile,
+    pub network: EnforcedNetworkProfile,
+    pub timeout_ms: u64,
+    pub limits: ProcessLimits,
+    pub expected_writes: Vec<ExpectedWrite>,
+    pub executor_claim: LeaseClaim,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,14 +529,52 @@ impl BoundToolApproval {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessReceipt {
     pub execution_id: ToolExecutionId,
+    pub status: ProcessStatus,
     pub exit_code: Option<i32>,
+    pub stdout: BoundedOutput,
+    pub stderr: BoundedOutput,
+    pub duration_ms: u64,
+    pub job_receipt: JobReceipt,
+    pub observed_writes: Vec<VerifiedWrite>,
+    /// Retained for the existing durable receipt schema.
     pub output_digest: Sha256Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancellationReceipt {
     pub execution_id: ToolExecutionId,
+    pub status: ProcessStatus,
+    pub job_receipt: Option<JobReceipt>,
+    /// Retained for the existing durable receipt schema.
     pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedOutput {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessStatus {
+    Exited,
+    Terminated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobReceipt {
+    pub root_pid: u32,
+    pub job_id: String,
+    pub kill_on_close: bool,
+    pub no_breakaway: bool,
+    pub job_memory_limit: bool,
+    pub job_cpu_time_limit: bool,
+    pub memory_limit_bytes: u64,
+    pub cpu_time_limit_ms: u64,
+    pub max_active_processes: u32,
+    pub total_user_time_ms: u64,
+    pub resource_limit_terminated: bool,
+    pub tree_terminated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -459,7 +626,7 @@ pub struct ToolExecutionSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedToolRequest {
     pub execution_id: ToolExecutionId,
-    request: AuthorizedProcessRequest,
+    request: ApprovedProcessRequest,
     approval: BoundToolApproval,
 }
 
@@ -467,7 +634,7 @@ impl AuthorizedToolRequest {
     pub fn new(
         execution_id: ToolExecutionId,
         approval: BoundToolApproval,
-        request: AuthorizedProcessRequest,
+        request: ApprovedProcessRequest,
     ) -> Self {
         Self {
             execution_id,
@@ -499,11 +666,11 @@ impl AuthorizedToolRequest {
         &self.approval.payload.nonce
     }
 
-    pub fn process_request(&self) -> &AuthorizedProcessRequest {
+    pub fn process_request(&self) -> &ApprovedProcessRequest {
         &self.request
     }
 
-    pub fn into_process_request(self) -> AuthorizedProcessRequest {
+    pub fn into_process_request(self) -> ApprovedProcessRequest {
         self.request
     }
 }
@@ -781,6 +948,62 @@ pub trait ProcessLauncher: Send + Sync {
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError>;
 }
 
+pub trait ExecutableVerificationGuard: Send + Sync {}
+
+pub trait ExecutableArtifactInspector: Send + Sync {
+    fn inspect_and_retain(
+        &self,
+        configured_absolute_path: &str,
+        toolchain_id: &str,
+        expected_sha256: &Sha256Digest,
+    ) -> Result<(ResolvedExecutable, Box<dyn ExecutableVerificationGuard>), PortError>;
+}
+
+pub trait ExecutableProfileResolver: Send + Sync {
+    fn resolve_registered(&self, toolchain_id: &str) -> Result<ResolvedExecutable, PortError>;
+    fn verify_and_retain(
+        &self,
+        executable: &ResolvedExecutable,
+    ) -> Result<Box<dyn ExecutableVerificationGuard>, PortError>;
+}
+
+pub trait PrivateRuntimeDirectoryVerificationGuard: Send + Sync {}
+
+pub trait PrivateRuntimeDirectoryInspector: Send + Sync {
+    fn inspect_and_retain(
+        &self,
+        configured_absolute_path: &str,
+        registration_id: &str,
+    ) -> Result<
+        (
+            ResolvedPrivateRuntimeDirectory,
+            Box<dyn PrivateRuntimeDirectoryVerificationGuard>,
+        ),
+        PortError,
+    >;
+}
+
+pub trait EnvironmentProfileResolver: Send + Sync {
+    fn resolve(
+        &self,
+        name: &str,
+        expected_digest: &Sha256Digest,
+    ) -> Result<ResolvedEnvironmentProfile, PortError>;
+}
+
+pub trait NetworkProfileVerifier: Send + Sync {
+    fn verify(&self, profile: &EnforcedNetworkProfile) -> Result<(), PortError>;
+}
+
+pub trait ApprovedProcessExecutor: Send + Sync {
+    fn execute(
+        &self,
+        execution_id: ToolExecutionId,
+        request: ApprovedProcessRequest,
+    ) -> Result<ProcessReceipt, PortError>;
+    fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError>;
+}
+
 pub trait ToolExecutionStore: Send + Sync {
     fn reserve(&self, request: NewToolIntent) -> Result<OperationIntentSnapshot, PortError>;
     fn begin(&self, request: NewToolExecution) -> Result<ToolExecutionSnapshot, PortError>;
@@ -1033,7 +1256,7 @@ fn valid_path_component(value: &str) -> bool {
 
 pub fn bind_tool_approval_payload(
     payload: ToolApprovalPayloadV1,
-    request: &AuthorizedProcessRequest,
+    request: &ApprovedProcessRequest,
 ) -> Result<BoundToolApproval, PortError> {
     let payload = bind_process_request(payload, request)?;
     canonical_approval_payload(&ApprovalDigestPayload::Tool(payload.clone()))?;
@@ -1045,7 +1268,7 @@ pub fn bind_tool_approval_payload(
 
 fn bind_process_request(
     mut payload: ToolApprovalPayloadV1,
-    request: &AuthorizedProcessRequest,
+    request: &ApprovedProcessRequest,
 ) -> Result<ToolApprovalPayloadV1, PortError> {
     let process = &request.process;
     let binding = process.binding();
@@ -1081,7 +1304,7 @@ fn canonical_process_arguments_digest(
 }
 
 fn canonical_tool_request_binding(
-    request: &AuthorizedProcessRequest,
+    request: &ApprovedProcessRequest,
 ) -> Result<ToolRequestBindingDigest, PortError> {
     validate_safe_integer_fields(request)?;
     let process = &request.process;
@@ -1123,7 +1346,7 @@ fn canonical_tool_request_binding(
         .map_err(|_| invalid_input())
 }
 
-fn validate_safe_integer_fields(request: &AuthorizedProcessRequest) -> Result<(), PortError> {
+fn validate_safe_integer_fields(request: &ApprovedProcessRequest) -> Result<(), PortError> {
     let process = &request.process;
     let binding = process.binding();
     let unsafe_integer = [

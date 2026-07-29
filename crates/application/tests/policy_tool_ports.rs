@@ -5,17 +5,17 @@ use local_agent_terminal_application::{
     bind_tool_approval_payload, canonical_approval_payload, canonical_file_write_recovery_request,
     parse_file_write_recovery_request, ApprovalCheck, ApprovalClaim, ApprovalDigestPayload,
     ApprovalId, ApprovalInvalidation, ApprovalResolution, ApprovalSnapshot, ApprovalState,
-    ApprovalStore, AuthorizedProcessRequest, AuthorizedToolRequest, BoundToolApproval,
-    CancellationReceipt, CanonicalEvidenceRef, CapabilityFileWriteSession,
+    ApprovalStore, ApprovedProcessExecutor, ApprovedProcessRequest, AuthorizedToolRequest,
+    BoundToolApproval, CancellationReceipt, CanonicalEvidenceRef, CapabilityFileWriteSession,
     CapabilityFileWriteSessionFactory, CapabilityFilesystem, CapabilityResolver,
     CapabilityRootIdentity, CaptureFileWritePostEvidence, CaptureFileWritePreEvidence, Clock,
     DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest, ExecuteApprovedTool,
     FileWriteEvidenceStore, FileWritePolicyBinding, FileWritePostExpectation, FileWritePreImage,
     FileWriteRecoveryRequest, NewApproval, ObservedFileImage, OpenFileWriteSession,
-    PolicyDecisionStore, PolicyEvaluator, PortError, ProcessLauncher, RelativePathComponents,
-    Retryability, SafeErrorClassification, StructuredGit, StructuredToolExecutor,
-    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionId, ToolExecutionResult,
-    ToolExecutionStore, VerifiedWrite,
+    PolicyDecisionStore, PolicyEvaluator, PortError, ProcessLauncher, ProcessStatus,
+    RelativePathComponents, Retryability, SafeErrorClassification, StructuredGit,
+    StructuredToolExecutor, ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionId,
+    ToolExecutionResult, ToolExecutionStore, VerifiedWrite,
 };
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken,
@@ -41,6 +41,7 @@ fn policy_and_tool_ports_are_object_safe() {
     assert_object_safe::<dyn CapabilityFilesystem>();
     assert_object_safe::<dyn StructuredGit>();
     assert_object_safe::<dyn ProcessLauncher>();
+    assert_object_safe::<dyn ApprovedProcessExecutor>();
     assert_object_safe::<dyn ToolExecutionStore>();
     assert_object_safe::<dyn StructuredToolExecutor>();
 }
@@ -339,7 +340,6 @@ fn every_changed_execution_detail_is_rejected_before_the_executor() {
         RequestMutation::Arguments,
         RequestMutation::Cwd,
         RequestMutation::Environment,
-        RequestMutation::TrustTier,
         RequestMutation::Network,
         RequestMutation::ExpectedReads,
         RequestMutation::ExpectedWrites,
@@ -377,7 +377,6 @@ fn arguments_digest_binds_only_argv() {
         RequestMutation::Executable,
         RequestMutation::Cwd,
         RequestMutation::Environment,
-        RequestMutation::TrustTier,
         RequestMutation::Network,
         RequestMutation::ExpectedReads,
         RequestMutation::ExpectedWrites,
@@ -419,7 +418,6 @@ fn arguments_digest_binds_only_argv() {
     for mutation in [
         RequestMutation::Phase,
         RequestMutation::Executable,
-        RequestMutation::TrustTier,
         RequestMutation::ExpectedReads,
         RequestMutation::Timeout,
         RequestMutation::MemoryLimit,
@@ -464,7 +462,6 @@ fn trusted_request_binding_covers_every_execution_detail() {
         RequestMutation::Arguments,
         RequestMutation::Cwd,
         RequestMutation::Environment,
-        RequestMutation::TrustTier,
         RequestMutation::Network,
         RequestMutation::ExpectedReads,
         RequestMutation::ExpectedWrites,
@@ -610,6 +607,8 @@ impl StructuredToolExecutor for CountingExecutor {
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
         Ok(CancellationReceipt {
             execution_id: execution_id.clone(),
+            status: ProcessStatus::Terminated,
+            job_receipt: None,
             cancelled: true,
         })
     }
@@ -734,7 +733,6 @@ enum RequestMutation {
     Arguments,
     Cwd,
     Environment,
-    TrustTier,
     Network,
     ExpectedReads,
     CrossTaskRead,
@@ -763,7 +761,7 @@ fn authorized_tool_request_with_nonce(nonce: &str) -> AuthorizedToolRequest {
     )
 }
 
-fn authorized_process_request_for(mutation: RequestMutation) -> AuthorizedProcessRequest {
+fn authorized_process_request_for(mutation: RequestMutation) -> ApprovedProcessRequest {
     let task_id = TaskId::new(if mutation == RequestMutation::Task {
         "task-2"
     } else {
@@ -838,11 +836,7 @@ fn authorized_process_request_for(mutation: RequestMutation) -> AuthorizedProces
                 },
             )
             .unwrap(),
-            if mutation == RequestMutation::TrustTier {
-                ProcessTrustTier::BrokeredProcess
-            } else {
-                ProcessTrustTier::IsolatedWorker
-            },
+            ProcessTrustTier::IsolatedWorker,
             if mutation == RequestMutation::Network {
                 NetworkProfile::ApprovedDestinations
             } else {
@@ -861,7 +855,7 @@ fn authorized_process_request_for(mutation: RequestMutation) -> AuthorizedProces
         .unwrap(),
     )
     .unwrap();
-    AuthorizedProcessRequest {
+    ApprovedProcessRequest {
         process,
         expected_reads: match mutation {
             RequestMutation::ExpectedReads => {
@@ -879,11 +873,11 @@ fn authorized_process_request_for(mutation: RequestMutation) -> AuthorizedProces
 
 const APPROVAL_NONCE: &str = "0123456789abcdef0123456789abcdef";
 
-fn approved_tool_payload(request: &AuthorizedProcessRequest, nonce: &str) -> ToolApprovalPayloadV1 {
+fn approved_tool_payload(request: &ApprovedProcessRequest, nonce: &str) -> ToolApprovalPayloadV1 {
     approved_tool_binding(request, nonce).payload().clone()
 }
 
-fn approved_tool_binding(request: &AuthorizedProcessRequest, nonce: &str) -> BoundToolApproval {
+fn approved_tool_binding(request: &ApprovedProcessRequest, nonce: &str) -> BoundToolApproval {
     bind_tool_approval_payload(
         ToolApprovalPayloadV1 {
             schema: "approval-digest.v1".to_owned(),

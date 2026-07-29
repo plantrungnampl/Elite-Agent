@@ -2,21 +2,21 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use local_agent_terminal_application::{
-    canonical_file_write_recovery_request, AcquireLease, AuthorizedFileRead, AuthorizedGitDiff,
-    AuthorizedGitStatus, CapabilityFileWriteSession, CapabilityFileWriteSessionFactory,
-    CapabilityFilesystem, CapabilityRequest, CapabilityResolver, CapabilityRootIdentity,
-    CaptureFileWritePostEvidence, CaptureFileWritePreEvidence, Clock, DisclosureContextProvider,
-    DisclosureContextRequest, DisclosureOutcome, DisclosurePolicyEvaluator, DisclosureRequest,
-    ExecutorLeaseStore, FileReadRequest, FileWriteEvidenceStore, FileWritePolicyBinding,
-    FileWritePostExpectation, FileWritePreImage, FileWriteRecoveryCompletion,
-    FileWriteRecoveryFailure, FileWriteRecoveryIntent, FileWriteRecoverySnapshot,
-    FileWriteRecoveryState, FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest,
-    GitStatusRequest, LeaseSnapshot, ObservedFileImage, OpenFileWriteSession,
-    PolicyApprovedDisclosure, PolicyDecisionId, PolicyDecisionStore, PortError, ProcessLauncher,
-    ProcessReceipt, RawGitDiffResult, RawGitStatusResult, RecordedPolicyDecision,
-    RelativePathComponents, ResolvedCapability, RevokeLease, StructuredGit, StructuredToolExecutor,
-    ToolExecutionId, TrustedDisclosureContext, VerifiedBytes, VerifiedFileWriteCompensation,
-    VerifiedWrite, WorkspaceWriteCoordinator,
+    canonical_file_write_recovery_request, AcquireLease, ApprovedProcessExecutor,
+    ApprovedProcessRequest, AuthorizedFileRead, AuthorizedGitDiff, AuthorizedGitStatus,
+    CapabilityFileWriteSession, CapabilityFileWriteSessionFactory, CapabilityFilesystem,
+    CapabilityRequest, CapabilityResolver, CapabilityRootIdentity, CaptureFileWritePostEvidence,
+    CaptureFileWritePreEvidence, Clock, DisclosureContextProvider, DisclosureContextRequest,
+    DisclosureOutcome, DisclosurePolicyEvaluator, DisclosureRequest, ExecutorLeaseStore,
+    FileReadRequest, FileWriteEvidenceStore, FileWritePolicyBinding, FileWritePostExpectation,
+    FileWritePreImage, FileWriteRecoveryCompletion, FileWriteRecoveryFailure,
+    FileWriteRecoveryIntent, FileWriteRecoverySnapshot, FileWriteRecoveryState,
+    FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest, GitStatusRequest, LeaseSnapshot,
+    ObservedFileImage, OpenFileWriteSession, PolicyApprovedDisclosure, PolicyDecisionId,
+    PolicyDecisionStore, PortError, ProcessReceipt, RawGitDiffResult, RawGitStatusResult,
+    RecordedPolicyDecision, RelativePathComponents, ResolvedCapability, RevokeLease, StructuredGit,
+    StructuredToolExecutor, ToolExecutionId, TrustedDisclosureContext, VerifiedBytes,
+    VerifiedFileWriteCompensation, VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     ActorId, ActorLocality, ArtifactId, CapabilityRef, FencingToken, GitObjectId, LeaseClaim,
@@ -1765,10 +1765,11 @@ impl StructuredGit for RootRecordingGit {
 
 struct Process;
 
-impl ProcessLauncher for Process {
+impl ApprovedProcessExecutor for Process {
     fn execute(
         &self,
-        _: local_agent_terminal_application::AuthorizedProcessRequest,
+        _: ToolExecutionId,
+        _: ApprovedProcessRequest,
     ) -> Result<ProcessReceipt, PortError> {
         unreachable!()
     }

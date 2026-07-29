@@ -3,18 +3,21 @@
 mod capability;
 mod filesystem;
 mod git;
+mod process;
+
+pub use process::ProcessRuntime;
 
 use local_agent_terminal_application::{
-    parse_policy_timestamp, AuthorizedToolRequest, CancellationReceipt,
+    parse_policy_timestamp, ApprovedProcessExecutor, AuthorizedToolRequest, CancellationReceipt,
     CapabilityFileWriteSessionFactory, CapabilityFilesystem, CapabilityResolver, Clock,
     DisclosureChannel, DisclosureContextProvider, DisclosureContextRequest, DisclosureOutcome,
     DisclosurePolicyEvaluator, DisclosureRequest, ExecutorLeaseStore, FileReadRequest,
     FileWriteEvidenceStore, FileWriteRecoverySnapshot, FileWriteRecoveryStore, FileWriteRequest,
     GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, PolicyBoundBytes,
-    PolicyDecisionId, PolicyDecisionStore, PortError, ProcessLauncher, RawGitDiffResult,
-    RawGitStatusResult, RecordedPolicyDecision, Retryability, SafeErrorClassification,
-    StructuredGit, StructuredToolExecutor, ToolExecutionId, ToolExecutionResult, VerifiedBytes,
-    VerifiedWrite, WorkspaceWriteCoordinator,
+    PolicyDecisionId, PolicyDecisionStore, PortError, RawGitDiffResult, RawGitStatusResult,
+    RecordedPolicyDecision, Retryability, SafeErrorClassification, StructuredGit,
+    StructuredToolExecutor, ToolExecutionId, ToolExecutionResult, VerifiedBytes, VerifiedWrite,
+    WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, PolicyAction, PolicyEffect, PolicyRequest, PolicyResource, TaskId,
@@ -27,7 +30,7 @@ pub struct ToolRuntime<'a> {
     file_write_sessions: &'a dyn CapabilityFileWriteSessionFactory,
     git: &'a dyn StructuredGit,
     leases: &'a dyn ExecutorLeaseStore,
-    process_launcher: &'a dyn ProcessLauncher,
+    process_executor: &'a dyn ApprovedProcessExecutor,
     file_write_evidence: &'a dyn FileWriteEvidenceStore,
     file_write_recovery: &'a dyn FileWriteRecoveryStore,
     workspace_writes: &'a WorkspaceWriteCoordinator,
@@ -46,7 +49,7 @@ impl<'a> ToolRuntime<'a> {
         file_write_sessions: &'a dyn CapabilityFileWriteSessionFactory,
         git: &'a dyn StructuredGit,
         leases: &'a dyn ExecutorLeaseStore,
-        process_launcher: &'a dyn ProcessLauncher,
+        process_executor: &'a dyn ApprovedProcessExecutor,
         file_write_evidence: &'a dyn FileWriteEvidenceStore,
         file_write_recovery: &'a dyn FileWriteRecoveryStore,
         workspace_writes: &'a WorkspaceWriteCoordinator,
@@ -61,7 +64,7 @@ impl<'a> ToolRuntime<'a> {
             file_write_sessions,
             git,
             leases,
-            process_launcher,
+            process_executor,
             file_write_evidence,
             file_write_recovery,
             workspace_writes,
@@ -256,13 +259,14 @@ impl<'a> ToolRuntime<'a> {
 
 impl StructuredToolExecutor for ToolRuntime<'_> {
     fn execute(&self, request: AuthorizedToolRequest) -> Result<ToolExecutionResult, PortError> {
-        self.process_launcher
-            .execute(request.into_process_request())
+        let execution_id = request.execution_id.clone();
+        self.process_executor
+            .execute(execution_id, request.into_process_request())
             .map(|receipt| ToolExecutionResult { receipt })
     }
 
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
-        self.process_launcher.cancel(execution_id)
+        self.process_executor.cancel(execution_id)
     }
 
     fn file_read(

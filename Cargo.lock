@@ -1897,6 +1897,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "local-agent-terminal-platform-core"
+version = "0.1.0"
+dependencies = [
+ "local-agent-terminal-application",
+ "local-agent-terminal-domain",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "local-agent-terminal-platform-windows"
 version = "0.1.0"
 dependencies = [
@@ -1904,8 +1914,10 @@ dependencies = [
  "cap-std",
  "local-agent-terminal-application",
  "local-agent-terminal-domain",
+ "local-agent-terminal-platform-core",
  "sha2",
  "tempfile",
+ "winapi-util",
  "windows-sys 0.61.2",
 ]
 
@@ -1967,6 +1979,8 @@ version = "0.1.0"
 dependencies = [
  "local-agent-terminal-application",
  "local-agent-terminal-domain",
+ "local-agent-terminal-platform-core",
+ "local-agent-terminal-platform-windows",
  "local-agent-terminal-policy-engine",
  "sha2",
 ]

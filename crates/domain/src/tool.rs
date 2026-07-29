@@ -294,6 +294,9 @@ impl ProcessInvocation {
         if cwd.worktree_task_id().is_none() {
             return Err(ToolError::WorktreeCapabilityRequired);
         }
+        if trust_tier == ProcessTrustTier::BrokeredProcess {
+            return Err(ToolError::BrokeredProcessWorktreeDenied);
+        }
         cwd.validate()?;
         if !expected_writes.is_empty() && executor_fencing_token.is_none() {
             return Err(ToolError::MissingFencingToken);
@@ -418,6 +421,7 @@ pub enum ToolError {
     InvalidTimeout,
     RegisteredExecutableRequired,
     WorktreeCapabilityRequired,
+    BrokeredProcessWorktreeDenied,
     MismatchedTaskScope,
     InvalidArgv,
     InvalidExpectedWrite,
@@ -435,6 +439,9 @@ impl fmt::Display for ToolError {
             Self::InvalidTimeout => "timeout must be positive",
             Self::RegisteredExecutableRequired => "registered executable capability is required",
             Self::WorktreeCapabilityRequired => "worktree capability is required",
+            Self::BrokeredProcessWorktreeDenied => {
+                "brokered processes cannot receive a worktree capability"
+            }
             Self::MismatchedTaskScope => "capability task does not match process binding",
             Self::InvalidArgv => "argv is invalid",
             Self::InvalidExpectedWrite => "expected write is invalid",

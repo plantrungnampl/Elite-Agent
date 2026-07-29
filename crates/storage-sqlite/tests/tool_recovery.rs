@@ -6,12 +6,13 @@ use std::sync::{Arc, Barrier};
 use local_agent_terminal_application::{
     canonical_approval_payload, canonical_file_write_recovery_request, parse_approval_payload,
     ApprovalClaim, ApprovalDigestPayload, ApprovalId, ApprovalResolution, ApprovalStore,
-    CanonicalEvidenceRef, CapabilityRootIdentity, FileWritePolicyBinding, FileWritePreImage,
-    FileWriteRecoveryCompletion, FileWriteRecoveryFailure, FileWriteRecoveryIntent,
-    FileWriteRecoveryRequest, FileWriteRecoveryState, FileWriteRecoveryStore, NewApproval,
-    NewToolExecution, NewToolIntent, ProcessReceipt, RelativePathComponents,
-    ToolExecutionCompletion, ToolExecutionId, ToolExecutionStore, ToolRequestBindingDigest,
-    VerifiedFileWriteCompensation, VerifiedWrite,
+    BoundedOutput, CanonicalEvidenceRef, CapabilityRootIdentity, FileWritePolicyBinding,
+    FileWritePreImage, FileWriteRecoveryCompletion, FileWriteRecoveryFailure,
+    FileWriteRecoveryIntent, FileWriteRecoveryRequest, FileWriteRecoveryState,
+    FileWriteRecoveryStore, JobReceipt, NewApproval, NewToolExecution, NewToolIntent,
+    ProcessReceipt, ProcessStatus, RelativePathComponents, ToolExecutionCompletion,
+    ToolExecutionId, ToolExecutionStore, ToolRequestBindingDigest, VerifiedFileWriteCompensation,
+    VerifiedWrite,
 };
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, FencingToken, GitObjectId, LeaseClaim, PolicyEffect, ProjectId, RunId,
@@ -154,11 +155,7 @@ fn begin_and_finish_roll_back_at_statement_faults_and_reopen_exactly() {
     assert!(store
         .finish(ToolExecutionCompletion {
             execution_id: execution_id.clone(),
-            receipt: ProcessReceipt {
-                execution_id: execution_id.clone(),
-                exit_code: Some(0),
-                output_digest: missing_output,
-            },
+            receipt: process_receipt(execution_id.clone(), Some(0), missing_output),
         })
         .is_err());
     let output_digest = persist_output_artifact(&database, b"exact output");
@@ -174,11 +171,7 @@ fn begin_and_finish_roll_back_at_statement_faults_and_reopen_exactly() {
         .unwrap();
     let completion = ToolExecutionCompletion {
         execution_id: execution_id.clone(),
-        receipt: ProcessReceipt {
-            execution_id: execution_id.clone(),
-            exit_code: Some(0),
-            output_digest,
-        },
+        receipt: process_receipt(execution_id.clone(), Some(0), output_digest),
     };
     assert!(store.finish(completion.clone()).is_err());
     let connection = configured_connection(&database.path);
@@ -232,6 +225,81 @@ fn begin_and_finish_roll_back_at_statement_faults_and_reopen_exactly() {
             .unwrap(),
         "succeeded:succeeded"
     );
+}
+
+#[test]
+fn terminated_process_is_durable_non_success_with_complete_job_evidence() {
+    let database = TempDatabase::new();
+    let operation_digest = persist_request_artifact(&database);
+    persist_policy_decision(&database.path, &operation_digest, "allow");
+    let output_digest = persist_output_artifact(&database, b"terminated output");
+    let store = SqliteStore::open(&database.path).unwrap();
+    let execution_id = ToolExecutionId::new("execution-terminated").unwrap();
+    store
+        .reserve(NewToolIntent {
+            execution_id: execution_id.clone(),
+            operation_digest,
+        })
+        .unwrap();
+    store
+        .begin(NewToolExecution {
+            execution_id: execution_id.clone(),
+        })
+        .unwrap();
+    let mut receipt = process_receipt(execution_id.clone(), None, output_digest);
+    receipt.status = ProcessStatus::Terminated;
+    receipt.stdout.bytes = b"terminated output".to_vec();
+    receipt.stdout.truncated = true;
+    receipt.duration_ms = 275;
+    receipt.job_receipt.root_pid = 4242;
+    receipt.job_receipt.job_id = "job-execution-terminated".to_owned();
+    receipt.job_receipt.total_user_time_ms = 650;
+    receipt.job_receipt.resource_limit_terminated = true;
+    receipt.job_receipt.tree_terminated = true;
+    receipt.observed_writes = vec![VerifiedWrite {
+        digest: digest_bytes(b"observed write"),
+        size_bytes: 14,
+    }];
+    let completion = ToolExecutionCompletion {
+        execution_id,
+        receipt,
+    };
+
+    assert!(store.finish(completion.clone()).unwrap().completed);
+    assert!(store.finish(completion).unwrap().completed);
+    drop(store);
+
+    let reopened = SqliteStore::open(&database.path).unwrap();
+    assert!(reopened.incomplete().unwrap().is_empty());
+    let connection = configured_connection(&database.path);
+    let durable: (String, String, String, String) = connection
+        .query_row(
+            "SELECT te.status, oi.status, oi.external_receipt_json,
+                    (SELECT payload_json FROM events
+                     WHERE event_type = 'tool.execution.completed'
+                       AND actor_id = 'execution-terminated')
+             FROM tool_executions te
+             JOIN operation_intents oi ON oi.id = te.operation_intent_id
+             WHERE te.id = 'execution-terminated'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(durable.0, "terminated");
+    assert_eq!(durable.1, "failed");
+    let receipt: serde_json::Value = serde_json::from_str(&durable.2).unwrap();
+    assert_eq!(receipt["schemaVersion"], 1);
+    assert_eq!(receipt["status"], "terminated");
+    assert_eq!(receipt["job"]["rootPid"], 4242);
+    assert_eq!(receipt["job"]["treeTerminated"], true);
+    assert_eq!(receipt["job"]["jobMemoryLimit"], true);
+    assert_eq!(receipt["job"]["jobCpuTimeLimit"], true);
+    assert_eq!(receipt["job"]["resourceLimitTerminated"], true);
+    assert_eq!(receipt["stdout"]["truncated"], true);
+    assert_eq!(receipt["durationMs"], 275);
+    assert_eq!(receipt["observedWrites"][0]["sizeBytes"], 14);
+    let event: serde_json::Value = serde_json::from_str(&durable.3).unwrap();
+    assert_eq!(event["status"], "terminated");
 }
 
 #[test]
@@ -841,11 +909,7 @@ fn finish_rolls_back_at_every_sql_statement_boundary() {
         assert!(store
             .finish(ToolExecutionCompletion {
                 execution_id: execution_id.clone(),
-                receipt: ProcessReceipt {
-                    execution_id,
-                    exit_code: Some(0),
-                    output_digest,
-                },
+                receipt: process_receipt(execution_id, Some(0), output_digest),
             })
             .is_err());
         drop(store);
@@ -1104,11 +1168,7 @@ fn completion_scopes_duplicate_output_digests_to_the_execution_task() {
         store
             .finish(ToolExecutionCompletion {
                 execution_id: execution_id.clone(),
-                receipt: ProcessReceipt {
-                    execution_id,
-                    exit_code: Some(0),
-                    output_digest,
-                },
+                receipt: process_receipt(execution_id, Some(0), output_digest),
             })
             .unwrap()
             .completed
@@ -1238,14 +1298,47 @@ fn completed_execution(
         .unwrap();
     let completion = ToolExecutionCompletion {
         execution_id: execution_id.clone(),
-        receipt: ProcessReceipt {
-            execution_id,
-            exit_code: Some(0),
-            output_digest,
-        },
+        receipt: process_receipt(execution_id, Some(0), output_digest),
     };
     store.finish(completion.clone()).unwrap();
     (store, completion)
+}
+
+fn process_receipt(
+    execution_id: ToolExecutionId,
+    exit_code: Option<i32>,
+    output_digest: Sha256Digest,
+) -> ProcessReceipt {
+    ProcessReceipt {
+        execution_id,
+        status: ProcessStatus::Exited,
+        exit_code,
+        stdout: BoundedOutput {
+            bytes: Vec::new(),
+            truncated: false,
+        },
+        stderr: BoundedOutput {
+            bytes: Vec::new(),
+            truncated: false,
+        },
+        duration_ms: 0,
+        job_receipt: JobReceipt {
+            root_pid: 1,
+            job_id: "storage-test-job".to_owned(),
+            kill_on_close: true,
+            no_breakaway: true,
+            job_memory_limit: true,
+            job_cpu_time_limit: true,
+            memory_limit_bytes: 256 * 1024 * 1024,
+            cpu_time_limit_ms: 5_000,
+            max_active_processes: 8,
+            total_user_time_ms: 10,
+            resource_limit_terminated: false,
+            tree_terminated: false,
+        },
+        observed_writes: Vec::new(),
+        output_digest,
+    }
 }
 
 fn insert_tool_execution(
