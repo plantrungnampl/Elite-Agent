@@ -511,7 +511,7 @@ git commit -m "feat: add capability filesystem and git tools"
 **Interfaces:**
 - `platform-core` resolves trusted executable registrations and immutable environment/network profiles without spawning. `platform-windows` implements `CapabilityFilesystem` with retained directory handles and the Windows lifecycle portion of `ProcessLauncher` with a verified restricted identity/boundary plus a kill-on-close, no-breakaway Job Object. `tool-runtime` exposes only typed `process.exec`; `shell.raw` remains denied. A brokered request cannot use a worktree cwd or repository reads/writes. Worktree execution dispatches only to a separately approved `isolated_worker` adapter and otherwise fails closed.
 
-- [ ] **Step 1 - Write failing profile, filesystem, and process tests**
+- [x] **Step 1 - Write failing profile, filesystem, and process tests**
 
 Profile tests reject relative executable paths, PATH lookup, mutable/replaced executables, digest/version mismatch, duplicate environment names, inherited environment, secret-looking values, unregistered cwd, unsupported network mode, redirect/rebinding ambiguity, response-file arguments, and raw script fields. Assert deterministic canonical profile digests.
 
@@ -525,13 +525,13 @@ cargo test -p local-agent-terminal-tool-runtime process
 
 Expected RED: platform crates, profile registries, handle-relative adapter, and Job Object launcher are absent.
 
-- [ ] **Step 2 - Implement registered profiles and handle-relative filesystem access**
+- [x] **Step 2 - Implement registered profiles and handle-relative filesystem access**
 
 `ExecutableRegistry` loads only trusted application configuration and returns `ResolvedExecutable { canonical_path, sha256, file_identity, toolchain_id }`. Reopen and verify identity/digest immediately before launch. `EnvironmentProfile` starts from an empty map and adds only named nonsecret values. `NetworkPolicyAdapter::prepare` either returns a verifiable enforcement receipt for `Denied`, `ProviderEndpointOnly`, or `ApprovedDestinations`, or denies.
 
 Implement Windows filesystem opens relative to retained trusted root handles; reject reparse points and unsupported path forms at every component; retain ancestor/leaf handles through the effect; use atomic create/replace where supported; and hash the exact opened/written bytes. Lexical prefix checks are never authorization.
 
-- [ ] **Step 3 - Implement Job Object process lifecycle and typed process dispatch**
+- [x] **Step 3 - Implement Job Object process lifecycle and typed process dispatch**
 
 Use this launch contract without a shell:
 
@@ -563,7 +563,7 @@ pub struct ProcessReceipt {
 
 Create the child suspended, assign it to a Job Object configured for kill-on-close and no breakaway, verify the enforced token/ACL/network receipts, then resume. On cancel, timeout, output overflow, launcher drop, or app shutdown, close/terminate the job, wait for the complete tree, and record `terminated` rather than `cancelled_cleanly` when graceful shutdown is unproven. Never pass an untrusted command line to `cmd.exe` or PowerShell.
 
-- [ ] **Step 4 - Run focused and architecture checks**
+- [x] **Step 4 - Run focused and architecture checks**
 
 ```powershell
 cargo fmt --all -- --check
@@ -575,7 +575,7 @@ node scripts/check-architecture.mjs
 
 Expected GREEN: argv boundaries survive metacharacters literally, no denied canary is accessible, no descendant survives cancellation, enforcement failure starts nothing, and process/Windows imports remain in the approved adapter.
 
-- [ ] **Step 5 - Commit**
+- [x] **Step 5 - Commit**
 
 ```powershell
 git add Cargo.toml Cargo.lock crates/platform-core crates/platform-windows crates/tool-runtime
