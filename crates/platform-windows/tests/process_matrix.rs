@@ -4,9 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::ptr;
 #[cfg(feature = "test-seams")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -56,7 +58,11 @@ use tempfile::TempDir;
 #[cfg(feature = "test-seams")]
 use windows_sys::Win32::Foundation::STILL_ACTIVE;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, FILETIME,
+    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION, ERROR_NOT_FOUND, ERROR_NOT_SUPPORTED,
+    ERROR_NOT_SUPPORTED_IN_APPCONTAINER, ERROR_NO_SUCH_LOGON_SESSION, ERROR_PIPE_CONNECTED,
+    ERROR_PIPE_LISTENING, ERROR_SUCCESS, FILETIME, GENERIC_READ, GENERIC_WRITE,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Networking::WinSock::{
     closesocket, connect, getsockopt, ioctlsocket, socket, WSACleanup, WSAGetLastError, WSAPoll,
@@ -65,10 +71,26 @@ use windows_sys::Win32::Networking::WinSock::{
     WSAEACCES, WSAEINPROGRESS, WSAEPROVIDERFAILEDINIT, WSAEWOULDBLOCK, WSAPOLLFD,
     WSASYSCALLFAILURE,
 };
+use windows_sys::Win32::Security::Credentials::{
+    CredDeleteW, CredEnumerateW, CredFree, CredReadW, CredWriteW, CREDENTIALW,
+    CRED_PERSIST_SESSION, CRED_TYPE_GENERIC,
+};
 use windows_sys::Win32::Security::{
     GetTokenInformation, TokenCapabilities, TokenIsAppContainer, SID_AND_ATTRIBUTES, TOKEN_GROUPS,
     TOKEN_QUERY,
 };
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+};
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_NOWAIT, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+};
+use windows_sys::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
+    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_BINARY, REG_CREATED_NEW_KEY, RRF_RT_REG_BINARY,
+};
+use windows_sys::Win32::System::Rpc::RPC_S_INVALID_BINDING;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessTimes, OpenProcessToken, CREATE_BREAKAWAY_FROM_JOB,
 };
@@ -219,7 +241,6 @@ fn verified_boundary_runs_in_a_real_kill_on_close_job_and_captures_output() {
         ],
         BTreeMap::from([("LAT_PROCESS_HELPER".to_owned(), "emit".to_owned())]),
     );
-
     let receipt = launcher.execute(request).unwrap();
 
     assert_eq!(receipt.status, ProcessStatus::Exited);
@@ -379,6 +400,11 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
         DeniedCanary::new("appdata", application_data_owner.path()),
         DeniedCanary::new("sibling", &sibling),
     ];
+    let registry = RegistryFixture::new();
+    let credentials = CredentialFixture::new();
+    let pipe = NamedPipeFixture::new();
+    pipe.prove_parent_connection();
+    let child_pipe_server = pipe.server();
 
     let junction = container.path().join("junction-escape");
     create_junction(repository_owner.path(), &junction);
@@ -439,6 +465,20 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
             lan_listener.local_addr().unwrap().to_string(),
         ),
         ("LAT_D2A_INTERNET".to_owned(), "1.1.1.1:443".to_owned()),
+        ("LAT_D2B_REGISTRY_KEY".to_owned(), registry.subkey.clone()),
+        (
+            "LAT_D2B_CREDENTIAL_PARENT".to_owned(),
+            credentials.parent_target.clone(),
+        ),
+        (
+            "LAT_D2B_CREDENTIAL_CHILD".to_owned(),
+            credentials.child_target.clone(),
+        ),
+        (
+            "LAT_D2B_CREDENTIAL_FILTER".to_owned(),
+            credentials.filter.clone(),
+        ),
+        ("LAT_D2B_PIPE".to_owned(), pipe.name.clone()),
     ]);
     for (index, canary) in canaries.iter().enumerate() {
         environment.insert(format!("LAT_D2A_READ_{index}"), path_text(&canary.read));
@@ -488,6 +528,12 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
         "path-long=denied",
         "path-ads=denied",
         "environment=clean",
+        "registry-read=denied",
+        "registry-write=denied",
+        "credential-read=rpc-invalid-binding",
+        "credential-enumerate=rpc-invalid-binding",
+        "credential-write=rpc-invalid-binding",
+        "pipe-connect=denied",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -518,6 +564,14 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
     for (_, path) in &path_variants {
         assert!(!stdout.contains(&path_text(path)));
     }
+    registry.assert_unchanged();
+    assert!(!stdout.contains(&registry.subkey));
+    credentials.assert_unchanged();
+    assert!(!stdout.contains(&credentials.parent_target));
+    assert!(!stdout.contains(&credentials.child_target));
+    assert!(!stdout.contains(std::str::from_utf8(CREDENTIAL_BLOB).unwrap()));
+    assert!(!child_pipe_server.accepted_connection());
+    assert!(!stdout.contains(&pipe.name));
     assert!(!stdout.contains("alternate stream canary"));
     assert_no_pending_connection(&loopback_listener);
     assert_no_pending_connection(&lan_listener);
@@ -536,6 +590,9 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
     );
     #[cfg(not(feature = "test-seams"))]
     let _ = execution_id;
+    registry.cleanup();
+    credentials.cleanup();
+    pipe.cleanup(child_pipe_server);
 }
 
 #[cfg(feature = "test-seams")]
@@ -1096,13 +1153,10 @@ fn executable_digest_is_revalidated_before_child_creation() {
     assert!(!marker.exists());
 }
 
-#[cfg(feature = "test-seams")]
 #[test]
 fn output_overflow_terminates_the_job_and_returns_only_the_bound() {
     let root = TempDir::new().unwrap();
-    let boundary = Arc::new(TestOnlyBoundary::valid(root.path().to_owned()));
-    let launcher =
-        WindowsProcessLauncher::with_isolated_worker_boundary(boundary, boundary_binding());
+    let launcher = registered_lpac_launcher(root.path());
     let mut request = request(
         vec![
             "--exact".to_owned(),
@@ -1111,14 +1165,25 @@ fn output_overflow_terminates_the_job_and_returns_only_the_bound() {
         ],
         BTreeMap::from([("LAT_PROCESS_HELPER".to_owned(), "flood".to_owned())]),
     );
+    request.execution_id = ToolExecutionId::new("execution-lpac-output-overflow").unwrap();
     request.limits.max_stdout_bytes = 32;
+    let execution_id = request.execution_id.clone();
 
     let receipt = launcher.execute(request).unwrap();
 
     assert_eq!(receipt.status, ProcessStatus::Terminated);
     assert!(receipt.stdout.truncated);
     assert_eq!(receipt.stdout.bytes.len(), 32);
+    assert!(receipt.job_receipt.kill_on_close);
+    assert!(receipt.job_receipt.no_breakaway);
+    assert!(receipt.job_receipt.job_memory_limit);
+    assert!(receipt.job_receipt.job_cpu_time_limit);
+    assert_eq!(receipt.job_receipt.memory_limit_bytes, 256 * 1024 * 1024);
+    assert_eq!(receipt.job_receipt.cpu_time_limit_ms, 5_000);
+    assert_eq!(receipt.job_receipt.max_active_processes, 8);
+    assert!(!receipt.job_receipt.resource_limit_terminated);
     assert!(receipt.job_receipt.tree_terminated);
+    assert_real_lpac_lifecycle(&execution_id);
 }
 
 #[cfg(feature = "test-seams")]
@@ -1707,13 +1772,10 @@ fn write_evidence_must_match_approved_scopes_one_to_one() {
     }
 }
 
-#[cfg(feature = "test-seams")]
 #[test]
 fn cpu_job_limit_terminates_busy_process_before_wall_timeout() {
     let root = TempDir::new().unwrap();
-    let boundary = Arc::new(TestOnlyBoundary::valid(root.path().to_owned()));
-    let launcher =
-        WindowsProcessLauncher::with_isolated_worker_boundary(boundary, boundary_binding());
+    let launcher = registered_lpac_launcher(root.path());
     let mut request = request(
         vec![
             "--exact".to_owned(),
@@ -1722,23 +1784,31 @@ fn cpu_job_limit_terminates_busy_process_before_wall_timeout() {
         ],
         BTreeMap::from([("LAT_PROCESS_HELPER".to_owned(), "cpu".to_owned())]),
     );
+    request.execution_id = ToolExecutionId::new("execution-lpac-cpu-limit").unwrap();
     request.timeout_ms = 15_000;
     request.limits.cpu_time_limit_ms = 1;
+    let execution_id = request.execution_id.clone();
 
     let receipt = launcher.execute(request).unwrap();
 
     assert_eq!(receipt.status, ProcessStatus::Terminated);
     assert!(receipt.duration_ms < 15_000);
+    assert!(receipt.job_receipt.kill_on_close);
+    assert!(receipt.job_receipt.no_breakaway);
+    assert!(receipt.job_receipt.job_memory_limit);
+    assert!(receipt.job_receipt.job_cpu_time_limit);
+    assert_eq!(receipt.job_receipt.memory_limit_bytes, 256 * 1024 * 1024);
+    assert_eq!(receipt.job_receipt.cpu_time_limit_ms, 1);
+    assert_eq!(receipt.job_receipt.max_active_processes, 8);
+    assert!(receipt.job_receipt.resource_limit_terminated);
     assert!(receipt.job_receipt.tree_terminated);
+    assert_real_lpac_lifecycle(&execution_id);
 }
 
-#[cfg(feature = "test-seams")]
 #[test]
 fn memory_job_limit_denies_additional_committed_memory() {
     let root = TempDir::new().unwrap();
-    let boundary = Arc::new(TestOnlyBoundary::valid(root.path().to_owned()));
-    let launcher =
-        WindowsProcessLauncher::with_isolated_worker_boundary(boundary, boundary_binding());
+    let launcher = registered_lpac_launcher(root.path());
     let mut request = request(
         vec![
             "--exact".to_owned(),
@@ -1747,14 +1817,26 @@ fn memory_job_limit_denies_additional_committed_memory() {
         ],
         BTreeMap::from([("LAT_PROCESS_HELPER".to_owned(), "memory".to_owned())]),
     );
+    request.execution_id = ToolExecutionId::new("execution-lpac-memory-limit").unwrap();
     request.timeout_ms = 5_000;
     request.limits.memory_limit_bytes = 64 * 1024 * 1024;
+    let execution_id = request.execution_id.clone();
 
     let receipt = launcher.execute(request).unwrap();
 
     assert_eq!(receipt.status, ProcessStatus::Exited);
     assert_eq!(receipt.exit_code, Some(0));
     assert!(String::from_utf8_lossy(&receipt.stdout.bytes).contains("memory-denied"));
+    assert!(receipt.job_receipt.kill_on_close);
+    assert!(receipt.job_receipt.no_breakaway);
+    assert!(receipt.job_receipt.job_memory_limit);
+    assert!(receipt.job_receipt.job_cpu_time_limit);
+    assert_eq!(receipt.job_receipt.memory_limit_bytes, 64 * 1024 * 1024);
+    assert_eq!(receipt.job_receipt.cpu_time_limit_ms, 5_000);
+    assert_eq!(receipt.job_receipt.max_active_processes, 8);
+    assert!(!receipt.job_receipt.resource_limit_terminated);
+    assert!(!receipt.job_receipt.tree_terminated);
+    assert_real_lpac_lifecycle(&execution_id);
 }
 
 #[cfg(feature = "test-seams")]
@@ -1774,7 +1856,6 @@ fn memory_limit_is_shared_by_the_complete_descendant_tree() {
     );
     request.timeout_ms = 5_000;
     request.limits.memory_limit_bytes = 96 * 1024 * 1024;
-
     let receipt = launcher.execute(request).unwrap();
 
     assert!(String::from_utf8_lossy(&receipt.stdout.bytes).contains("memory-denied"));
@@ -1797,7 +1878,6 @@ fn cpu_limit_is_shared_by_the_complete_descendant_tree() {
     );
     request.timeout_ms = 20_000;
     request.limits.cpu_time_limit_ms = 650;
-
     let receipt = launcher.execute(request).unwrap();
 
     assert!(receipt.job_receipt.job_cpu_time_limit);
@@ -2020,6 +2100,102 @@ fn run_lpac_hostile_d2a_probe() {
     );
 
     run_lpac_d2a_network_probe();
+    println!(
+        "d2a-registry-read={}",
+        registry_read_status(&std::env::var("LAT_D2B_REGISTRY_KEY").unwrap_or_default())
+    );
+    println!(
+        "d2a-registry-write={}",
+        registry_write_status(&std::env::var("LAT_D2B_REGISTRY_KEY").unwrap_or_default())
+    );
+    println!(
+        "d2a-credential-read={}",
+        credential_read_status(&std::env::var("LAT_D2B_CREDENTIAL_PARENT").unwrap_or_default())
+    );
+    println!(
+        "d2a-credential-enumerate={}",
+        credential_enumerate_status(
+            &std::env::var("LAT_D2B_CREDENTIAL_FILTER").unwrap_or_default()
+        )
+    );
+    println!(
+        "d2a-credential-write={}",
+        credential_write_status(&std::env::var("LAT_D2B_CREDENTIAL_CHILD").unwrap_or_default())
+    );
+    println!(
+        "d2a-pipe-connect={}",
+        pipe_connect_status(&std::env::var("LAT_D2B_PIPE").unwrap_or_default())
+    );
+}
+
+fn registry_read_status(subkey: &str) -> &'static str {
+    let subkey = wide_nul(subkey);
+    let mut key = ptr::null_mut();
+    // SAFETY: subkey is NUL-terminated and key points to writable storage.
+    let status =
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut key) };
+    if status != ERROR_SUCCESS {
+        return protected_resource_status(status);
+    }
+    let key = OwnedRegistryKey(key);
+    match read_registry_binary(key.0, REGISTRY_PARENT_VALUE) {
+        Ok(_) => "success",
+        Err(status) => protected_resource_status(status),
+    }
+}
+
+fn registry_write_status(subkey: &str) -> &'static str {
+    match create_registry_key(HKEY_CURRENT_USER, subkey, KEY_WRITE) {
+        Ok((key, _)) => match set_registry_binary(key.0, REGISTRY_CHILD_MARKER, b"child marker") {
+            Ok(()) => "success",
+            Err(status) => protected_resource_status(status),
+        },
+        Err(status) => protected_resource_status(status),
+    }
+}
+
+fn credential_read_status(target: &str) -> &'static str {
+    match read_credential(target) {
+        Ok(_) => "success",
+        Err(status) => protected_resource_status(status),
+    }
+}
+
+fn credential_enumerate_status(filter: &str) -> &'static str {
+    match enumerate_credentials(filter) {
+        Ok(_) => "success",
+        Err(status) => protected_resource_status(status),
+    }
+}
+
+fn credential_write_status(target: &str) -> &'static str {
+    match write_credential(target, CREDENTIAL_BLOB) {
+        Ok(()) => match delete_credential(target) {
+            Ok(()) => "isolated-cleaned",
+            Err(_) => "cleanup-failed",
+        },
+        Err(status) => protected_resource_status(status),
+    }
+}
+
+fn protected_resource_status(status: u32) -> &'static str {
+    match status {
+        ERROR_ACCESS_DENIED => "denied",
+        ERROR_FILE_NOT_FOUND | ERROR_NOT_FOUND => "not-found",
+        ERROR_NO_SUCH_LOGON_SESSION => "no-logon-session",
+        ERROR_NOT_SUPPORTED => "not-supported",
+        ERROR_NOT_SUPPORTED_IN_APPCONTAINER => "not-supported-in-appcontainer",
+        ERROR_INVALID_FUNCTION => "invalid-function",
+        status if status == RPC_S_INVALID_BINDING as u32 => "rpc-invalid-binding",
+        _ => "error",
+    }
+}
+
+fn pipe_connect_status(name: &str) -> &'static str {
+    match connect_pipe(name) {
+        Ok(_) => "success",
+        Err(status) => protected_resource_status(status),
+    }
 }
 
 fn run_lpac_d2a_network_probe() {
@@ -2651,11 +2827,503 @@ fn registered_lpac_launcher(root: &std::path::Path) -> WindowsProcessLauncher {
     .unwrap()
 }
 
+#[cfg(feature = "test-seams")]
+fn assert_real_lpac_lifecycle(execution_id: &ToolExecutionId) {
+    assert_eq!(
+        lpac_lifecycle_counts_for_test(execution_id),
+        LpacLifecycleCountsForTest {
+            profiles_created: 1,
+            profiles_deleted: 1,
+            acl_grants: 2,
+            acl_revokes: 2,
+            suspended_children_created: 1,
+            resumes_succeeded: 1,
+            last_windows_error: None,
+        }
+    );
+}
+
+#[cfg(not(feature = "test-seams"))]
+fn assert_real_lpac_lifecycle(_: &ToolExecutionId) {}
+
 struct DeniedCanary {
     read: PathBuf,
     write: PathBuf,
     read_contents: Vec<u8>,
     write_contents: Vec<u8>,
+}
+
+const REGISTRY_PARENT_VALUE: &str = "parent-value";
+const REGISTRY_CHILD_MARKER: &str = "child-marker";
+const REGISTRY_CONTENTS: &[u8] = b"task7 inert registry fixture";
+static NEXT_REGISTRY_FIXTURE: AtomicU64 = AtomicU64::new(1);
+const CREDENTIAL_BLOB: &[u8] = b"task7 inert credential blob";
+static NEXT_CREDENTIAL_FIXTURE: AtomicU64 = AtomicU64::new(1);
+static NEXT_PIPE_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+struct RegistryFixture {
+    subkey: String,
+    key: Option<OwnedRegistryKey>,
+    active: bool,
+}
+
+impl RegistryFixture {
+    fn new() -> Self {
+        let parent = open_registry_key("Software", KEY_READ | KEY_WRITE).unwrap();
+        let child_name = format!(
+            "LocalAgentTerminal-Task7-{}-{}",
+            std::process::id(),
+            NEXT_REGISTRY_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        );
+        let (key, disposition) =
+            create_registry_key(parent.0, &child_name, KEY_READ | KEY_WRITE).unwrap();
+        let mut fixture = Self {
+            subkey: format!(r"Software\{child_name}"),
+            key: Some(key),
+            active: disposition == REG_CREATED_NEW_KEY,
+        };
+        assert_eq!(disposition, REG_CREATED_NEW_KEY);
+        let key = fixture.key.as_ref().unwrap().0;
+        set_registry_binary(key, REGISTRY_PARENT_VALUE, REGISTRY_CONTENTS).unwrap();
+        assert_eq!(
+            read_registry_binary(key, REGISTRY_PARENT_VALUE).unwrap(),
+            REGISTRY_CONTENTS
+        );
+        set_registry_binary(key, REGISTRY_PARENT_VALUE, b"parent write control").unwrap();
+        assert_eq!(
+            read_registry_binary(key, REGISTRY_PARENT_VALUE).unwrap(),
+            b"parent write control"
+        );
+        set_registry_binary(key, REGISTRY_PARENT_VALUE, REGISTRY_CONTENTS).unwrap();
+        assert_eq!(
+            read_registry_binary(key, REGISTRY_CHILD_MARKER),
+            Err(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND)
+        );
+        drop(fixture.key.take());
+        fixture
+    }
+
+    fn assert_unchanged(&self) {
+        let key = open_registry_key(&self.subkey, KEY_READ).unwrap();
+        assert_eq!(
+            read_registry_binary(key.0, REGISTRY_PARENT_VALUE).unwrap(),
+            REGISTRY_CONTENTS
+        );
+        assert_eq!(
+            read_registry_binary(key.0, REGISTRY_CHILD_MARKER),
+            Err(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND)
+        );
+    }
+
+    fn cleanup(mut self) {
+        self.remove();
+        assert!(matches!(
+            open_registry_key(&self.subkey, KEY_READ),
+            Err(ERROR_FILE_NOT_FOUND)
+        ));
+    }
+
+    fn remove(&mut self) {
+        if self.active {
+            drop(self.key.take());
+            let subkey = wide_nul(self.subkey.as_ref());
+            // SAFETY: subkey is NUL-terminated and names only this test-owned tree.
+            assert_eq!(
+                unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, subkey.as_ptr()) },
+                ERROR_SUCCESS
+            );
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for RegistryFixture {
+    fn drop(&mut self) {
+        if self.active {
+            drop(self.key.take());
+            let subkey = wide_nul(self.subkey.as_ref());
+            // SAFETY: subkey is NUL-terminated and names only this test-owned tree.
+            unsafe {
+                RegDeleteTreeW(HKEY_CURRENT_USER, subkey.as_ptr());
+            }
+        }
+    }
+}
+
+struct CredentialFixture {
+    parent_target: String,
+    child_target: String,
+    filter: String,
+    active: bool,
+}
+
+impl CredentialFixture {
+    fn new() -> Self {
+        let prefix = format!(
+            "LocalAgentTerminal/Task7/{}/{}/",
+            std::process::id(),
+            NEXT_CREDENTIAL_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        );
+        let fixture = Self {
+            parent_target: format!("{prefix}parent"),
+            child_target: format!("{prefix}child"),
+            filter: format!("{prefix}*"),
+            active: true,
+        };
+        write_credential(&fixture.parent_target, CREDENTIAL_BLOB).unwrap();
+        assert_eq!(
+            credential_write_status(&fixture.child_target),
+            "isolated-cleaned"
+        );
+        fixture.assert_unchanged();
+        fixture
+    }
+
+    fn assert_unchanged(&self) {
+        assert_eq!(
+            read_credential(&self.parent_target).unwrap(),
+            CREDENTIAL_BLOB
+        );
+        assert_eq!(read_credential(&self.child_target), Err(ERROR_NOT_FOUND));
+        let targets = enumerate_credentials(&self.filter).unwrap();
+        assert_eq!(targets, vec![self.parent_target.clone()]);
+    }
+
+    fn cleanup(mut self) {
+        delete_credential(&self.parent_target).unwrap();
+        assert_eq!(delete_credential(&self.child_target), Err(ERROR_NOT_FOUND));
+        self.active = false;
+        assert_eq!(read_credential(&self.parent_target), Err(ERROR_NOT_FOUND));
+        assert_eq!(enumerate_credentials(&self.filter), Err(ERROR_NOT_FOUND));
+    }
+}
+
+impl Drop for CredentialFixture {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = delete_credential(&self.parent_target);
+            let _ = delete_credential(&self.child_target);
+        }
+    }
+}
+
+struct NamedPipeFixture {
+    name: String,
+}
+
+impl NamedPipeFixture {
+    fn new() -> Self {
+        Self {
+            name: format!(
+                r"\\.\pipe\LocalAgentTerminal-Task7-{}-{}",
+                std::process::id(),
+                NEXT_PIPE_FIXTURE.fetch_add(1, Ordering::Relaxed)
+            ),
+        }
+    }
+
+    fn server(&self) -> OwnedNamedPipe {
+        let name = wide_nul(&self.name);
+        // SAFETY: name is NUL-terminated; null security selects the parent token's default DACL.
+        let handle = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                0,
+                0,
+                0,
+                ptr::null(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        OwnedNamedPipe(handle)
+    }
+
+    fn prove_parent_connection(&self) {
+        let server = self.server();
+        let client = connect_pipe(&self.name).unwrap();
+        assert!(server.accepted_connection());
+        drop(client);
+        server.disconnect();
+    }
+
+    fn cleanup(self, server: OwnedNamedPipe) {
+        drop(server);
+        assert_eq!(connect_pipe(&self.name).unwrap_err(), ERROR_FILE_NOT_FOUND);
+    }
+}
+
+#[derive(Debug)]
+struct OwnedNamedPipe(windows_sys::Win32::Foundation::HANDLE);
+
+impl OwnedNamedPipe {
+    fn accepted_connection(&self) -> bool {
+        // SAFETY: the server handle is live; PIPE_NOWAIT makes this observation bounded.
+        if unsafe { ConnectNamedPipe(self.0, ptr::null_mut()) } != 0 {
+            return true;
+        }
+        // SAFETY: ConnectNamedPipe failed on this thread, so GetLastError returns its status.
+        match unsafe { GetLastError() } {
+            ERROR_PIPE_CONNECTED => true,
+            ERROR_PIPE_LISTENING => false,
+            status => panic!("unexpected named-pipe observation status {status}"),
+        }
+    }
+
+    fn disconnect(&self) {
+        // SAFETY: the server handle is live and has an accepted parent connection.
+        assert_ne!(unsafe { DisconnectNamedPipe(self.0) }, 0);
+    }
+}
+
+impl Drop for OwnedNamedPipe {
+    fn drop(&mut self) {
+        // SAFETY: this server handle is owned here.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OwnedPipeClient(windows_sys::Win32::Foundation::HANDLE);
+
+impl Drop for OwnedPipeClient {
+    fn drop(&mut self) {
+        // SAFETY: this client handle is owned here.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+fn connect_pipe(name: &str) -> Result<OwnedPipeClient, u32> {
+    let name = wide_nul(name);
+    // SAFETY: name is NUL-terminated; optional security and template handles are null.
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        // SAFETY: CreateFileW failed on this thread, so GetLastError returns its status.
+        Err(unsafe { GetLastError() })
+    } else {
+        Ok(OwnedPipeClient(handle))
+    }
+}
+
+struct OwnedRegistryKey(windows_sys::Win32::System::Registry::HKEY);
+
+impl Drop for OwnedRegistryKey {
+    fn drop(&mut self) {
+        // SAFETY: this handle was returned by RegCreateKeyExW and is owned here.
+        unsafe {
+            RegCloseKey(self.0);
+        }
+    }
+}
+
+fn create_registry_key(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    subkey: &str,
+    access: u32,
+) -> Result<(OwnedRegistryKey, u32), u32> {
+    let subkey = wide_nul(subkey);
+    let mut key = ptr::null_mut();
+    let mut disposition = 0;
+    // SAFETY: root is live; subkey is NUL-terminated; output storage is valid;
+    // optional pointers are null.
+    let status = unsafe {
+        RegCreateKeyExW(
+            root,
+            subkey.as_ptr(),
+            0,
+            ptr::null(),
+            0,
+            access,
+            ptr::null(),
+            &mut key,
+            &mut disposition,
+        )
+    };
+    if status == ERROR_SUCCESS {
+        Ok((OwnedRegistryKey(key), disposition))
+    } else {
+        Err(status)
+    }
+}
+
+fn open_registry_key(subkey: &str, access: u32) -> Result<OwnedRegistryKey, u32> {
+    let subkey = wide_nul(subkey);
+    let mut key = ptr::null_mut();
+    // SAFETY: subkey is NUL-terminated and key points to writable storage.
+    let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, access, &mut key) };
+    if status == ERROR_SUCCESS {
+        Ok(OwnedRegistryKey(key))
+    } else {
+        Err(status)
+    }
+}
+
+fn set_registry_binary(
+    key: windows_sys::Win32::System::Registry::HKEY,
+    name: &str,
+    value: &[u8],
+) -> Result<(), u32> {
+    let name = wide_nul(name);
+    // SAFETY: key is live; name is NUL-terminated; value points to value.len() bytes.
+    let status = unsafe {
+        RegSetValueExW(
+            key,
+            name.as_ptr(),
+            0,
+            REG_BINARY,
+            value.as_ptr(),
+            u32::try_from(value.len()).unwrap(),
+        )
+    };
+    (status == ERROR_SUCCESS).then_some(()).ok_or(status)
+}
+
+fn read_registry_binary(
+    key: windows_sys::Win32::System::Registry::HKEY,
+    name: &str,
+) -> Result<Vec<u8>, u32> {
+    let name = wide_nul(name);
+    let mut value = [0_u8; 128];
+    let mut size = value.len() as u32;
+    // SAFETY: key is live; name is NUL-terminated; value and size are writable.
+    let status = unsafe {
+        RegGetValueW(
+            key,
+            ptr::null(),
+            name.as_ptr(),
+            RRF_RT_REG_BINARY,
+            ptr::null_mut(),
+            value.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    if status == ERROR_SUCCESS {
+        Ok(value[..size as usize].to_vec())
+    } else {
+        Err(status)
+    }
+}
+
+fn write_credential(target: &str, blob: &[u8]) -> Result<(), u32> {
+    let target = wide_nul(target);
+    let username = wide_nul("task7");
+    let credential = CREDENTIALW {
+        Type: CRED_TYPE_GENERIC,
+        TargetName: target.as_ptr().cast_mut(),
+        CredentialBlobSize: u32::try_from(blob.len()).unwrap(),
+        CredentialBlob: blob.as_ptr().cast_mut(),
+        Persist: CRED_PERSIST_SESSION,
+        UserName: username.as_ptr().cast_mut(),
+        ..CREDENTIALW::default()
+    };
+    // SAFETY: all credential pointers reference live buffers for the duration of the call.
+    if unsafe { CredWriteW(&credential, 0) } != 0 {
+        Ok(())
+    } else {
+        // SAFETY: CredWriteW failed on this thread, so GetLastError returns its status.
+        Err(unsafe { GetLastError() })
+    }
+}
+
+fn read_credential(target: &str) -> Result<Vec<u8>, u32> {
+    let target = wide_nul(target);
+    let mut credential = ptr::null_mut();
+    // SAFETY: target is NUL-terminated and credential points to writable storage.
+    if unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) } == 0 {
+        // SAFETY: CredReadW failed on this thread, so GetLastError returns its status.
+        return Err(unsafe { GetLastError() });
+    }
+    let credential = OwnedCredentialBuffer(credential.cast());
+    // SAFETY: successful CredReadW returns one valid CREDENTIALW allocation.
+    let credential = unsafe { &*credential.0.cast::<CREDENTIALW>() };
+    // SAFETY: CredentialBlob points to CredentialBlobSize readable bytes.
+    Ok(unsafe {
+        std::slice::from_raw_parts(
+            credential.CredentialBlob,
+            credential.CredentialBlobSize as usize,
+        )
+        .to_vec()
+    })
+}
+
+fn enumerate_credentials(filter: &str) -> Result<Vec<String>, u32> {
+    let filter = wide_nul(filter);
+    let mut count = 0;
+    let mut credentials = ptr::null_mut();
+    // SAFETY: filter is NUL-terminated and both output pointers are writable.
+    if unsafe { CredEnumerateW(filter.as_ptr(), 0, &mut count, &mut credentials) } == 0 {
+        // SAFETY: CredEnumerateW failed on this thread, so GetLastError returns its status.
+        return Err(unsafe { GetLastError() });
+    }
+    let credentials = OwnedCredentialBuffer(credentials.cast());
+    // SAFETY: successful CredEnumerateW returns count pointers to valid CREDENTIALW values.
+    let credentials = unsafe {
+        std::slice::from_raw_parts(credentials.0.cast::<*mut CREDENTIALW>(), count as usize)
+    };
+    let mut targets = credentials
+        .iter()
+        .map(|credential| {
+            // SAFETY: each returned credential and TargetName are valid until CredFree.
+            unsafe { wide_ptr_string((**credential).TargetName) }
+        })
+        .collect::<Vec<_>>();
+    targets.sort();
+    Ok(targets)
+}
+
+fn delete_credential(target: &str) -> Result<(), u32> {
+    let target = wide_nul(target);
+    // SAFETY: target is NUL-terminated.
+    if unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } != 0 {
+        Ok(())
+    } else {
+        // SAFETY: CredDeleteW failed on this thread, so GetLastError returns its status.
+        Err(unsafe { GetLastError() })
+    }
+}
+
+struct OwnedCredentialBuffer(*mut std::ffi::c_void);
+
+impl Drop for OwnedCredentialBuffer {
+    fn drop(&mut self) {
+        // SAFETY: this allocation was returned by CredReadW or CredEnumerateW.
+        unsafe {
+            CredFree(self.0);
+        }
+    }
+}
+
+unsafe fn wide_ptr_string(value: *const u16) -> String {
+    let mut length = 0;
+    // SAFETY: caller guarantees value points to a NUL-terminated Windows string.
+    while unsafe { *value.add(length) } != 0 {
+        length += 1;
+    }
+    // SAFETY: caller guarantees the first length elements are readable.
+    String::from_utf16(unsafe { std::slice::from_raw_parts(value, length) }).unwrap()
+}
+
+fn wide_nul(value: &str) -> Vec<u16> {
+    std::ffi::OsStr::new(value)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 impl DeniedCanary {
