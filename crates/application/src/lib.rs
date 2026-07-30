@@ -17,6 +17,7 @@ mod orchestration;
 mod policy;
 mod ports;
 mod repository;
+mod resume;
 mod tool;
 mod workspace;
 
@@ -68,6 +69,10 @@ pub use repository::{
     ManagedWorktreePath, ObjectFormat, OnboardRepository, OriginalCheckoutState, RepositoryGateway,
     RepositoryHazard, RepositoryHazardReason, RepositoryHealth, RepositoryLocator,
     RepositorySnapshot, WorktreeObservation, WorktreeSnapshot, WorktreeState,
+};
+pub use resume::{
+    validate_approval_resume_relation, validate_pending_approval_resume, ApprovalResumeSnapshot,
+    ApprovalResumeStore, ToolExecutionResumeSnapshot, ToolExecutionResumeStore,
 };
 pub use tool::{
     bind_tool_approval_payload, canonical_file_write_recovery_request,

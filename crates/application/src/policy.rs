@@ -29,6 +29,21 @@ impl PolicyDecisionId {
         Self(format!("policy-decision:{digest}"))
     }
 
+    pub fn from_persisted(value: impl Into<String>) -> Result<Self, PortError> {
+        let value = value.into();
+        let Some(digest) = value.strip_prefix("policy-decision:") else {
+            return Err(invalid_input());
+        };
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(invalid_input());
+        }
+        Ok(Self(value))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -43,6 +58,10 @@ impl PolicyRequestBindingDigest {
     }
 
     pub(crate) const fn new(digest: Sha256Digest) -> Self {
+        Self(digest)
+    }
+
+    pub const fn from_persisted(digest: Sha256Digest) -> Self {
         Self(digest)
     }
 }
