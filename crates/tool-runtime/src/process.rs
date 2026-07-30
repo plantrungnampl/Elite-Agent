@@ -60,9 +60,9 @@ impl<'a> ProcessRuntime<'a> {
         execution_id: ToolExecutionId,
         approved: ApprovedProcessRequest,
     ) -> Result<ProcessReceipt, PortError> {
-        let process = &approved.process;
+        let process = approved.process();
         if process.trust_tier() != ProcessTrustTier::IsolatedWorker
-            || !approved.expected_reads.is_empty()
+            || !approved.expected_reads().is_empty()
             || process
                 .argv()
                 .iter()
@@ -76,7 +76,7 @@ impl<'a> ProcessRuntime<'a> {
             _ => return Err(permission_denied()),
         };
         let executable = self.executables.resolve_registered(executable_id)?;
-        if executable != approved.approved_executable {
+        if &executable != approved.approved_executable() {
             return Err(integrity_failure());
         }
         let binding = process.binding();
@@ -189,9 +189,9 @@ fn process_limits(
 ) -> Result<ProcessLimits, PortError> {
     let limits = ProcessLimits {
         memory_limit_bytes: request
-            .memory_limit_bytes
+            .memory_limit_bytes()
             .unwrap_or(DEFAULT_MEMORY_LIMIT_BYTES),
-        cpu_time_limit_ms: request.cpu_time_limit_ms.unwrap_or(timeout_ms),
+        cpu_time_limit_ms: request.cpu_time_limit_ms().unwrap_or(timeout_ms),
         max_stdout_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
         max_stderr_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
         max_active_processes: DEFAULT_MAX_ACTIVE_PROCESSES,

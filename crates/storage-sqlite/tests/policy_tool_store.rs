@@ -721,8 +721,8 @@ fn approval_payload() -> (
         1_000,
     )
     .unwrap();
-    let request = ApprovedProcessRequest {
-        approved_executable: ApprovedExecutableIdentity::new(
+    let request = ApprovedProcessRequest::new(
+        ApprovedExecutableIdentity::new(
             ResolvedExecutable {
                 canonical_path: std::env::temp_dir()
                     .join("local-agent-terminal-approved-executables")
@@ -734,7 +734,7 @@ fn approval_payload() -> (
             "1.97.1",
         )
         .unwrap(),
-        process: ProcessToolRequest::new(
+        ProcessToolRequest::new(
             binding,
             ProcessInvocation::new(
                 CapabilityRef::toolchain("cargo").unwrap(),
@@ -748,10 +748,11 @@ fn approval_payload() -> (
             .unwrap(),
         )
         .unwrap(),
-        expected_reads: Vec::new(),
-        memory_limit_bytes: None,
-        cpu_time_limit_ms: None,
-    };
+        Vec::new(),
+        None,
+        None,
+    )
+    .unwrap();
     let bound = bind_tool_approval_payload(
         ToolApprovalPayloadV1 {
             schema: "approval-digest.v1".to_owned(),

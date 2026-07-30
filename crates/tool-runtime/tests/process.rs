@@ -283,13 +283,14 @@ fn runtime_initial_check_cannot_bypass_final_windows_resume_fence() {
     let error = runtime
         .execute(
             execution_id.clone(),
-            ApprovedProcessRequest {
+            ApprovedProcessRequest::new(
                 approved_executable,
                 process,
-                expected_reads: Vec::new(),
-                memory_limit_bytes: Some(64 * 1024 * 1024),
-                cpu_time_limit_ms: Some(2_000),
-            },
+                Vec::new(),
+                Some(64 * 1024 * 1024),
+                Some(2_000),
+            )
+            .unwrap(),
         )
         .expect_err("replacement after the runtime check must deny resume");
 
@@ -585,20 +586,18 @@ fn execute_with_registry(
     .unwrap();
 
     let execution_id = ToolExecutionId::new("execution-1").unwrap();
-    let result = runtime.execute(
-        execution_id.clone(),
-        ApprovedProcessRequest {
-            approved_executable,
-            process,
-            expected_reads: if mutation == CaseMutation::ExpectedReads {
-                vec![CapabilityRef::worktree(TaskId::new("task-1").unwrap(), "src").unwrap()]
-            } else {
-                Vec::new()
-            },
-            memory_limit_bytes: Some(64 * 1024 * 1024),
-            cpu_time_limit_ms: Some(2_000),
+    let approved = ApprovedProcessRequest::new(
+        approved_executable,
+        process,
+        if mutation == CaseMutation::ExpectedReads {
+            vec![CapabilityRef::worktree(TaskId::new("task-1").unwrap(), "src").unwrap()]
+        } else {
+            Vec::new()
         },
+        Some(64 * 1024 * 1024),
+        Some(2_000),
     );
+    let result = approved.and_then(|approved| runtime.execute(execution_id.clone(), approved));
     let request = launcher.request.lock().unwrap().clone();
     let launcher_calls = launcher.calls.load(Ordering::SeqCst);
     CaseOutcome {
