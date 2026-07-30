@@ -3,11 +3,12 @@ use std::sync::Mutex;
 
 use local_agent_terminal_application::{
     canonical_policy_binding_digest, canonical_tool_request, policy_request_for_tool, ApprovalId,
-    ArtifactId, Clock, IdGenerator, ImmutableToolRequest, PolicyDecision, PolicyDecisionId,
-    PolicyDecisionStore, PolicyEvaluator, PortError, PreEffectOutcome, RecordedPolicyDecision,
-    Retryability, SafeErrorClassification, ToolApprovalPublication, ToolApprovalRequest,
-    ToolApprovalRequestPublisher, ToolExecutionId, ToolExecutionOrchestration, ToolPolicyContext,
-    ToolRequest, ToolRequestPublisher,
+    ArtifactId, Clock, IdGenerator, ImmutableToolRequest, LeaseSnapshot, LeaseState,
+    PolicyDecision, PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator, PortError,
+    PreEffectOutcome, RecordedPolicyDecision, Retryability, SafeErrorClassification,
+    ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestPublisher,
+    ToolAuthorityResolver, ToolAuthoritySnapshot, ToolExecutionId, ToolExecutionOrchestration,
+    ToolPolicyContext, ToolRequest, ToolRequestPublisher,
 };
 use local_agent_terminal_domain::{
     combine_policy_rules, ActorLocality, CapabilityRef, EnvironmentProfile, FencingToken,
@@ -16,6 +17,9 @@ use local_agent_terminal_domain::{
     ProcessToolRequest, ProcessTrustTier, ResourceClass, RunId, Sha256Digest, TaskId, TaskRisk,
     Timestamp, TrustTier, WorkspaceVersion,
 };
+use sha2::{Digest, Sha256};
+
+const AUTHORITY_RESOURCE_BYTES: &[u8] = b"orchestration authority";
 
 #[test]
 fn policy_request_maps_exact_validated_tool_identity() {
@@ -37,7 +41,7 @@ fn policy_request_maps_exact_validated_tool_identity() {
             action: PolicyAction::new("process.exec").unwrap(),
             resource: PolicyResource {
                 capability: CapabilityRef::worktree(TaskId::new("task-1").unwrap(), ".",).unwrap(),
-                content_digest: digest('a'),
+                content_digest: resource_digest(AUTHORITY_RESOURCE_BYTES),
                 resource_class: ResourceClass::InternalCode,
             },
             task_risk: TaskRisk::High,
@@ -137,10 +141,15 @@ fn allow_publishes_before_pre_effect_ready() {
         records: &records,
         decision_id: decision_id.clone(),
     };
+    let authority = RecordingAuthority {
+        events: &events,
+        current: request.clone(),
+    };
     let ids = SequenceIds::new(&events);
     let approval_requests = RecordingApprovalPublisher::new();
     let orchestrator = ToolExecutionOrchestration::new(
         &publisher,
+        &authority,
         &clock,
         &evaluator,
         &policy_store,
@@ -156,7 +165,7 @@ fn allow_publishes_before_pre_effect_ready() {
 
     assert_eq!(
         events.into_inner().unwrap(),
-        ["publish", "clock", "evaluate", "record"]
+        ["publish", "authority", "clock", "evaluate", "record"]
     );
     assert_eq!(records.into_inner().unwrap()[0].recorded_at, evaluated_at);
     assert_eq!(ready.execution_id(), &execution_id);
@@ -189,7 +198,10 @@ fn deny_is_recorded_once_before_typed_branch() {
             policy_decision_id: decision_id,
         }
     );
-    assert_eq!(events, ["publish", "clock", "evaluate", "record"]);
+    assert_eq!(
+        events,
+        ["publish", "authority", "clock", "evaluate", "record"]
+    );
     assert_eq!(records.len(), 1);
 }
 
@@ -215,7 +227,16 @@ fn require_approval_constructs_core_owned_canonical_terms_after_policy_recording
 
             assert_eq!(
                 *events.lock().unwrap(),
-                ["publish", "clock", "evaluate", "record", "id", "id", "id"]
+                [
+                    "publish",
+                    "authority",
+                    "clock",
+                    "evaluate",
+                    "record",
+                    "id",
+                    "id",
+                    "id"
+                ]
             );
             assert_eq!(records.lock().unwrap().len(), 1);
             assert_eq!(published.approval_id().as_str(), "approval-1");
@@ -344,9 +365,14 @@ fn replay_keeps_original_policy_decision_separate_from_fresh_decision() {
             records: &records,
             decision_id: decision_id.clone(),
         };
+        let authority = RecordingAuthority {
+            events: &events,
+            current: request.clone(),
+        };
         let ids = SequenceIds::with_values(&events, id_values);
         let orchestrator = ToolExecutionOrchestration::new(
             &publisher,
+            &authority,
             &clock,
             &evaluator,
             &policy_store,
@@ -475,7 +501,10 @@ fn allow_with_redaction_fails_closed_for_process_execution() {
             policy_decision_id: decision_id,
         }
     );
-    assert_eq!(events, ["publish", "clock", "evaluate", "record"]);
+    assert_eq!(
+        events,
+        ["publish", "authority", "clock", "evaluate", "record"]
+    );
     assert_eq!(records.len(), 1);
 }
 
@@ -535,7 +564,7 @@ fn evaluator_echo_mutations_fail_integrity_before_recording() {
             result.unwrap_err().safe_classification(),
             SafeErrorClassification::IntegrityFailure
         );
-        assert_eq!(events, ["publish", "clock", "evaluate"]);
+        assert_eq!(events, ["publish", "authority", "clock", "evaluate"]);
         assert!(records.is_empty());
     }
 }
@@ -554,7 +583,10 @@ fn evaluator_resource_class_may_upgrade_but_not_downgrade() {
         panic!("resource-class upgrade did not remain allowable");
     };
     assert_eq!(ready.policy_decision_id(), &upgraded_id);
-    assert_eq!(events, ["publish", "clock", "evaluate", "record"]);
+    assert_eq!(
+        events,
+        ["publish", "authority", "clock", "evaluate", "record"]
+    );
     assert_eq!(records.len(), 1);
 
     let mut downgraded = request;
@@ -566,7 +598,7 @@ fn evaluator_resource_class_may_upgrade_but_not_downgrade() {
         result.unwrap_err().safe_classification(),
         SafeErrorClassification::IntegrityFailure
     );
-    assert_eq!(events, ["publish", "clock", "evaluate"]);
+    assert_eq!(events, ["publish", "authority", "clock", "evaluate"]);
     assert!(records.is_empty());
 }
 
@@ -589,12 +621,16 @@ fn decision_id_mismatch_fails_integrity_after_one_record() {
         result.unwrap_err().safe_classification(),
         SafeErrorClassification::IntegrityFailure
     );
-    assert_eq!(events, ["publish", "clock", "evaluate", "record"]);
+    assert_eq!(
+        events,
+        ["publish", "authority", "clock", "evaluate", "record"]
+    );
     assert_eq!(records.len(), 1);
 }
 
 #[test]
 fn invalid_clock_timestamp_stops_before_policy_evaluation() {
+    let request = tool_request();
     let events = Mutex::new(Vec::new());
     let records = Mutex::new(Vec::new());
     let publisher = RecordingPublisher {
@@ -608,7 +644,7 @@ fn invalid_clock_timestamp_stops_before_policy_evaluation() {
     let evaluator = RecordingEvaluator {
         events: &events,
         decision: policy_decision(
-            policy_request_for_tool(&tool_request(), Timestamp::from_unix_seconds(1_753_272_000)),
+            policy_request_for_tool(&request, Timestamp::from_unix_seconds(1_753_272_000)),
             PolicyEffect::Allow,
         ),
     };
@@ -617,10 +653,15 @@ fn invalid_clock_timestamp_stops_before_policy_evaluation() {
         records: &records,
         decision_id: PolicyDecisionId::from_decision(&evaluator.decision),
     };
+    let authority = RecordingAuthority {
+        events: &events,
+        current: request.clone(),
+    };
     let ids = SequenceIds::new(&events);
     let approval_requests = RecordingApprovalPublisher::new();
     let orchestrator = ToolExecutionOrchestration::new(
         &publisher,
+        &authority,
         &clock,
         &evaluator,
         &policy_store,
@@ -628,19 +669,58 @@ fn invalid_clock_timestamp_stops_before_policy_evaluation() {
         &approval_requests,
     );
 
-    let result = orchestrator.execute(tool_request());
+    let result = orchestrator.execute(request);
 
     assert_eq!(
         result.unwrap_err().safe_classification(),
         SafeErrorClassification::InvalidInput
     );
-    assert_eq!(events.into_inner().unwrap(), ["publish", "clock"]);
+    assert_eq!(
+        events.into_inner().unwrap(),
+        ["publish", "authority", "clock"]
+    );
     assert!(records.into_inner().unwrap().is_empty());
+}
+
+#[test]
+fn authoritative_request_mutation_stops_before_policy_evaluation() {
+    let request = tool_request();
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let decision = policy_decision(
+        policy_request_for_tool(&request, evaluated_at),
+        PolicyEffect::Allow,
+    );
+    let decision_id = PolicyDecisionId::from_decision(&decision);
+
+    let (result, events, records) = execute_with_authority(
+        tool_request_with_argv(vec!["check".to_owned()]),
+        decision,
+        decision_id,
+    );
+
+    assert_eq!(
+        result.unwrap_err().safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(events, ["publish", "authority"]);
+    assert!(records.is_empty());
 }
 
 struct RecordingPublisher<'a> {
     events: &'a Mutex<Vec<&'static str>>,
     artifact_id: ArtifactId,
+}
+
+struct RecordingAuthority<'a> {
+    events: &'a Mutex<Vec<&'static str>>,
+    current: ToolRequest,
+}
+
+impl ToolAuthorityResolver for RecordingAuthority<'_> {
+    fn resolve(&self, _: &ToolRequest) -> Result<ToolAuthoritySnapshot, PortError> {
+        self.events.lock().unwrap().push("authority");
+        authority_snapshot(self.current.clone())
+    }
 }
 
 impl ToolRequestPublisher for RecordingPublisher<'_> {
@@ -860,9 +940,14 @@ fn with_require_approval_orchestrator<R>(
         records: &records,
         decision_id: decision_id.clone(),
     };
+    let authority = RecordingAuthority {
+        events: &events,
+        current: request.clone(),
+    };
     let ids = SequenceIds::new(&events);
     let orchestrator = ToolExecutionOrchestration::new(
         &publisher,
+        &authority,
         &clock,
         &evaluator,
         &policy_store,
@@ -873,6 +958,18 @@ fn with_require_approval_orchestrator<R>(
 }
 
 fn execute_with_decision(
+    decision: PolicyDecision,
+    decision_id: PolicyDecisionId,
+) -> (
+    Result<PreEffectOutcome, PortError>,
+    Vec<&'static str>,
+    Vec<RecordedPolicyDecision>,
+) {
+    execute_with_authority(tool_request(), decision, decision_id)
+}
+
+fn execute_with_authority(
+    current_request: ToolRequest,
     decision: PolicyDecision,
     decision_id: PolicyDecisionId,
 ) -> (
@@ -899,18 +996,24 @@ fn execute_with_decision(
         records: &records,
         decision_id,
     };
+    let request = tool_request();
+    let authority = RecordingAuthority {
+        events: &events,
+        current: current_request,
+    };
     let ids = SequenceIds::new(&events);
     let approval_requests = RecordingApprovalPublisher::new();
     let result = {
         let orchestrator = ToolExecutionOrchestration::new(
             &publisher,
+            &authority,
             &clock,
             &evaluator,
             &policy_store,
             &ids,
             &approval_requests,
         );
-        orchestrator.execute(tool_request())
+        orchestrator.execute(request)
     };
 
     (
@@ -1030,7 +1133,7 @@ fn tool_request_with_argv(argv: Vec<String>) -> ToolRequest {
             PolicyAction::new("process.exec").unwrap(),
             PolicyResource {
                 capability: CapabilityRef::worktree(task_id, ".").unwrap(),
-                content_digest: digest('a'),
+                content_digest: resource_digest(AUTHORITY_RESOURCE_BYTES),
                 resource_class: ResourceClass::InternalCode,
             },
             TaskRisk::High,
@@ -1040,6 +1143,28 @@ fn tool_request_with_argv(argv: Vec<String>) -> ToolRequest {
         .unwrap(),
     )
     .unwrap()
+}
+
+fn authority_snapshot(request: ToolRequest) -> Result<ToolAuthoritySnapshot, PortError> {
+    let binding = request.process().process().binding();
+    let lease = request
+        .process()
+        .process()
+        .executor_fencing_token()
+        .map(|token| LeaseSnapshot {
+            task_id: binding.task_id().clone(),
+            holder_run_id: binding.run_id().clone(),
+            token,
+            state: LeaseState::Active,
+            acquired_at: "2025-07-23T11:00:00Z".to_owned(),
+            expires_at: "2025-07-23T13:00:00Z".to_owned(),
+            released_at: None,
+        });
+    ToolAuthoritySnapshot::new(request, AUTHORITY_RESOURCE_BYTES, lease)
+}
+
+fn resource_digest(bytes: &[u8]) -> Sha256Digest {
+    Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
 }
 
 fn digest(character: char) -> Sha256Digest {

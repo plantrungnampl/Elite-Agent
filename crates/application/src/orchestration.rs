@@ -11,10 +11,11 @@ use crate::{
     canonical_approval_payload, canonical_policy_binding_digest, canonical_tool_request,
     parse_policy_timestamp,
     tool::{logical_capability, process_approval_operation},
-    ApprovalId, ApprovalRequestDto, ArtifactId, Clock, IdGenerator, ImmutableToolRequest,
-    PolicyDecision, PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator,
-    PolicyRequestBindingDigest, PortError, RecordedPolicyDecision, Retryability,
-    SafeErrorClassification, ToolExecutionId, ToolRequest, ToolRequestBindingDigest,
+    validate_authoritative_tool_request, ApprovalId, ApprovalRequestDto, ArtifactId, Clock,
+    IdGenerator, ImmutableToolRequest, PolicyDecision, PolicyDecisionId, PolicyDecisionStore,
+    PolicyEvaluator, PolicyRequestBindingDigest, PortError, RecordedPolicyDecision, Retryability,
+    SafeErrorClassification, ToolAuthorityResolver, ToolExecutionId, ToolRequest,
+    ToolRequestBindingDigest,
 };
 
 const TOOL_APPROVAL_LIFETIME_MINUTES: i64 = 15;
@@ -41,6 +42,7 @@ pub trait ToolRequestPublisher: Send + Sync {
 
 pub struct ToolExecutionOrchestration<'a> {
     publisher: &'a dyn ToolRequestPublisher,
+    authority: &'a dyn ToolAuthorityResolver,
     clock: &'a dyn Clock,
     policies: &'a dyn PolicyEvaluator,
     policy_decisions: &'a dyn PolicyDecisionStore,
@@ -51,6 +53,7 @@ pub struct ToolExecutionOrchestration<'a> {
 impl<'a> ToolExecutionOrchestration<'a> {
     pub const fn new(
         publisher: &'a dyn ToolRequestPublisher,
+        authority: &'a dyn ToolAuthorityResolver,
         clock: &'a dyn Clock,
         policies: &'a dyn PolicyEvaluator,
         policy_decisions: &'a dyn PolicyDecisionStore,
@@ -59,6 +62,7 @@ impl<'a> ToolExecutionOrchestration<'a> {
     ) -> Self {
         Self {
             publisher,
+            authority,
             clock,
             policies,
             policy_decisions,
@@ -70,9 +74,12 @@ impl<'a> ToolExecutionOrchestration<'a> {
     pub fn execute(&self, request: ToolRequest) -> Result<PreEffectOutcome, PortError> {
         let immutable = canonical_tool_request(&request)?;
         let request_artifact_id = self.publisher.publish(&immutable)?;
+        let authority = self.authority.resolve(&request)?;
+        validate_authoritative_tool_request(&request, &authority)?;
+        let authoritative_request = authority.request();
         let requested_at = self.clock.now_utc()?;
         let evaluated_at = parse_policy_timestamp(&requested_at)?;
-        let policy_request = policy_request_for_tool(&request, evaluated_at);
+        let policy_request = policy_request_for_tool(authoritative_request, evaluated_at);
         let policy_request_binding_digest = canonical_policy_binding_digest(&policy_request)?;
         let decision = self.policies.evaluate(policy_request.clone())?;
         validate_policy_decision(&policy_request, &decision)?;
@@ -98,7 +105,7 @@ impl<'a> ToolExecutionOrchestration<'a> {
                 policy_decision_id: recorded_decision_id,
             }),
             PolicyEffect::RequireApproval => self.request_approval(
-                &request,
+                authoritative_request,
                 &immutable,
                 request_artifact_id,
                 recorded_decision_id,
