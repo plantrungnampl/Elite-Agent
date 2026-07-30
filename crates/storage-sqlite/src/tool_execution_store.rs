@@ -12,11 +12,11 @@ use local_agent_terminal_application::{
     FileWriteRecoveryState, FileWriteRecoveryStore, IdempotencyClass, ImmutableToolRequest,
     IncompleteToolExecution, NewToolExecution, NewToolIntent, OperationIntentSnapshot,
     PolicyDecisionId, PolicyRequestBindingDigest, PortError, ProcessExecutionBindingStore,
-    Retryability, SafeErrorClassification, SafeToolExecutionError, ToolExecutionClaim,
-    ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
-    ToolExecutionRecoveryEvidence, ToolExecutionResolution, ToolExecutionStore,
-    ToolExecutionTerminal, ToolExecutionTerminalKind, VerifiedFileWriteCompensation,
-    WorkspaceMutationRequest,
+    Retryability, SafeErrorClassification, SafeToolExecutionError, ToolExecutionCancellationClaim,
+    ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId,
+    ToolExecutionOutput, ToolExecutionRecoveryEvidence, ToolExecutionResolution,
+    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
+    VerifiedFileWriteCompensation, WorkspaceMutationRequest,
 };
 use local_agent_terminal_domain::{
     ArtifactId, FencingToken, PolicyEffect, ProjectId, RunId, Sequence, Sha256Digest, TaskId,
@@ -791,6 +791,92 @@ impl ToolExecutionStore for SqliteStore {
             request.request_artifact_id,
             request.policy_decision_id,
         ))
+    }
+
+    fn request_cancellation(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<ToolExecutionCancellationClaim, PortError> {
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error_to_port)?;
+        let intent = load_intent(&transaction, execution_id)?;
+        validate_tool_intent(&transaction, execution_id, &intent)?;
+        if matches!(
+            intent.status.as_str(),
+            "succeeded" | "failed" | "interrupted"
+        ) || (matches!(intent.status.as_str(), "cancelled" | "indeterminate")
+            && intent.external_receipt_json.is_some())
+        {
+            let receipt = load_terminal_receipt(&transaction, execution_id, &intent)?;
+            transaction.rollback().map_err(sqlite_error_to_port)?;
+            return Ok(ToolExecutionCancellationClaim::Completed(receipt));
+        }
+        if intent.status != "started" {
+            return Err(conflict());
+        }
+        let execution = load_tool_execution(&transaction, execution_id)?;
+        validate_tool_execution_identity(execution_id, &intent, &execution)?;
+        if execution.status != "running" {
+            return Err(integrity_failure());
+        }
+        let authority = authority_from_intent(execution_id, &intent)?;
+        let cancellation_payloads = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT payload_json FROM events
+                     WHERE stream_id = ?1 AND event_type = 'operation.cancel.requested'
+                       AND actor_type = 'tool' AND actor_id = ?2",
+                )
+                .map_err(sqlite_error_to_port)?;
+            let payloads = statement
+                .query_map(params![intent.task_id, execution_id.as_str()], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(sqlite_error_to_port)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_error_to_port)?;
+            payloads
+        };
+        let expected_payload = cancellation_event_payload(&authority);
+        match cancellation_payloads.as_slice() {
+            [] => {
+                append_tool_event(
+                    &transaction,
+                    &intent.task_id,
+                    execution_id.as_str(),
+                    "operation.cancel.requested",
+                    "Cancelling",
+                    expected_payload,
+                )?;
+                transaction.commit().map_err(sqlite_error_to_port)?;
+                Ok(ToolExecutionCancellationClaim::Claimed(authority))
+            }
+            [payload]
+                if serde_json::from_str::<Value>(payload).map_err(|_| integrity_failure())?
+                    == expected_payload =>
+            {
+                let (state, current_sequence, latest_sequence): (String, i64, i64) = transaction
+                    .query_row(
+                        "SELECT operation_state, current_sequence,
+                                COALESCE(
+                                    (SELECT MAX(sequence) FROM events WHERE stream_id = tasks.id),
+                                    0
+                                )
+                         FROM tasks WHERE id = ?1",
+                        [&intent.task_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .map_err(sqlite_error_to_port)?;
+                if state != "Cancelling" || current_sequence != latest_sequence {
+                    return Err(integrity_failure());
+                }
+                transaction.rollback().map_err(sqlite_error_to_port)?;
+                Ok(ToolExecutionCancellationClaim::InFlight(authority))
+            }
+            _ => Err(integrity_failure()),
+        }
     }
 
     fn resolve_terminal(
@@ -3301,6 +3387,17 @@ fn terminal_event_payload(receipt: &DurableToolExecutionReceipt) -> serde_json::
         "operationDigest": receipt.authority().operation_digest().as_str(),
         "ownerRunId": receipt.authority().owner_run_id().as_str(),
         "receipt": terminal_receipt_value(receipt),
+    })
+}
+
+fn cancellation_event_payload(authority: &ToolExecutionClaimAuthority) -> serde_json::Value {
+    json!({
+        "attempt": authority.attempt(),
+        "executionId": authority.execution_id().as_str(),
+        "executorFencingToken": authority.executor_fencing_token().map(FencingToken::get),
+        "operationDigest": authority.operation_digest().as_str(),
+        "ownerRunId": authority.owner_run_id().as_str(),
+        "schema": "tool-execution-cancellation.v1",
     })
 }
 

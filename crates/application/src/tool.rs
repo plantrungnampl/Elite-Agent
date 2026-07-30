@@ -1407,6 +1407,23 @@ pub enum ToolExecutionClaim {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolExecutionCancellationClaim {
+    Claimed(ToolExecutionClaimAuthority),
+    InFlight(ToolExecutionClaimAuthority),
+    Completed(DurableToolExecutionReceipt),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableToolCancellationOutcome {
+    Requested {
+        authority: ToolExecutionClaimAuthority,
+        receipt: CancellationReceipt,
+    },
+    InFlight(ToolExecutionClaimAuthority),
+    Completed(DurableToolExecutionReceipt),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DurableToolExecutionOutcome {
     InFlight(ToolExecutionRecoveryEvidence),
     Completed(DurableToolExecutionReceipt),
@@ -1831,6 +1848,10 @@ pub trait ToolExecutionStore: Send + Sync {
         &self,
         request: ToolExecutionDenialRequest,
     ) -> Result<DeniedToolExecution, PortError>;
+    fn request_cancellation(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<ToolExecutionCancellationClaim, PortError>;
     fn resolve_terminal(
         &self,
         resolution: ToolExecutionResolution,

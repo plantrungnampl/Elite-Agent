@@ -1,10 +1,11 @@
 use crate::{
     approval::valid_approval_nonce, ApprovalCheck, ApprovalClaim, ApprovalSnapshot, ApprovalState,
-    ApprovalStore, AuthorizedToolRequest, Clock, DurableToolExecutionOutcome,
-    DurableToolExecutionReceipt, IncompleteToolExecution, NewToolExecution, PortError,
-    Retryability, SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor,
-    ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionResolution, ToolExecutionResult,
-    ToolExecutionStore, ToolExecutionTerminal,
+    ApprovalStore, AuthorizedToolRequest, Clock, DurableToolCancellationOutcome,
+    DurableToolExecutionOutcome, DurableToolExecutionReceipt, IncompleteToolExecution,
+    NewToolExecution, PortError, ProcessStatus, Retryability, SafeErrorClassification,
+    SafeToolExecutionError, StructuredToolExecutor, ToolExecutionCancellationClaim,
+    ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionId, ToolExecutionResolution,
+    ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal,
 };
 use local_agent_terminal_domain::{FencingToken, RunId, Sha256Digest, TaskId};
 use time::format_description::well_known::Rfc3339;
@@ -160,6 +161,44 @@ impl<'a> ExecuteDurableTool<'a> {
 
     pub fn incomplete(&self) -> Result<Vec<IncompleteToolExecution>, PortError> {
         self.executions.incomplete()
+    }
+
+    pub fn cancel(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<DurableToolCancellationOutcome, PortError> {
+        match self.executions.request_cancellation(execution_id)? {
+            ToolExecutionCancellationClaim::Claimed(authority) => {
+                validate_cancellation_authority(&authority, execution_id)?;
+                let receipt = self.executor.cancel(execution_id)?;
+                if receipt.execution_id != *execution_id
+                    || receipt.status != ProcessStatus::Terminated
+                    || !receipt.cancelled
+                {
+                    return Err(integrity_failure());
+                }
+                Ok(DurableToolCancellationOutcome::Requested { authority, receipt })
+            }
+            ToolExecutionCancellationClaim::InFlight(authority) => {
+                validate_cancellation_authority(&authority, execution_id)?;
+                Ok(DurableToolCancellationOutcome::InFlight(authority))
+            }
+            ToolExecutionCancellationClaim::Completed(receipt) => {
+                validate_cancellation_authority(receipt.authority(), execution_id)?;
+                Ok(DurableToolCancellationOutcome::Completed(receipt))
+            }
+        }
+    }
+}
+
+fn validate_cancellation_authority(
+    authority: &ToolExecutionClaimAuthority,
+    execution_id: &ToolExecutionId,
+) -> Result<(), PortError> {
+    if authority.execution_id() == execution_id {
+        Ok(())
+    } else {
+        Err(integrity_failure())
     }
 }
 

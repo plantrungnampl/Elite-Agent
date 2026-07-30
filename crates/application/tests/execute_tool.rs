@@ -8,13 +8,14 @@ use local_agent_terminal_application::{
     canonical_tool_request, parse_tool_request, ApprovalDigestPayload, ApprovedExecutableIdentity,
     ApprovedProcessRequest, AuthoritativeProcessBinding, AuthorizedToolExecutionClaim,
     AuthorizedToolRequest, BoundToolApproval, BoundedOutput, CancellationReceipt,
-    DeniedToolExecution, DurableToolExecutionArtifact, DurableToolExecutionArtifacts,
-    DurableToolExecutionOutcome, DurableToolExecutionReceipt, ExecuteDurableTool, IdempotencyClass,
-    IncompleteToolExecution, JobReceipt, NewToolExecution, NewToolIntent, OperationIntentSnapshot,
-    PortError, ProcessExecutionBindingStore, ProcessReceipt, ProcessStatus, ResolvedExecutable,
-    Retryability, SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor,
-    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionClaim,
-    ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
+    DeniedToolExecution, DurableToolCancellationOutcome, DurableToolExecutionArtifact,
+    DurableToolExecutionArtifacts, DurableToolExecutionOutcome, DurableToolExecutionReceipt,
+    ExecuteDurableTool, IdempotencyClass, IncompleteToolExecution, JobReceipt, NewToolExecution,
+    NewToolIntent, OperationIntentSnapshot, PortError, ProcessExecutionBindingStore,
+    ProcessReceipt, ProcessStatus, ResolvedExecutable, Retryability, SafeErrorClassification,
+    SafeToolExecutionError, StructuredToolExecutor, ToolApprovalOperationV1, ToolApprovalPayloadV1,
+    ToolExecutionCancellationClaim, ToolExecutionClaim, ToolExecutionClaimAuthority,
+    ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
     ToolExecutionRecoveryEvidence, ToolExecutionResolution, ToolExecutionResult,
     ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolPolicyContext,
     ToolRequest,
@@ -63,6 +64,46 @@ fn exact_authorized_begin_is_part_of_the_object_safe_store_contract() {
     let _ = <dyn ToolExecutionStore>::begin_authorized;
     let _ = <dyn ToolExecutionStore>::load_denied;
     let _ = <dyn ToolExecutionStore>::resolve_denied;
+    let _ = <dyn ToolExecutionStore>::request_cancellation;
+}
+
+#[test]
+fn cancellation_claim_precedes_and_permits_exactly_one_executor_call() {
+    let execution_id = ToolExecutionId::new("execution-cancel").unwrap();
+    let authority = claim_authority(execution_id.clone(), digest('a'));
+    let sequence = recording_sequence();
+    let store = RecordingStore::with_cancellation_claim(
+        ToolExecutionCancellationClaim::Claimed(authority.clone()),
+        sequence.clone(),
+    );
+    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
+    let use_case = ExecuteDurableTool::new(&store, &executor);
+
+    let outcome = use_case.cancel(&execution_id).unwrap();
+
+    let DurableToolCancellationOutcome::Requested {
+        authority: observed_authority,
+        receipt,
+    } = outcome
+    else {
+        panic!("the cancellation claimant must call the executor");
+    };
+    assert_eq!(observed_authority, authority);
+    assert_eq!(receipt.execution_id, execution_id);
+    assert_eq!(receipt.status, ProcessStatus::Terminated);
+    assert!(receipt.cancelled);
+    assert_eq!(executor.cancel_calls(), 1);
+    assert_eq!(
+        sequence.lock().unwrap().as_slice(),
+        ["cancel_claim", "cancel_effect"]
+    );
+
+    store.set_cancellation_claim(ToolExecutionCancellationClaim::InFlight(authority.clone()));
+    assert_eq!(
+        use_case.cancel(&execution_id).unwrap(),
+        DurableToolCancellationOutcome::InFlight(authority)
+    );
+    assert_eq!(executor.cancel_calls(), 1);
 }
 
 #[test]
@@ -909,6 +950,7 @@ fn recording_sequence() -> RecordingSequence {
 
 struct RecordingStore {
     claim: Result<ToolExecutionClaim, PortError>,
+    cancellation_claim: Mutex<Result<ToolExecutionCancellationClaim, PortError>>,
     incomplete: Vec<IncompleteToolExecution>,
     sequence: RecordingSequence,
     begin_requests: Mutex<Vec<NewToolExecution>>,
@@ -928,6 +970,7 @@ impl RecordingStore {
     ) -> Self {
         Self {
             claim,
+            cancellation_claim: Mutex::new(Err(unavailable())),
             incomplete: Vec::new(),
             sequence,
             begin_requests: Mutex::new(Vec::new()),
@@ -935,6 +978,19 @@ impl RecordingStore {
             resolution_error: None,
             enforce_first_digest: false,
         }
+    }
+
+    fn with_cancellation_claim(
+        claim: ToolExecutionCancellationClaim,
+        sequence: RecordingSequence,
+    ) -> Self {
+        let store = Self::with_claim(Err(unavailable()), sequence);
+        *store.cancellation_claim.lock().unwrap() = Ok(claim);
+        store
+    }
+
+    fn set_cancellation_claim(&self, claim: ToolExecutionCancellationClaim) {
+        *self.cancellation_claim.lock().unwrap() = Ok(claim);
     }
 
     fn digest_checking(receipt: DurableToolExecutionReceipt, sequence: RecordingSequence) -> Self {
@@ -1036,6 +1092,14 @@ impl ToolExecutionStore for RecordingStore {
         Ok(resolution.receipt().clone())
     }
 
+    fn request_cancellation(
+        &self,
+        _: &ToolExecutionId,
+    ) -> Result<ToolExecutionCancellationClaim, PortError> {
+        self.sequence.lock().unwrap().push("cancel_claim");
+        self.cancellation_claim.lock().unwrap().clone()
+    }
+
     fn incomplete(&self) -> Result<Vec<IncompleteToolExecution>, PortError> {
         self.sequence.lock().unwrap().push("incomplete");
         Ok(self.incomplete.clone())
@@ -1045,6 +1109,7 @@ impl ToolExecutionStore for RecordingStore {
 struct RecordingExecutor {
     result: Mutex<Option<Result<ToolExecutionResult, PortError>>>,
     calls: AtomicUsize,
+    cancel_calls: AtomicUsize,
     sequence: RecordingSequence,
 }
 
@@ -1053,6 +1118,7 @@ impl RecordingExecutor {
         Self {
             result: Mutex::new(Some(Ok(ToolExecutionResult { receipt }))),
             calls: AtomicUsize::new(0),
+            cancel_calls: AtomicUsize::new(0),
             sequence,
         }
     }
@@ -1061,12 +1127,17 @@ impl RecordingExecutor {
         Self {
             result: Mutex::new(Some(Err(error))),
             calls: AtomicUsize::new(0),
+            cancel_calls: AtomicUsize::new(0),
             sequence,
         }
     }
 
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    fn cancel_calls(&self) -> usize {
+        self.cancel_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -1078,6 +1149,8 @@ impl StructuredToolExecutor for RecordingExecutor {
     }
 
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
+        self.sequence.lock().unwrap().push("cancel_effect");
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
         Ok(CancellationReceipt {
             execution_id: execution_id.clone(),
             status: ProcessStatus::Terminated,

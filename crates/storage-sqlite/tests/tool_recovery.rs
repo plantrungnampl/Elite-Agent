@@ -17,11 +17,11 @@ use local_agent_terminal_application::{
     NewToolExecution, NewToolIntent, PolicyDecision, PolicyDecisionStore,
     ProcessExecutionBindingStore, RecordedPolicyDecision, RelativePathComponents,
     ResolvedExecutable, SafeToolExecutionError, ToolApprovalOperationV1, ToolApprovalPayloadV1,
-    ToolApprovalRequest, ToolExecutionClaim, ToolExecutionClaimAuthority,
-    ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput, ToolExecutionResolution,
-    ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
-    ToolPolicyContext, ToolRequest, ToolRequestBindingDigest, VerifiedFileWriteCompensation,
-    VerifiedWrite,
+    ToolApprovalRequest, ToolExecutionCancellationClaim, ToolExecutionClaim,
+    ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
+    ToolExecutionResolution, ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal,
+    ToolExecutionTerminalKind, ToolPolicyContext, ToolRequest, ToolRequestBindingDigest,
+    VerifiedFileWriteCompensation, VerifiedWrite,
 };
 use local_agent_terminal_domain::{
     combine_policy_rules, ActorId, ActorLocality, ArtifactId, CapabilityRef, EnvironmentProfile,
@@ -390,6 +390,137 @@ fn process_binding_rejects_stale_claim_authority_without_starting() {
             )
             .unwrap(),
         "claimed:pending:1"
+    );
+}
+
+#[test]
+fn concurrent_cancellation_has_one_durable_claimant_and_one_cancelling_event() {
+    let database = TempDatabase::new();
+    let (store, _, authority) = reserve_and_claim(&database, "execution-cancel-concurrent");
+    let execution_id = authority.execution_id().clone();
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let store = store.clone();
+        let execution_id = execution_id.clone();
+        let barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            store.request_cancellation(&execution_id).unwrap()
+        }));
+    }
+    barrier.wait();
+    let outcomes = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ToolExecutionCancellationClaim::Claimed(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ToolExecutionCancellationClaim::InFlight(_)))
+            .count(),
+        1
+    );
+    assert!(outcomes.iter().all(|outcome| match outcome {
+        ToolExecutionCancellationClaim::Claimed(observed)
+        | ToolExecutionCancellationClaim::InFlight(observed) => observed == &authority,
+        ToolExecutionCancellationClaim::Completed(_) => false,
+    }));
+    let connection = configured_connection(&database.path);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT oi.status || ':' || te.status || ':' || t.operation_state
+                 FROM operation_intents oi
+                 JOIN tool_executions te ON te.id = oi.id
+                 JOIN tasks t ON t.id = oi.task_id
+                 WHERE oi.id = ?1",
+                [execution_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "started:running:Cancelling"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE event_type = 'operation.cancel.requested'
+                   AND json_extract(payload_json, '$.executionId') = ?1
+                   AND json_extract(payload_json, '$.attempt') = ?2",
+                params![execution_id.as_str(), authority.attempt()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn cancellation_rolls_back_atomically_and_replays_the_terminal_receipt() {
+    let database = TempDatabase::new();
+    let (store, output_digest, authority) =
+        reserve_and_claim(&database, "execution-cancel-terminal");
+    let execution_id = authority.execution_id().clone();
+    let connection = configured_connection(&database.path);
+    connection
+        .execute_batch(
+            "CREATE TRIGGER injected BEFORE UPDATE ON tasks
+             WHEN NEW.operation_state = 'Cancelling'
+             BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        )
+        .unwrap();
+
+    assert!(store.request_cancellation(&execution_id).is_err());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT t.operation_state || ':' ||
+                        (SELECT COUNT(*) FROM events
+                         WHERE event_type = 'operation.cancel.requested'
+                           AND json_extract(payload_json, '$.executionId') = ?1)
+                 FROM tasks t WHERE t.id = 'task-1'",
+                [execution_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "Running:0"
+    );
+    connection.execute_batch("DROP TRIGGER injected;").unwrap();
+
+    assert_eq!(
+        store.request_cancellation(&execution_id).unwrap(),
+        ToolExecutionCancellationClaim::Claimed(authority.clone())
+    );
+    let terminal = terminal_fixture(ToolExecutionTerminalKind::Terminated, output_digest, None);
+    let expected = DurableToolExecutionReceipt::new(authority, terminal);
+    assert_eq!(
+        store
+            .resolve_terminal(ToolExecutionResolution::new(expected.clone()))
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        store.request_cancellation(&execution_id).unwrap(),
+        ToolExecutionCancellationClaim::Completed(expected)
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT operation_state FROM tasks WHERE id = 'task-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "None"
     );
 }
 

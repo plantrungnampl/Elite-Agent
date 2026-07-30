@@ -1,16 +1,175 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use local_agent_terminal_application::{
-    ArtifactId, ArtifactWriteReservation, Clock, ImmutableToolRequest, NewToolIntent,
-    OperationIntentSnapshot, PortError, ProjectId, ReservedArtifact, Retryability,
-    SafeErrorClassification, TaskId, TaskQuery, ToolApprovalPublication, ToolApprovalRequest,
-    ToolApprovalRequestPublisher, ToolExecutionResumeStore, ToolExecutionStore,
-    ToolRequestPublisher, WorkspaceEvidenceStore,
+    ArtifactId, ArtifactWriteReservation, Clock, DurableToolExecutionReceipt, ImmutableToolRequest,
+    NewToolIntent, OperationIntentSnapshot, PortError, ProcessStatus, ProjectId, ReservedArtifact,
+    Retryability, SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor, TaskId,
+    TaskQuery, ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestPublisher,
+    ToolExecutionCancellationClaim, ToolExecutionId, ToolExecutionResolution,
+    ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal, ToolRequestPublisher,
+    WorkspaceEvidenceStore,
 };
 use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
 use local_agent_terminal_storage_sqlite::SqliteStore;
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+
+type ToolWorkerResult = Result<DurableToolExecutionReceipt, PortError>;
+
+struct ToolRuntimeState {
+    dispatch_open: bool,
+    workers: BTreeMap<ToolExecutionId, JoinHandle<ToolWorkerResult>>,
+}
+
+pub struct ToolRuntime {
+    executions: Arc<dyn ToolExecutionStore>,
+    executor: Arc<dyn StructuredToolExecutor>,
+    state: Mutex<ToolRuntimeState>,
+    shutdown: Mutex<()>,
+}
+
+impl ToolRuntime {
+    pub fn new(
+        executions: Arc<dyn ToolExecutionStore>,
+        executor: Arc<dyn StructuredToolExecutor>,
+    ) -> Self {
+        Self {
+            executions,
+            executor,
+            state: Mutex::new(ToolRuntimeState {
+                dispatch_open: true,
+                workers: BTreeMap::new(),
+            }),
+            shutdown: Mutex::new(()),
+        }
+    }
+
+    pub fn dispatch(
+        &self,
+        execution_id: ToolExecutionId,
+        worker: impl FnOnce() -> Result<DurableToolExecutionReceipt, PortError> + Send + 'static,
+    ) -> Result<(), PortError> {
+        let mut state = self.state.lock().map_err(|_| internal_failure())?;
+        if !state.dispatch_open || state.workers.contains_key(&execution_id) {
+            return Err(conflict());
+        }
+        let handle = thread::Builder::new()
+            .spawn(worker)
+            .map_err(|_| unavailable())?;
+        state.workers.insert(execution_id, handle);
+        Ok(())
+    }
+
+    pub fn stop_all(&self) -> Result<Vec<DurableToolExecutionReceipt>, PortError> {
+        let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
+        let workers = {
+            let mut state = self.state.lock().map_err(|_| internal_failure())?;
+            state.dispatch_open = false;
+            std::mem::take(&mut state.workers)
+        };
+        let mut authorities = BTreeMap::new();
+        let mut completed = BTreeMap::new();
+        let mut cancellation_errors = BTreeMap::new();
+        let mut first_error = None;
+        for execution_id in workers.keys() {
+            match self.executions.request_cancellation(execution_id) {
+                Ok(ToolExecutionCancellationClaim::Claimed(authority)) => {
+                    authorities.insert(execution_id.clone(), authority);
+                    match self.executor.cancel(execution_id) {
+                        Ok(receipt)
+                            if receipt.execution_id == *execution_id
+                                && receipt.status == ProcessStatus::Terminated
+                                && receipt.cancelled => {}
+                        Ok(_) => {
+                            cancellation_errors.insert(execution_id.clone(), integrity_failure());
+                        }
+                        Err(error) => {
+                            cancellation_errors.insert(execution_id.clone(), error);
+                        }
+                    }
+                }
+                Ok(ToolExecutionCancellationClaim::InFlight(authority)) => {
+                    authorities.insert(execution_id.clone(), authority);
+                }
+                Ok(ToolExecutionCancellationClaim::Completed(receipt)) => {
+                    completed.insert(execution_id.clone(), receipt);
+                }
+                Err(error) => {
+                    cancellation_errors.insert(execution_id.clone(), error);
+                }
+            }
+        }
+
+        let mut receipts = Vec::with_capacity(workers.len());
+        for (execution_id, worker) in workers {
+            let worker_receipt = match worker.join() {
+                Ok(Ok(receipt)) => Some(receipt),
+                Ok(Err(worker_error)) => match authorities.remove(&execution_id) {
+                    Some(authority) => {
+                        let error = cancellation_errors
+                            .remove(&execution_id)
+                            .unwrap_or(worker_error);
+                        Some(indeterminate_receipt(authority, &error))
+                    }
+                    None => {
+                        let error = cancellation_errors
+                            .remove(&execution_id)
+                            .unwrap_or(worker_error);
+                        record_first_error(&mut first_error, error);
+                        None
+                    }
+                },
+                Err(_) => match authorities.remove(&execution_id) {
+                    Some(authority) => {
+                        let error = cancellation_errors
+                            .remove(&execution_id)
+                            .unwrap_or_else(internal_failure);
+                        Some(indeterminate_receipt(authority, &error))
+                    }
+                    None => {
+                        let error = cancellation_errors
+                            .remove(&execution_id)
+                            .unwrap_or_else(internal_failure);
+                        record_first_error(&mut first_error, error);
+                        None
+                    }
+                },
+            };
+            if let Some(persisted) = completed.remove(&execution_id) {
+                cancellation_errors.remove(&execution_id);
+                if worker_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt != &persisted)
+                {
+                    record_first_error(&mut first_error, integrity_failure());
+                }
+                receipts.push(persisted);
+                continue;
+            }
+            let Some(receipt) = worker_receipt else {
+                continue;
+            };
+            match self
+                .executions
+                .resolve_terminal(ToolExecutionResolution::new(receipt))
+            {
+                Ok(receipt) => {
+                    cancellation_errors.remove(&execution_id);
+                    receipts.push(receipt);
+                }
+                Err(error) => record_first_error(&mut first_error, error),
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(receipts)
+        }
+    }
+}
 
 pub struct ToolArtifactPublisher<'a> {
     database: &'a SqliteStore,
@@ -193,5 +352,45 @@ fn integrity_failure() -> PortError {
     PortError::failure(
         SafeErrorClassification::IntegrityFailure,
         Retryability::NonRetryable,
+    )
+}
+
+fn conflict() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::Conflict,
+        Retryability::NonRetryable,
+    )
+}
+
+fn unavailable() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::Unavailable,
+        Retryability::Retryable,
+    )
+}
+
+fn internal_failure() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::Internal,
+        Retryability::NonRetryable,
+    )
+}
+
+fn record_first_error(first: &mut Option<PortError>, error: PortError) {
+    if first.is_none() {
+        *first = Some(error);
+    }
+}
+
+fn indeterminate_receipt(
+    authority: local_agent_terminal_application::ToolExecutionClaimAuthority,
+    error: &PortError,
+) -> DurableToolExecutionReceipt {
+    DurableToolExecutionReceipt::new(
+        authority,
+        ToolExecutionTerminal::indeterminate(SafeToolExecutionError {
+            classification: error.safe_classification(),
+            retryability: error.retryability(),
+        }),
     )
 }

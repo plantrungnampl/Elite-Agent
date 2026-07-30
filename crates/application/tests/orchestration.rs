@@ -1063,6 +1063,13 @@ impl ToolExecutionStore for TestExecutionStore<'_> {
         unreachable!("pre-effect orchestration does not resolve execution")
     }
 
+    fn request_cancellation(
+        &self,
+        _: &local_agent_terminal_application::ToolExecutionId,
+    ) -> Result<local_agent_terminal_application::ToolExecutionCancellationClaim, PortError> {
+        unreachable!("pre-effect orchestration does not cancel execution")
+    }
+
     fn incomplete(&self) -> Result<Vec<IncompleteToolExecution>, PortError> {
         unreachable!("pre-effect orchestration does not inspect incomplete execution")
     }
