@@ -1,10 +1,10 @@
-use local_agent_terminal_domain::{PolicyEffect, PolicyRequest, ResourceClass, Timestamp};
+use local_agent_terminal_domain::{PolicyEffect, PolicyRequest, Timestamp};
 
 use crate::{
-    canonical_tool_request, parse_policy_timestamp, ArtifactId, Clock, ImmutableToolRequest,
-    PolicyDecision, PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator, PortError,
-    RecordedPolicyDecision, Retryability, SafeErrorClassification, ToolExecutionId, ToolRequest,
-    ToolRequestBindingDigest,
+    authority::resource_class_is_at_least, canonical_tool_request, parse_policy_timestamp,
+    ArtifactId, Clock, ImmutableToolRequest, PolicyDecision, PolicyDecisionId, PolicyDecisionStore,
+    PolicyEvaluator, PortError, RecordedPolicyDecision, Retryability, SafeErrorClassification,
+    ToolExecutionId, ToolRequest, ToolRequestBindingDigest,
 };
 
 pub fn policy_request_for_tool(request: &ToolRequest, evaluated_at: Timestamp) -> PolicyRequest {
@@ -143,19 +143,6 @@ fn validate_policy_decision(
         return Err(integrity_failure());
     }
     Ok(())
-}
-
-const fn resource_class_is_at_least(candidate: ResourceClass, expected: ResourceClass) -> bool {
-    resource_class_rank(candidate) >= resource_class_rank(expected)
-}
-
-const fn resource_class_rank(resource_class: ResourceClass) -> u8 {
-    match resource_class {
-        ResourceClass::Public => 0,
-        ResourceClass::InternalCode => 1,
-        ResourceClass::Restricted => 2,
-        ResourceClass::Secret => 3,
-    }
 }
 
 fn integrity_failure() -> PortError {

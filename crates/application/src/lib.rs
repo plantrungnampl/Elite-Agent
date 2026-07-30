@@ -7,6 +7,7 @@ pub use local_agent_terminal_domain::{
 
 mod append_events;
 mod approval;
+mod authority;
 mod canonical_json;
 mod dto;
 mod error;
@@ -26,6 +27,9 @@ pub use approval::{
     ApprovalResolution, ApprovalSnapshot, ApprovalState, ApprovalStore, CanonicalApprovalPayload,
     NewApproval, PolicyExceptionApprovalOperationV1, PolicyExceptionApprovalPayloadV1,
     ToolApprovalOperationV1, ToolApprovalPayloadV1,
+};
+pub use authority::{
+    validate_authoritative_tool_request, ToolAuthorityResolver, ToolAuthoritySnapshot,
 };
 pub use canonical_json::{canonical_evidence, CanonicalEvidenceRef, CanonicalJsonRequest};
 pub use dto::{
