@@ -10,17 +10,19 @@ use local_agent_terminal_domain::{
     FencingToken, GitObjectId, LeaseClaim, NetworkProfile, Phase, PlanStepId, PolicyAction,
     PolicyActor, PolicyEffect, PolicyRequest, PolicyResource, ProcessBinding, ProcessInvocation,
     ProcessToolRequest, ProcessTrustTier, ProjectId, RepositoryId, ResourceClass, RunId, Sequence,
-    Sha256Digest, TaskId, TaskRisk, TrustTier, WorkspaceFingerprint, WorkspaceVersion,
+    Sha256Digest, TaskId, TaskRisk, Timestamp, TrustTier, WorkspaceFingerprint, WorkspaceVersion,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::approval::{
     canonical_approval_payload, ApprovalDigestPayload, ApprovalId, ToolApprovalOperationV1,
-    ToolApprovalPayloadV1,
+    ToolApprovalPayloadV1, ToolApprovalRequest,
 };
 use crate::canonical_json::{invalid_input, sha256_digest};
-use crate::{PolicyRequestBindingDigest, PortError, Retryability, SafeErrorClassification};
+use crate::{
+    PolicyDecisionId, PolicyRequestBindingDigest, PortError, Retryability, SafeErrorClassification,
+};
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PROCESS_WRITE_SCOPES: usize = 1024;
@@ -978,6 +980,24 @@ pub struct NewToolExecution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedToolExecutionClaim {
+    pub execution_id: ToolExecutionId,
+    pub request_artifact_id: ArtifactId,
+    pub request_content_digest: Sha256Digest,
+    pub request_binding_digest: ToolRequestBindingDigest,
+    pub task_id: TaskId,
+    pub run_id: RunId,
+    pub tool_name: String,
+    pub policy_decision_id: PolicyDecisionId,
+    pub policy_request_binding_digest: PolicyRequestBindingDigest,
+    pub approval: Option<ToolApprovalRequest>,
+    pub workspace_version: WorkspaceVersion,
+    pub policy_snapshot_digest: Sha256Digest,
+    pub fencing_token: Option<FencingToken>,
+    pub checked_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DurableToolExecutionArtifact {
     Available(ArtifactId),
     Unavailable,
@@ -1703,6 +1723,10 @@ pub trait ApprovedProcessExecutor: Send + Sync {
 pub trait ToolExecutionStore: Send + Sync {
     fn reserve(&self, request: NewToolIntent) -> Result<OperationIntentSnapshot, PortError>;
     fn begin(&self, request: NewToolExecution) -> Result<ToolExecutionClaim, PortError>;
+    fn begin_authorized(
+        &self,
+        request: AuthorizedToolExecutionClaim,
+    ) -> Result<ToolExecutionClaim, PortError>;
     fn resolve_terminal(
         &self,
         resolution: ToolExecutionResolution,

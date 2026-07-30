@@ -154,7 +154,7 @@ impl<'a> ToolExecutionOrchestration<'a> {
             }),
             PolicyEffect::RequireApproval => {
                 if let Some(approval) = resumed_approval {
-                    validate_published_approval(
+                    validate_tool_approval_request(
                         authoritative_request,
                         immutable,
                         &request_artifact_id,
@@ -221,7 +221,7 @@ impl<'a> ToolExecutionOrchestration<'a> {
             }
             ToolApprovalPublication::Replayed(published) => published,
         };
-        validate_published_approval(
+        validate_tool_approval_request(
             request,
             immutable,
             &tool_request_artifact_id,
@@ -354,7 +354,7 @@ fn validate_resume_artifacts(
     let approval_expires_at = parse_policy_timestamp(&approval_request.payload().expires_at)
         .map_err(|_| integrity_failure())?;
 
-    validate_published_approval(
+    validate_tool_approval_request(
         request,
         immutable,
         &execution.request_artifact_id,
@@ -382,7 +382,7 @@ fn validate_resume_artifacts(
     Ok(())
 }
 
-fn validate_published_approval(
+pub fn validate_tool_approval_request(
     request: &ToolRequest,
     immutable: &ImmutableToolRequest,
     tool_request_artifact_id: &ArtifactId,

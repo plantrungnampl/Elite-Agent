@@ -567,7 +567,7 @@ fn approval_task_id(
     TaskId::new(value).map_err(|_| integrity_failure())
 }
 
-fn append_approval_event(
+pub(crate) fn append_approval_event(
     transaction: &Transaction<'_>,
     task_id: &TaskId,
     approval_id: &ApprovalId,

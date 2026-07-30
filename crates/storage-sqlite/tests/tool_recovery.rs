@@ -4,21 +4,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
 use local_agent_terminal_application::{
-    canonical_approval_payload, canonical_file_write_recovery_request, parse_approval_payload,
-    ApprovalClaim, ApprovalDigestPayload, ApprovalId, ApprovalResolution, ApprovalStore,
-    CanonicalEvidenceRef, CapabilityRootIdentity, DurableToolExecutionArtifact,
-    DurableToolExecutionArtifacts, DurableToolExecutionReceipt, FileWritePolicyBinding,
-    FileWritePreImage, FileWriteRecoveryCompletion, FileWriteRecoveryFailure,
-    FileWriteRecoveryIntent, FileWriteRecoveryRequest, FileWriteRecoveryState,
-    FileWriteRecoveryStore, IncompleteToolExecution, NewApproval, NewToolExecution, NewToolIntent,
-    RelativePathComponents, SafeToolExecutionError, ToolExecutionClaim,
-    ToolExecutionClaimAuthority, ToolExecutionId, ToolExecutionOutput, ToolExecutionResolution,
-    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolRequestBindingDigest,
-    VerifiedFileWriteCompensation, VerifiedWrite,
+    bind_tool_approval_payload, canonical_approval_payload, canonical_file_write_recovery_request,
+    canonical_policy_binding_digest, canonical_tool_request, parse_approval_payload,
+    policy_request_for_tool, ApprovalClaim, ApprovalDigestPayload, ApprovalId, ApprovalResolution,
+    ApprovalStore, ApprovedExecutableIdentity, ApprovedProcessRequest,
+    AuthorizedToolExecutionClaim, CanonicalEvidenceRef, CapabilityRootIdentity,
+    DurableToolExecutionArtifact, DurableToolExecutionArtifacts, DurableToolExecutionReceipt,
+    ExecutableFileIdentity, FileWritePolicyBinding, FileWritePreImage, FileWriteRecoveryCompletion,
+    FileWriteRecoveryFailure, FileWriteRecoveryIntent, FileWriteRecoveryRequest,
+    FileWriteRecoveryState, FileWriteRecoveryStore, IncompleteToolExecution, NewApproval,
+    NewToolExecution, NewToolIntent, PolicyDecision, PolicyDecisionStore, RecordedPolicyDecision,
+    RelativePathComponents, ResolvedExecutable, SafeToolExecutionError, ToolApprovalOperationV1,
+    ToolApprovalPayloadV1, ToolApprovalRequest, ToolExecutionClaim, ToolExecutionClaimAuthority,
+    ToolExecutionId, ToolExecutionOutput, ToolExecutionResolution, ToolExecutionStore,
+    ToolExecutionTerminal, ToolExecutionTerminalKind, ToolPolicyContext, ToolRequest,
+    ToolRequestBindingDigest, VerifiedFileWriteCompensation, VerifiedWrite,
 };
 use local_agent_terminal_domain::{
-    ActorId, ArtifactId, FencingToken, GitObjectId, LeaseClaim, PolicyEffect, ProjectId, RunId,
-    Sequence, Sha256Digest, TaskId, WorkspaceFingerprint, WorkspaceVersion,
+    combine_policy_rules, ActorId, ActorLocality, ArtifactId, CapabilityRef, EnvironmentProfile,
+    FencingToken, GitObjectId, LeaseClaim, MatchedPolicyRule, NetworkProfile, Phase, PlanStepId,
+    PolicyAction, PolicyActor, PolicyEffect, PolicyResource, PolicyRuleId, PolicyVersion,
+    ProcessBinding, ProcessInvocation, ProcessToolRequest, ProcessTrustTier, ProjectId,
+    ResourceClass, RunId, Sequence, Sha256Digest, TaskId, TaskRisk, Timestamp, TrustTier,
+    WorkspaceFingerprint, WorkspaceVersion,
 };
 use local_agent_terminal_storage_sqlite::SqliteStore;
 use rusqlite::{params, Connection};
@@ -93,6 +101,411 @@ fn reserve_requires_authoritative_request_evidence() {
             operation_digest: noncanonical_digest,
         })
         .is_err());
+}
+
+#[test]
+fn authorized_begin_uses_the_exact_effective_policy_id() {
+    let database = TempDatabase::new();
+    let store = SqliteStore::open(&database.path).unwrap();
+    let request = exact_tool_request("execution-exact-policy");
+    let immutable = canonical_tool_request(&request).unwrap();
+    let request_digest = immutable.binding_digest().as_sha256().clone();
+    let request_artifact_id = ArtifactId::new("exact-tool-request").unwrap();
+    persist_artifact(
+        &database,
+        request_artifact_id.as_str(),
+        "tool-requests/execution-exact-policy.json",
+        "tool-request",
+        immutable.canonical_bytes(),
+    );
+    store
+        .reserve(NewToolIntent {
+            execution_id: request.execution_id().clone(),
+            operation_digest: request_digest.clone(),
+        })
+        .unwrap();
+
+    let checked_at = Timestamp::from_unix_seconds(1_753_272_300);
+    let effective_policy_id =
+        record_exact_policy(&store, &request, checked_at, PolicyEffect::Allow, '1');
+    record_exact_policy(
+        &store,
+        &request,
+        Timestamp::from_unix_seconds(1_753_272_360),
+        PolicyEffect::Deny,
+        '2',
+    );
+    let process = request.process().process();
+    let binding = process.binding();
+    let claim = AuthorizedToolExecutionClaim {
+        execution_id: request.execution_id().clone(),
+        request_artifact_id,
+        request_content_digest: request_digest,
+        request_binding_digest: immutable.binding_digest().clone(),
+        task_id: binding.task_id().clone(),
+        run_id: binding.run_id().clone(),
+        tool_name: "process.exec".to_owned(),
+        policy_decision_id: effective_policy_id.clone(),
+        policy_request_binding_digest: canonical_policy_binding_digest(&policy_request_for_tool(
+            &request, checked_at,
+        ))
+        .unwrap(),
+        approval: None,
+        workspace_version: binding.workspace_version(),
+        policy_snapshot_digest: request.policy().policy_snapshot_digest().clone(),
+        fencing_token: process.executor_fencing_token(),
+        checked_at,
+    };
+
+    assert!(matches!(
+        store.begin_authorized(claim).unwrap(),
+        ToolExecutionClaim::Claimed(_)
+    ));
+    assert_eq!(
+        configured_connection(&database.path)
+            .query_row(
+                "SELECT policy_decision_id FROM tool_executions
+                 WHERE id = 'execution-exact-policy'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        effective_policy_id.as_str()
+    );
+}
+
+#[test]
+fn authorized_begin_rejects_the_approval_time_policy_as_the_fresh_policy() {
+    let database = TempDatabase::new();
+    let (store, mut claim, _, _) =
+        exact_approval_claim_fixture(&database, "execution-stale-policy");
+    claim.policy_decision_id = claim
+        .approval
+        .as_ref()
+        .unwrap()
+        .policy_decision_id()
+        .clone();
+
+    assert!(store.begin_authorized(claim).is_err());
+    let connection = configured_connection(&database.path);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status || ':' || attempt_count FROM operation_intents
+                 WHERE id = 'execution-stale-policy'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "pending:0"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM tool_executions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn authorized_begin_consumes_the_exact_grant_with_the_execution_claim() {
+    let database = TempDatabase::new();
+    let (store, claim, approval_id, effective_policy_id) =
+        exact_approval_claim_fixture(&database, "execution-exact-approval");
+    let approval = claim.approval.as_ref().unwrap();
+    assert_ne!(
+        claim.request_content_digest,
+        approval.canonical_payload().operation_digest
+    );
+    assert_ne!(
+        approval.policy_decision_id(),
+        &effective_policy_id,
+        "approval-time P1 must remain distinct from fresh P2"
+    );
+
+    assert!(matches!(
+        store.begin_authorized(claim.clone()).unwrap(),
+        ToolExecutionClaim::Claimed(_)
+    ));
+    let mut replay = claim;
+    replay.checked_at = Timestamp::from_unix_seconds(4_102_444_801);
+    assert!(matches!(
+        store.begin_authorized(replay).unwrap(),
+        ToolExecutionClaim::InFlight(_)
+    ));
+
+    let connection = configured_connection(&database.path);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status || ':' || invalidation_reason
+                 FROM approvals WHERE id = ?1",
+                [approval_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "invalidated:consumed"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT policy_decision_id || ':' || approval_id
+                 FROM tool_executions WHERE id = 'execution-exact-approval'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        format!("{}:{}", effective_policy_id.as_str(), approval_id.as_str())
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE stream_id = 'task-1' AND event_type = 'approval.consumed'
+                   AND json_extract(payload_json, '$.approvalId') = ?1",
+                [approval_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn concurrent_authorized_begin_has_one_claimant_and_consumes_once() {
+    let database = TempDatabase::new();
+    let (store, claim, approval_id, _) =
+        exact_approval_claim_fixture(&database, "execution-authorized-concurrent");
+    let barrier = Arc::new(Barrier::new(2));
+
+    let outcomes = std::thread::scope(|scope| {
+        let first_store = store.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first_claim = claim.clone();
+        let first = scope.spawn(move || {
+            first_barrier.wait();
+            first_store.begin_authorized(first_claim)
+        });
+        let second_store = store.clone();
+        let second_barrier = Arc::clone(&barrier);
+        let second = scope.spawn(move || {
+            second_barrier.wait();
+            second_store.begin_authorized(claim)
+        });
+        [
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        ]
+    });
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ToolExecutionClaim::Claimed(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ToolExecutionClaim::InFlight(_)))
+            .count(),
+        1
+    );
+    let connection = configured_connection(&database.path);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE event_type = 'approval.consumed'
+                   AND json_extract(payload_json, '$.approvalId') = ?1",
+                [approval_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM tool_executions
+                 WHERE id = 'execution-authorized-concurrent' AND status = 'running'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn authorized_replay_rejects_changed_approval_terms_with_the_same_id() {
+    let database = TempDatabase::new();
+    let (store, claim, approval_id, _) =
+        exact_approval_claim_fixture(&database, "execution-changed-approval");
+    assert!(matches!(
+        store.begin_authorized(claim.clone()).unwrap(),
+        ToolExecutionClaim::Claimed(_)
+    ));
+
+    let mut changed = claim;
+    let approval = changed.approval.take().unwrap();
+    let mut payload = approval.payload().clone();
+    payload.nonce = "abcdef0123456789abcdef0123456789".to_owned();
+    changed.approval = Some(
+        ToolApprovalRequest::from_persisted(
+            approval.approval_id().clone(),
+            approval.approval_artifact_id().clone(),
+            approval.execution_id().clone(),
+            approval.policy_decision_id().clone(),
+            approval.policy_request_binding_digest().clone(),
+            approval.tool_request_artifact_id().clone(),
+            approval.tool_request_binding_digest().clone(),
+            payload,
+        )
+        .unwrap(),
+    );
+
+    assert!(store.begin_authorized(changed).is_err());
+    assert_eq!(
+        configured_connection(&database.path)
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE stream_id = 'task-1' AND event_type = 'approval.consumed'
+                   AND json_extract(payload_json, '$.approvalId') = ?1",
+                [approval_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn authorized_begin_rejects_wrong_request_or_approval_artifact_kinds() {
+    for approval_artifact in [false, true] {
+        let database = TempDatabase::new();
+        let execution_id = if approval_artifact {
+            "execution-wrong-approval-kind"
+        } else {
+            "execution-wrong-request-kind"
+        };
+        let (store, claim, _, _) = exact_approval_claim_fixture(&database, execution_id);
+        let artifact_id = if approval_artifact {
+            claim
+                .approval
+                .as_ref()
+                .unwrap()
+                .approval_artifact_id()
+                .as_str()
+        } else {
+            claim.request_artifact_id.as_str()
+        };
+        configured_connection(&database.path)
+            .execute(
+                "UPDATE artifacts SET artifact_type = 'evidence' WHERE id = ?1",
+                [artifact_id],
+            )
+            .unwrap();
+
+        assert!(store.begin_authorized(claim).is_err());
+        assert_eq!(
+            configured_connection(&database.path)
+                .query_row(
+                    "SELECT status || ':' || attempt_count FROM operation_intents
+                     WHERE id = ?1",
+                    [execution_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "pending:0"
+        );
+    }
+}
+
+#[test]
+fn authorized_begin_fault_rolls_back_grant_and_execution_together() {
+    let faults = [
+        "CREATE TRIGGER injected BEFORE UPDATE ON approvals
+         WHEN NEW.invalidation_reason = 'consumed'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE INSERT ON events
+         WHEN NEW.event_type = 'approval.consumed'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE UPDATE ON tasks
+         WHEN NEW.operation_state = 'None' AND NEW.current_sequence > OLD.current_sequence
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE UPDATE ON operation_intents
+         WHEN NEW.status = 'started'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE INSERT ON tool_executions
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE INSERT ON events
+         WHEN NEW.event_type = 'tool.execution.started'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE UPDATE ON tasks
+         WHEN NEW.operation_state = 'Running'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+    ];
+    for (index, trigger) in faults.into_iter().enumerate() {
+        let database = TempDatabase::new();
+        let execution_id = format!("execution-approval-fault-{index}");
+        let (store, claim, approval_id, _) = exact_approval_claim_fixture(&database, &execution_id);
+        configured_connection(&database.path)
+            .execute_batch(trigger)
+            .unwrap();
+
+        assert!(store.begin_authorized(claim).is_err(), "{trigger}");
+
+        let connection = configured_connection(&database.path);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status || ':' || COALESCE(invalidation_reason, '')
+                     FROM approvals WHERE id = ?1",
+                    [approval_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "granted:",
+            "{trigger}"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status || ':' || attempt_count FROM operation_intents
+                     WHERE id = ?1",
+                    [execution_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "pending:0",
+            "{trigger}"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM tool_executions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0,
+            "{trigger}"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT operation_state || ':' || current_sequence
+                     FROM tasks WHERE id = 'task-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "None:2",
+            "{trigger}"
+        );
+    }
 }
 
 #[test]
@@ -1986,6 +2399,308 @@ fn seed_authoritative_context(path: &Path, artifact_root: &Path) {
             [],
         )
         .unwrap();
+}
+
+fn exact_tool_request(execution_id: &str) -> ToolRequest {
+    let task_id = TaskId::new("task-1").unwrap();
+    let process = ProcessToolRequest::new(
+        ProcessBinding::new(
+            task_id.clone(),
+            RunId::new("run-1").unwrap(),
+            PlanStepId::new("step-1").unwrap(),
+            Phase::Implementation,
+            WorkspaceVersion::new(4),
+            EnvironmentProfile::new("rust", digest_char('e')).unwrap(),
+            1,
+        )
+        .unwrap(),
+        ProcessInvocation::new(
+            CapabilityRef::toolchain("cargo").unwrap(),
+            vec!["test".to_owned()],
+            CapabilityRef::worktree(task_id.clone(), ".").unwrap(),
+            ProcessTrustTier::IsolatedWorker,
+            NetworkProfile::Denied,
+            Vec::new(),
+            Some(FencingToken::new(19).unwrap()),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let approved = ApprovedProcessRequest::new(
+        ApprovedExecutableIdentity::new(
+            ResolvedExecutable {
+                canonical_path: PathBuf::from(resolver_canonical_executable_path()),
+                sha256: digest_char('d'),
+                file_identity: ExecutableFileIdentity::new("cargo-file").unwrap(),
+                toolchain_id: "cargo".to_owned(),
+            },
+            "1.97.1",
+        )
+        .unwrap(),
+        process,
+        Vec::new(),
+        None,
+        None,
+    )
+    .unwrap();
+    let policy = ToolPolicyContext::new(
+        PolicyActor {
+            connection_id: "connection-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            trust_tier: TrustTier::IsolatedWorker,
+            locality: ActorLocality::Local,
+        },
+        PolicyAction::new("process.exec").unwrap(),
+        PolicyResource {
+            capability: CapabilityRef::worktree(task_id, ".").unwrap(),
+            content_digest: digest_char('a'),
+            resource_class: ResourceClass::InternalCode,
+        },
+        TaskRisk::High,
+        "run focused tests",
+        digest_char('b'),
+    )
+    .unwrap();
+    ToolRequest::new(
+        ToolExecutionId::new(execution_id).unwrap(),
+        approved,
+        policy,
+    )
+    .unwrap()
+}
+
+fn record_exact_policy(
+    store: &SqliteStore,
+    request: &ToolRequest,
+    evaluated_at: Timestamp,
+    effect: PolicyEffect,
+    digest_marker: char,
+) -> local_agent_terminal_application::PolicyDecisionId {
+    let policy_request = policy_request_for_tool(request, evaluated_at);
+    let draft = combine_policy_rules(
+        policy_request,
+        PolicyVersion::new(1).unwrap(),
+        vec![MatchedPolicyRule {
+            rule_id: PolicyRuleId::new(format!("rule-{digest_marker}")).unwrap(),
+            effect,
+            redactions: Vec::new(),
+        }],
+        Some(Timestamp::from_unix_seconds(4_102_444_800)),
+    )
+    .unwrap();
+    store
+        .record(RecordedPolicyDecision {
+            decision: PolicyDecision {
+                draft,
+                operation_digest: digest_char(digest_marker),
+            },
+            recorded_at: evaluated_at,
+        })
+        .unwrap()
+}
+
+fn exact_approval_claim_fixture(
+    database: &TempDatabase,
+    execution_id: &str,
+) -> (
+    SqliteStore,
+    AuthorizedToolExecutionClaim,
+    ApprovalId,
+    local_agent_terminal_application::PolicyDecisionId,
+) {
+    let store = SqliteStore::open(&database.path).unwrap();
+    let request = exact_tool_request(execution_id);
+    let immutable = canonical_tool_request(&request).unwrap();
+    let request_artifact_id = ArtifactId::new(format!("request-{execution_id}")).unwrap();
+    persist_artifact(
+        database,
+        request_artifact_id.as_str(),
+        &format!("tool-requests/{execution_id}.json"),
+        "tool-request",
+        immutable.canonical_bytes(),
+    );
+    store
+        .reserve(NewToolIntent {
+            execution_id: request.execution_id().clone(),
+            operation_digest: immutable.binding_digest().as_sha256().clone(),
+        })
+        .unwrap();
+
+    let checked_at = Timestamp::from_unix_seconds(1_753_272_300);
+    let approval_policy_id = record_exact_policy(
+        &store,
+        &request,
+        Timestamp::from_unix_seconds(checked_at.unix_seconds() - 60),
+        PolicyEffect::RequireApproval,
+        '3',
+    );
+    let effective_policy_id = record_exact_policy(
+        &store,
+        &request,
+        checked_at,
+        PolicyEffect::RequireApproval,
+        '4',
+    );
+    let policy_binding =
+        canonical_policy_binding_digest(&policy_request_for_tool(&request, checked_at)).unwrap();
+    let bound = bind_tool_approval_payload(
+        ToolApprovalPayloadV1 {
+            schema: "approval-digest.v1".to_owned(),
+            approval_type: "tool".to_owned(),
+            task_id: "unbound".to_owned(),
+            operation: ToolApprovalOperationV1 {
+                run_id: "unbound".to_owned(),
+                plan_step_id: "unbound".to_owned(),
+                tool: "process.exec".to_owned(),
+                executable_digest: None,
+                arguments_digest: digest_char('0').to_string(),
+                script_digest: None,
+                cwd_capability: "unbound".to_owned(),
+                environment_profile_digest: digest_char('0').to_string(),
+                network_profile: "denied".to_owned(),
+                expected_writes: Vec::new(),
+                executor_fencing_token: None,
+            },
+            policy_snapshot_digest: request.policy().policy_snapshot_digest().to_string(),
+            workspace_version: 0,
+            requested_at: "2026-07-23T12:00:00Z".to_owned(),
+            expires_at: "2099-07-23T12:15:00Z".to_owned(),
+            nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+        },
+        request.process(),
+    )
+    .unwrap();
+    let approval_id = ApprovalId::new(format!("approval-{execution_id}")).unwrap();
+    let approval_artifact_id =
+        ArtifactId::new(format!("approval-artifact-{execution_id}")).unwrap();
+    let approval = ToolApprovalRequest::from_persisted(
+        approval_id.clone(),
+        approval_artifact_id.clone(),
+        request.execution_id().clone(),
+        approval_policy_id.clone(),
+        policy_binding.clone(),
+        request_artifact_id.clone(),
+        immutable.binding_digest().clone(),
+        bound.payload().clone(),
+    )
+    .unwrap();
+    persist_artifact(
+        database,
+        approval_artifact_id.as_str(),
+        &format!("approvals/{}.json", approval_id.as_str()),
+        "approval-payload",
+        &approval.canonical_payload().canonical_bytes,
+    );
+    let connection = configured_connection(&database.path);
+    connection
+        .execute(
+            "INSERT INTO approvals (
+                id, task_id, approval_type, schema_version, operation_digest, status,
+                requested_at, resolved_at, resolved_by, expires_at, request_artifact_id,
+                invalidation_reason
+             ) VALUES (?1, 'task-1', 'tool', 'approval-digest.v1', ?2, 'granted',
+                ?3, '2026-07-30T00:00:00Z', 'user', ?4, ?5, NULL)",
+            params![
+                approval_id.as_str(),
+                approval.canonical_payload().operation_digest.as_str(),
+                approval.payload().requested_at,
+                approval.payload().expires_at,
+                approval_artifact_id.as_str(),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO events (
+                event_id, stream_id, sequence, event_type, schema_version, actor_type,
+                actor_id, observation_class, payload_json, metadata_json, causation_id,
+                correlation_id, created_at
+             ) VALUES (?1, 'task-1', 1, 'approval.requested', 1, 'core',
+                'approval-store', 'core_observed', ?2, '{}', ?3, ?3,
+                '2026-07-23T12:00:00Z')",
+            params![
+                format!("approval.requested:{}:1", approval_id.as_str()),
+                serde_json::json!({
+                    "approvalId": approval_id.as_str(),
+                    "approvalType": "tool",
+                    "operationDigest": approval.canonical_payload().operation_digest.as_str(),
+                    "executionId": request.execution_id().as_str(),
+                    "approvalPolicyDecisionId": approval_policy_id.as_str(),
+                    "policyRequestBindingDigest": policy_binding.as_sha256().as_str(),
+                    "toolRequestArtifactId": request_artifact_id.as_str(),
+                    "toolRequestBindingDigest": immutable.binding_digest().as_sha256().as_str(),
+                    "workspaceVersion": request.process().process().binding().workspace_version().get(),
+                    "policySnapshotDigest": request.policy().policy_snapshot_digest().as_str(),
+                    "fencingToken": request
+                        .process()
+                        .process()
+                        .executor_fencing_token()
+                        .map(FencingToken::get),
+                    "nonce": approval.payload().nonce,
+                    "requestArtifactId": approval_artifact_id.as_str(),
+                })
+                .to_string(),
+                format!("approval:{}", approval_id.as_str()),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO events (
+                event_id, stream_id, sequence, event_type, schema_version, actor_type,
+                actor_id, observation_class, payload_json, metadata_json, causation_id,
+                correlation_id, created_at
+             ) VALUES (?1, 'task-1', 2, 'approval.granted', 1, 'core',
+                'approval-store', 'core_observed', ?2, '{}', ?3, ?3,
+                '2026-07-30T00:00:00Z')",
+            params![
+                format!("approval.granted:{}:2", approval_id.as_str()),
+                serde_json::json!({
+                    "approvalId": approval_id.as_str(),
+                    "status": "granted",
+                })
+                .to_string(),
+                format!("approval:{}", approval_id.as_str()),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET operation_state = 'None', current_sequence = 2
+             WHERE id = 'task-1'",
+            [],
+        )
+        .unwrap();
+
+    let process = request.process().process();
+    let binding = process.binding();
+    let claim = AuthorizedToolExecutionClaim {
+        execution_id: request.execution_id().clone(),
+        request_artifact_id,
+        request_content_digest: immutable.binding_digest().as_sha256().clone(),
+        request_binding_digest: immutable.binding_digest().clone(),
+        task_id: binding.task_id().clone(),
+        run_id: binding.run_id().clone(),
+        tool_name: "process.exec".to_owned(),
+        policy_decision_id: effective_policy_id.clone(),
+        policy_request_binding_digest: policy_binding,
+        approval: Some(approval),
+        workspace_version: binding.workspace_version(),
+        policy_snapshot_digest: request.policy().policy_snapshot_digest().clone(),
+        fencing_token: process.executor_fencing_token(),
+        checked_at,
+    };
+    (store, claim, approval_id, effective_policy_id)
+}
+
+#[cfg(windows)]
+fn resolver_canonical_executable_path() -> &'static str {
+    r"\\?\C:\approved\cargo.exe"
+}
+
+#[cfg(not(windows))]
+fn resolver_canonical_executable_path() -> &'static str {
+    "/approved/cargo"
 }
 
 fn persist_request_artifact(database: &TempDatabase) -> Sha256Digest {

@@ -48,8 +48,8 @@ pub use lease::{
     AcquireExecutorLease, AcquireLease, ExecutorLeaseStore, LeaseSnapshot, LeaseState, RevokeLease,
 };
 pub use orchestration::{
-    policy_request_for_tool, PreEffectOutcome, PreEffectReady, ToolExecutionOrchestration,
-    ToolRequestPublisher,
+    policy_request_for_tool, validate_tool_approval_request, PreEffectOutcome, PreEffectReady,
+    ToolExecutionOrchestration, ToolRequestPublisher,
 };
 pub use policy::{
     bind_disclosure_channel, parse_policy_timestamp, DisclosureChannel, DisclosureContextProvider,
@@ -81,8 +81,8 @@ pub use tool::{
     parse_tool_request, validate_and_order_process_writes, ApprovedExecutableIdentity,
     ApprovedProcessExecutor, ApprovedProcessRequest, AuthorizedExpectedWrite, AuthorizedFileRead,
     AuthorizedFileWrite, AuthorizedGitDiff, AuthorizedGitStatus, AuthorizedProcessRequest,
-    AuthorizedToolRequest, BoundToolApproval, BoundedOutput, CancellationReceipt,
-    CanonicalFileWriteRecoveryRequest, CapabilityFileWriteSession,
+    AuthorizedToolExecutionClaim, AuthorizedToolRequest, BoundToolApproval, BoundedOutput,
+    CancellationReceipt, CanonicalFileWriteRecoveryRequest, CapabilityFileWriteSession,
     CapabilityFileWriteSessionFactory, CapabilityFilesystem, CapabilityRequest, CapabilityResolver,
     CapabilityRootIdentity, CaptureFileWritePostEvidence, CaptureFileWritePreEvidence,
     DirectoryFileIdentity, DurableToolExecutionArtifact, DurableToolExecutionArtifacts,

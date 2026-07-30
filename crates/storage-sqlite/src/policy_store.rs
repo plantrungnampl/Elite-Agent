@@ -144,7 +144,7 @@ impl PolicyDecisionStore for SqliteStore {
     }
 }
 
-fn actor_json(request: &local_agent_terminal_domain::PolicyRequest) -> Value {
+pub(crate) fn actor_json(request: &local_agent_terminal_domain::PolicyRequest) -> Value {
     json!({
         "connectionId": request.actor.connection_id,
         "agentId": request.actor.agent_id,
@@ -160,7 +160,7 @@ fn actor_json(request: &local_agent_terminal_domain::PolicyRequest) -> Value {
     })
 }
 
-fn resource_json(request: &local_agent_terminal_domain::PolicyRequest) -> Value {
+pub(crate) fn resource_json(request: &local_agent_terminal_domain::PolicyRequest) -> Value {
     json!({
         "capability": capability_json(&request.resource.capability),
         "contentDigest": request.resource.content_digest.as_str(),
@@ -196,7 +196,7 @@ fn capability_json(capability: &CapabilityRef) -> Value {
     }
 }
 
-fn digest_json(value: &Value) -> Result<String, PortError> {
+pub(crate) fn digest_json(value: &Value) -> Result<String, PortError> {
     let bytes = serde_json::to_vec(value).map_err(|_| invalid_input())?;
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }

@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex};
 use local_agent_terminal_application::{
     bind_tool_approval_payload, canonical_approval_payload, canonical_policy_binding_digest,
     canonical_tool_request, parse_tool_request, ApprovalDigestPayload, ApprovedExecutableIdentity,
-    ApprovedProcessRequest, AuthorizedToolRequest, BoundToolApproval, BoundedOutput,
-    CancellationReceipt, DurableToolExecutionArtifact, DurableToolExecutionArtifacts,
-    DurableToolExecutionOutcome, DurableToolExecutionReceipt, ExecuteDurableTool, IdempotencyClass,
-    IncompleteToolExecution, JobReceipt, NewToolExecution, NewToolIntent, OperationIntentSnapshot,
-    PortError, ProcessReceipt, ProcessStatus, ResolvedExecutable, Retryability,
-    SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor,
-    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionClaim,
+    ApprovedProcessRequest, AuthorizedToolExecutionClaim, AuthorizedToolRequest, BoundToolApproval,
+    BoundedOutput, CancellationReceipt, DurableToolExecutionArtifact,
+    DurableToolExecutionArtifacts, DurableToolExecutionOutcome, DurableToolExecutionReceipt,
+    ExecuteDurableTool, IdempotencyClass, IncompleteToolExecution, JobReceipt, NewToolExecution,
+    NewToolIntent, OperationIntentSnapshot, PortError, ProcessReceipt, ProcessStatus,
+    ResolvedExecutable, Retryability, SafeErrorClassification, SafeToolExecutionError,
+    StructuredToolExecutor, ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionClaim,
     ToolExecutionClaimAuthority, ToolExecutionId, ToolExecutionOutput,
     ToolExecutionRecoveryEvidence, ToolExecutionResolution, ToolExecutionResult,
     ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolPolicyContext,
@@ -53,6 +53,13 @@ fn immutable_tool_request_round_trips_without_approval_material() {
         .unwrap()
         .operation_digest
     );
+}
+
+#[test]
+fn exact_authorized_begin_is_part_of_the_object_safe_store_contract() {
+    fn accepts(_: &dyn ToolExecutionStore) {}
+    let _ = accepts;
+    let _ = <dyn ToolExecutionStore>::begin_authorized;
 }
 
 #[test]
@@ -963,6 +970,16 @@ impl ToolExecutionStore for RecordingStore {
             return Err(conflict());
         }
         self.claim.clone()
+    }
+
+    fn begin_authorized(
+        &self,
+        request: AuthorizedToolExecutionClaim,
+    ) -> Result<ToolExecutionClaim, PortError> {
+        self.begin(NewToolExecution {
+            execution_id: request.execution_id,
+            operation_digest: request.request_content_digest,
+        })
     }
 
     fn resolve_terminal(
