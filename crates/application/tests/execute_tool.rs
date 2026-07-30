@@ -7,13 +7,13 @@ use local_agent_terminal_application::{
     bind_tool_approval_payload, canonical_approval_payload, canonical_policy_binding_digest,
     canonical_tool_request, parse_tool_request, ApprovalDigestPayload, ApprovedExecutableIdentity,
     ApprovedProcessRequest, AuthorizedToolExecutionClaim, AuthorizedToolRequest, BoundToolApproval,
-    BoundedOutput, CancellationReceipt, DurableToolExecutionArtifact,
+    BoundedOutput, CancellationReceipt, DeniedToolExecution, DurableToolExecutionArtifact,
     DurableToolExecutionArtifacts, DurableToolExecutionOutcome, DurableToolExecutionReceipt,
     ExecuteDurableTool, IdempotencyClass, IncompleteToolExecution, JobReceipt, NewToolExecution,
     NewToolIntent, OperationIntentSnapshot, PortError, ProcessReceipt, ProcessStatus,
     ResolvedExecutable, Retryability, SafeErrorClassification, SafeToolExecutionError,
     StructuredToolExecutor, ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionClaim,
-    ToolExecutionClaimAuthority, ToolExecutionId, ToolExecutionOutput,
+    ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
     ToolExecutionRecoveryEvidence, ToolExecutionResolution, ToolExecutionResult,
     ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolPolicyContext,
     ToolRequest,
@@ -60,6 +60,8 @@ fn exact_authorized_begin_is_part_of_the_object_safe_store_contract() {
     fn accepts(_: &dyn ToolExecutionStore) {}
     let _ = accepts;
     let _ = <dyn ToolExecutionStore>::begin_authorized;
+    let _ = <dyn ToolExecutionStore>::load_denied;
+    let _ = <dyn ToolExecutionStore>::resolve_denied;
 }
 
 #[test]
@@ -980,6 +982,21 @@ impl ToolExecutionStore for RecordingStore {
             execution_id: request.execution_id,
             operation_digest: request.request_content_digest,
         })
+    }
+
+    fn load_denied(
+        &self,
+        _: &local_agent_terminal_application::ArtifactId,
+        _: &local_agent_terminal_application::ImmutableToolRequest,
+    ) -> Result<Option<DeniedToolExecution>, PortError> {
+        Ok(None)
+    }
+
+    fn resolve_denied(
+        &self,
+        _: ToolExecutionDenialRequest,
+    ) -> Result<DeniedToolExecution, PortError> {
+        Err(unavailable())
     }
 
     fn resolve_terminal(

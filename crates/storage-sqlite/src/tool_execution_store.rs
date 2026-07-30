@@ -5,20 +5,22 @@ use local_agent_terminal_application::{
     canonical_file_write_recovery_request, canonical_policy_binding_digest,
     parse_file_write_recovery_request, parse_tool_request, policy_request_for_tool,
     validate_tool_approval_request, ApprovalDigestPayload, AuthorizedToolExecutionClaim,
-    CanonicalEvidenceRef, DurableToolExecutionArtifact, DurableToolExecutionArtifacts,
-    DurableToolExecutionReceipt, FileWritePreImage, FileWriteRecoveryCompletion,
-    FileWriteRecoveryFailure, FileWriteRecoveryIntent, FileWriteRecoveryRequest,
-    FileWriteRecoverySnapshot, FileWriteRecoveryState, FileWriteRecoveryStore, IdempotencyClass,
-    ImmutableToolRequest, IncompleteToolExecution, NewToolExecution, NewToolIntent,
-    OperationIntentSnapshot, PolicyDecisionId, PolicyRequestBindingDigest, PortError, Retryability,
-    SafeErrorClassification, SafeToolExecutionError, ToolExecutionClaim,
-    ToolExecutionClaimAuthority, ToolExecutionId, ToolExecutionOutput,
+    CanonicalEvidenceRef, DeniedToolExecution, DurableToolExecutionArtifact,
+    DurableToolExecutionArtifacts, DurableToolExecutionReceipt, FileWritePreImage,
+    FileWriteRecoveryCompletion, FileWriteRecoveryFailure, FileWriteRecoveryIntent,
+    FileWriteRecoveryRequest, FileWriteRecoverySnapshot, FileWriteRecoveryState,
+    FileWriteRecoveryStore, IdempotencyClass, ImmutableToolRequest, IncompleteToolExecution,
+    NewToolExecution, NewToolIntent, OperationIntentSnapshot, PolicyDecisionId,
+    PolicyRequestBindingDigest, PortError, Retryability, SafeErrorClassification,
+    SafeToolExecutionError, ToolExecutionClaim, ToolExecutionClaimAuthority,
+    ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
     ToolExecutionRecoveryEvidence, ToolExecutionResolution, ToolExecutionStore,
     ToolExecutionTerminal, ToolExecutionTerminalKind, VerifiedFileWriteCompensation,
     WorkspaceMutationRequest,
 };
 use local_agent_terminal_domain::{
     ArtifactId, FencingToken, PolicyEffect, ProjectId, RunId, Sequence, Sha256Digest, TaskId,
+    Timestamp,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
@@ -26,7 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::approval_store::{append_approval_event, parse_canonical_approval_payload};
 use crate::event_store::{open_error_to_port, sqlite_error_to_port};
-use crate::policy_store::{actor_json, digest_json, resource_json};
+use crate::policy_store::{actor_json, digest_json, effect_name, resource_json};
 use crate::workspace_store::{
     record_workspace_mutation_in_transaction, verify_evidence_ref_in_transaction,
 };
@@ -44,6 +46,7 @@ struct PersistedToolExecution {
     operation_intent_id: String,
     executor_fencing_token: Option<i64>,
     status: String,
+    started_at: Option<String>,
     exit_code: Option<i32>,
     stdout_artifact_id: Option<String>,
     stderr_artifact_id: Option<String>,
@@ -712,6 +715,84 @@ impl ToolExecutionStore for SqliteStore {
         Ok(ToolExecutionClaim::Claimed(authority))
     }
 
+    fn load_denied(
+        &self,
+        request_artifact_id: &ArtifactId,
+        request: &ImmutableToolRequest,
+    ) -> Result<Option<DeniedToolExecution>, PortError> {
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection.transaction().map_err(sqlite_error_to_port)?;
+        let execution_id = request.request().execution_id();
+        let intent = load_intent(&transaction, execution_id)?;
+        validate_denial_request_artifact(&transaction, request_artifact_id, request, &intent)?;
+        if intent.status == "pending" {
+            transaction.rollback().map_err(sqlite_error_to_port)?;
+            return Ok(None);
+        }
+        if intent.status != "cancelled" {
+            return Err(conflict());
+        }
+        let outcome = load_denied_projection(
+            &transaction,
+            execution_id,
+            request_artifact_id,
+            request,
+            &intent,
+        )?;
+        transaction.rollback().map_err(sqlite_error_to_port)?;
+        Ok(Some(outcome))
+    }
+
+    fn resolve_denied(
+        &self,
+        request: ToolExecutionDenialRequest,
+    ) -> Result<DeniedToolExecution, PortError> {
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error_to_port)?;
+        let execution_id = request.request.request().execution_id().clone();
+        let intent = load_intent(&transaction, &execution_id)?;
+        validate_denial_request_artifact(
+            &transaction,
+            &request.request_artifact_id,
+            &request.request,
+            &intent,
+        )?;
+        if intent.status == "cancelled" {
+            validate_denial_policy(&transaction, &request, PolicyValidationMode::Terminal)?;
+            let outcome = load_denied_projection(
+                &transaction,
+                &execution_id,
+                &request.request_artifact_id,
+                &request.request,
+                &intent,
+            )?;
+            if outcome.policy_decision_id() != &request.policy_decision_id {
+                return Err(integrity_failure());
+            }
+            transaction.rollback().map_err(sqlite_error_to_port)?;
+            return Ok(outcome);
+        }
+        if intent.status != "pending"
+            || intent.attempt_count != 0
+            || intent.lease_owner.is_some()
+            || intent.result_artifact_id.is_some()
+            || intent.external_receipt_json.is_some()
+            || intent.error_json.is_some()
+        {
+            return Err(conflict());
+        }
+        validate_denial_policy(&transaction, &request, PolicyValidationMode::Fresh)?;
+        persist_denied_projection(&transaction, &request, &intent)?;
+        transaction.commit().map_err(sqlite_error_to_port)?;
+        Ok(DeniedToolExecution::new(
+            execution_id,
+            request.request_artifact_id,
+            request.policy_decision_id,
+        ))
+    }
+
     fn resolve_terminal(
         &self,
         resolution: ToolExecutionResolution,
@@ -873,6 +954,296 @@ fn validate_authorized_request(
     Ok(immutable)
 }
 
+fn validate_denial_request_artifact(
+    transaction: &Transaction<'_>,
+    request_artifact_id: &ArtifactId,
+    request: &ImmutableToolRequest,
+    intent: &IntentRow,
+) -> Result<(), PortError> {
+    let tool_request = request.request();
+    let execution_id = tool_request.execution_id();
+    let process = tool_request.process().process();
+    let binding = process.binding();
+    validate_tool_intent(transaction, execution_id, intent)?;
+    let fencing_token = process
+        .executor_fencing_token()
+        .map(FencingToken::get)
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| integrity_failure())?;
+    if intent.artifact_id != request_artifact_id.as_str()
+        || intent.operation_digest != request.binding_digest().as_sha256().as_str()
+        || intent.task_id != binding.task_id().as_str()
+        || intent.run_id != binding.run_id().as_str()
+        || intent.operation_kind != "process.exec"
+        || intent.fencing_token != fencing_token
+    {
+        return Err(integrity_failure());
+    }
+    validate_artifact_type(transaction, request_artifact_id.as_str(), "tool-request")?;
+    let logical_path: String = transaction
+        .query_row(
+            "SELECT logical_path FROM artifacts WHERE id = ?1",
+            [request_artifact_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error_to_port)?
+        .ok_or_else(not_found)?;
+    if logical_path != format!("tool-requests/{}.json", execution_id.as_str()) {
+        return Err(integrity_failure());
+    }
+    let artifact = artifact_by_id_on_connection(
+        transaction,
+        request_artifact_id.as_str(),
+        request.binding_digest().as_sha256(),
+        binding.task_id().as_str(),
+    )?;
+    let persisted = parse_tool_request(&artifact.bytes).map_err(|_| integrity_failure())?;
+    if persisted != *request {
+        return Err(integrity_failure());
+    }
+    Ok(())
+}
+
+fn validate_denial_policy(
+    transaction: &Transaction<'_>,
+    request: &ToolExecutionDenialRequest,
+    mode: PolicyValidationMode,
+) -> Result<(), PortError> {
+    if !matches!(
+        request.effect,
+        PolicyEffect::Deny | PolicyEffect::AllowWithRedaction
+    ) {
+        return Err(integrity_failure());
+    }
+    let expected_binding = canonical_policy_binding_digest(&policy_request_for_tool(
+        request.request.request(),
+        request.checked_at,
+    ))
+    .map_err(|_| integrity_failure())?;
+    if expected_binding != request.policy_request_binding_digest {
+        return Err(integrity_failure());
+    }
+    validate_policy_identity(
+        transaction,
+        &request.policy_decision_id,
+        &request.policy_request_binding_digest,
+        request.request.request(),
+        request.checked_at,
+        effect_name(request.effect),
+        mode,
+    )
+}
+
+fn persist_denied_projection(
+    transaction: &Transaction<'_>,
+    request: &ToolExecutionDenialRequest,
+    intent: &IntentRow,
+) -> Result<(), PortError> {
+    let execution_id = request.request.request().execution_id();
+    let error = denial_error(
+        execution_id,
+        &request.request_artifact_id,
+        &request.policy_decision_id,
+    );
+    let changed = transaction
+        .execute(
+            "UPDATE operation_intents
+             SET status = 'cancelled', error_json = ?1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?2 AND status = 'pending' AND attempt_count = 0
+               AND lease_owner IS NULL",
+            params![error.to_string(), execution_id.as_str()],
+        )
+        .map_err(sqlite_error_to_port)?;
+    if changed != 1 {
+        return Err(conflict());
+    }
+    transaction
+        .execute(
+            "INSERT INTO tool_executions (
+                id, task_id, run_id, request_id, tool_name, arguments_artifact_id,
+                policy_decision_id, approval_id, operation_intent_id,
+                executor_fencing_token, status, started_at, completed_at, exit_code,
+                stdout_artifact_id, stderr_artifact_id
+             ) VALUES (?1, ?2, ?3, ?1, ?4, ?5, ?6, NULL, ?1, ?7, 'denied',
+                NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL, NULL, NULL)",
+            params![
+                execution_id.as_str(),
+                intent.task_id,
+                intent.run_id,
+                intent.operation_kind,
+                request.request_artifact_id.as_str(),
+                request.policy_decision_id.as_str(),
+                intent.fencing_token,
+            ],
+        )
+        .map_err(sqlite_error_to_port)?;
+    append_tool_event(
+        transaction,
+        &intent.task_id,
+        execution_id.as_str(),
+        "tool.execution.denied",
+        "None",
+        denial_event_payload(
+            request,
+            request.request.binding_digest().as_sha256().as_str(),
+        ),
+    )
+}
+
+fn load_denied_projection(
+    transaction: &Transaction<'_>,
+    execution_id: &ToolExecutionId,
+    request_artifact_id: &ArtifactId,
+    request: &ImmutableToolRequest,
+    intent: &IntentRow,
+) -> Result<DeniedToolExecution, PortError> {
+    if intent.status != "cancelled"
+        || intent.attempt_count != 0
+        || intent.lease_owner.is_some()
+        || intent.result_artifact_id.is_some()
+        || intent.external_receipt_json.is_some()
+    {
+        return Err(integrity_failure());
+    }
+    let execution = load_tool_execution(transaction, execution_id)?;
+    validate_tool_execution_identity(execution_id, intent, &execution)?;
+    if execution.status != "denied"
+        || execution.approval_id.is_some()
+        || execution.started_at.is_some()
+        || execution.completed_at.as_deref().is_none_or(str::is_empty)
+        || execution.exit_code.is_some()
+        || execution.stdout_artifact_id.is_some()
+        || execution.stderr_artifact_id.is_some()
+    {
+        return Err(integrity_failure());
+    }
+    let (policy_decision_id, effect, evaluated_at, policy_binding) =
+        load_denied_policy(transaction, &execution.policy_decision_id, request)?;
+    let expected_error = denial_error(execution_id, request_artifact_id, &policy_decision_id);
+    let actual_error: Value =
+        serde_json::from_str(intent.error_json.as_deref().ok_or_else(integrity_failure)?)
+            .map_err(|_| integrity_failure())?;
+    if actual_error != expected_error {
+        return Err(integrity_failure());
+    }
+    let expected_event = denial_event_payload(
+        &ToolExecutionDenialRequest {
+            request_artifact_id: request_artifact_id.clone(),
+            request: request.clone(),
+            policy_decision_id: policy_decision_id.clone(),
+            policy_request_binding_digest: policy_binding,
+            effect,
+            checked_at: evaluated_at,
+        },
+        request.binding_digest().as_sha256().as_str(),
+    );
+    let mut statement = transaction
+        .prepare(
+            "SELECT payload_json FROM events
+             WHERE stream_id = ?1 AND event_type = 'tool.execution.denied'
+               AND json_extract(payload_json, '$.executionId') = ?2
+             ORDER BY sequence",
+        )
+        .map_err(sqlite_error_to_port)?;
+    let payloads = statement
+        .query_map(params![intent.task_id, execution_id.as_str()], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(sqlite_error_to_port)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error_to_port)?;
+    let [payload] = payloads.as_slice() else {
+        return Err(integrity_failure());
+    };
+    let payload: Value = serde_json::from_str(payload).map_err(|_| integrity_failure())?;
+    if payload != expected_event {
+        return Err(integrity_failure());
+    }
+    Ok(DeniedToolExecution::new(
+        execution_id.clone(),
+        request_artifact_id.clone(),
+        policy_decision_id,
+    ))
+}
+
+fn load_denied_policy(
+    transaction: &Transaction<'_>,
+    policy_decision_id: &str,
+    request: &ImmutableToolRequest,
+) -> Result<
+    (
+        PolicyDecisionId,
+        PolicyEffect,
+        Timestamp,
+        PolicyRequestBindingDigest,
+    ),
+    PortError,
+> {
+    let (effect, evaluated_at): (String, i64) = transaction
+        .query_row(
+            "SELECT effect, unixepoch(created_at) FROM policy_decisions WHERE id = ?1",
+            [policy_decision_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error_to_port)?
+        .ok_or_else(not_found)?;
+    let effect = denial_effect(&effect)?;
+    let evaluated_at = Timestamp::from_unix_seconds(evaluated_at);
+    let policy_decision_id = PolicyDecisionId::from_persisted(policy_decision_id.to_owned())
+        .map_err(|_| integrity_failure())?;
+    let policy_binding =
+        canonical_policy_binding_digest(&policy_request_for_tool(request.request(), evaluated_at))
+            .map_err(|_| integrity_failure())?;
+    validate_policy_identity(
+        transaction,
+        &policy_decision_id,
+        &policy_binding,
+        request.request(),
+        evaluated_at,
+        effect_name(effect),
+        PolicyValidationMode::Terminal,
+    )?;
+    Ok((policy_decision_id, effect, evaluated_at, policy_binding))
+}
+
+fn denial_effect(value: &str) -> Result<PolicyEffect, PortError> {
+    match value {
+        "deny" => Ok(PolicyEffect::Deny),
+        "allow_with_redaction" => Ok(PolicyEffect::AllowWithRedaction),
+        _ => Err(integrity_failure()),
+    }
+}
+
+fn denial_error(
+    execution_id: &ToolExecutionId,
+    request_artifact_id: &ArtifactId,
+    policy_decision_id: &PolicyDecisionId,
+) -> Value {
+    json!({
+        "kind": "policy_denied",
+        "executionId": execution_id.as_str(),
+        "requestArtifactId": request_artifact_id.as_str(),
+        "policyDecisionId": policy_decision_id.as_str(),
+    })
+}
+
+fn denial_event_payload(request: &ToolExecutionDenialRequest, operation_digest: &str) -> Value {
+    json!({
+        "executionId": request.request.request().execution_id().as_str(),
+        "requestArtifactId": request.request_artifact_id.as_str(),
+        "operationDigest": operation_digest,
+        "requestBindingDigest": request.request.binding_digest().as_sha256().as_str(),
+        "policyDecisionId": request.policy_decision_id.as_str(),
+        "policyRequestBindingDigest": request.policy_request_binding_digest.as_sha256().as_str(),
+        "policyEffect": effect_name(request.effect),
+        "evaluatedAtUnix": request.checked_at.unix_seconds(),
+    })
+}
+
 #[derive(Debug)]
 struct ExactPolicyRow {
     task_id: Option<String>,
@@ -895,6 +1266,7 @@ enum PolicyValidationMode {
     Fresh,
     Approval,
     Consumed,
+    Terminal,
 }
 
 fn validate_exact_policy(
@@ -968,6 +1340,7 @@ fn validate_policy_identity(
         PolicyValidationMode::Fresh => (Some(checked_at.unix_seconds()), true),
         PolicyValidationMode::Approval => (None, true),
         PolicyValidationMode::Consumed => (None, false),
+        PolicyValidationMode::Terminal => (Some(checked_at.unix_seconds()), false),
     };
     let actor: Value = serde_json::from_str(&row.actor_json).map_err(|_| integrity_failure())?;
     let resource: Value =
@@ -1394,6 +1767,33 @@ fn incomplete_with_checkpoint(
                     &execution_id,
                     &intent,
                 )?));
+            }
+            ("cancelled", "denied") if intent.attempt_count == 0 => {
+                let request_artifact_id =
+                    ArtifactId::new(intent.artifact_id.clone()).map_err(|_| integrity_failure())?;
+                let operation_digest = Sha256Digest::new(intent.operation_digest.clone())
+                    .map_err(|_| integrity_failure())?;
+                let artifact = artifact_by_id_on_connection(
+                    &transaction,
+                    request_artifact_id.as_str(),
+                    &operation_digest,
+                    &intent.task_id,
+                )?;
+                let request =
+                    parse_tool_request(&artifact.bytes).map_err(|_| integrity_failure())?;
+                validate_denial_request_artifact(
+                    &transaction,
+                    &request_artifact_id,
+                    &request,
+                    &intent,
+                )?;
+                load_denied_projection(
+                    &transaction,
+                    &execution_id,
+                    &request_artifact_id,
+                    &request,
+                    &intent,
+                )?;
             }
             ("succeeded" | "failed" | "cancelled" | "interrupted", _)
             | ("indeterminate", "indeterminate") => {
@@ -2248,6 +2648,15 @@ fn validate_tool_intent(
         {
             Ok(())
         }
+        "cancelled"
+            if intent.attempt_count == 0
+                && intent.lease_owner.is_none()
+                && intent.result_artifact_id.is_none()
+                && intent.external_receipt_json.is_none()
+                && intent.error_json.is_some() =>
+        {
+            Ok(())
+        }
         "started" | "succeeded" | "failed" | "cancelled" | "interrupted" | "indeterminate"
             if intent.attempt_count > 0
                 && intent.lease_owner.as_deref() == Some(intent.run_id.as_str()) =>
@@ -2346,8 +2755,8 @@ fn load_tool_execution(
         .query_row(
             "SELECT task_id, run_id, request_id, tool_name, arguments_artifact_id,
                     policy_decision_id, approval_id, operation_intent_id,
-                    executor_fencing_token, status, exit_code, stdout_artifact_id,
-                    stderr_artifact_id, completed_at
+                    executor_fencing_token, status, started_at, exit_code,
+                    stdout_artifact_id, stderr_artifact_id, completed_at
              FROM tool_executions WHERE id = ?1",
             [execution_id.as_str()],
             |row| {
@@ -2362,10 +2771,11 @@ fn load_tool_execution(
                     operation_intent_id: row.get(7)?,
                     executor_fencing_token: row.get(8)?,
                     status: row.get(9)?,
-                    exit_code: row.get(10)?,
-                    stdout_artifact_id: row.get(11)?,
-                    stderr_artifact_id: row.get(12)?,
-                    completed_at: row.get(13)?,
+                    started_at: row.get(10)?,
+                    exit_code: row.get(11)?,
+                    stdout_artifact_id: row.get(12)?,
+                    stderr_artifact_id: row.get(13)?,
+                    completed_at: row.get(14)?,
                 })
             },
         )

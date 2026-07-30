@@ -211,7 +211,7 @@ fn timestamp(connection: &rusqlite::Connection, unix_seconds: i64) -> Result<Str
         .map_err(sqlite_error_to_port)
 }
 
-const fn effect_name(effect: PolicyEffect) -> &'static str {
+pub(crate) const fn effect_name(effect: PolicyEffect) -> &'static str {
     match effect {
         PolicyEffect::Allow => "allow",
         PolicyEffect::Deny => "deny",

@@ -998,6 +998,49 @@ pub struct AuthorizedToolExecutionClaim {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionDenialRequest {
+    pub request_artifact_id: ArtifactId,
+    pub request: ImmutableToolRequest,
+    pub policy_decision_id: PolicyDecisionId,
+    pub policy_request_binding_digest: PolicyRequestBindingDigest,
+    pub effect: PolicyEffect,
+    pub checked_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeniedToolExecution {
+    execution_id: ToolExecutionId,
+    request_artifact_id: ArtifactId,
+    policy_decision_id: PolicyDecisionId,
+}
+
+impl DeniedToolExecution {
+    pub const fn new(
+        execution_id: ToolExecutionId,
+        request_artifact_id: ArtifactId,
+        policy_decision_id: PolicyDecisionId,
+    ) -> Self {
+        Self {
+            execution_id,
+            request_artifact_id,
+            policy_decision_id,
+        }
+    }
+
+    pub const fn execution_id(&self) -> &ToolExecutionId {
+        &self.execution_id
+    }
+
+    pub const fn request_artifact_id(&self) -> &ArtifactId {
+        &self.request_artifact_id
+    }
+
+    pub const fn policy_decision_id(&self) -> &PolicyDecisionId {
+        &self.policy_decision_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DurableToolExecutionArtifact {
     Available(ArtifactId),
     Unavailable,
@@ -1727,6 +1770,15 @@ pub trait ToolExecutionStore: Send + Sync {
         &self,
         request: AuthorizedToolExecutionClaim,
     ) -> Result<ToolExecutionClaim, PortError>;
+    fn load_denied(
+        &self,
+        request_artifact_id: &ArtifactId,
+        request: &ImmutableToolRequest,
+    ) -> Result<Option<DeniedToolExecution>, PortError>;
+    fn resolve_denied(
+        &self,
+        request: ToolExecutionDenialRequest,
+    ) -> Result<DeniedToolExecution, PortError>;
     fn resolve_terminal(
         &self,
         resolution: ToolExecutionResolution,

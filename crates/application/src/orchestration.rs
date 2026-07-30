@@ -14,10 +14,11 @@ use crate::{
     tool::{logical_capability, process_approval_operation},
     validate_approval_resume_relation, validate_authoritative_tool_request,
     validate_pending_approval_resume, ApprovalId, ApprovalRequestDto, ApprovalResumeSnapshot,
-    ApprovalResumeStore, ArtifactId, Clock, IdGenerator, ImmutableToolRequest, PolicyDecision,
-    PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator, PolicyRequestBindingDigest, PortError,
-    RecordedPolicyDecision, Retryability, SafeErrorClassification, ToolAuthorityResolver,
-    ToolExecutionId, ToolExecutionResumeSnapshot, ToolExecutionResumeStore, ToolRequest,
+    ApprovalResumeStore, ArtifactId, Clock, DeniedToolExecution, IdGenerator, ImmutableToolRequest,
+    PolicyDecision, PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator,
+    PolicyRequestBindingDigest, PortError, RecordedPolicyDecision, Retryability,
+    SafeErrorClassification, ToolAuthorityResolver, ToolExecutionDenialRequest, ToolExecutionId,
+    ToolExecutionResumeSnapshot, ToolExecutionResumeStore, ToolExecutionStore, ToolRequest,
     ToolRequestBindingDigest,
 };
 
@@ -53,6 +54,7 @@ pub struct ToolExecutionOrchestration<'a> {
     approval_requests: &'a dyn ToolApprovalRequestPublisher,
     approval_resumes: &'a dyn ApprovalResumeStore,
     execution_resumes: &'a dyn ToolExecutionResumeStore,
+    executions: &'a dyn ToolExecutionStore,
 }
 
 impl<'a> ToolExecutionOrchestration<'a> {
@@ -67,6 +69,7 @@ impl<'a> ToolExecutionOrchestration<'a> {
         approval_requests: &'a dyn ToolApprovalRequestPublisher,
         approval_resumes: &'a dyn ApprovalResumeStore,
         execution_resumes: &'a dyn ToolExecutionResumeStore,
+        executions: &'a dyn ToolExecutionStore,
     ) -> Self {
         Self {
             publisher,
@@ -78,6 +81,7 @@ impl<'a> ToolExecutionOrchestration<'a> {
             approval_requests,
             approval_resumes,
             execution_resumes,
+            executions,
         }
     }
 
@@ -122,6 +126,17 @@ impl<'a> ToolExecutionOrchestration<'a> {
         let authority = self.authority.resolve(request)?;
         validate_authoritative_tool_request(request, &authority)?;
         let authoritative_request = authority.request();
+        if let Some(denied) = self
+            .executions
+            .load_denied(&request_artifact_id, immutable)?
+        {
+            if denied.execution_id() != request.execution_id()
+                || denied.request_artifact_id() != &request_artifact_id
+            {
+                return Err(integrity_failure());
+            }
+            return Ok(PreEffectOutcome::Denied(denied));
+        }
         let (requested_at, evaluated_at) = match observed_at {
             Some(observed_at) => observed_at,
             None => self.observed_at()?,
@@ -149,9 +164,23 @@ impl<'a> ToolExecutionOrchestration<'a> {
                 policy_decision_id: recorded_decision_id,
                 approval_id: None,
             })),
-            PolicyEffect::Deny | PolicyEffect::AllowWithRedaction => Ok(PreEffectOutcome::Denied {
-                policy_decision_id: recorded_decision_id,
-            }),
+            PolicyEffect::Deny | PolicyEffect::AllowWithRedaction => {
+                let denied = self.executions.resolve_denied(ToolExecutionDenialRequest {
+                    request_artifact_id: request_artifact_id.clone(),
+                    request: immutable.clone(),
+                    policy_decision_id: recorded_decision_id.clone(),
+                    policy_request_binding_digest,
+                    effect,
+                    checked_at: evaluated_at,
+                })?;
+                if denied.execution_id() != request.execution_id()
+                    || denied.request_artifact_id() != &request_artifact_id
+                    || denied.policy_decision_id() != &recorded_decision_id
+                {
+                    return Err(integrity_failure());
+                }
+                Ok(PreEffectOutcome::Denied(denied))
+            }
             PolicyEffect::RequireApproval => {
                 if let Some(approval) = resumed_approval {
                     validate_tool_approval_request(
@@ -277,9 +306,7 @@ impl<'a> ToolExecutionOrchestration<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreEffectOutcome {
     Allowed(PreEffectReady),
-    Denied {
-        policy_decision_id: PolicyDecisionId,
-    },
+    Denied(DeniedToolExecution),
     ApprovalRequired(ApprovalRequestDto),
 }
 

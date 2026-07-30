@@ -3,14 +3,17 @@ use std::sync::Mutex;
 
 use local_agent_terminal_application::{
     canonical_policy_binding_digest, canonical_tool_request, policy_request_for_tool, ApprovalId,
-    ApprovalResumeSnapshot, ApprovalResumeStore, ApprovalState, ArtifactId, Clock, IdGenerator,
-    ImmutableToolRequest, LeaseSnapshot, LeaseState, OperationIntentStatus, PolicyDecision,
-    PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator, PortError, PreEffectOutcome,
-    RecordedPolicyDecision, Retryability, SafeErrorClassification, ToolApprovalPublication,
-    ToolApprovalRequest, ToolApprovalRequestPublisher, ToolAuthorityResolver,
-    ToolAuthoritySnapshot, ToolExecutionId, ToolExecutionOrchestration,
-    ToolExecutionResumeSnapshot, ToolExecutionResumeStore, ToolPolicyContext, ToolRequest,
-    ToolRequestPublisher,
+    ApprovalResumeSnapshot, ApprovalResumeStore, ApprovalState, ArtifactId,
+    AuthorizedToolExecutionClaim, Clock, DeniedToolExecution, DurableToolExecutionReceipt,
+    IdGenerator, ImmutableToolRequest, IncompleteToolExecution, LeaseSnapshot, LeaseState,
+    NewToolExecution, NewToolIntent, OperationIntentSnapshot, OperationIntentStatus,
+    PolicyDecision, PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator, PortError,
+    PreEffectOutcome, RecordedPolicyDecision, Retryability, SafeErrorClassification,
+    ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestPublisher,
+    ToolAuthorityResolver, ToolAuthoritySnapshot, ToolExecutionClaim, ToolExecutionDenialRequest,
+    ToolExecutionId, ToolExecutionOrchestration, ToolExecutionResolution,
+    ToolExecutionResumeSnapshot, ToolExecutionResumeStore, ToolExecutionStore, ToolPolicyContext,
+    ToolRequest, ToolRequestPublisher,
 };
 use local_agent_terminal_domain::{
     combine_policy_rules, ActorLocality, CapabilityRef, EnvironmentProfile, FencingToken,
@@ -160,6 +163,7 @@ fn allow_publishes_before_pre_effect_ready() {
         &approval_requests,
         &resumes,
         &resumes,
+        &NO_DENIALS,
     );
 
     let execution_id = request.execution_id().clone();
@@ -199,15 +203,94 @@ fn deny_is_recorded_once_before_typed_branch() {
 
     assert_eq!(
         result.unwrap(),
-        PreEffectOutcome::Denied {
-            policy_decision_id: decision_id,
-        }
+        PreEffectOutcome::Denied(DeniedToolExecution::new(
+            ToolExecutionId::new("execution-orchestration").unwrap(),
+            ArtifactId::new("artifact-tool-request-1").unwrap(),
+            decision_id,
+        ))
     );
     assert_eq!(
         events,
-        ["publish", "authority", "clock", "evaluate", "record"]
+        [
+            "publish",
+            "authority",
+            "clock",
+            "evaluate",
+            "record",
+            "resolve-denied",
+        ]
     );
     assert_eq!(records.len(), 1);
+}
+
+#[test]
+fn replayed_denial_skips_clock_policy_and_approval_publication() {
+    let events = Mutex::new(Vec::new());
+    let records = Mutex::new(Vec::new());
+    let request = tool_request();
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let decision = policy_decision(
+        policy_request_for_tool(&request, evaluated_at),
+        PolicyEffect::Deny,
+    );
+    let decision_id = PolicyDecisionId::from_decision(&decision);
+    let artifact_id = ArtifactId::new("artifact-tool-request-1").unwrap();
+    let executions = TestExecutionStore::replaying(
+        &events,
+        DeniedToolExecution::new(
+            request.execution_id().clone(),
+            artifact_id.clone(),
+            decision_id.clone(),
+        ),
+    );
+    let publisher = RecordingPublisher {
+        events: &events,
+        artifact_id,
+    };
+    let authority = RecordingAuthority {
+        events: &events,
+        current: request.clone(),
+    };
+    let clock = RecordingClock {
+        events: &events,
+        value: "2025-07-23T12:00:00Z",
+    };
+    let evaluator = RecordingEvaluator {
+        events: &events,
+        decision,
+    };
+    let policy_store = RecordingPolicyStore {
+        events: &events,
+        records: &records,
+        decision_id,
+    };
+    let ids = SequenceIds::new(&events);
+    let approval_requests = RecordingApprovalPublisher::new();
+    let resumes = UnusedResumeStore;
+    let orchestrator = ToolExecutionOrchestration::new(
+        &publisher,
+        &authority,
+        &clock,
+        &evaluator,
+        &policy_store,
+        &ids,
+        &approval_requests,
+        &resumes,
+        &resumes,
+        &executions,
+    );
+
+    assert!(matches!(
+        orchestrator.execute(request).unwrap(),
+        PreEffectOutcome::Denied(_)
+    ));
+    assert_eq!(events.into_inner().unwrap(), ["publish", "authority"]);
+    assert!(records.into_inner().unwrap().is_empty());
+    assert!(approval_requests
+        .candidates
+        .into_inner()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -386,6 +469,7 @@ fn replay_keeps_original_policy_decision_separate_from_fresh_decision() {
             &approval_requests,
             &resumes,
             &resumes,
+            &NO_DENIALS,
         );
         (orchestrator.execute(request.clone()).unwrap(), decision_id)
     };
@@ -536,6 +620,7 @@ fn approved_resume_reloads_exact_records_and_reuses_pre_effect_path() {
             &replay_publications,
             &resumes,
             &resumes,
+            &NO_DENIALS,
         );
 
         let outcome = orchestrator
@@ -578,6 +663,7 @@ fn approved_resume_reloads_exact_records_and_reuses_pre_effect_path() {
         &replay_publications,
         &resumes,
         &resumes,
+        &NO_DENIALS,
     );
 
     let error = orchestrator
@@ -680,13 +766,22 @@ fn allow_with_redaction_fails_closed_for_process_execution() {
 
     assert_eq!(
         result.unwrap(),
-        PreEffectOutcome::Denied {
-            policy_decision_id: decision_id,
-        }
+        PreEffectOutcome::Denied(DeniedToolExecution::new(
+            ToolExecutionId::new("execution-orchestration").unwrap(),
+            ArtifactId::new("artifact-tool-request-1").unwrap(),
+            decision_id,
+        ))
     );
     assert_eq!(
         events,
-        ["publish", "authority", "clock", "evaluate", "record"]
+        [
+            "publish",
+            "authority",
+            "clock",
+            "evaluate",
+            "record",
+            "resolve-denied",
+        ]
     );
     assert_eq!(records.len(), 1);
 }
@@ -853,6 +948,7 @@ fn invalid_clock_timestamp_stops_before_policy_evaluation() {
         &approval_requests,
         &resumes,
         &resumes,
+        &NO_DENIALS,
     );
 
     let result = orchestrator.execute(request);
@@ -890,6 +986,86 @@ fn authoritative_request_mutation_stops_before_policy_evaluation() {
     );
     assert_eq!(events, ["publish", "authority"]);
     assert!(records.is_empty());
+}
+
+static NO_DENIALS: TestExecutionStore<'static> = TestExecutionStore {
+    events: None,
+    denied: Mutex::new(None),
+};
+
+struct TestExecutionStore<'a> {
+    events: Option<&'a Mutex<Vec<&'static str>>>,
+    denied: Mutex<Option<DeniedToolExecution>>,
+}
+
+impl<'a> TestExecutionStore<'a> {
+    fn recording(events: &'a Mutex<Vec<&'static str>>) -> Self {
+        Self {
+            events: Some(events),
+            denied: Mutex::new(None),
+        }
+    }
+
+    fn replaying(events: &'a Mutex<Vec<&'static str>>, denied: DeniedToolExecution) -> Self {
+        Self {
+            events: Some(events),
+            denied: Mutex::new(Some(denied)),
+        }
+    }
+}
+
+impl ToolExecutionStore for TestExecutionStore<'_> {
+    fn reserve(&self, _: NewToolIntent) -> Result<OperationIntentSnapshot, PortError> {
+        unreachable!("pre-effect orchestration does not reserve execution intents")
+    }
+
+    fn begin(&self, _: NewToolExecution) -> Result<ToolExecutionClaim, PortError> {
+        unreachable!("pre-effect orchestration does not begin execution")
+    }
+
+    fn begin_authorized(
+        &self,
+        _: AuthorizedToolExecutionClaim,
+    ) -> Result<ToolExecutionClaim, PortError> {
+        unreachable!("pre-effect orchestration does not begin execution")
+    }
+
+    fn load_denied(
+        &self,
+        _: &ArtifactId,
+        _: &ImmutableToolRequest,
+    ) -> Result<Option<DeniedToolExecution>, PortError> {
+        Ok(self.denied.lock().unwrap().clone())
+    }
+
+    fn resolve_denied(
+        &self,
+        request: ToolExecutionDenialRequest,
+    ) -> Result<DeniedToolExecution, PortError> {
+        self.events
+            .expect("denial tests must use a recording execution store")
+            .lock()
+            .unwrap()
+            .push("resolve-denied");
+        let denied = DeniedToolExecution::new(
+            request.request.request().execution_id().clone(),
+            request.request_artifact_id,
+            request.policy_decision_id,
+        );
+        *self.denied.lock().unwrap() = Some(denied.clone());
+        Ok(denied)
+    }
+
+    fn resolve_terminal(
+        &self,
+        _: ToolExecutionResolution,
+    ) -> Result<DurableToolExecutionReceipt, PortError> {
+        unreachable!("pre-effect orchestration does not resolve execution")
+    }
+
+    fn incomplete(&self) -> Result<Vec<IncompleteToolExecution>, PortError> {
+        unreachable!("pre-effect orchestration does not inspect incomplete execution")
+    }
 }
 
 struct RecordingPublisher<'a> {
@@ -1219,6 +1395,7 @@ fn with_require_approval_orchestrator<R>(
         approval_requests,
         &resumes,
         &resumes,
+        &NO_DENIALS,
     );
     run(&orchestrator, &events, &records, &decision_id)
 }
@@ -1270,6 +1447,7 @@ fn execute_with_authority(
     let ids = SequenceIds::new(&events);
     let approval_requests = RecordingApprovalPublisher::new();
     let resumes = UnusedResumeStore;
+    let executions = TestExecutionStore::recording(&events);
     let result = {
         let orchestrator = ToolExecutionOrchestration::new(
             &publisher,
@@ -1281,6 +1459,7 @@ fn execute_with_authority(
             &approval_requests,
             &resumes,
             &resumes,
+            &executions,
         );
         orchestrator.execute(request)
     };

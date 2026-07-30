@@ -17,9 +17,10 @@ use local_agent_terminal_application::{
     NewToolExecution, NewToolIntent, PolicyDecision, PolicyDecisionStore, RecordedPolicyDecision,
     RelativePathComponents, ResolvedExecutable, SafeToolExecutionError, ToolApprovalOperationV1,
     ToolApprovalPayloadV1, ToolApprovalRequest, ToolExecutionClaim, ToolExecutionClaimAuthority,
-    ToolExecutionId, ToolExecutionOutput, ToolExecutionResolution, ToolExecutionResumeStore,
-    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolPolicyContext,
-    ToolRequest, ToolRequestBindingDigest, VerifiedFileWriteCompensation, VerifiedWrite,
+    ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput, ToolExecutionResolution,
+    ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
+    ToolPolicyContext, ToolRequest, ToolRequestBindingDigest, VerifiedFileWriteCompensation,
+    VerifiedWrite,
 };
 use local_agent_terminal_domain::{
     combine_policy_rules, ActorId, ActorLocality, ArtifactId, CapabilityRef, EnvironmentProfile,
@@ -271,6 +272,191 @@ fn authorized_begin_consumes_the_exact_grant_with_the_execution_claim() {
             )
             .unwrap(),
         1
+    );
+}
+
+#[test]
+fn denied_disposition_is_terminal_and_replayable() {
+    let database = TempDatabase::new();
+    let (store, denial, claim) = exact_denial_fixture(&database, "execution-denied-disposition");
+    let immutable = denial.request.clone();
+    let denied_policy_id = denial.policy_decision_id.clone();
+
+    assert!(store
+        .load_denied(&claim.request_artifact_id, &immutable)
+        .unwrap()
+        .is_none());
+    let outcome = store.resolve_denied(denial.clone()).unwrap();
+    assert_eq!(outcome.execution_id(), &claim.execution_id);
+    assert_eq!(outcome.request_artifact_id(), &claim.request_artifact_id);
+    assert_eq!(outcome.policy_decision_id(), &denied_policy_id);
+    assert_eq!(
+        configured_connection(&database.path)
+            .query_row(
+                "SELECT oi.status || ':' || te.status
+                 FROM operation_intents oi
+                 JOIN tool_executions te ON te.id = oi.id
+                 WHERE oi.id = ?1",
+                [claim.execution_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "cancelled:denied"
+    );
+    let replay = store
+        .load_denied(&claim.request_artifact_id, &immutable)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay, outcome);
+    assert_eq!(store.resolve_denied(denial).unwrap(), outcome);
+    assert!(store.begin_authorized(claim.clone()).is_err());
+    assert!(store.incomplete().unwrap().is_empty());
+    assert_eq!(
+        configured_connection(&database.path)
+            .query_row(
+                "SELECT json_extract(error_json, '$.kind') || ':' ||
+                        json_extract(error_json, '$.policyDecisionId')
+                 FROM operation_intents WHERE id = ?1",
+                [claim.execution_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        format!("policy_denied:{}", denied_policy_id.as_str())
+    );
+    assert_eq!(
+        configured_connection(&database.path)
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE event_type = 'tool.execution.denied'
+                   AND json_extract(payload_json, '$.policyDecisionId') = ?1",
+                [denied_policy_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn denied_disposition_faults_leave_the_intent_pending() {
+    let faults = [
+        "CREATE TRIGGER injected BEFORE UPDATE ON operation_intents
+         WHEN NEW.status = 'cancelled'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE INSERT ON tool_executions
+         WHEN NEW.status = 'denied'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE INSERT ON events
+         WHEN NEW.event_type = 'tool.execution.denied'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE UPDATE ON tasks
+         WHEN NEW.current_sequence > OLD.current_sequence
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+    ];
+    for (index, fault) in faults.into_iter().enumerate() {
+        let database = TempDatabase::new();
+        let execution_id = format!("execution-denied-fault-{index}");
+        let (store, denial, _) = exact_denial_fixture(&database, &execution_id);
+        configured_connection(&database.path)
+            .execute_batch(fault)
+            .unwrap();
+
+        assert!(store.resolve_denied(denial).is_err());
+        let connection = configured_connection(&database.path);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status || ':' || COALESCE(error_json, 'null')
+                     FROM operation_intents WHERE id = ?1",
+                    [execution_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "pending:null"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM tool_executions WHERE id = ?1",
+                    [execution_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE event_type = 'tool.execution.denied'
+                       AND json_extract(payload_json, '$.executionId') = ?1",
+                    [execution_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn concurrent_denied_disposition_creates_one_terminal_projection() {
+    let database = TempDatabase::new();
+    let (store, denial, _) = exact_denial_fixture(&database, "execution-denied-concurrent");
+    let barrier = Arc::new(Barrier::new(2));
+    let outcomes = std::thread::scope(|scope| {
+        let first_store = store.clone();
+        let first_denial = denial.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first = scope.spawn(move || {
+            first_barrier.wait();
+            first_store.resolve_denied(first_denial)
+        });
+        let second_store = store.clone();
+        let second_barrier = Arc::clone(&barrier);
+        let second = scope.spawn(move || {
+            second_barrier.wait();
+            second_store.resolve_denied(denial)
+        });
+        [
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        ]
+    });
+
+    assert_eq!(outcomes[0], outcomes[1]);
+    assert_eq!(
+        configured_connection(&database.path)
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE event_type = 'tool.execution.denied'
+                   AND json_extract(payload_json, '$.executionId') =
+                       'execution-denied-concurrent'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn denied_disposition_rejects_a_non_denial_policy_without_transition() {
+    let database = TempDatabase::new();
+    let (store, mut denial, authorized) =
+        exact_denial_fixture(&database, "execution-denied-wrong-policy");
+    denial.policy_decision_id = authorized.policy_decision_id.clone();
+
+    assert_integrity_failure(store.resolve_denied(denial));
+    assert_eq!(
+        configured_connection(&database.path)
+            .query_row(
+                "SELECT status FROM operation_intents WHERE id = ?1",
+                [authorized.execution_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "pending"
     );
 }
 
@@ -2597,6 +2783,36 @@ fn record_exact_policy(
             recorded_at: evaluated_at,
         })
         .unwrap()
+}
+
+fn exact_denial_fixture(
+    database: &TempDatabase,
+    execution_id: &str,
+) -> (
+    SqliteStore,
+    ToolExecutionDenialRequest,
+    AuthorizedToolExecutionClaim,
+) {
+    let (store, authorized, _, _) = exact_approval_claim_fixture(database, execution_id);
+    let immutable = store
+        .load_request_artifact(&authorized.request_artifact_id)
+        .unwrap();
+    let policy_decision_id = record_exact_policy(
+        &store,
+        immutable.request(),
+        authorized.checked_at,
+        PolicyEffect::Deny,
+        '9',
+    );
+    let denial = ToolExecutionDenialRequest {
+        request_artifact_id: authorized.request_artifact_id.clone(),
+        request: immutable,
+        policy_decision_id,
+        policy_request_binding_digest: authorized.policy_request_binding_digest.clone(),
+        effect: PolicyEffect::Deny,
+        checked_at: authorized.checked_at,
+    };
+    (store, denial, authorized)
 }
 
 fn exact_approval_claim_fixture(
