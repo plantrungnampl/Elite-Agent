@@ -4,13 +4,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use local_agent_terminal_application::{
-    AcquireLease, ApprovedExecutableIdentity, ApprovedProcessRequest, AuthorizedProcessRequest,
-    BoundedOutput, CancellationReceipt, CapabilityRequest, CapabilityResolver,
-    CapabilityRootIdentity, ExecutorLeaseStore, JobReceipt, LeaseSnapshot, ObservedProcessWrite,
-    PortError, ProcessFenceAuthority, ProcessLauncher, ProcessReceipt, ProcessStatus,
-    ProcessWorkingDirectory, RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget,
-    Retryability, RevokeLease, SafeErrorClassification, ToolExecutionId, VerifiedWrite,
-    WorkspaceWriteCoordinator,
+    AcquireLease, ApprovedExecutableIdentity, ApprovedProcessRequest, AuthoritativeProcessBinding,
+    AuthorizedProcessRequest, BoundedOutput, CancellationReceipt, CapabilityRequest,
+    CapabilityResolver, CapabilityRootIdentity, ExecutorLeaseStore, JobReceipt, LeaseSnapshot,
+    ObservedProcessWrite, PortError, ProcessExecutionBindingStore, ProcessFenceAuthority,
+    ProcessLauncher, ProcessReceipt, ProcessStatus, ProcessWorkingDirectory,
+    RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget, Retryability,
+    RevokeLease, SafeErrorClassification, ToolExecutionClaimAuthority, ToolExecutionId,
+    VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken, LeaseClaim, NetworkProfile,
@@ -60,6 +61,11 @@ fn typed_process_exec_resolves_profiles_and_preserves_argv_boundaries() {
     assert_eq!(captured.environment.values.get("CI").unwrap(), "1");
     assert_eq!(captured.network.profile, NetworkProfile::Denied);
     assert_eq!(captured.executor_claim, outcome.claim);
+    assert_eq!(outcome.process_bindings.len(), 1);
+    assert_eq!(
+        outcome.process_bindings[0].authority().execution_id(),
+        &outcome.execution_id
+    );
     assert!(matches!(
         captured.cwd,
         ProcessWorkingDirectory::IsolatedWorktree(_)
@@ -115,11 +121,14 @@ fn unresolved_profiles_cwd_and_stale_lease_never_reach_the_launcher() {
         CaseMutation::StaleLease,
         CaseMutation::MissingFencingToken,
         CaseMutation::ExpectedReads,
+        CaseMutation::ClaimAuthority,
     ] {
         let outcome = execute_case(vec!["test".to_owned()], mutation);
 
         assert!(outcome.result.is_err(), "{mutation:?}");
+        assert_eq!(outcome.launcher_calls, 0, "{mutation:?}");
         assert!(outcome.request.is_none(), "{mutation:?}");
+        assert!(outcome.process_bindings.is_empty(), "{mutation:?}");
     }
 }
 
@@ -237,6 +246,7 @@ fn runtime_initial_check_cannot_bypass_final_windows_resume_fence() {
     let resolver = WorktreeResolver {
         mutation: CaseMutation::None,
     };
+    let process_bindings = RecordingProcessBindings::default();
     let runtime = ProcessRuntime::new(
         &executables,
         &environments,
@@ -245,6 +255,7 @@ fn runtime_initial_check_cannot_bypass_final_windows_resume_fence() {
         &resolver,
         &authority,
         &launcher,
+        &process_bindings,
     )
     .unwrap();
     let task_id = TaskId::new("task-1").unwrap();
@@ -334,6 +345,7 @@ enum CaseMutation {
     WriteRootIdentity,
     WriteTarget,
     LauncherMissingWriteEvidence,
+    ClaimAuthority,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +363,7 @@ struct CaseOutcome {
     execution_id: ToolExecutionId,
     claim: LeaseClaim,
     launcher_calls: usize,
+    process_bindings: Vec<AuthoritativeProcessBinding>,
 }
 
 fn execute_case(argv: Vec<String>, mutation: CaseMutation) -> CaseOutcome {
@@ -515,6 +528,10 @@ fn execute_with_registry(
         omit_write_evidence: mutation == CaseMutation::LauncherMissingWriteEvidence,
         ..CapturingLauncher::default()
     };
+    let process_bindings = RecordingProcessBindings {
+        stale_authority: mutation == CaseMutation::ClaimAuthority,
+        ..RecordingProcessBindings::default()
+    };
     let runtime = ProcessRuntime::new(
         executables,
         &environments,
@@ -523,6 +540,7 @@ fn execute_with_registry(
         &resolver,
         &executor_fence,
         &launcher,
+        &process_bindings,
     )
     .unwrap();
     let process = ProcessToolRequest::new(
@@ -600,12 +618,14 @@ fn execute_with_registry(
     let result = approved.and_then(|approved| runtime.execute(execution_id.clone(), approved));
     let request = launcher.request.lock().unwrap().clone();
     let launcher_calls = launcher.calls.load(Ordering::SeqCst);
+    let process_bindings = process_bindings.recorded.lock().unwrap().clone();
     CaseOutcome {
         result,
         request,
         execution_id,
         claim,
         launcher_calls,
+        process_bindings,
     }
 }
 
@@ -617,9 +637,17 @@ struct CapturingLauncher {
 }
 
 impl ProcessLauncher for CapturingLauncher {
-    fn execute(&self, request: AuthorizedProcessRequest) -> Result<ProcessReceipt, PortError> {
+    fn execute(
+        &self,
+        request: AuthorizedProcessRequest,
+        authority: &ToolExecutionClaimAuthority,
+        bindings: &dyn ProcessExecutionBindingStore,
+    ) -> Result<ProcessReceipt, PortError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let execution_id = request.execution_id.clone();
+        bindings.record_process_binding(
+            AuthoritativeProcessBinding::new(authority.clone(), 1, "test-job").unwrap(),
+        )?;
         let observed_writes = if self.omit_write_evidence {
             Vec::new()
         } else {
@@ -679,6 +707,40 @@ impl ProcessLauncher for CapturingLauncher {
             job_receipt: None,
             cancelled: true,
         })
+    }
+}
+
+#[derive(Default)]
+struct RecordingProcessBindings {
+    recorded: Mutex<Vec<AuthoritativeProcessBinding>>,
+    stale_authority: bool,
+}
+
+impl ProcessExecutionBindingStore for RecordingProcessBindings {
+    fn load_claimed_authority(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<ToolExecutionClaimAuthority, PortError> {
+        ToolExecutionClaimAuthority::from_persisted(
+            execution_id.clone(),
+            digest(b"claimed operation"),
+            RunId::new(if self.stale_authority {
+                "run-2"
+            } else {
+                "run-1"
+            })
+            .unwrap(),
+            1,
+            Some(FencingToken::new(7).unwrap()),
+        )
+    }
+
+    fn record_process_binding(
+        &self,
+        binding: AuthoritativeProcessBinding,
+    ) -> Result<(), PortError> {
+        self.recorded.lock().unwrap().push(binding);
+        Ok(())
     }
 }
 

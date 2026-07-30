@@ -25,13 +25,14 @@ use std::time::Instant;
 #[cfg(feature = "test-seams")]
 use local_agent_terminal_application::ExecutableFileIdentity;
 use local_agent_terminal_application::{
-    validate_and_order_process_writes, AcquireLease, AuthorizedExpectedWrite,
-    AuthorizedProcessRequest, CapabilityRootIdentity, EnforcedNetworkProfile, ExecutorLeaseStore,
-    LeaseSnapshot, LeaseState, NetworkEnforcementReceipt, ObservedProcessWrite, PortError,
-    ProcessFenceAuthority, ProcessLauncher, ProcessLimits, ProcessStatus, ProcessWorkingDirectory,
+    validate_and_order_process_writes, AcquireLease, AuthoritativeProcessBinding,
+    AuthorizedExpectedWrite, AuthorizedProcessRequest, CancellationReceipt, CapabilityRootIdentity,
+    EnforcedNetworkProfile, ExecutorLeaseStore, LeaseSnapshot, LeaseState,
+    NetworkEnforcementReceipt, ObservedProcessWrite, PortError, ProcessExecutionBindingStore,
+    ProcessFenceAuthority, ProcessLimits, ProcessReceipt, ProcessStatus, ProcessWorkingDirectory,
     RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget,
-    ResolvedEnvironmentProfile, RevokeLease, ToolExecutionId, VerifiedWrite,
-    WorkspaceWriteCoordinator,
+    ResolvedEnvironmentProfile, Retryability, RevokeLease, SafeErrorClassification,
+    ToolExecutionClaimAuthority, ToolExecutionId, VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, ExpectedWrite, FencingToken, LeaseClaim, NetworkProfile, ProcessTrustTier,
@@ -115,6 +116,86 @@ use windows_sys::Win32::System::Threading::{
 
 #[cfg(feature = "test-seams")]
 static JOB_CLEANUP_FAILURE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+trait TestProcessLauncher {
+    fn execute(&self, request: AuthorizedProcessRequest) -> Result<ProcessReceipt, PortError>;
+    fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError>;
+}
+
+impl TestProcessLauncher for WindowsProcessLauncher {
+    fn execute(&self, request: AuthorizedProcessRequest) -> Result<ProcessReceipt, PortError> {
+        let authority = claimed_authority(&request);
+        let bindings = TestProcessBindings::accepting(authority.clone());
+        local_agent_terminal_application::ProcessLauncher::execute(
+            self, request, &authority, &bindings,
+        )
+    }
+
+    fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
+        local_agent_terminal_application::ProcessLauncher::cancel(self, execution_id)
+    }
+}
+
+struct TestProcessBindings {
+    authority: ToolExecutionClaimAuthority,
+    reject_record: bool,
+}
+
+impl TestProcessBindings {
+    fn accepting(authority: ToolExecutionClaimAuthority) -> Self {
+        Self {
+            authority,
+            reject_record: false,
+        }
+    }
+
+    fn rejecting(authority: ToolExecutionClaimAuthority) -> Self {
+        Self {
+            authority,
+            reject_record: true,
+        }
+    }
+}
+
+impl ProcessExecutionBindingStore for TestProcessBindings {
+    fn load_claimed_authority(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<ToolExecutionClaimAuthority, PortError> {
+        if self.authority.execution_id() != execution_id {
+            return Err(test_binding_error());
+        }
+        Ok(self.authority.clone())
+    }
+
+    fn record_process_binding(
+        &self,
+        binding: AuthoritativeProcessBinding,
+    ) -> Result<(), PortError> {
+        if binding.authority() != &self.authority || self.reject_record {
+            return Err(test_binding_error());
+        }
+        Ok(())
+    }
+}
+
+fn claimed_authority(request: &AuthorizedProcessRequest) -> ToolExecutionClaimAuthority {
+    ToolExecutionClaimAuthority::from_persisted(
+        request.execution_id.clone(),
+        digest(b"test process operation"),
+        request.executor_claim.holder_run_id().clone(),
+        1,
+        Some(request.executor_claim.token()),
+    )
+    .unwrap()
+}
+
+fn test_binding_error() -> PortError {
+    PortError::Failure {
+        classification: SafeErrorClassification::Internal,
+        retryability: Retryability::NonRetryable,
+    }
+}
 
 #[test]
 fn executable_registry_rejects_path_lookup_version_drift_and_replacement() {
@@ -586,6 +667,42 @@ fn output_reader_start_failure_never_resumes_or_leaves_an_active_job() {
     thread::sleep(Duration::from_millis(100));
     assert!(!marker.exists());
     assert!(launcher.cancel(&execution_id).is_err());
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn process_binding_failure_never_resumes_and_releases_the_execution_id() {
+    let root = TempDir::new().unwrap();
+    let marker = root.path().join("must-not-run-before-binding");
+    let retry_marker = root.path().join("binding-failure-retry");
+    let boundary = Arc::new(TestOnlyBoundary::valid(root.path().to_owned()));
+    let launcher =
+        WindowsProcessLauncher::with_isolated_worker_boundary(boundary, boundary_binding());
+    let request = lpac_marker_request("execution-binding-failure", &marker);
+    let execution_id = request.execution_id.clone();
+    let authority = claimed_authority(&request);
+    let bindings = TestProcessBindings::rejecting(authority.clone());
+
+    local_agent_terminal_application::ProcessLauncher::execute(
+        &launcher, request, &authority, &bindings,
+    )
+    .expect_err("a durable binding failure must abort the suspended child");
+
+    assert_eq!(
+        lpac_lifecycle_counts_for_test(&execution_id).resumes_succeeded,
+        0
+    );
+    assert!(!marker.exists());
+    assert!(launcher.cancel(&execution_id).is_err());
+
+    let receipt = launcher
+        .execute(lpac_marker_request(
+            "execution-binding-failure",
+            &retry_marker,
+        ))
+        .expect("the execution ID must be reusable after binding cleanup");
+    assert_eq!(receipt.status, ProcessStatus::Exited);
+    assert!(retry_marker.exists());
 }
 
 #[cfg(feature = "test-seams")]

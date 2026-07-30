@@ -4,16 +4,16 @@ use std::path::{Component, Path, PathBuf};
 use local_agent_terminal_application::{
     canonical_file_write_recovery_request, canonical_policy_binding_digest,
     parse_file_write_recovery_request, parse_tool_request, policy_request_for_tool,
-    validate_tool_approval_request, ApprovalDigestPayload, AuthorizedToolExecutionClaim,
-    CanonicalEvidenceRef, DeniedToolExecution, DurableToolExecutionArtifact,
-    DurableToolExecutionArtifacts, DurableToolExecutionReceipt, FileWritePreImage,
-    FileWriteRecoveryCompletion, FileWriteRecoveryFailure, FileWriteRecoveryIntent,
-    FileWriteRecoveryRequest, FileWriteRecoverySnapshot, FileWriteRecoveryState,
-    FileWriteRecoveryStore, IdempotencyClass, ImmutableToolRequest, IncompleteToolExecution,
-    NewToolExecution, NewToolIntent, OperationIntentSnapshot, PolicyDecisionId,
-    PolicyRequestBindingDigest, PortError, Retryability, SafeErrorClassification,
-    SafeToolExecutionError, ToolExecutionClaim, ToolExecutionClaimAuthority,
-    ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
+    validate_tool_approval_request, ApprovalDigestPayload, AuthoritativeProcessBinding,
+    AuthorizedToolExecutionClaim, CanonicalEvidenceRef, DeniedToolExecution,
+    DurableToolExecutionArtifact, DurableToolExecutionArtifacts, DurableToolExecutionReceipt,
+    FileWritePreImage, FileWriteRecoveryCompletion, FileWriteRecoveryFailure,
+    FileWriteRecoveryIntent, FileWriteRecoveryRequest, FileWriteRecoverySnapshot,
+    FileWriteRecoveryState, FileWriteRecoveryStore, IdempotencyClass, ImmutableToolRequest,
+    IncompleteToolExecution, NewToolExecution, NewToolIntent, OperationIntentSnapshot,
+    PolicyDecisionId, PolicyRequestBindingDigest, PortError, ProcessExecutionBindingStore,
+    Retryability, SafeErrorClassification, SafeToolExecutionError, ToolExecutionClaim,
+    ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
     ToolExecutionRecoveryEvidence, ToolExecutionResolution, ToolExecutionStore,
     ToolExecutionTerminal, ToolExecutionTerminalKind, VerifiedFileWriteCompensation,
     WorkspaceMutationRequest,
@@ -704,7 +704,7 @@ impl ToolExecutionStore for SqliteStore {
         } else {
             None
         };
-        let authority = start_tool_execution(
+        let authority = claim_tool_execution(
             &transaction,
             &request.execution_id,
             &intent,
@@ -902,6 +902,123 @@ impl ToolExecutionStore for SqliteStore {
 
     fn incomplete(&self) -> Result<Vec<IncompleteToolExecution>, PortError> {
         incomplete_with_checkpoint(self, || {})
+    }
+}
+
+impl ProcessExecutionBindingStore for SqliteStore {
+    fn load_claimed_authority(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<ToolExecutionClaimAuthority, PortError> {
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection.transaction().map_err(sqlite_error_to_port)?;
+        let intent = load_intent(&transaction, execution_id)?;
+        validate_tool_intent(&transaction, execution_id, &intent)?;
+        let execution = load_tool_execution(&transaction, execution_id)?;
+        validate_tool_execution_identity(execution_id, &intent, &execution)?;
+        if intent.status != "claimed" || execution.status != "pending" {
+            return Err(conflict());
+        }
+        let authority = authority_from_intent(execution_id, &intent)?;
+        transaction.rollback().map_err(sqlite_error_to_port)?;
+        Ok(authority)
+    }
+
+    fn record_process_binding(
+        &self,
+        binding: AuthoritativeProcessBinding,
+    ) -> Result<(), PortError> {
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error_to_port)?;
+        let execution_id = binding.authority().execution_id();
+        let intent = load_intent(&transaction, execution_id)?;
+        validate_tool_intent(&transaction, execution_id, &intent)?;
+        if authority_from_intent(execution_id, &intent)? != *binding.authority() {
+            return Err(integrity_failure());
+        }
+        let execution = load_tool_execution(&transaction, execution_id)?;
+        validate_tool_execution_identity(execution_id, &intent, &execution)?;
+        let binding_value = process_binding_value(&binding);
+        if intent.status == "started" {
+            let persisted = intent
+                .external_receipt_json
+                .as_deref()
+                .ok_or_else(integrity_failure)
+                .and_then(|value| {
+                    serde_json::from_str::<Value>(value).map_err(|_| integrity_failure())
+                })?;
+            if execution.status != "running" || persisted != binding_value {
+                return Err(integrity_failure());
+            }
+            transaction.rollback().map_err(sqlite_error_to_port)?;
+            return Ok(());
+        }
+        if intent.status != "claimed"
+            || execution.status != "pending"
+            || intent.external_receipt_json.is_some()
+        {
+            return Err(conflict());
+        }
+        let binding_json =
+            serde_json::to_string(&binding_value).map_err(|_| integrity_failure())?;
+        let fencing_token = binding
+            .authority()
+            .executor_fencing_token()
+            .map(FencingToken::get)
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| integrity_failure())?;
+        let intent_changed = transaction
+            .execute(
+                "UPDATE operation_intents
+                 SET status = 'started', external_receipt_json = ?1,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE id = ?2 AND status = 'claimed' AND operation_digest = ?3
+                   AND lease_owner = ?4 AND attempt_count = ?5
+                   AND executor_fencing_token IS ?6",
+                params![
+                    binding_json,
+                    execution_id.as_str(),
+                    binding.authority().operation_digest().as_str(),
+                    binding.authority().owner_run_id().as_str(),
+                    binding.authority().attempt(),
+                    fencing_token,
+                ],
+            )
+            .map_err(sqlite_error_to_port)?;
+        let execution_changed = transaction
+            .execute(
+                "UPDATE tool_executions
+                 SET status = 'running',
+                     started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE id = ?1 AND status = 'pending' AND started_at IS NULL",
+                [execution_id.as_str()],
+            )
+            .map_err(sqlite_error_to_port)?;
+        if intent_changed != 1 || execution_changed != 1 {
+            return Err(conflict());
+        }
+        append_tool_event(
+            &transaction,
+            &intent.task_id,
+            execution_id.as_str(),
+            "tool.execution.started",
+            "Running",
+            json!({
+                "executionId": execution_id.as_str(),
+                "operationDigest": binding.authority().operation_digest().as_str(),
+                "policyDecisionId": execution.policy_decision_id,
+                "approvalId": execution.approval_id,
+                "executorFencingToken": fencing_token,
+                "ownerRunId": binding.authority().owner_run_id().as_str(),
+                "attempt": binding.authority().attempt(),
+                "rootPid": binding.root_pid(),
+                "jobId": binding.job_id(),
+            }),
+        )?;
+        transaction.commit().map_err(sqlite_error_to_port)
     }
 }
 
@@ -1654,10 +1771,15 @@ fn replay_existing_claim(
     intent: &IntentRow,
 ) -> Result<ToolExecutionClaim, PortError> {
     match intent.status.as_str() {
-        "started" => {
+        "claimed" | "started" => {
             let execution = load_tool_execution(transaction, execution_id)?;
             validate_tool_execution_identity(execution_id, intent, &execution)?;
-            if execution.status != "running" {
+            let expected_status = if intent.status == "claimed" {
+                "pending"
+            } else {
+                "running"
+            };
+            if execution.status != expected_status {
                 return Err(integrity_failure());
             }
             recovery_evidence(execution_id, intent).map(ToolExecutionClaim::InFlight)
@@ -1682,6 +1804,55 @@ fn replay_existing_claim(
         }
         _ => Err(integrity_failure()),
     }
+}
+
+fn claim_tool_execution(
+    transaction: &Transaction<'_>,
+    execution_id: &ToolExecutionId,
+    intent: &IntentRow,
+    policy_decision_id: &str,
+    approval_id: Option<&str>,
+) -> Result<ToolExecutionClaimAuthority, PortError> {
+    let changed = transaction
+        .execute(
+            "UPDATE operation_intents
+             SET status = 'claimed', lease_owner = run_id, attempt_count = attempt_count + 1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?1 AND status = 'pending'",
+            [execution_id.as_str()],
+        )
+        .map_err(sqlite_error_to_port)?;
+    if changed != 1 {
+        return Err(conflict());
+    }
+    let attempt = intent
+        .attempt_count
+        .checked_add(1)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(integrity_failure)?;
+    let authority = claim_authority(execution_id, intent, attempt)?;
+    transaction
+        .execute(
+            "INSERT INTO tool_executions (
+                id, task_id, run_id, request_id, tool_name, arguments_artifact_id,
+                policy_decision_id, approval_id, operation_intent_id,
+                executor_fencing_token, status, started_at, completed_at, exit_code,
+                stdout_artifact_id, stderr_artifact_id
+             ) VALUES (?1, ?2, ?3, ?1, ?4, ?5, ?6, ?7, ?1, ?8, 'pending',
+                NULL, NULL, NULL, NULL, NULL)",
+            params![
+                execution_id.as_str(),
+                intent.task_id,
+                intent.run_id,
+                intent.operation_kind,
+                intent.artifact_id,
+                policy_decision_id,
+                approval_id,
+                intent.fencing_token,
+            ],
+        )
+        .map_err(sqlite_error_to_port)?;
+    Ok(authority)
 }
 
 fn start_tool_execution(
@@ -1749,6 +1920,22 @@ fn start_tool_execution(
     Ok(authority)
 }
 
+fn process_binding_value(binding: &AuthoritativeProcessBinding) -> Value {
+    json!({
+        "schema": "process-binding.v1",
+        "executionId": binding.authority().execution_id().as_str(),
+        "operationDigest": binding.authority().operation_digest().as_str(),
+        "ownerRunId": binding.authority().owner_run_id().as_str(),
+        "attempt": binding.authority().attempt(),
+        "executorFencingToken": binding
+            .authority()
+            .executor_fencing_token()
+            .map(FencingToken::get),
+        "rootPid": binding.root_pid(),
+        "jobId": binding.job_id(),
+    })
+}
+
 fn incomplete_with_checkpoint(
     store: &SqliteStore,
     after_candidate_read: impl FnOnce(),
@@ -1786,7 +1973,7 @@ fn incomplete_with_checkpoint(
         let execution = load_tool_execution(&transaction, &execution_id)?;
         validate_tool_execution_identity(&execution_id, &intent, &execution)?;
         match (intent.status.as_str(), execution.status.as_str()) {
-            ("started", "running") => {
+            ("claimed", "pending") | ("started", "running") => {
                 incomplete.push(IncompleteToolExecution::InFlight(recovery_evidence(
                     &execution_id,
                     &intent,
@@ -2672,6 +2859,15 @@ fn validate_tool_intent(
         "pending"
             if intent.attempt_count == 0
                 && intent.lease_owner.is_none()
+                && intent.result_artifact_id.is_none()
+                && intent.external_receipt_json.is_none()
+                && intent.error_json.is_none() =>
+        {
+            Ok(())
+        }
+        "claimed"
+            if intent.attempt_count > 0
+                && intent.lease_owner.as_deref() == Some(intent.run_id.as_str())
                 && intent.result_artifact_id.is_none()
                 && intent.external_receipt_json.is_none()
                 && intent.error_json.is_none() =>

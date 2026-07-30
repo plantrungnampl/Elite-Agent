@@ -8,15 +8,16 @@ use local_agent_terminal_application::{
     canonical_policy_binding_digest, canonical_tool_request, parse_approval_payload,
     policy_request_for_tool, validate_approval_resume_relation, ApprovalClaim,
     ApprovalDigestPayload, ApprovalId, ApprovalResolution, ApprovalResumeStore, ApprovalStore,
-    ApprovedExecutableIdentity, ApprovedProcessRequest, AuthorizedToolExecutionClaim,
-    CanonicalEvidenceRef, CapabilityRootIdentity, DurableToolExecutionArtifact,
-    DurableToolExecutionArtifacts, DurableToolExecutionReceipt, ExecutableFileIdentity,
-    FileWritePolicyBinding, FileWritePreImage, FileWriteRecoveryCompletion,
+    ApprovedExecutableIdentity, ApprovedProcessRequest, AuthoritativeProcessBinding,
+    AuthorizedToolExecutionClaim, CanonicalEvidenceRef, CapabilityRootIdentity,
+    DurableToolExecutionArtifact, DurableToolExecutionArtifacts, DurableToolExecutionReceipt,
+    ExecutableFileIdentity, FileWritePolicyBinding, FileWritePreImage, FileWriteRecoveryCompletion,
     FileWriteRecoveryFailure, FileWriteRecoveryIntent, FileWriteRecoveryRequest,
     FileWriteRecoveryState, FileWriteRecoveryStore, IncompleteToolExecution, NewApproval,
-    NewToolExecution, NewToolIntent, PolicyDecision, PolicyDecisionStore, RecordedPolicyDecision,
-    RelativePathComponents, ResolvedExecutable, SafeToolExecutionError, ToolApprovalOperationV1,
-    ToolApprovalPayloadV1, ToolApprovalRequest, ToolExecutionClaim, ToolExecutionClaimAuthority,
+    NewToolExecution, NewToolIntent, PolicyDecision, PolicyDecisionStore,
+    ProcessExecutionBindingStore, RecordedPolicyDecision, RelativePathComponents,
+    ResolvedExecutable, SafeToolExecutionError, ToolApprovalOperationV1, ToolApprovalPayloadV1,
+    ToolApprovalRequest, ToolExecutionClaim, ToolExecutionClaimAuthority,
     ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput, ToolExecutionResolution,
     ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
     ToolPolicyContext, ToolRequest, ToolRequestBindingDigest, VerifiedFileWriteCompensation,
@@ -227,10 +228,11 @@ fn authorized_begin_consumes_the_exact_grant_with_the_execution_claim() {
         "approval-time P1 must remain distinct from fresh P2"
     );
 
-    assert!(matches!(
-        store.begin_authorized(claim.clone()).unwrap(),
-        ToolExecutionClaim::Claimed(_)
-    ));
+    let ToolExecutionClaim::Claimed(authority) = store.begin_authorized(claim.clone()).unwrap()
+    else {
+        panic!("fresh authorized execution must win the durable claim");
+    };
+    assert_eq!(authority.execution_id(), &claim.execution_id);
     let mut replay = claim;
     replay.checked_at = Timestamp::from_unix_seconds(4_102_444_801);
     assert!(matches!(
@@ -264,6 +266,32 @@ fn authorized_begin_consumes_the_exact_grant_with_the_execution_claim() {
     assert_eq!(
         connection
             .query_row(
+                "SELECT oi.status || ':' || te.status
+                 FROM operation_intents oi
+                 JOIN tool_executions te ON te.id = oi.id
+                 WHERE oi.id = 'execution-exact-approval'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "claimed:pending"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE event_type = 'tool.execution.started'
+                   AND json_extract(payload_json, '$.executionId') =
+                       'execution-exact-approval'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
                 "SELECT COUNT(*) FROM events
                  WHERE stream_id = 'task-1' AND event_type = 'approval.consumed'
                    AND json_extract(payload_json, '$.approvalId') = ?1",
@@ -272,6 +300,96 @@ fn authorized_begin_consumes_the_exact_grant_with_the_execution_claim() {
             )
             .unwrap(),
         1
+    );
+}
+
+#[test]
+fn authoritative_process_binding_starts_only_the_exact_claim() {
+    let database = TempDatabase::new();
+    let (store, claim, _, _) = exact_approval_claim_fixture(&database, "execution-process-binding");
+    let ToolExecutionClaim::Claimed(authority) = store.begin_authorized(claim).unwrap() else {
+        panic!("fresh authorized execution must win the durable claim");
+    };
+    assert_eq!(
+        store
+            .load_claimed_authority(authority.execution_id())
+            .unwrap(),
+        authority
+    );
+    let binding =
+        AuthoritativeProcessBinding::new(authority.clone(), 4_242, "job-process-binding").unwrap();
+
+    store.record_process_binding(binding.clone()).unwrap();
+    store.record_process_binding(binding).unwrap();
+
+    let connection = configured_connection(&database.path);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT oi.status || ':' || te.status || ':' ||
+                        json_extract(oi.external_receipt_json, '$.schema') || ':' ||
+                        json_extract(oi.external_receipt_json, '$.rootPid') || ':' ||
+                        json_extract(oi.external_receipt_json, '$.jobId')
+                 FROM operation_intents oi
+                 JOIN tool_executions te ON te.id = oi.id
+                 WHERE oi.id = 'execution-process-binding'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "started:running:process-binding.v1:4242:job-process-binding"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE event_type = 'tool.execution.started'
+                   AND json_extract(payload_json, '$.executionId') =
+                       'execution-process-binding'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_integrity_failure(store.record_process_binding(
+        AuthoritativeProcessBinding::new(authority, 4_243, "job-process-binding").unwrap(),
+    ));
+}
+
+#[test]
+fn process_binding_rejects_stale_claim_authority_without_starting() {
+    let database = TempDatabase::new();
+    let (store, claim, _, _) =
+        exact_approval_claim_fixture(&database, "execution-stale-process-binding");
+    let ToolExecutionClaim::Claimed(authority) = store.begin_authorized(claim).unwrap() else {
+        panic!("fresh authorized execution must win the durable claim");
+    };
+    let stale = ToolExecutionClaimAuthority::from_persisted(
+        authority.execution_id().clone(),
+        authority.operation_digest().clone(),
+        authority.owner_run_id().clone(),
+        authority.attempt() + 1,
+        authority.executor_fencing_token(),
+    )
+    .unwrap();
+
+    assert_integrity_failure(store.record_process_binding(
+        AuthoritativeProcessBinding::new(stale, 4_242, "job-stale-binding").unwrap(),
+    ));
+    assert_eq!(
+        configured_connection(&database.path)
+            .query_row(
+                "SELECT oi.status || ':' || te.status || ':' ||
+                        (oi.external_receipt_json IS NULL)
+                 FROM operation_intents oi
+                 JOIN tool_executions te ON te.id = oi.id
+                 WHERE oi.id = 'execution-stale-process-binding'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "claimed:pending:1"
     );
 }
 
@@ -617,7 +735,7 @@ fn concurrent_authorized_begin_has_one_claimant_and_consumes_once() {
         connection
             .query_row(
                 "SELECT COUNT(*) FROM tool_executions
-                 WHERE id = 'execution-authorized-concurrent' AND status = 'running'",
+                 WHERE id = 'execution-authorized-concurrent' AND status = 'pending'",
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -724,15 +842,10 @@ fn authorized_begin_fault_rolls_back_grant_and_execution_together() {
          WHEN NEW.operation_state = 'None' AND NEW.current_sequence > OLD.current_sequence
          BEGIN SELECT RAISE(ABORT, 'fault'); END;",
         "CREATE TRIGGER injected BEFORE UPDATE ON operation_intents
-         WHEN NEW.status = 'started'
+         WHEN NEW.status = 'claimed'
          BEGIN SELECT RAISE(ABORT, 'fault'); END;",
         "CREATE TRIGGER injected BEFORE INSERT ON tool_executions
-         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
-        "CREATE TRIGGER injected BEFORE INSERT ON events
-         WHEN NEW.event_type = 'tool.execution.started'
-         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
-        "CREATE TRIGGER injected BEFORE UPDATE ON tasks
-         WHEN NEW.operation_state = 'Running'
+         WHEN NEW.status = 'pending'
          BEGIN SELECT RAISE(ABORT, 'fault'); END;",
     ];
     for (index, trigger) in faults.into_iter().enumerate() {
@@ -789,6 +902,75 @@ fn authorized_begin_fault_rolls_back_grant_and_execution_together() {
                 )
                 .unwrap(),
             "None:2",
+            "{trigger}"
+        );
+    }
+}
+
+#[test]
+fn process_binding_faults_leave_the_execution_claimed_and_suspended() {
+    let faults = [
+        "CREATE TRIGGER injected BEFORE UPDATE ON operation_intents
+         WHEN NEW.status = 'started'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE UPDATE ON tool_executions
+         WHEN NEW.status = 'running'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE INSERT ON events
+         WHEN NEW.event_type = 'tool.execution.started'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE UPDATE ON tasks
+         WHEN NEW.operation_state = 'Running'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+    ];
+    for (index, trigger) in faults.into_iter().enumerate() {
+        let database = TempDatabase::new();
+        let execution_id = format!("execution-binding-fault-{index}");
+        let (store, claim, _, _) = exact_approval_claim_fixture(&database, &execution_id);
+        let ToolExecutionClaim::Claimed(authority) = store.begin_authorized(claim).unwrap() else {
+            panic!("fresh authorized execution must win the durable claim");
+        };
+        configured_connection(&database.path)
+            .execute_batch(trigger)
+            .unwrap();
+
+        assert!(
+            store
+                .record_process_binding(
+                    AuthoritativeProcessBinding::new(authority, 4_242, "job-binding-fault")
+                        .unwrap(),
+                )
+                .is_err(),
+            "{trigger}"
+        );
+
+        let connection = configured_connection(&database.path);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT oi.status || ':' || te.status || ':' ||
+                            (oi.external_receipt_json IS NULL)
+                     FROM operation_intents oi
+                     JOIN tool_executions te ON te.id = oi.id
+                     WHERE oi.id = ?1",
+                    [execution_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "claimed:pending:1",
+            "{trigger}"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE event_type = 'tool.execution.started'
+                       AND json_extract(payload_json, '$.executionId') = ?1",
+                    [execution_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
             "{trigger}"
         );
     }

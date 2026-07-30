@@ -6,13 +6,14 @@ use std::sync::{Arc, Mutex};
 use local_agent_terminal_application::{
     bind_tool_approval_payload, canonical_approval_payload, canonical_policy_binding_digest,
     canonical_tool_request, parse_tool_request, ApprovalDigestPayload, ApprovedExecutableIdentity,
-    ApprovedProcessRequest, AuthorizedToolExecutionClaim, AuthorizedToolRequest, BoundToolApproval,
-    BoundedOutput, CancellationReceipt, DeniedToolExecution, DurableToolExecutionArtifact,
-    DurableToolExecutionArtifacts, DurableToolExecutionOutcome, DurableToolExecutionReceipt,
-    ExecuteDurableTool, IdempotencyClass, IncompleteToolExecution, JobReceipt, NewToolExecution,
-    NewToolIntent, OperationIntentSnapshot, PortError, ProcessReceipt, ProcessStatus,
-    ResolvedExecutable, Retryability, SafeErrorClassification, SafeToolExecutionError,
-    StructuredToolExecutor, ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionClaim,
+    ApprovedProcessRequest, AuthoritativeProcessBinding, AuthorizedToolExecutionClaim,
+    AuthorizedToolRequest, BoundToolApproval, BoundedOutput, CancellationReceipt,
+    DeniedToolExecution, DurableToolExecutionArtifact, DurableToolExecutionArtifacts,
+    DurableToolExecutionOutcome, DurableToolExecutionReceipt, ExecuteDurableTool, IdempotencyClass,
+    IncompleteToolExecution, JobReceipt, NewToolExecution, NewToolIntent, OperationIntentSnapshot,
+    PortError, ProcessExecutionBindingStore, ProcessReceipt, ProcessStatus, ResolvedExecutable,
+    Retryability, SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor,
+    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionClaim,
     ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
     ToolExecutionRecoveryEvidence, ToolExecutionResolution, ToolExecutionResult,
     ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolPolicyContext,
@@ -62,6 +63,27 @@ fn exact_authorized_begin_is_part_of_the_object_safe_store_contract() {
     let _ = <dyn ToolExecutionStore>::begin_authorized;
     let _ = <dyn ToolExecutionStore>::load_denied;
     let _ = <dyn ToolExecutionStore>::resolve_denied;
+}
+
+#[test]
+fn authoritative_process_binding_contract_is_object_safe_and_validated() {
+    fn accepts(_: &dyn ProcessExecutionBindingStore) {}
+    let _ = accepts;
+    let _ = <dyn ProcessExecutionBindingStore>::load_claimed_authority;
+    let _ = <dyn ProcessExecutionBindingStore>::record_process_binding;
+    let authority = claim_authority(
+        ToolExecutionId::new("binding-contract").unwrap(),
+        digest('a'),
+    );
+
+    assert!(AuthoritativeProcessBinding::new(authority.clone(), 0, "job-1").is_err());
+    assert!(AuthoritativeProcessBinding::new(authority.clone(), 1, "").is_err());
+    assert!(AuthoritativeProcessBinding::new(authority.clone(), 1, "bad\0job").is_err());
+    assert!(AuthoritativeProcessBinding::new(authority.clone(), 1, "x".repeat(257)).is_err());
+    let binding = AuthoritativeProcessBinding::new(authority.clone(), 42, "job-1").unwrap();
+    assert_eq!(binding.authority(), &authority);
+    assert_eq!(binding.root_pid(), 42);
+    assert_eq!(binding.job_id(), "job-1");
 }
 
 #[test]

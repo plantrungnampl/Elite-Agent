@@ -18,9 +18,10 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use local_agent_terminal_application::{
-    validate_and_order_process_writes, AuthorizedProcessRequest, BoundedOutput,
-    CancellationReceipt, ObservedProcessWrite, PortError, ProcessLauncher, ProcessReceipt,
-    ProcessStatus, Retryability, SafeErrorClassification, ToolExecutionId, WorkspaceWritePermit,
+    validate_and_order_process_writes, AuthoritativeProcessBinding, AuthorizedProcessRequest,
+    BoundedOutput, CancellationReceipt, ObservedProcessWrite, PortError,
+    ProcessExecutionBindingStore, ProcessLauncher, ProcessReceipt, ProcessStatus, Retryability,
+    SafeErrorClassification, ToolExecutionClaimAuthority, ToolExecutionId, WorkspaceWritePermit,
 };
 #[cfg(feature = "test-seams")]
 use local_agent_terminal_application::{
@@ -614,9 +615,20 @@ impl Default for WindowsProcessLauncher {
 }
 
 impl ProcessLauncher for WindowsProcessLauncher {
-    fn execute(&self, request: AuthorizedProcessRequest) -> Result<ProcessReceipt, PortError> {
+    fn execute(
+        &self,
+        request: AuthorizedProcessRequest,
+        authority: &ToolExecutionClaimAuthority,
+        bindings: &dyn ProcessExecutionBindingStore,
+    ) -> Result<ProcessReceipt, PortError> {
         let configured = self.boundary.as_ref().ok_or_else(permission_denied)?;
         validate_request(&request)?;
+        if authority.execution_id() != &request.execution_id
+            || authority.owner_run_id() != request.executor_claim.holder_run_id()
+            || authority.executor_fencing_token() != Some(request.executor_claim.token())
+        {
+            return Err(integrity_failure());
+        }
         let _executable_guard = verify_executable_and_retain(&request.executable)?;
         let mut registration =
             ExecutionRegistrationGuard::register(self, request.execution_id.clone())?;
@@ -634,6 +646,11 @@ impl ProcessLauncher for WindowsProcessLauncher {
             cleanup.prepared(),
             child.active.process_handle(),
         )?;
+        bindings.record_process_binding(AuthoritativeProcessBinding::new(
+            authority.clone(),
+            child.active.root_pid(),
+            child.active.job_id(),
+        )?)?;
 
         drop(child.stdout_write);
         drop(child.stderr_write);

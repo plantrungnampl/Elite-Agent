@@ -1324,6 +1324,44 @@ impl ToolExecutionClaimAuthority {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoritativeProcessBinding {
+    authority: ToolExecutionClaimAuthority,
+    root_pid: u32,
+    job_id: String,
+}
+
+impl AuthoritativeProcessBinding {
+    pub fn new(
+        authority: ToolExecutionClaimAuthority,
+        root_pid: u32,
+        job_id: impl Into<String>,
+    ) -> Result<Self, PortError> {
+        let job_id = job_id.into();
+        if root_pid == 0 || job_id.trim().is_empty() || job_id.len() > 256 || job_id.contains('\0')
+        {
+            return Err(invalid_input());
+        }
+        Ok(Self {
+            authority,
+            root_pid,
+            job_id,
+        })
+    }
+
+    pub const fn authority(&self) -> &ToolExecutionClaimAuthority {
+        &self.authority
+    }
+
+    pub const fn root_pid(&self) -> u32 {
+        self.root_pid
+    }
+
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionRecoveryEvidence {
     pub authority: ToolExecutionClaimAuthority,
     pub task_id: TaskId,
@@ -1700,8 +1738,22 @@ pub trait StructuredGit: Send + Sync {
 }
 
 pub trait ProcessLauncher: Send + Sync {
-    fn execute(&self, request: AuthorizedProcessRequest) -> Result<ProcessReceipt, PortError>;
+    fn execute(
+        &self,
+        request: AuthorizedProcessRequest,
+        authority: &ToolExecutionClaimAuthority,
+        bindings: &dyn ProcessExecutionBindingStore,
+    ) -> Result<ProcessReceipt, PortError>;
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError>;
+}
+
+pub trait ProcessExecutionBindingStore: Send + Sync {
+    fn load_claimed_authority(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<ToolExecutionClaimAuthority, PortError>;
+    fn record_process_binding(&self, binding: AuthoritativeProcessBinding)
+        -> Result<(), PortError>;
 }
 
 pub trait ExecutableVerificationGuard: Send + Sync {}

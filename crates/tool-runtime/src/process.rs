@@ -2,9 +2,9 @@ use local_agent_terminal_application::{
     validate_and_order_process_writes, ApprovedProcessExecutor, ApprovedProcessRequest,
     AuthorizedExpectedWrite, AuthorizedProcessRequest, CancellationReceipt, CapabilityRequest,
     CapabilityResolver, EnforcedNetworkProfile, EnvironmentProfileResolver,
-    ExecutableProfileResolver, NetworkProfileVerifier, PortError, ProcessFenceAuthority,
-    ProcessLauncher, ProcessLimits, ProcessReceipt, ProcessWorkingDirectory, Retryability,
-    SafeErrorClassification, ToolExecutionId,
+    ExecutableProfileResolver, NetworkProfileVerifier, PortError, ProcessExecutionBindingStore,
+    ProcessFenceAuthority, ProcessLauncher, ProcessLimits, ProcessReceipt, ProcessWorkingDirectory,
+    Retryability, SafeErrorClassification, ToolExecutionId,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, ExpectedWrite, LeaseClaim, ProcessTrustTier, TaskId,
@@ -23,9 +23,12 @@ pub struct ProcessRuntime<'a> {
     resolver: &'a dyn CapabilityResolver,
     executor_fence: &'a ProcessFenceAuthority,
     launcher: &'a dyn ProcessLauncher,
+    process_bindings: &'a dyn ProcessExecutionBindingStore,
 }
 
 impl<'a> ProcessRuntime<'a> {
+    // Composition keeps each independently replaceable application port explicit.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         executables: &'a dyn ExecutableProfileResolver,
         environments: &'a dyn EnvironmentProfileResolver,
@@ -34,6 +37,7 @@ impl<'a> ProcessRuntime<'a> {
         resolver: &'a dyn CapabilityResolver,
         executor_fence: &'a ProcessFenceAuthority,
         launcher: &'a dyn ProcessLauncher,
+        process_bindings: &'a dyn ProcessExecutionBindingStore,
     ) -> Result<Self, PortError> {
         for (index, profile) in enforced_networks.iter().enumerate() {
             networks.verify(profile)?;
@@ -52,6 +56,7 @@ impl<'a> ProcessRuntime<'a> {
             resolver,
             executor_fence,
             launcher,
+            process_bindings,
         })
     }
 
@@ -134,8 +139,19 @@ impl<'a> ProcessRuntime<'a> {
         let _retained_executable = self.executables.verify_and_retain(&authorized.executable)?;
         self.networks.verify(&authorized.network)?;
         self.executor_fence.assert_current(executor_claim)?;
+        let authority = self
+            .process_bindings
+            .load_claimed_authority(&authorized.execution_id)?;
+        if authority.execution_id() != &authorized.execution_id
+            || authority.owner_run_id() != binding.run_id()
+            || authority.executor_fencing_token() != Some(fencing_token)
+        {
+            return Err(integrity_failure());
+        }
         let approved_writes = authorized.expected_writes.clone();
-        let mut receipt = self.launcher.execute(authorized)?;
+        let mut receipt = self
+            .launcher
+            .execute(authorized, &authority, self.process_bindings)?;
         receipt.observed_writes =
             validate_and_order_process_writes(&approved_writes, receipt.observed_writes)?;
         Ok(receipt)

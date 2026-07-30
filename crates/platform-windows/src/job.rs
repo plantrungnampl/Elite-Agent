@@ -235,6 +235,14 @@ impl ActiveJob {
         self.process.as_raw()
     }
 
+    pub(super) const fn root_pid(&self) -> u32 {
+        self.root_pid
+    }
+
+    pub(super) fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
     pub(super) fn stop_remaining_tree(&self) -> Result<(), PortError> {
         let grace_deadline = Instant::now() + NATURAL_TREE_EXIT_GRACE;
         while self.active_process_count()? != 0 && Instant::now() < grace_deadline {
