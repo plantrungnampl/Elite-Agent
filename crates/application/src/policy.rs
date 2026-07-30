@@ -35,6 +35,19 @@ impl PolicyDecisionId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRequestBindingDigest(Sha256Digest);
+
+impl PolicyRequestBindingDigest {
+    pub const fn as_sha256(&self) -> &Sha256Digest {
+        &self.0
+    }
+
+    pub(crate) const fn new(digest: Sha256Digest) -> Self {
+        Self(digest)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedPolicyDecision {
     pub decision: PolicyDecision,
     pub recorded_at: Timestamp,

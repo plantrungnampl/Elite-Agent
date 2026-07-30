@@ -80,10 +80,10 @@ impl<'a> ExecuteDurableTool<'a> {
         request: AuthorizedToolRequest,
     ) -> Result<DurableToolExecutionOutcome, PortError> {
         let execution_id = request.execution_id.clone();
-        let binding = request.process_request().process.binding();
+        let binding = request.process_request().process().binding();
         let task_id = binding.task_id().clone();
         let owner_run_id = binding.run_id().clone();
-        let executor_fencing_token = request.process_request().process.executor_fencing_token();
+        let executor_fencing_token = request.process_request().process().executor_fencing_token();
         let operation_digest = request.revalidated_operation_digest()?;
         match self.executions.begin(NewToolExecution {
             execution_id: execution_id.clone(),
@@ -245,33 +245,35 @@ fn validate_claimed_approval(
     approval: &ApprovalSnapshot,
     claim: &ApprovalClaim,
 ) -> Result<(), PortError> {
-    if approval.state != ApprovalState::Consumed
-        || approval.approval_id != claim.approval_id
-        || is_expired(&approval.expires_at, &claim.claimed_at)
-        || approval.operation_digest != claim.expected_operation_digest
-        || approval.task_id != claim.task_id
-        || approval.workspace_version != claim.workspace_version
-        || approval.policy_snapshot_digest != claim.policy_snapshot_digest
-        || approval.fencing_token != claim.fencing_token
-        || approval.tool_request_binding_digest.as_ref() != Some(&claim.tool_request_binding_digest)
-        || !valid_approval_nonce(&approval.nonce)
-        || approval.nonce != claim.nonce
-    {
+    if approval.state != ApprovalState::Consumed || !approval_bindings_match(approval, claim) {
         return Err(denied());
     }
     Ok(())
 }
 
+fn approval_bindings_match(approval: &ApprovalSnapshot, claim: &ApprovalClaim) -> bool {
+    approval.approval_id == claim.approval_id
+        && !is_expired(&approval.expires_at, &claim.claimed_at)
+        && approval.operation_digest == claim.expected_operation_digest
+        && approval.task_id == claim.task_id
+        && approval.workspace_version == claim.workspace_version
+        && approval.policy_snapshot_digest == claim.policy_snapshot_digest
+        && approval.fencing_token == claim.fencing_token
+        && approval.tool_request_binding_digest.as_ref() == Some(&claim.tool_request_binding_digest)
+        && valid_approval_nonce(&approval.nonce)
+        && approval.nonce == claim.nonce
+}
+
 fn request_matches(request: &AuthorizedToolRequest, check: &ApprovalCheck) -> bool {
     let process_request = request.process_request();
-    let process = &process_request.process;
+    let process = process_request.process();
     request
         .revalidated_operation_digest()
         .is_ok_and(|digest| digest == check.expected_operation_digest)
         && process.binding().task_id() == &check.task_id
         && process.binding().workspace_version() == check.workspace_version
         && process.executor_fencing_token().map(|token| token.get()) == check.fencing_token
-        && process_request.expected_reads.iter().all(|capability| {
+        && process_request.expected_reads().iter().all(|capability| {
             capability
                 .worktree_task_id()
                 .is_none_or(|task_id| task_id == &check.task_id)

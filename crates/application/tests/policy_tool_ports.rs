@@ -522,8 +522,14 @@ fn process_approval_freezes_digest_version_path_and_file_identity() {
             "replacement-file-cargo",
         ),
     ] {
-        let mut changed_request = baseline_request.clone();
-        changed_request.approved_executable = approved_executable;
+        let changed_request = ApprovedProcessRequest::new(
+            approved_executable,
+            baseline_request.process().clone(),
+            baseline_request.expected_reads().to_vec(),
+            baseline_request.memory_limit_bytes(),
+            baseline_request.cpu_time_limit_ms(),
+        )
+        .unwrap();
         let changed = approved_tool_binding(&changed_request, APPROVAL_NONCE);
 
         assert_ne!(
@@ -908,8 +914,8 @@ fn authorized_process_request_for(mutation: RequestMutation) -> ApprovedProcessR
         .unwrap(),
     )
     .unwrap();
-    ApprovedProcessRequest {
-        approved_executable: approved_executable_identity(
+    ApprovedProcessRequest::new(
+        approved_executable_identity(
             if mutation == RequestMutation::Executable {
                 "rustc"
             } else {
@@ -921,7 +927,7 @@ fn authorized_process_request_for(mutation: RequestMutation) -> ApprovedProcessR
             "file-cargo",
         ),
         process,
-        expected_reads: match mutation {
+        match mutation {
             RequestMutation::ExpectedReads => {
                 vec![CapabilityRef::worktree(task_id, "src").unwrap()]
             }
@@ -930,9 +936,10 @@ fn authorized_process_request_for(mutation: RequestMutation) -> ApprovedProcessR
             }
             _ => Vec::new(),
         },
-        memory_limit_bytes: (mutation == RequestMutation::MemoryLimit).then_some(1024),
-        cpu_time_limit_ms: (mutation == RequestMutation::CpuLimit).then_some(500),
-    }
+        (mutation == RequestMutation::MemoryLimit).then_some(1024),
+        (mutation == RequestMutation::CpuLimit).then_some(500),
+    )
+    .unwrap()
 }
 
 fn approved_executable_identity(
