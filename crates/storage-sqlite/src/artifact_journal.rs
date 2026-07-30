@@ -101,7 +101,13 @@ impl ArtifactJournal for SqliteStore {
         if let Some(availability) = terminal_availability(transition.next_status) {
             let changed = transaction
                 .execute(
-                    "UPDATE artifacts SET availability = ?1
+                    "UPDATE artifacts
+                     SET availability = ?1,
+                         verification_state = CASE
+                             WHEN ?1 = 'available' AND verification_state = 'unverified'
+                                 THEN 'hash_verified'
+                             ELSE verification_state
+                         END
                      WHERE id = (
                         SELECT artifact_id FROM artifact_operations WHERE id = ?2
                      )",

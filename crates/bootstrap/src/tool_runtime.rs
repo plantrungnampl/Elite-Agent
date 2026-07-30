@@ -1,0 +1,197 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use local_agent_terminal_application::{
+    ArtifactId, ArtifactWriteReservation, Clock, ImmutableToolRequest, NewToolIntent,
+    OperationIntentSnapshot, PortError, ProjectId, ReservedArtifact, Retryability,
+    SafeErrorClassification, TaskId, TaskQuery, ToolApprovalPublication, ToolApprovalRequest,
+    ToolApprovalRequestPublisher, ToolExecutionResumeStore, ToolExecutionStore,
+    ToolRequestPublisher, WorkspaceEvidenceStore,
+};
+use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
+use local_agent_terminal_storage_sqlite::SqliteStore;
+
+static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+
+pub struct ToolArtifactPublisher<'a> {
+    database: &'a SqliteStore,
+    artifacts: &'a ContentAddressedArtifactStore,
+}
+
+impl<'a> ToolArtifactPublisher<'a> {
+    pub const fn new(
+        database: &'a SqliteStore,
+        artifacts: &'a ContentAddressedArtifactStore,
+    ) -> Self {
+        Self {
+            database,
+            artifacts,
+        }
+    }
+
+    fn publish_artifact(&self, artifact: JournaledToolArtifact<'_>) -> Result<(), PortError> {
+        let storage_key = ContentAddressedArtifactStore::storage_key(artifact.digest)?;
+        if let Some(existing) = self.database.available_evidence(artifact.artifact_id)? {
+            if existing.content_hash != artifact.digest
+                || existing.storage_key != storage_key
+                || existing.size_bytes != artifact.bytes.len() as u64
+                || existing.project_id != *artifact.project_id
+                || existing.task_id.as_ref() != Some(artifact.task_id)
+            {
+                return Err(integrity_failure());
+            }
+            return Ok(());
+        }
+        let created_at = self.database.now_utc()?;
+        let digest_suffix = artifact
+            .digest
+            .strip_prefix("sha256:")
+            .ok_or_else(integrity_failure)?;
+        JournaledArtifactWriter::new(self.artifacts, self.database, self.database).write(
+            ArtifactWriteReservation {
+                operation_id: format!(
+                    "publish:{}:{}",
+                    artifact.artifact_type,
+                    artifact.artifact_id.as_str()
+                ),
+                artifact: ReservedArtifact {
+                    artifact_id: artifact.artifact_id.as_str().to_owned(),
+                    task_id: Some(artifact.task_id.clone()),
+                    project_id: artifact.project_id.as_str().to_owned(),
+                    artifact_type: artifact.artifact_type.to_owned(),
+                    logical_path: artifact.logical_path,
+                    content_hash: artifact.digest.to_owned(),
+                    storage_key,
+                    size_bytes: artifact.bytes.len() as u64,
+                    mime_type: Some("application/json".to_owned()),
+                    created_by_type: "tool".to_owned(),
+                    created_by_id: artifact.created_by_id.to_owned(),
+                    created_at: created_at.clone(),
+                    supersedes: None,
+                },
+                temp_name: format!(
+                    "tool-{}-{}-{}.tmp",
+                    std::process::id(),
+                    NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed),
+                    &digest_suffix[..16]
+                ),
+                created_at,
+            },
+            artifact.bytes,
+        )?;
+        Ok(())
+    }
+
+    fn project_id(&self, task_id: &TaskId) -> Result<ProjectId, PortError> {
+        let task = self.database.task(task_id)?;
+        if task.task_id != *task_id {
+            return Err(integrity_failure());
+        }
+        Ok(task.project_id)
+    }
+}
+
+impl ToolRequestPublisher for ToolArtifactPublisher<'_> {
+    fn publish(&self, request: &ImmutableToolRequest) -> Result<ArtifactId, PortError> {
+        let tool_request = request.request();
+        let process = tool_request.process().process();
+        let task_id = process.binding().task_id();
+        let project_id = self.project_id(task_id)?;
+        let digest = request.binding_digest().as_sha256();
+        let digest_suffix = digest
+            .as_str()
+            .strip_prefix("sha256:")
+            .ok_or_else(integrity_failure)?;
+        let artifact_id = ArtifactId::new(format!("tool-request-{digest_suffix}"))
+            .map_err(|_| invalid_input())?;
+        self.publish_artifact(JournaledToolArtifact {
+            artifact_id: &artifact_id,
+            task_id,
+            project_id: &project_id,
+            artifact_type: "tool-request",
+            logical_path: format!(
+                "tool-requests/{}.json",
+                tool_request.execution_id().as_str()
+            ),
+            created_by_id: tool_request.execution_id().as_str(),
+            digest: digest.as_str(),
+            bytes: request.canonical_bytes(),
+        })?;
+        let persisted = self.database.load_request_artifact(&artifact_id)?;
+        if persisted != *request {
+            return Err(integrity_failure());
+        }
+        let reserved = ToolExecutionStore::reserve(
+            self.database,
+            NewToolIntent {
+                execution_id: tool_request.execution_id().clone(),
+                operation_digest: digest.clone(),
+            },
+        )?;
+        validate_reservation(&reserved, tool_request.execution_id(), digest.as_str())?;
+        Ok(artifact_id)
+    }
+}
+
+impl ToolApprovalRequestPublisher for ToolArtifactPublisher<'_> {
+    fn publish_or_replay(
+        &self,
+        request: ToolApprovalRequest,
+    ) -> Result<ToolApprovalPublication, PortError> {
+        match self.database.load_intent(request.execution_id()) {
+            Ok(_) => return self.database.record_tool_approval_request(request),
+            Err(error) if error.safe_classification() == SafeErrorClassification::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let task_id =
+            TaskId::new(request.payload().task_id.clone()).map_err(|_| invalid_input())?;
+        let project_id = self.project_id(&task_id)?;
+        let digest = &request.canonical_payload().operation_digest;
+        self.publish_artifact(JournaledToolArtifact {
+            artifact_id: request.approval_artifact_id(),
+            task_id: &task_id,
+            project_id: &project_id,
+            artifact_type: "approval-payload",
+            logical_path: format!("approvals/{}.json", request.approval_id().as_str()),
+            created_by_id: request.approval_id().as_str(),
+            digest: digest.as_str(),
+            bytes: &request.canonical_payload().canonical_bytes,
+        })?;
+        self.database.record_tool_approval_request(request)
+    }
+}
+
+struct JournaledToolArtifact<'a> {
+    artifact_id: &'a ArtifactId,
+    task_id: &'a TaskId,
+    project_id: &'a ProjectId,
+    artifact_type: &'static str,
+    logical_path: String,
+    created_by_id: &'a str,
+    digest: &'a str,
+    bytes: &'a [u8],
+}
+
+fn validate_reservation(
+    snapshot: &OperationIntentSnapshot,
+    execution_id: &local_agent_terminal_application::ToolExecutionId,
+    digest: &str,
+) -> Result<(), PortError> {
+    if snapshot.execution_id != *execution_id || snapshot.operation_digest.as_str() != digest {
+        return Err(integrity_failure());
+    }
+    Ok(())
+}
+
+fn invalid_input() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::InvalidInput,
+        Retryability::NonRetryable,
+    )
+}
+
+fn integrity_failure() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::IntegrityFailure,
+        Retryability::NonRetryable,
+    )
+}

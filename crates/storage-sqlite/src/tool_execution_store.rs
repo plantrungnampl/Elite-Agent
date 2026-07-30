@@ -1369,6 +1369,36 @@ fn validate_policy_identity(
     Ok(())
 }
 
+pub(crate) fn validate_tool_approval_policy(
+    transaction: &Transaction<'_>,
+    decision_id: &PolicyDecisionId,
+    binding_digest: &PolicyRequestBindingDigest,
+    request: &local_agent_terminal_application::ToolRequest,
+    checked_at: Timestamp,
+    approval_expires_at: Timestamp,
+) -> Result<(), PortError> {
+    let policy_expires_at: Option<i64> = transaction
+        .query_row(
+            "SELECT unixepoch(expires_at) FROM policy_decisions WHERE id = ?1",
+            [decision_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error_to_port)?;
+    if policy_expires_at.is_some_and(|expires_at| approval_expires_at.unix_seconds() > expires_at) {
+        return Err(integrity_failure());
+    }
+    validate_policy_identity(
+        transaction,
+        decision_id,
+        binding_digest,
+        request,
+        checked_at,
+        "require_approval",
+        PolicyValidationMode::Fresh,
+    )
+}
+
 #[derive(Debug)]
 struct ExactApprovalRow {
     task_id: String,

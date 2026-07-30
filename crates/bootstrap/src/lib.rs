@@ -2,6 +2,7 @@
 
 mod logging;
 mod startup;
+mod tool_runtime;
 mod workspace_monitor;
 mod workspace_runtime;
 
@@ -12,4 +13,5 @@ pub use local_agent_terminal_application::{
     WorkspaceDashboardRequestDto,
 };
 pub use startup::{Bootstrap, StartupConfig};
+pub use tool_runtime::ToolArtifactPublisher;
 pub use workspace_runtime::WorkspaceRuntime;

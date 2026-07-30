@@ -114,7 +114,7 @@ impl ContentAddressedArtifactStore {
         Ok(self.root.join(object_relative(hash)?))
     }
 
-    pub(crate) fn storage_key(hash: &str) -> Result<String, PortError> {
+    pub fn storage_key(hash: &str) -> Result<String, PortError> {
         let hex = validate_hash(hash)?;
         Ok(format!("objects/{}/{}", &hex[..2], hex))
     }

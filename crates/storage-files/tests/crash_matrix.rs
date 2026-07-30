@@ -227,6 +227,70 @@ fn logical_metadata_is_separate_from_deduplicated_content() {
 }
 
 #[test]
+fn completed_journal_entry_promotes_hash_verified_metadata() {
+    let fixture = Fixture::new();
+    JournaledArtifactWriter::new(&fixture.store, &fixture.journal, &fixture.clock)
+        .write(
+            reservation(
+                "operation-hash-verified",
+                "artifact-hash-verified",
+                "verified.txt",
+            ),
+            b"hello",
+        )
+        .unwrap();
+
+    assert_eq!(
+        Connection::open(&fixture.database_path)
+            .unwrap()
+            .query_row(
+                "SELECT verification_state FROM artifacts WHERE id = 'artifact-hash-verified'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "hash_verified"
+    );
+}
+
+#[test]
+fn completed_journal_entry_preserves_higher_verification_metadata() {
+    let fixture = Fixture::new();
+    let reservation = reservation(
+        "operation-tool-verified",
+        "artifact-tool-verified",
+        "verified.txt",
+    );
+    JournaledArtifactWriter::new(&fixture.store, &fixture.journal, &fixture.clock)
+        .write_with_fault(reservation, b"hello", |point| {
+            if point == FaultPoint::AfterJournalTransition {
+                Connection::open(&fixture.database_path)
+                    .unwrap()
+                    .execute(
+                        "UPDATE artifacts SET verification_state = 'tool_verified'
+                         WHERE id = 'artifact-tool-verified'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        Connection::open(&fixture.database_path)
+            .unwrap()
+            .query_row(
+                "SELECT verification_state FROM artifacts WHERE id = 'artifact-tool-verified'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "tool_verified"
+    );
+}
+
+#[test]
 fn staging_bytes_without_an_intent_are_quarantined_not_deleted() {
     let fixture = Fixture::new();
     let orphan = fixture.store.root().join("staging/orphan.tmp");
