@@ -12,6 +12,7 @@ mod dto;
 mod error;
 mod execute_tool;
 mod lease;
+mod orchestration;
 mod policy;
 mod ports;
 mod repository;
@@ -40,6 +41,7 @@ pub use execute_tool::{ExecuteApprovedTool, ExecuteDurableTool};
 pub use lease::{
     AcquireExecutorLease, AcquireLease, ExecutorLeaseStore, LeaseSnapshot, LeaseState, RevokeLease,
 };
+pub use orchestration::{PreEffectReady, ToolExecutionOrchestration, ToolRequestPublisher};
 pub use policy::{
     bind_disclosure_channel, parse_policy_timestamp, DisclosureChannel, DisclosureContextProvider,
     DisclosureContextRequest, DisclosureOutcome, DisclosurePolicyEvaluator, DisclosureRequest,
