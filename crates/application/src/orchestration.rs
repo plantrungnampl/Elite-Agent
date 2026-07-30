@@ -1,7 +1,25 @@
+use local_agent_terminal_domain::{PolicyRequest, Timestamp};
+
 use crate::{
     canonical_tool_request, ArtifactId, ImmutableToolRequest, PortError, ToolExecutionId,
     ToolRequest, ToolRequestBindingDigest,
 };
+
+pub fn policy_request_for_tool(request: &ToolRequest, evaluated_at: Timestamp) -> PolicyRequest {
+    let binding = request.process().process().binding();
+    let policy = request.policy();
+    PolicyRequest {
+        task_id: binding.task_id().clone(),
+        actor: policy.actor().clone(),
+        action: policy.action().clone(),
+        resource: policy.resource().clone(),
+        task_risk: policy.task_risk(),
+        workflow_phase: binding.workflow_phase().as_str().to_owned(),
+        purpose: policy.purpose().to_owned(),
+        policy_snapshot_digest: policy.policy_snapshot_digest().clone(),
+        evaluated_at,
+    }
+}
 
 pub trait ToolRequestPublisher: Send + Sync {
     fn publish(&self, request: &ImmutableToolRequest) -> Result<ArtifactId, PortError>;

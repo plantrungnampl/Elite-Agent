@@ -1,15 +1,96 @@
 use std::sync::Mutex;
 
 use local_agent_terminal_application::{
-    ArtifactId, ImmutableToolRequest, PortError, ToolExecutionOrchestration, ToolRequest,
-    ToolRequestPublisher,
+    canonical_policy_binding_digest, policy_request_for_tool, ArtifactId, ImmutableToolRequest,
+    PortError, SafeErrorClassification, ToolExecutionId, ToolExecutionOrchestration,
+    ToolPolicyContext, ToolRequest, ToolRequestPublisher,
 };
 use local_agent_terminal_domain::{
     ActorLocality, CapabilityRef, EnvironmentProfile, FencingToken, NetworkProfile, Phase,
-    PlanStepId, PolicyAction, PolicyActor, PolicyResource, ProcessBinding, ProcessInvocation,
-    ProcessToolRequest, ProcessTrustTier, ResourceClass, RunId, Sha256Digest, TaskId, TaskRisk,
-    TrustTier, WorkspaceVersion,
+    PlanStepId, PolicyAction, PolicyActor, PolicyRequest, PolicyResource, ProcessBinding,
+    ProcessInvocation, ProcessToolRequest, ProcessTrustTier, ResourceClass, RunId, Sha256Digest,
+    TaskId, TaskRisk, Timestamp, TrustTier, WorkspaceVersion,
 };
+
+#[test]
+fn policy_request_maps_exact_validated_tool_identity() {
+    let request = tool_request();
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+
+    let actual = policy_request_for_tool(&request, evaluated_at);
+
+    assert_eq!(
+        actual,
+        PolicyRequest {
+            task_id: TaskId::new("task-1").unwrap(),
+            actor: PolicyActor {
+                connection_id: "connection-1".to_owned(),
+                agent_id: "agent-1".to_owned(),
+                trust_tier: TrustTier::IsolatedWorker,
+                locality: ActorLocality::Local,
+            },
+            action: PolicyAction::new("process.exec").unwrap(),
+            resource: PolicyResource {
+                capability: CapabilityRef::worktree(TaskId::new("task-1").unwrap(), ".",).unwrap(),
+                content_digest: digest('a'),
+                resource_class: ResourceClass::InternalCode,
+            },
+            task_risk: TaskRisk::High,
+            workflow_phase: "Implementation".to_owned(),
+            purpose: "run focused tests".to_owned(),
+            policy_snapshot_digest: digest('b'),
+            evaluated_at,
+        }
+    );
+}
+
+#[test]
+fn evaluation_time_is_injected_but_not_echoed_into_policy_identity() {
+    let request = tool_request();
+    let first_time = Timestamp::from_unix_seconds(1_753_272_000);
+    let second_time = Timestamp::from_unix_seconds(1_753_272_060);
+
+    let first = policy_request_for_tool(&request, first_time);
+    let second = policy_request_for_tool(&request, second_time);
+
+    assert_eq!(first.evaluated_at, first_time);
+    assert_eq!(second.evaluated_at, second_time);
+    assert_eq!(
+        canonical_policy_binding_digest(&first).unwrap(),
+        canonical_policy_binding_digest(&second).unwrap()
+    );
+}
+
+#[test]
+fn mismatched_policy_task_is_invalid_before_policy_request_mapping() {
+    let request = tool_request();
+    let policy = request.policy();
+    let mismatched_policy = ToolPolicyContext::new(
+        policy.actor().clone(),
+        policy.action().clone(),
+        PolicyResource {
+            capability: CapabilityRef::worktree(TaskId::new("task-2").unwrap(), ".").unwrap(),
+            content_digest: policy.resource().content_digest.clone(),
+            resource_class: policy.resource().resource_class,
+        },
+        policy.task_risk(),
+        policy.purpose(),
+        policy.policy_snapshot_digest().clone(),
+    )
+    .unwrap();
+
+    let error = ToolRequest::new(
+        ToolExecutionId::new("execution-mismatched-policy-task").unwrap(),
+        request.process().clone(),
+        mismatched_policy,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::InvalidInput
+    );
+}
 
 /// RED contract for the shared pre-effect boundary.
 ///

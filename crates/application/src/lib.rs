@@ -41,7 +41,9 @@ pub use execute_tool::{ExecuteApprovedTool, ExecuteDurableTool};
 pub use lease::{
     AcquireExecutorLease, AcquireLease, ExecutorLeaseStore, LeaseSnapshot, LeaseState, RevokeLease,
 };
-pub use orchestration::{PreEffectReady, ToolExecutionOrchestration, ToolRequestPublisher};
+pub use orchestration::{
+    policy_request_for_tool, PreEffectReady, ToolExecutionOrchestration, ToolRequestPublisher,
+};
 pub use policy::{
     bind_disclosure_channel, parse_policy_timestamp, DisclosureChannel, DisclosureContextProvider,
     DisclosureContextRequest, DisclosureOutcome, DisclosurePolicyEvaluator, DisclosureRequest,
