@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::approval::{
-    canonical_approval_payload, ApprovalDigestPayload, ApprovalId, ToolApprovalPayloadV1,
+    canonical_approval_payload, ApprovalDigestPayload, ApprovalId, ToolApprovalOperationV1,
+    ToolApprovalPayloadV1,
 };
 use crate::canonical_json::{invalid_input, sha256_digest};
 use crate::{PolicyRequestBindingDigest, PortError, Retryability, SafeErrorClassification};
@@ -1966,28 +1967,36 @@ fn bind_process_request(
     request: &ApprovedProcessRequest,
 ) -> Result<ToolApprovalPayloadV1, PortError> {
     let process = &request.process;
-    let approved_executable = approved_executable_identity(request)?;
     let binding = process.binding();
     payload.task_id = binding.task_id().as_str().to_owned();
-    payload.operation.run_id = binding.run_id().as_str().to_owned();
-    payload.operation.plan_step_id = binding.plan_step_id().as_str().to_owned();
-    payload.operation.tool = "process.exec".to_owned();
-    payload.operation.executable_digest =
-        Some(approved_executable.executable().sha256.as_str().to_owned());
-    payload.operation.arguments_digest = canonical_process_arguments_digest(process)?.to_string();
-    payload.operation.cwd_capability = logical_capability(process.cwd());
-    payload.operation.environment_profile_digest =
-        binding.environment_profile().digest().as_str().to_owned();
-    payload.operation.network_profile = network_profile(process.network()).to_owned();
-    payload.operation.expected_writes = process
-        .expected_writes()
-        .iter()
-        .map(|write| logical_capability(write.capability()))
-        .collect();
-    payload.operation.executor_fencing_token =
-        process.executor_fencing_token().map(FencingToken::get);
+    payload.operation = process_approval_operation(request)?;
     payload.workspace_version = binding.workspace_version().get();
     Ok(payload)
+}
+
+pub(crate) fn process_approval_operation(
+    request: &ApprovedProcessRequest,
+) -> Result<ToolApprovalOperationV1, PortError> {
+    let process = request.process();
+    let binding = process.binding();
+    let approved_executable = approved_executable_identity(request)?;
+    Ok(ToolApprovalOperationV1 {
+        run_id: binding.run_id().as_str().to_owned(),
+        plan_step_id: binding.plan_step_id().as_str().to_owned(),
+        tool: "process.exec".to_owned(),
+        executable_digest: Some(approved_executable.executable().sha256.as_str().to_owned()),
+        arguments_digest: canonical_process_arguments_digest(process)?.to_string(),
+        script_digest: None,
+        cwd_capability: logical_capability(process.cwd()),
+        environment_profile_digest: binding.environment_profile().digest().as_str().to_owned(),
+        network_profile: network_profile(process.network()).to_owned(),
+        expected_writes: process
+            .expected_writes()
+            .iter()
+            .map(|write| logical_capability(write.capability()))
+            .collect(),
+        executor_fencing_token: process.executor_fencing_token().map(FencingToken::get),
+    })
 }
 
 fn canonical_process_arguments_digest(
@@ -2607,7 +2616,7 @@ fn capability_value(capability: &CapabilityRef) -> Value {
     }
 }
 
-fn logical_capability(capability: &CapabilityRef) -> String {
+pub(crate) fn logical_capability(capability: &CapabilityRef) -> String {
     match capability {
         CapabilityRef::Source(value) => {
             format!("source:{}:{}", value.revision(), value.path())

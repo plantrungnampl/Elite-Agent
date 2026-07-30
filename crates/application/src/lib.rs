@@ -27,7 +27,8 @@ pub use approval::{
     ApprovalClaim, ApprovalDigestPayload, ApprovalId, ApprovalInvalidation, ApprovalRequestBuild,
     ApprovalResolution, ApprovalSnapshot, ApprovalState, ApprovalStore, CanonicalApprovalPayload,
     NewApproval, PolicyExceptionApprovalOperationV1, PolicyExceptionApprovalPayloadV1,
-    ToolApprovalOperationV1, ToolApprovalPayloadV1,
+    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolApprovalPublication, ToolApprovalRequest,
+    ToolApprovalRequestPublisher,
 };
 pub use authority::{
     validate_authoritative_tool_request, ToolAuthorityResolver, ToolAuthoritySnapshot,

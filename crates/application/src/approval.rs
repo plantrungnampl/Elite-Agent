@@ -8,8 +8,11 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::canonical_json::sha256_digest;
-use crate::tool::ToolRequestBindingDigest;
-use crate::{CanonicalJsonRequest, PortError, Retryability, SafeErrorClassification};
+use crate::tool::{ToolExecutionId, ToolRequestBindingDigest};
+use crate::{
+    CanonicalJsonRequest, PolicyDecisionId, PolicyRequestBindingDigest, PortError, Retryability,
+    SafeErrorClassification,
+};
 
 const SCHEMA: &str = "approval-digest.v1";
 const SHA256_LENGTH: usize = 71;
@@ -126,6 +129,107 @@ impl ApprovalId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// One immutable, journaled tool approval request.
+///
+/// The approval payload is kept separate from the full tool request and
+/// stable policy bindings because each has a distinct canonical digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolApprovalRequest {
+    approval_id: ApprovalId,
+    approval_artifact_id: ArtifactId,
+    execution_id: ToolExecutionId,
+    policy_decision_id: PolicyDecisionId,
+    policy_request_binding_digest: PolicyRequestBindingDigest,
+    tool_request_artifact_id: ArtifactId,
+    tool_request_binding_digest: ToolRequestBindingDigest,
+    payload: ToolApprovalPayloadV1,
+    canonical_payload: CanonicalApprovalPayload,
+}
+
+impl ToolApprovalRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_persisted(
+        approval_id: ApprovalId,
+        approval_artifact_id: ArtifactId,
+        execution_id: ToolExecutionId,
+        policy_decision_id: PolicyDecisionId,
+        policy_request_binding_digest: PolicyRequestBindingDigest,
+        tool_request_artifact_id: ArtifactId,
+        tool_request_binding_digest: ToolRequestBindingDigest,
+        payload: ToolApprovalPayloadV1,
+    ) -> Result<Self, PortError> {
+        let canonical_payload = canonical_approval_payload(&ApprovalDigestPayload::Tool(payload))?;
+        let normalized = parse_approval_payload(
+            std::str::from_utf8(&canonical_payload.canonical_bytes).map_err(|_| invalid_input())?,
+        )?;
+        let ApprovalDigestPayload::Tool(payload) = normalized else {
+            return Err(invalid_input());
+        };
+        Ok(Self {
+            approval_id,
+            approval_artifact_id,
+            execution_id,
+            policy_decision_id,
+            policy_request_binding_digest,
+            tool_request_artifact_id,
+            tool_request_binding_digest,
+            payload,
+            canonical_payload,
+        })
+    }
+
+    pub const fn approval_id(&self) -> &ApprovalId {
+        &self.approval_id
+    }
+
+    pub const fn approval_artifact_id(&self) -> &ArtifactId {
+        &self.approval_artifact_id
+    }
+
+    pub const fn execution_id(&self) -> &ToolExecutionId {
+        &self.execution_id
+    }
+
+    pub const fn policy_decision_id(&self) -> &PolicyDecisionId {
+        &self.policy_decision_id
+    }
+
+    pub const fn policy_request_binding_digest(&self) -> &PolicyRequestBindingDigest {
+        &self.policy_request_binding_digest
+    }
+
+    pub const fn tool_request_artifact_id(&self) -> &ArtifactId {
+        &self.tool_request_artifact_id
+    }
+
+    pub const fn tool_request_binding_digest(&self) -> &ToolRequestBindingDigest {
+        &self.tool_request_binding_digest
+    }
+
+    pub const fn payload(&self) -> &ToolApprovalPayloadV1 {
+        &self.payload
+    }
+
+    pub const fn canonical_payload(&self) -> &CanonicalApprovalPayload {
+        &self.canonical_payload
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolApprovalPublication {
+    Created(ToolApprovalRequest),
+    Replayed(ToolApprovalRequest),
+}
+
+/// Atomically publishes a new approval artifact and relation or replays the
+/// existing immutable request for the same durable execution identity.
+pub trait ToolApprovalRequestPublisher: Send + Sync {
+    fn publish_or_replay(
+        &self,
+        request: ToolApprovalRequest,
+    ) -> Result<ToolApprovalPublication, PortError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
