@@ -8,13 +8,16 @@ use crate::{
         ToolApprovalRequestPublisher,
     },
     authority::resource_class_is_at_least,
-    canonical_approval_payload, canonical_policy_binding_digest, canonical_tool_request,
-    parse_policy_timestamp,
+    canonical_approval_payload,
+    canonical_json::sha256_digest,
+    canonical_policy_binding_digest, canonical_tool_request, parse_policy_timestamp,
     tool::{logical_capability, process_approval_operation},
-    validate_authoritative_tool_request, ApprovalId, ApprovalRequestDto, ArtifactId, Clock,
-    IdGenerator, ImmutableToolRequest, PolicyDecision, PolicyDecisionId, PolicyDecisionStore,
-    PolicyEvaluator, PolicyRequestBindingDigest, PortError, RecordedPolicyDecision, Retryability,
-    SafeErrorClassification, ToolAuthorityResolver, ToolExecutionId, ToolRequest,
+    validate_approval_resume_relation, validate_authoritative_tool_request,
+    validate_pending_approval_resume, ApprovalId, ApprovalRequestDto, ApprovalResumeSnapshot,
+    ApprovalResumeStore, ArtifactId, Clock, IdGenerator, ImmutableToolRequest, PolicyDecision,
+    PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator, PolicyRequestBindingDigest, PortError,
+    RecordedPolicyDecision, Retryability, SafeErrorClassification, ToolAuthorityResolver,
+    ToolExecutionId, ToolExecutionResumeSnapshot, ToolExecutionResumeStore, ToolRequest,
     ToolRequestBindingDigest,
 };
 
@@ -48,9 +51,12 @@ pub struct ToolExecutionOrchestration<'a> {
     policy_decisions: &'a dyn PolicyDecisionStore,
     ids: &'a dyn IdGenerator,
     approval_requests: &'a dyn ToolApprovalRequestPublisher,
+    approval_resumes: &'a dyn ApprovalResumeStore,
+    execution_resumes: &'a dyn ToolExecutionResumeStore,
 }
 
 impl<'a> ToolExecutionOrchestration<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         publisher: &'a dyn ToolRequestPublisher,
         authority: &'a dyn ToolAuthorityResolver,
@@ -59,6 +65,8 @@ impl<'a> ToolExecutionOrchestration<'a> {
         policy_decisions: &'a dyn PolicyDecisionStore,
         ids: &'a dyn IdGenerator,
         approval_requests: &'a dyn ToolApprovalRequestPublisher,
+        approval_resumes: &'a dyn ApprovalResumeStore,
+        execution_resumes: &'a dyn ToolExecutionResumeStore,
     ) -> Self {
         Self {
             publisher,
@@ -68,17 +76,56 @@ impl<'a> ToolExecutionOrchestration<'a> {
             policy_decisions,
             ids,
             approval_requests,
+            approval_resumes,
+            execution_resumes,
         }
     }
 
     pub fn execute(&self, request: ToolRequest) -> Result<PreEffectOutcome, PortError> {
         let immutable = canonical_tool_request(&request)?;
         let request_artifact_id = self.publisher.publish(&immutable)?;
-        let authority = self.authority.resolve(&request)?;
-        validate_authoritative_tool_request(&request, &authority)?;
+        self.pre_effect(&immutable, request_artifact_id, None, None)
+    }
+
+    pub fn resume_approved(&self, approval_id: ApprovalId) -> Result<PreEffectOutcome, PortError> {
+        let observed_at = self.observed_at()?;
+        let approval = self
+            .approval_resumes
+            .load_for_resume(&approval_id, observed_at.1)?;
+        if approval.approval_id != approval_id {
+            return Err(integrity_failure());
+        }
+        let execution = self.execution_resumes.load_intent(&approval.execution_id)?;
+        validate_approval_resume_relation(&approval, &execution)?;
+        validate_pending_approval_resume(&approval, &execution, observed_at.1)?;
+        let immutable = self
+            .execution_resumes
+            .load_request_artifact(&execution.request_artifact_id)?;
+        let approval_request = self.approval_resumes.load_approval_request(&approval_id)?;
+        validate_resume_artifacts(&approval, &execution, &immutable, &approval_request)?;
+        self.pre_effect(
+            &immutable,
+            execution.request_artifact_id,
+            Some(observed_at),
+            Some(&approval_request),
+        )
+    }
+
+    fn pre_effect(
+        &self,
+        immutable: &ImmutableToolRequest,
+        request_artifact_id: ArtifactId,
+        observed_at: Option<(String, Timestamp)>,
+        resumed_approval: Option<&ToolApprovalRequest>,
+    ) -> Result<PreEffectOutcome, PortError> {
+        let request = immutable.request();
+        let authority = self.authority.resolve(request)?;
+        validate_authoritative_tool_request(request, &authority)?;
         let authoritative_request = authority.request();
-        let requested_at = self.clock.now_utc()?;
-        let evaluated_at = parse_policy_timestamp(&requested_at)?;
+        let (requested_at, evaluated_at) = match observed_at {
+            Some(observed_at) => observed_at,
+            None => self.observed_at()?,
+        };
         let policy_request = policy_request_for_tool(authoritative_request, evaluated_at);
         let policy_request_binding_digest = canonical_policy_binding_digest(&policy_request)?;
         let decision = self.policies.evaluate(policy_request.clone())?;
@@ -100,20 +147,46 @@ impl<'a> ToolExecutionOrchestration<'a> {
                 request_artifact_id,
                 request_binding_digest: immutable.binding_digest().clone(),
                 policy_decision_id: recorded_decision_id,
+                approval_id: None,
             })),
             PolicyEffect::Deny | PolicyEffect::AllowWithRedaction => Ok(PreEffectOutcome::Denied {
                 policy_decision_id: recorded_decision_id,
             }),
-            PolicyEffect::RequireApproval => self.request_approval(
-                authoritative_request,
-                &immutable,
-                request_artifact_id,
-                recorded_decision_id,
-                policy_request_binding_digest,
-                &requested_at,
-                policy_expires_at,
-            ),
+            PolicyEffect::RequireApproval => {
+                if let Some(approval) = resumed_approval {
+                    validate_published_approval(
+                        authoritative_request,
+                        immutable,
+                        &request_artifact_id,
+                        &policy_request_binding_digest,
+                        approval,
+                    )?;
+                    Ok(PreEffectOutcome::Allowed(PreEffectReady {
+                        execution_id: request.execution_id().clone(),
+                        request_artifact_id,
+                        request_binding_digest: immutable.binding_digest().clone(),
+                        policy_decision_id: recorded_decision_id,
+                        approval_id: Some(approval.approval_id().clone()),
+                    }))
+                } else {
+                    self.request_approval(
+                        authoritative_request,
+                        immutable,
+                        request_artifact_id,
+                        recorded_decision_id,
+                        policy_request_binding_digest,
+                        &requested_at,
+                        policy_expires_at,
+                    )
+                }
+            }
         }
+    }
+
+    fn observed_at(&self) -> Result<(String, Timestamp), PortError> {
+        let value = self.clock.now_utc()?;
+        let timestamp = parse_policy_timestamp(&value)?;
+        Ok((value, timestamp))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -216,6 +289,7 @@ pub struct PreEffectReady {
     request_artifact_id: ArtifactId,
     request_binding_digest: ToolRequestBindingDigest,
     policy_decision_id: PolicyDecisionId,
+    approval_id: Option<ApprovalId>,
 }
 
 impl PreEffectReady {
@@ -233,6 +307,10 @@ impl PreEffectReady {
 
     pub const fn policy_decision_id(&self) -> &PolicyDecisionId {
         &self.policy_decision_id
+    }
+
+    pub const fn approval_id(&self) -> Option<&ApprovalId> {
+        self.approval_id.as_ref()
     }
 }
 
@@ -255,6 +333,49 @@ fn validate_policy_decision(
         || echoed.purpose != expected.purpose
         || echoed.policy_snapshot_digest != expected.policy_snapshot_digest
         || echoed.evaluated_at != expected.evaluated_at
+    {
+        return Err(integrity_failure());
+    }
+    Ok(())
+}
+
+fn validate_resume_artifacts(
+    approval: &ApprovalResumeSnapshot,
+    execution: &ToolExecutionResumeSnapshot,
+    immutable: &ImmutableToolRequest,
+    approval_request: &ToolApprovalRequest,
+) -> Result<(), PortError> {
+    let request = immutable.request();
+    let process = request.process().process();
+    let binding = process.binding();
+    let policy_binding =
+        canonical_policy_binding_digest(&policy_request_for_tool(request, approval.expires_at))
+            .map_err(|_| integrity_failure())?;
+    let approval_expires_at = parse_policy_timestamp(&approval_request.payload().expires_at)
+        .map_err(|_| integrity_failure())?;
+
+    validate_published_approval(
+        request,
+        immutable,
+        &execution.request_artifact_id,
+        &approval.policy_request_binding_digest,
+        approval_request,
+    )?;
+    if approval_request.approval_id() != &approval.approval_id
+        || approval_request.policy_decision_id() != &approval.policy_decision_id
+        || approval_request.canonical_payload().operation_digest
+            != approval.approval_operation_digest
+        || immutable.binding_digest() != &execution.request_binding_digest
+        || sha256_digest(immutable.canonical_bytes()) != execution.request_content_digest.as_str()
+        || policy_binding != approval.policy_request_binding_digest
+        || request.execution_id() != &execution.execution_id
+        || binding.task_id() != &execution.task_id
+        || binding.run_id() != &execution.run_id
+        || binding.workspace_version() != execution.workspace_version
+        || request.policy().policy_snapshot_digest() != &execution.policy_snapshot_digest
+        || process.executor_fencing_token() != execution.fencing_token
+        || approval_expires_at != approval.expires_at
+        || approval_request.payload().nonce != approval.nonce
     {
         return Err(integrity_failure());
     }

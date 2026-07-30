@@ -3,12 +3,14 @@ use std::sync::Mutex;
 
 use local_agent_terminal_application::{
     canonical_policy_binding_digest, canonical_tool_request, policy_request_for_tool, ApprovalId,
-    ArtifactId, Clock, IdGenerator, ImmutableToolRequest, LeaseSnapshot, LeaseState,
-    PolicyDecision, PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator, PortError,
-    PreEffectOutcome, RecordedPolicyDecision, Retryability, SafeErrorClassification,
-    ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestPublisher,
-    ToolAuthorityResolver, ToolAuthoritySnapshot, ToolExecutionId, ToolExecutionOrchestration,
-    ToolPolicyContext, ToolRequest, ToolRequestPublisher,
+    ApprovalResumeSnapshot, ApprovalResumeStore, ApprovalState, ArtifactId, Clock, IdGenerator,
+    ImmutableToolRequest, LeaseSnapshot, LeaseState, OperationIntentStatus, PolicyDecision,
+    PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator, PortError, PreEffectOutcome,
+    RecordedPolicyDecision, Retryability, SafeErrorClassification, ToolApprovalPublication,
+    ToolApprovalRequest, ToolApprovalRequestPublisher, ToolAuthorityResolver,
+    ToolAuthoritySnapshot, ToolExecutionId, ToolExecutionOrchestration,
+    ToolExecutionResumeSnapshot, ToolExecutionResumeStore, ToolPolicyContext, ToolRequest,
+    ToolRequestPublisher,
 };
 use local_agent_terminal_domain::{
     combine_policy_rules, ActorLocality, CapabilityRef, EnvironmentProfile, FencingToken,
@@ -147,6 +149,7 @@ fn allow_publishes_before_pre_effect_ready() {
     };
     let ids = SequenceIds::new(&events);
     let approval_requests = RecordingApprovalPublisher::new();
+    let resumes = UnusedResumeStore;
     let orchestrator = ToolExecutionOrchestration::new(
         &publisher,
         &authority,
@@ -155,6 +158,8 @@ fn allow_publishes_before_pre_effect_ready() {
         &policy_store,
         &ids,
         &approval_requests,
+        &resumes,
+        &resumes,
     );
 
     let execution_id = request.execution_id().clone();
@@ -370,6 +375,7 @@ fn replay_keeps_original_policy_decision_separate_from_fresh_decision() {
             current: request.clone(),
         };
         let ids = SequenceIds::with_values(&events, id_values);
+        let resumes = UnusedResumeStore;
         let orchestrator = ToolExecutionOrchestration::new(
             &publisher,
             &authority,
@@ -378,6 +384,8 @@ fn replay_keeps_original_policy_decision_separate_from_fresh_decision() {
             &policy_store,
             &ids,
             &approval_requests,
+            &resumes,
+            &resumes,
         );
         (orchestrator.execute(request.clone()).unwrap(), decision_id)
     };
@@ -416,6 +424,181 @@ fn replay_keeps_original_policy_decision_separate_from_fresh_decision() {
     );
     assert_eq!(first, replayed);
     assert_eq!(*approval_requests.inserts.lock().unwrap(), 1);
+}
+
+#[test]
+fn approved_resume_reloads_exact_records_and_reuses_pre_effect_path() {
+    let request = tool_request();
+    let immutable = canonical_tool_request(&request).unwrap();
+    let initial_approvals = RecordingApprovalPublisher::new();
+    let published = with_require_approval_orchestrator(
+        &request,
+        &initial_approvals,
+        None,
+        |orchestrator, _, _, _| {
+            orchestrator.execute(request.clone()).unwrap();
+            initial_approvals.stored.lock().unwrap().clone().unwrap()
+        },
+    );
+    let request_content_digest = resource_digest(immutable.canonical_bytes());
+    let binding = request.process().process().binding();
+    let expires_at = Timestamp::from_unix_seconds(1_753_272_900);
+    let intent_id = "intent-orchestration-1".to_owned();
+    let approval = ApprovalResumeSnapshot::new(
+        published.approval_id().clone(),
+        published.execution_id().clone(),
+        published.policy_decision_id().clone(),
+        published.policy_request_binding_digest().clone(),
+        published.canonical_payload().operation_digest.clone(),
+        published.tool_request_binding_digest().clone(),
+        binding.task_id().clone(),
+        binding.run_id().clone(),
+        published.tool_request_artifact_id().clone(),
+        request_content_digest.clone(),
+        intent_id.clone(),
+        binding.workspace_version(),
+        request.policy().policy_snapshot_digest().clone(),
+        request.process().process().executor_fencing_token(),
+        expires_at,
+        published.payload().nonce.clone(),
+        ApprovalState::Approved,
+    )
+    .unwrap();
+    let execution = ToolExecutionResumeSnapshot::new(
+        published.execution_id().clone(),
+        published.approval_id().clone(),
+        published.policy_decision_id().clone(),
+        published.canonical_payload().operation_digest.clone(),
+        published.policy_request_binding_digest().clone(),
+        published.tool_request_binding_digest().clone(),
+        binding.task_id().clone(),
+        binding.run_id().clone(),
+        binding.workspace_version(),
+        request.policy().policy_snapshot_digest().clone(),
+        request.process().process().executor_fencing_token(),
+        expires_at,
+        published.payload().nonce.clone(),
+        published.tool_request_artifact_id().clone(),
+        request_content_digest.clone(),
+        request_content_digest,
+        intent_id,
+        OperationIntentStatus::Pending,
+    )
+    .unwrap();
+
+    let events = Mutex::new(Vec::new());
+    let records = Mutex::new(Vec::new());
+    let mut resumes = RecordingResumeStore {
+        events: &events,
+        checked_at: Timestamp::from_unix_seconds(1_753_272_300),
+        approval,
+        execution,
+        approval_request: published.clone(),
+        immutable,
+    };
+    let publisher = RecordingPublisher {
+        events: &events,
+        artifact_id: published.tool_request_artifact_id().clone(),
+    };
+    let authority = RecordingAuthority {
+        events: &events,
+        current: request.clone(),
+    };
+    let clock = RecordingClock {
+        events: &events,
+        value: "2025-07-23T12:05:00Z",
+    };
+    let decision = policy_decision_with_digest(
+        policy_request_for_tool(&request, Timestamp::from_unix_seconds(1_753_272_300)),
+        PolicyEffect::RequireApproval,
+        'd',
+    );
+    let fresh_policy_decision_id = PolicyDecisionId::from_decision(&decision);
+    let evaluator = RecordingEvaluator {
+        events: &events,
+        decision,
+    };
+    let policy_store = RecordingPolicyStore {
+        events: &events,
+        records: &records,
+        decision_id: fresh_policy_decision_id.clone(),
+    };
+    let ids = SequenceIds::new(&events);
+    let replay_publications = RecordingApprovalPublisher::new();
+    {
+        let orchestrator = ToolExecutionOrchestration::new(
+            &publisher,
+            &authority,
+            &clock,
+            &evaluator,
+            &policy_store,
+            &ids,
+            &replay_publications,
+            &resumes,
+            &resumes,
+        );
+
+        let outcome = orchestrator
+            .resume_approved(published.approval_id().clone())
+            .unwrap();
+        let PreEffectOutcome::Allowed(ready) = outcome else {
+            panic!("approved resume did not reach pre-effect ready");
+        };
+
+        assert_eq!(ready.approval_id(), Some(published.approval_id()));
+        assert_eq!(ready.policy_decision_id(), &fresh_policy_decision_id);
+        assert_ne!(ready.policy_decision_id(), published.policy_decision_id());
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "clock",
+                "approval-resume",
+                "execution-resume",
+                "request-artifact",
+                "approval-artifact",
+                "authority",
+                "evaluate",
+                "record"
+            ]
+        );
+        assert!(replay_publications.candidates.lock().unwrap().is_empty());
+    }
+
+    events.lock().unwrap().clear();
+    records.lock().unwrap().clear();
+    resumes.immutable =
+        canonical_tool_request(&tool_request_with_argv(vec!["check".to_owned()])).unwrap();
+    let orchestrator = ToolExecutionOrchestration::new(
+        &publisher,
+        &authority,
+        &clock,
+        &evaluator,
+        &policy_store,
+        &ids,
+        &replay_publications,
+        &resumes,
+        &resumes,
+    );
+
+    let error = orchestrator
+        .resume_approved(published.approval_id().clone())
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "clock",
+            "approval-resume",
+            "execution-resume",
+            "request-artifact",
+            "approval-artifact"
+        ]
+    );
+    assert!(records.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -659,6 +842,7 @@ fn invalid_clock_timestamp_stops_before_policy_evaluation() {
     };
     let ids = SequenceIds::new(&events);
     let approval_requests = RecordingApprovalPublisher::new();
+    let resumes = UnusedResumeStore;
     let orchestrator = ToolExecutionOrchestration::new(
         &publisher,
         &authority,
@@ -667,6 +851,8 @@ fn invalid_clock_timestamp_stops_before_policy_evaluation() {
         &policy_store,
         &ids,
         &approval_requests,
+        &resumes,
+        &resumes,
     );
 
     let result = orchestrator.execute(request);
@@ -720,6 +906,83 @@ impl ToolAuthorityResolver for RecordingAuthority<'_> {
     fn resolve(&self, _: &ToolRequest) -> Result<ToolAuthoritySnapshot, PortError> {
         self.events.lock().unwrap().push("authority");
         authority_snapshot(self.current.clone())
+    }
+}
+
+struct UnusedResumeStore;
+
+impl ApprovalResumeStore for UnusedResumeStore {
+    fn load_for_resume(
+        &self,
+        _: &ApprovalId,
+        _: Timestamp,
+    ) -> Result<ApprovalResumeSnapshot, PortError> {
+        unreachable!("initial execution does not read approval resume state")
+    }
+
+    fn load_approval_request(&self, _: &ApprovalId) -> Result<ToolApprovalRequest, PortError> {
+        unreachable!("initial execution does not read approval artifacts")
+    }
+}
+
+impl ToolExecutionResumeStore for UnusedResumeStore {
+    fn load_intent(&self, _: &ToolExecutionId) -> Result<ToolExecutionResumeSnapshot, PortError> {
+        unreachable!("initial execution does not read execution resume state")
+    }
+
+    fn load_request_artifact(&self, _: &ArtifactId) -> Result<ImmutableToolRequest, PortError> {
+        unreachable!("initial execution does not read request artifacts")
+    }
+}
+
+struct RecordingResumeStore<'a> {
+    events: &'a Mutex<Vec<&'static str>>,
+    checked_at: Timestamp,
+    approval: ApprovalResumeSnapshot,
+    execution: ToolExecutionResumeSnapshot,
+    approval_request: ToolApprovalRequest,
+    immutable: ImmutableToolRequest,
+}
+
+impl ApprovalResumeStore for RecordingResumeStore<'_> {
+    fn load_for_resume(
+        &self,
+        approval_id: &ApprovalId,
+        checked_at: Timestamp,
+    ) -> Result<ApprovalResumeSnapshot, PortError> {
+        assert_eq!(approval_id, &self.approval.approval_id);
+        assert_eq!(checked_at, self.checked_at);
+        self.events.lock().unwrap().push("approval-resume");
+        Ok(self.approval.clone())
+    }
+
+    fn load_approval_request(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<ToolApprovalRequest, PortError> {
+        assert_eq!(approval_id, self.approval_request.approval_id());
+        self.events.lock().unwrap().push("approval-artifact");
+        Ok(self.approval_request.clone())
+    }
+}
+
+impl ToolExecutionResumeStore for RecordingResumeStore<'_> {
+    fn load_intent(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<ToolExecutionResumeSnapshot, PortError> {
+        assert_eq!(execution_id, &self.execution.execution_id);
+        self.events.lock().unwrap().push("execution-resume");
+        Ok(self.execution.clone())
+    }
+
+    fn load_request_artifact(
+        &self,
+        artifact_id: &ArtifactId,
+    ) -> Result<ImmutableToolRequest, PortError> {
+        assert_eq!(artifact_id, &self.execution.request_artifact_id);
+        self.events.lock().unwrap().push("request-artifact");
+        Ok(self.immutable.clone())
     }
 }
 
@@ -945,6 +1208,7 @@ fn with_require_approval_orchestrator<R>(
         current: request.clone(),
     };
     let ids = SequenceIds::new(&events);
+    let resumes = UnusedResumeStore;
     let orchestrator = ToolExecutionOrchestration::new(
         &publisher,
         &authority,
@@ -953,6 +1217,8 @@ fn with_require_approval_orchestrator<R>(
         &policy_store,
         &ids,
         approval_requests,
+        &resumes,
+        &resumes,
     );
     run(&orchestrator, &events, &records, &decision_id)
 }
@@ -1003,6 +1269,7 @@ fn execute_with_authority(
     };
     let ids = SequenceIds::new(&events);
     let approval_requests = RecordingApprovalPublisher::new();
+    let resumes = UnusedResumeStore;
     let result = {
         let orchestrator = ToolExecutionOrchestration::new(
             &publisher,
@@ -1012,6 +1279,8 @@ fn execute_with_authority(
             &policy_store,
             &ids,
             &approval_requests,
+            &resumes,
+            &resumes,
         );
         orchestrator.execute(request)
     };

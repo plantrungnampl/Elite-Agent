@@ -1,9 +1,9 @@
 use local_agent_terminal_application::{
     validate_approval_resume_relation, validate_pending_approval_resume, ApprovalId,
-    ApprovalResumeSnapshot, ApprovalResumeStore, ApprovalState, ArtifactId, OperationIntentStatus,
-    PolicyDecisionId, PolicyRequestBindingDigest, PortError, Retryability, SafeErrorClassification,
-    ToolExecutionId, ToolExecutionResumeSnapshot, ToolExecutionResumeStore,
-    ToolRequestBindingDigest,
+    ApprovalResumeSnapshot, ApprovalResumeStore, ApprovalState, ArtifactId, ImmutableToolRequest,
+    OperationIntentStatus, PolicyDecisionId, PolicyRequestBindingDigest, PortError, Retryability,
+    SafeErrorClassification, ToolApprovalRequest, ToolExecutionId, ToolExecutionResumeSnapshot,
+    ToolExecutionResumeStore, ToolRequestBindingDigest,
 };
 use local_agent_terminal_domain::{
     FencingToken, RunId, Sha256Digest, TaskId, Timestamp, WorkspaceVersion,
@@ -22,6 +22,10 @@ fn resume_ports_are_object_safe_and_lookup_only_typed_inputs() {
             assert_eq!(checked_at, Timestamp::from_unix_seconds(100));
             Ok(resume_pair().0)
         }
+
+        fn load_approval_request(&self, _: &ApprovalId) -> Result<ToolApprovalRequest, PortError> {
+            unreachable!("object-safety test does not read approval artifacts")
+        }
     }
 
     struct ExecutionReader;
@@ -32,6 +36,10 @@ fn resume_ports_are_object_safe_and_lookup_only_typed_inputs() {
         ) -> Result<ToolExecutionResumeSnapshot, PortError> {
             assert_eq!(execution_id.as_str(), "execution-1");
             Ok(resume_pair().1)
+        }
+
+        fn load_request_artifact(&self, _: &ArtifactId) -> Result<ImmutableToolRequest, PortError> {
+            unreachable!("object-safety test does not read request artifacts")
         }
     }
 

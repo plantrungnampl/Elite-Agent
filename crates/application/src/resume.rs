@@ -3,8 +3,9 @@ use local_agent_terminal_domain::{
 };
 
 use crate::{
-    ApprovalId, ApprovalState, OperationIntentStatus, PolicyDecisionId, PolicyRequestBindingDigest,
-    PortError, Retryability, SafeErrorClassification, ToolExecutionId, ToolRequestBindingDigest,
+    ApprovalId, ApprovalState, ImmutableToolRequest, OperationIntentStatus, PolicyDecisionId,
+    PolicyRequestBindingDigest, PortError, Retryability, SafeErrorClassification,
+    ToolApprovalRequest, ToolExecutionId, ToolRequestBindingDigest,
 };
 
 /// The immutable relation needed to resume an approval by its opaque ID.
@@ -155,6 +156,11 @@ pub trait ApprovalResumeStore: Send + Sync {
         approval_id: &ApprovalId,
         checked_at: Timestamp,
     ) -> Result<ApprovalResumeSnapshot, PortError>;
+
+    fn load_approval_request(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<ToolApprovalRequest, PortError>;
 }
 
 /// Reads the exact execution intent reached from the approval relation.
@@ -163,6 +169,11 @@ pub trait ToolExecutionResumeStore: Send + Sync {
         &self,
         execution_id: &ToolExecutionId,
     ) -> Result<ToolExecutionResumeSnapshot, PortError>;
+
+    fn load_request_artifact(
+        &self,
+        artifact_id: &ArtifactId,
+    ) -> Result<ImmutableToolRequest, PortError>;
 }
 
 /// Validates only the persisted approval -> execution -> intent identity.
