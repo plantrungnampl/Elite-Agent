@@ -1161,7 +1161,7 @@ fn validate_exact_approval(
     )
 }
 
-fn validate_artifact_type(
+pub(crate) fn validate_artifact_type(
     transaction: &Transaction<'_>,
     artifact_id: &str,
     expected: &str,
@@ -2303,7 +2303,7 @@ fn validate_started_event(
     }
 }
 
-fn artifact_by_id_on_connection(
+pub(crate) fn artifact_by_id_on_connection(
     connection: &rusqlite::Connection,
     artifact_id: &str,
     digest: &Sha256Digest,

@@ -6,19 +6,20 @@ use std::sync::{Arc, Barrier};
 use local_agent_terminal_application::{
     bind_tool_approval_payload, canonical_approval_payload, canonical_file_write_recovery_request,
     canonical_policy_binding_digest, canonical_tool_request, parse_approval_payload,
-    policy_request_for_tool, ApprovalClaim, ApprovalDigestPayload, ApprovalId, ApprovalResolution,
-    ApprovalStore, ApprovedExecutableIdentity, ApprovedProcessRequest,
-    AuthorizedToolExecutionClaim, CanonicalEvidenceRef, CapabilityRootIdentity,
-    DurableToolExecutionArtifact, DurableToolExecutionArtifacts, DurableToolExecutionReceipt,
-    ExecutableFileIdentity, FileWritePolicyBinding, FileWritePreImage, FileWriteRecoveryCompletion,
+    policy_request_for_tool, validate_approval_resume_relation, ApprovalClaim,
+    ApprovalDigestPayload, ApprovalId, ApprovalResolution, ApprovalResumeStore, ApprovalStore,
+    ApprovedExecutableIdentity, ApprovedProcessRequest, AuthorizedToolExecutionClaim,
+    CanonicalEvidenceRef, CapabilityRootIdentity, DurableToolExecutionArtifact,
+    DurableToolExecutionArtifacts, DurableToolExecutionReceipt, ExecutableFileIdentity,
+    FileWritePolicyBinding, FileWritePreImage, FileWriteRecoveryCompletion,
     FileWriteRecoveryFailure, FileWriteRecoveryIntent, FileWriteRecoveryRequest,
     FileWriteRecoveryState, FileWriteRecoveryStore, IncompleteToolExecution, NewApproval,
     NewToolExecution, NewToolIntent, PolicyDecision, PolicyDecisionStore, RecordedPolicyDecision,
     RelativePathComponents, ResolvedExecutable, SafeToolExecutionError, ToolApprovalOperationV1,
     ToolApprovalPayloadV1, ToolApprovalRequest, ToolExecutionClaim, ToolExecutionClaimAuthority,
-    ToolExecutionId, ToolExecutionOutput, ToolExecutionResolution, ToolExecutionStore,
-    ToolExecutionTerminal, ToolExecutionTerminalKind, ToolPolicyContext, ToolRequest,
-    ToolRequestBindingDigest, VerifiedFileWriteCompensation, VerifiedWrite,
+    ToolExecutionId, ToolExecutionOutput, ToolExecutionResolution, ToolExecutionResumeStore,
+    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolPolicyContext,
+    ToolRequest, ToolRequestBindingDigest, VerifiedFileWriteCompensation, VerifiedWrite,
 };
 use local_agent_terminal_domain::{
     combine_policy_rules, ActorId, ActorLocality, ArtifactId, CapabilityRef, EnvironmentProfile,
@@ -271,6 +272,105 @@ fn authorized_begin_consumes_the_exact_grant_with_the_execution_claim() {
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn sqlite_resume_loads_the_exact_approval_intent_and_full_request_relation() {
+    let database = TempDatabase::new();
+    let (store, claim, approval_id, _) =
+        exact_approval_claim_fixture(&database, "execution-resume-storage");
+    let approval_request = claim.approval.as_ref().unwrap();
+    let approval_snapshot = store
+        .load_for_resume(&approval_id, claim.checked_at)
+        .unwrap();
+    let execution_snapshot = store.load_intent(&claim.execution_id).unwrap();
+    validate_approval_resume_relation(&approval_snapshot, &execution_snapshot).unwrap();
+    let immutable = store
+        .load_request_artifact(&claim.request_artifact_id)
+        .unwrap();
+    let loaded_approval = store.load_approval_request(&approval_id).unwrap();
+
+    assert_eq!(approval_snapshot.approval_id, approval_id);
+    assert_eq!(
+        approval_snapshot.execution_id, claim.execution_id,
+        "resume must follow the immutable event relation"
+    );
+    assert_eq!(
+        execution_snapshot.request_artifact_id,
+        claim.request_artifact_id
+    );
+    assert_eq!(immutable.binding_digest(), &claim.request_binding_digest);
+    assert_eq!(&loaded_approval, approval_request);
+}
+
+#[test]
+fn sqlite_resume_rejects_artifacts_outside_canonical_paths() {
+    for approval_artifact in [false, true] {
+        let database = TempDatabase::new();
+        let (store, claim, approval_id, _) =
+            exact_approval_claim_fixture(&database, "execution-resume-wrong-path");
+        let artifact_id = if approval_artifact {
+            claim
+                .approval
+                .as_ref()
+                .unwrap()
+                .approval_artifact_id()
+                .as_str()
+        } else {
+            claim.request_artifact_id.as_str()
+        };
+        configured_connection(&database.path)
+            .execute(
+                "UPDATE artifacts SET logical_path = ?1 WHERE id = ?2",
+                params![
+                    if approval_artifact {
+                        "wrong/path.json"
+                    } else {
+                        "tool-requests/another-execution.json"
+                    },
+                    artifact_id,
+                ],
+            )
+            .unwrap();
+
+        if approval_artifact {
+            assert_integrity_failure(store.load_approval_request(&approval_id));
+        } else {
+            assert_integrity_failure(store.load_request_artifact(&claim.request_artifact_id));
+        }
+    }
+}
+
+#[test]
+fn sqlite_resume_rejects_an_intent_owned_by_another_task() {
+    let database = TempDatabase::new();
+    let (store, claim, approval_id, _) =
+        exact_approval_claim_fixture(&database, "execution-resume-wrong-task");
+    seed_other_task(&database);
+    configured_connection(&database.path)
+        .execute(
+            "UPDATE operation_intents SET task_id = 'task-2' WHERE id = ?1",
+            [claim.execution_id.as_str()],
+        )
+        .unwrap();
+
+    assert_integrity_failure(store.load_for_resume(&approval_id, claim.checked_at));
+}
+
+#[test]
+fn sqlite_resume_rejects_a_request_artifact_owned_by_another_task() {
+    let database = TempDatabase::new();
+    let (store, claim, _, _) =
+        exact_approval_claim_fixture(&database, "execution-resume-wrong-artifact-task");
+    seed_other_task(&database);
+    configured_connection(&database.path)
+        .execute(
+            "UPDATE artifacts SET task_id = 'task-2' WHERE id = ?1",
+            [claim.request_artifact_id.as_str()],
+        )
+        .unwrap();
+
+    assert_integrity_failure(store.load_request_artifact(&claim.request_artifact_id));
 }
 
 #[test]

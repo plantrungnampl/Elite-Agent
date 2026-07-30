@@ -1,9 +1,15 @@
 use local_agent_terminal_application::{
-    canonical_approval_payload, parse_approval_payload, ApprovalCheck, ApprovalClaim,
-    ApprovalDigestPayload, ApprovalId, ApprovalInvalidation, ApprovalResolution, ApprovalSnapshot,
-    ApprovalState, ApprovalStore, NewApproval, PortError, Retryability, SafeErrorClassification,
+    canonical_approval_payload, parse_approval_payload, parse_policy_timestamp, ApprovalCheck,
+    ApprovalClaim, ApprovalDigestPayload, ApprovalId, ApprovalInvalidation, ApprovalResolution,
+    ApprovalResumeSnapshot, ApprovalResumeStore, ApprovalSnapshot, ApprovalState, ApprovalStore,
+    ImmutableToolRequest, NewApproval, OperationIntentStatus, PolicyDecisionId,
+    PolicyRequestBindingDigest, PortError, Retryability, SafeErrorClassification,
+    ToolApprovalRequest, ToolExecutionId, ToolExecutionResumeSnapshot, ToolExecutionResumeStore,
+    ToolRequestBindingDigest,
 };
-use local_agent_terminal_domain::{Sha256Digest, TaskId, WorkspaceVersion};
+use local_agent_terminal_domain::{
+    ArtifactId, FencingToken, RunId, Sha256Digest, TaskId, Timestamp, WorkspaceVersion,
+};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
 
@@ -313,6 +319,431 @@ impl ApprovalStore for SqliteStore {
         }
         transaction.commit().map_err(sqlite_error_to_port)?;
         u64::try_from(ids.len()).map_err(|_| invalid_input())
+    }
+}
+
+impl ApprovalResumeStore for SqliteStore {
+    fn load_for_resume(
+        &self,
+        approval_id: &ApprovalId,
+        _checked_at: Timestamp,
+    ) -> Result<ApprovalResumeSnapshot, PortError> {
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection.transaction().map_err(sqlite_error_to_port)?;
+        let relation = load_tool_approval_relation(&transaction, Some(approval_id), None)?;
+        let snapshot = ApprovalResumeSnapshot::new(
+            relation.approval_id,
+            relation.execution_id,
+            relation.approval_policy_decision_id,
+            relation.policy_request_binding_digest,
+            relation.approval_operation_digest,
+            relation.tool_request_binding_digest,
+            relation.task_id,
+            relation.run_id,
+            relation.request_artifact_id,
+            relation.request_content_digest,
+            relation.intent_id,
+            relation.workspace_version,
+            relation.policy_snapshot_digest,
+            relation.fencing_token,
+            relation.expires_at,
+            relation.nonce,
+            relation.state,
+        )?;
+        if snapshot.approval_id != *approval_id {
+            return Err(integrity_failure());
+        }
+        transaction.rollback().map_err(sqlite_error_to_port)?;
+        Ok(snapshot)
+    }
+
+    fn load_approval_request(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<ToolApprovalRequest, PortError> {
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection.transaction().map_err(sqlite_error_to_port)?;
+        let relation = load_tool_approval_relation(&transaction, Some(approval_id), None)?;
+        let logical_path = format!("approvals/{}.json", approval_id.as_str());
+        let stored_logical_path: String = transaction
+            .query_row(
+                "SELECT logical_path FROM artifacts WHERE id = ?1",
+                [relation.approval_artifact_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?
+            .ok_or_else(not_found)?;
+        if stored_logical_path != logical_path {
+            return Err(integrity_failure());
+        }
+        let artifact = crate::tool_execution_store::artifact_by_id_on_connection(
+            &transaction,
+            relation.approval_artifact_id.as_str(),
+            &relation.approval_operation_digest,
+            relation.task_id.as_str(),
+        )?;
+        crate::tool_execution_store::validate_artifact_type(
+            &transaction,
+            relation.approval_artifact_id.as_str(),
+            "approval-payload",
+        )?;
+        let payload = parse_canonical_approval_payload(&artifact.bytes)?;
+        let ApprovalDigestPayload::Tool(payload) = payload else {
+            return Err(integrity_failure());
+        };
+        let request = ToolApprovalRequest::from_persisted(
+            relation.approval_id,
+            relation.approval_artifact_id,
+            relation.execution_id,
+            relation.approval_policy_decision_id,
+            relation.policy_request_binding_digest,
+            relation.request_artifact_id,
+            relation.tool_request_binding_digest,
+            payload,
+        )?;
+        transaction.rollback().map_err(sqlite_error_to_port)?;
+        Ok(request)
+    }
+}
+
+impl ToolExecutionResumeStore for SqliteStore {
+    fn load_intent(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<ToolExecutionResumeSnapshot, PortError> {
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection.transaction().map_err(sqlite_error_to_port)?;
+        let relation = load_tool_approval_relation(&transaction, None, Some(execution_id))?;
+        let snapshot = ToolExecutionResumeSnapshot::new(
+            relation.execution_id,
+            relation.approval_id,
+            relation.approval_policy_decision_id,
+            relation.approval_operation_digest,
+            relation.policy_request_binding_digest,
+            relation.tool_request_binding_digest,
+            relation.task_id,
+            relation.run_id,
+            relation.workspace_version,
+            relation.policy_snapshot_digest,
+            relation.fencing_token,
+            relation.expires_at,
+            relation.nonce,
+            relation.request_artifact_id,
+            relation.request_content_digest.clone(),
+            relation.intent_operation_digest,
+            relation.intent_id,
+            relation.intent_status,
+        )?;
+        transaction.rollback().map_err(sqlite_error_to_port)?;
+        Ok(snapshot)
+    }
+
+    fn load_request_artifact(
+        &self,
+        artifact_id: &ArtifactId,
+    ) -> Result<ImmutableToolRequest, PortError> {
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection.transaction().map_err(sqlite_error_to_port)?;
+        let (content_hash, task_id, artifact_type, logical_path): (String, String, String, String) =
+            transaction
+                .query_row(
+                    "SELECT content_hash, task_id, artifact_type, logical_path
+                 FROM artifacts WHERE id = ?1",
+                    [artifact_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(sqlite_error_to_port)?
+                .ok_or_else(not_found)?;
+        if artifact_type != "tool-request" {
+            return Err(integrity_failure());
+        }
+        let digest = Sha256Digest::new(content_hash).map_err(|_| integrity_failure())?;
+        let artifact = crate::tool_execution_store::artifact_by_id_on_connection(
+            &transaction,
+            artifact_id.as_str(),
+            &digest,
+            task_id.as_str(),
+        )?;
+        let immutable = local_agent_terminal_application::parse_tool_request(&artifact.bytes)
+            .map_err(|_| integrity_failure())?;
+        let request = immutable.request();
+        if logical_path != format!("tool-requests/{}.json", request.execution_id().as_str())
+            || request.process().process().binding().task_id().as_str() != task_id
+        {
+            return Err(integrity_failure());
+        }
+        transaction.rollback().map_err(sqlite_error_to_port)?;
+        Ok(immutable)
+    }
+}
+
+#[derive(Debug)]
+struct RawToolApprovalRelation {
+    approval_id: String,
+    task_id: String,
+    approval_status: String,
+    invalidation_reason: Option<String>,
+    approval_operation_digest: String,
+    approval_expires_at: String,
+    approval_artifact_id: String,
+    event_payload: String,
+    intent_id: String,
+    run_id: Option<String>,
+    operation_kind: String,
+    idempotency_class: String,
+    idempotency_key: String,
+    request_artifact_id: String,
+    intent_operation_digest: String,
+    intent_status: String,
+    intent_fencing_token: Option<i64>,
+    intent_attempt_count: i64,
+    intent_lease_owner: Option<String>,
+    intent_task_id: String,
+}
+
+#[derive(Debug)]
+struct ToolApprovalRelation {
+    approval_id: ApprovalId,
+    execution_id: ToolExecutionId,
+    approval_policy_decision_id: PolicyDecisionId,
+    policy_request_binding_digest: PolicyRequestBindingDigest,
+    approval_operation_digest: Sha256Digest,
+    tool_request_binding_digest: ToolRequestBindingDigest,
+    task_id: TaskId,
+    run_id: RunId,
+    request_artifact_id: ArtifactId,
+    request_content_digest: Sha256Digest,
+    intent_operation_digest: Sha256Digest,
+    intent_id: String,
+    workspace_version: WorkspaceVersion,
+    policy_snapshot_digest: Sha256Digest,
+    fencing_token: Option<FencingToken>,
+    expires_at: Timestamp,
+    nonce: String,
+    state: ApprovalState,
+    intent_status: OperationIntentStatus,
+    approval_artifact_id: ArtifactId,
+}
+
+fn load_tool_approval_relation(
+    transaction: &Transaction<'_>,
+    approval_id: Option<&ApprovalId>,
+    execution_id: Option<&ToolExecutionId>,
+) -> Result<ToolApprovalRelation, PortError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT a.id, a.task_id, a.status, a.invalidation_reason,
+                    a.operation_digest, a.expires_at, a.request_artifact_id,
+                    e.payload_json,
+                    oi.id, oi.run_id, oi.operation_kind, oi.idempotency_class,
+                    oi.idempotency_key, oi.canonical_request_artifact_id,
+                    oi.operation_digest, oi.status, oi.executor_fencing_token,
+                    oi.attempt_count, oi.lease_owner, oi.task_id
+             FROM approvals a
+             JOIN events e
+               ON e.stream_id = a.task_id
+              AND e.event_type = 'approval.requested'
+              AND json_extract(e.payload_json, '$.approvalId') = a.id
+             JOIN operation_intents oi
+               ON oi.id = json_extract(e.payload_json, '$.executionId')
+             WHERE (?1 IS NULL OR a.id = ?1)
+               AND (?2 IS NULL OR json_extract(e.payload_json, '$.executionId') = ?2)
+             ORDER BY e.sequence",
+        )
+        .map_err(sqlite_error_to_port)?;
+    let rows = statement
+        .query_map(
+            params![
+                approval_id.map(ApprovalId::as_str),
+                execution_id.map(ToolExecutionId::as_str),
+            ],
+            |row| {
+                Ok(RawToolApprovalRelation {
+                    approval_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    approval_status: row.get(2)?,
+                    invalidation_reason: row.get(3)?,
+                    approval_operation_digest: row.get(4)?,
+                    approval_expires_at: row.get(5)?,
+                    approval_artifact_id: row.get(6)?,
+                    event_payload: row.get(7)?,
+                    intent_id: row.get(8)?,
+                    run_id: row.get(9)?,
+                    operation_kind: row.get(10)?,
+                    idempotency_class: row.get(11)?,
+                    idempotency_key: row.get(12)?,
+                    request_artifact_id: row.get(13)?,
+                    intent_operation_digest: row.get(14)?,
+                    intent_status: row.get(15)?,
+                    intent_fencing_token: row.get(16)?,
+                    intent_attempt_count: row.get(17)?,
+                    intent_lease_owner: row.get(18)?,
+                    intent_task_id: row.get(19)?,
+                })
+            },
+        )
+        .map_err(sqlite_error_to_port)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error_to_port)?;
+    let [raw] = rows.as_slice() else {
+        return Err(if rows.is_empty() {
+            not_found()
+        } else {
+            integrity_failure()
+        });
+    };
+    let payload: Value =
+        serde_json::from_str(&raw.event_payload).map_err(|_| integrity_failure())?;
+    let approval_id_value =
+        ApprovalId::new(raw.approval_id.clone()).map_err(|_| integrity_failure())?;
+    let execution_id_value = parse_event_id(&payload, "executionId", ToolExecutionId::new)?;
+    if payload_string(&payload, "approvalId")? != raw.approval_id
+        || payload_string(&payload, "approvalType")? != "tool"
+        || payload_string(&payload, "operationDigest")? != raw.approval_operation_digest
+        || payload_string(&payload, "requestArtifactId")? != raw.approval_artifact_id
+        || payload_string(&payload, "toolRequestArtifactId")? != raw.request_artifact_id
+        || execution_id_value.as_str() != raw.intent_id
+        || raw.intent_task_id != raw.task_id
+        || raw.run_id.as_deref().is_none_or(str::is_empty)
+        || raw.operation_kind != "process.exec"
+        || raw.idempotency_class != "non_repeatable"
+        || raw.idempotency_key
+            != format!(
+                "tool:{}:{}",
+                raw.run_id.as_deref().unwrap_or_default(),
+                raw.intent_id
+            )
+        || (raw.intent_status == "pending"
+            && (raw.intent_attempt_count != 0 || raw.intent_lease_owner.is_some()))
+    {
+        return Err(integrity_failure());
+    }
+    let task_id = TaskId::new(raw.task_id.clone()).map_err(|_| integrity_failure())?;
+    let run_id = RunId::new(raw.run_id.clone().ok_or_else(integrity_failure)?)
+        .map_err(|_| integrity_failure())?;
+    let approval_policy_decision_id =
+        PolicyDecisionId::from_persisted(payload_string(&payload, "approvalPolicyDecisionId")?)
+            .map_err(|_| integrity_failure())?;
+    let policy_request_binding_digest =
+        parse_policy_binding(payload_string(&payload, "policyRequestBindingDigest")?)?;
+    let approval_operation_digest = Sha256Digest::new(raw.approval_operation_digest.clone())
+        .map_err(|_| integrity_failure())?;
+    let tool_request_binding_digest =
+        parse_tool_binding(payload_string(&payload, "toolRequestBindingDigest")?)?;
+    let request_artifact_id =
+        ArtifactId::new(raw.request_artifact_id.clone()).map_err(|_| integrity_failure())?;
+    let request_content_digest =
+        Sha256Digest::new(raw.intent_operation_digest.clone()).map_err(|_| integrity_failure())?;
+    let intent_operation_digest =
+        Sha256Digest::new(raw.intent_operation_digest.clone()).map_err(|_| integrity_failure())?;
+    let policy_snapshot_digest =
+        Sha256Digest::new(payload_string(&payload, "policySnapshotDigest")?)
+            .map_err(|_| integrity_failure())?;
+    let workspace_version = WorkspaceVersion::new(payload_u64(&payload, "workspaceVersion")?);
+    let fencing_token = payload_optional_fencing_token(&payload, "fencingToken")?;
+    let intent_fencing_token = raw
+        .intent_fencing_token
+        .map(FencingToken::try_from)
+        .transpose()
+        .map_err(|_| integrity_failure())?;
+    if fencing_token != intent_fencing_token
+        || payload_u64(&payload, "workspaceVersion")? > 9_007_199_254_740_991
+    {
+        return Err(integrity_failure());
+    }
+    let expires_at =
+        parse_policy_timestamp(&raw.approval_expires_at).map_err(|_| integrity_failure())?;
+    let state = approval_state_from_row(&raw.approval_status, raw.invalidation_reason.as_deref())?;
+    let intent_status =
+        OperationIntentStatus::parse(&raw.intent_status).ok_or_else(integrity_failure)?;
+    if intent_status == OperationIntentStatus::Pending && raw.intent_attempt_count != 0 {
+        return Err(integrity_failure());
+    }
+    Ok(ToolApprovalRelation {
+        approval_id: approval_id_value,
+        execution_id: execution_id_value,
+        approval_policy_decision_id,
+        policy_request_binding_digest,
+        approval_operation_digest,
+        tool_request_binding_digest,
+        task_id,
+        run_id,
+        request_artifact_id,
+        request_content_digest,
+        intent_operation_digest,
+        intent_id: raw.intent_id.clone(),
+        workspace_version,
+        policy_snapshot_digest,
+        fencing_token,
+        expires_at,
+        nonce: payload_string(&payload, "nonce")?,
+        state,
+        intent_status,
+        approval_artifact_id: ArtifactId::new(raw.approval_artifact_id.clone())
+            .map_err(|_| integrity_failure())?,
+    })
+}
+
+fn payload_string(payload: &Value, key: &str) -> Result<String, PortError> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(integrity_failure)
+}
+
+fn payload_u64(payload: &Value, key: &str) -> Result<u64, PortError> {
+    payload
+        .get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(integrity_failure)
+}
+
+fn payload_optional_fencing_token(
+    payload: &Value,
+    key: &str,
+) -> Result<Option<FencingToken>, PortError> {
+    let value = payload.get(key).ok_or_else(integrity_failure)?;
+    value
+        .as_u64()
+        .map(FencingToken::new)
+        .transpose()
+        .map_err(|_| integrity_failure())
+}
+
+fn parse_event_id<T>(
+    payload: &Value,
+    key: &str,
+    parse: impl FnOnce(String) -> Result<T, PortError>,
+) -> Result<T, PortError> {
+    parse(payload_string(payload, key)?).map_err(|_| integrity_failure())
+}
+
+fn parse_policy_binding(value: String) -> Result<PolicyRequestBindingDigest, PortError> {
+    Ok(PolicyRequestBindingDigest::from_persisted(
+        Sha256Digest::new(value).map_err(|_| integrity_failure())?,
+    ))
+}
+
+fn parse_tool_binding(value: String) -> Result<ToolRequestBindingDigest, PortError> {
+    Ok(ToolRequestBindingDigest::from_persisted(
+        Sha256Digest::new(value).map_err(|_| integrity_failure())?,
+    ))
+}
+
+fn approval_state_from_row(
+    status: &str,
+    invalidation_reason: Option<&str>,
+) -> Result<ApprovalState, PortError> {
+    match status {
+        "pending" => Ok(ApprovalState::Requested),
+        "granted" => Ok(ApprovalState::Approved),
+        "denied" => Ok(ApprovalState::Rejected),
+        "invalidated" if invalidation_reason == Some("consumed") => Ok(ApprovalState::Consumed),
+        "invalidated" | "expired" => Ok(ApprovalState::Invalidated),
+        _ => Err(integrity_failure()),
     }
 }
 
