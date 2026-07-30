@@ -42,7 +42,8 @@ pub use lease::{
     AcquireExecutorLease, AcquireLease, ExecutorLeaseStore, LeaseSnapshot, LeaseState, RevokeLease,
 };
 pub use orchestration::{
-    policy_request_for_tool, PreEffectReady, ToolExecutionOrchestration, ToolRequestPublisher,
+    policy_request_for_tool, PreEffectOutcome, PreEffectReady, ToolExecutionOrchestration,
+    ToolRequestPublisher,
 };
 pub use policy::{
     bind_disclosure_channel, parse_policy_timestamp, DisclosureChannel, DisclosureContextProvider,
