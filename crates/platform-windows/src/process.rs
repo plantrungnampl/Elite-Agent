@@ -449,6 +449,7 @@ enum ExecutionRegistration {
     CancelRequested,
     Active {
         job: Arc<ActiveJob>,
+        authority: Option<ToolExecutionClaimAuthority>,
         cancel_requested: bool,
     },
 }
@@ -651,6 +652,7 @@ impl ProcessLauncher for WindowsProcessLauncher {
             child.active.root_pid(),
             child.active.job_id(),
         )?)?;
+        cleanup.bind_authority(authority)?;
 
         drop(child.stdout_write);
         drop(child.stderr_write);
@@ -761,6 +763,7 @@ impl ProcessLauncher for WindowsProcessLauncher {
                 ExecutionRegistration::Active {
                     job,
                     cancel_requested,
+                    ..
                 } => {
                     *cancel_requested = true;
                     Some(job.clone())
@@ -777,6 +780,42 @@ impl ProcessLauncher for WindowsProcessLauncher {
         active.wait_tree_exit()?;
         Ok(CancellationReceipt {
             execution_id: execution_id.clone(),
+            status: ProcessStatus::Terminated,
+            job_receipt: Some(active.receipt(true)?),
+            cancelled: true,
+        })
+    }
+
+    fn terminate_retained_process(
+        &self,
+        binding: &AuthoritativeProcessBinding,
+    ) -> Result<CancellationReceipt, PortError> {
+        let active = {
+            let mut registrations = self.registrations.lock().map_err(|_| internal_error())?;
+            let Some(ExecutionRegistration::Active {
+                job,
+                authority: Some(authority),
+                cancel_requested,
+            }) = registrations.get_mut(binding.authority().execution_id())
+            else {
+                return Err(permission_denied());
+            };
+            if authority != binding.authority()
+                || job.root_pid() != binding.root_pid()
+                || job.job_id() != binding.job_id()
+            {
+                return Err(integrity_failure());
+            }
+            *cancel_requested = true;
+            job.clone()
+        };
+        active.terminate()?;
+        if active.wait_process(INFINITE) != WAIT_OBJECT_0 {
+            return Err(platform_error());
+        }
+        active.wait_tree_exit()?;
+        Ok(CancellationReceipt {
+            execution_id: binding.authority().execution_id().clone(),
             status: ProcessStatus::Terminated,
             job_receipt: Some(active.receipt(true)?),
             cancelled: true,
@@ -860,11 +899,43 @@ impl<'launcher> ExecutionRegistrationGuard<'launcher> {
             self.execution_id.clone(),
             ExecutionRegistration::Active {
                 job: child.active.clone(),
+                authority: None,
                 cancel_requested: false,
             },
         );
         self.active = Some(child.active.clone());
         Ok(Some(child))
+    }
+
+    fn bind_authority(&self, authority: &ToolExecutionClaimAuthority) -> Result<(), PortError> {
+        if authority.execution_id() != &self.execution_id {
+            return Err(integrity_failure());
+        }
+        let mut registrations = self
+            .launcher
+            .registrations
+            .lock()
+            .map_err(|_| internal_error())?;
+        let Some(ExecutionRegistration::Active {
+            job,
+            authority: registered,
+            ..
+        }) = registrations.get_mut(&self.execution_id)
+        else {
+            return Err(integrity_failure());
+        };
+        if self
+            .active
+            .as_ref()
+            .is_none_or(|expected| !Arc::ptr_eq(job, expected))
+            || registered
+                .as_ref()
+                .is_some_and(|current| current != authority)
+        {
+            return Err(integrity_failure());
+        }
+        *registered = Some(authority.clone());
+        Ok(())
     }
 
     fn resume_unless_cancelled(&self, primary_thread: HANDLE) -> Result<bool, PortError> {
@@ -876,6 +947,7 @@ impl<'launcher> ExecutionRegistrationGuard<'launcher> {
         let Some(ExecutionRegistration::Active {
             job,
             cancel_requested,
+            ..
         }) = registrations.get(&self.execution_id)
         else {
             return Err(integrity_failure());
@@ -958,6 +1030,13 @@ impl<'launcher, 'permit> ExecutionCleanupGuard<'launcher, 'permit> {
         self.boundary
             .as_ref()
             .expect("prepared boundary remains owned until cleanup completes")
+    }
+
+    fn bind_authority(&self, authority: &ToolExecutionClaimAuthority) -> Result<(), PortError> {
+        self.registration
+            .as_ref()
+            .ok_or_else(integrity_failure)?
+            .bind_authority(authority)
     }
 
     fn resume_unless_cancelled(&self, primary_thread: HANDLE) -> Result<bool, PortError> {

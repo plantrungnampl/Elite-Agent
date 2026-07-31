@@ -16,9 +16,9 @@ use local_agent_terminal_application::{
     SafeToolExecutionError, StructuredToolExecutor, ToolApprovalOperationV1, ToolApprovalPayloadV1,
     ToolExecutionCancellationClaim, ToolExecutionClaim, ToolExecutionClaimAuthority,
     ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
-    ToolExecutionRecoveryEvidence, ToolExecutionResolution, ToolExecutionResult,
-    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolPolicyContext,
-    ToolRequest,
+    ToolExecutionRecoveryEvidence, ToolExecutionRecoveryState, ToolExecutionResolution,
+    ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
+    ToolPolicyContext, ToolRequest,
 };
 use sha2::{Digest, Sha256};
 
@@ -523,6 +523,7 @@ fn in_flight_claim_stops_after_begin() {
     let evidence = recovery_evidence(
         fixture.request.execution_id.clone(),
         fixture.operation_digest.clone(),
+        ToolExecutionRecoveryState::Started,
     );
     let sequence = recording_sequence();
     let store = RecordingStore::with_claim(
@@ -535,6 +536,31 @@ fn in_flight_claim_stops_after_begin() {
     let outcome = use_case.execute(fixture.request).unwrap();
 
     assert_eq!(outcome, DurableToolExecutionOutcome::InFlight(evidence));
+    assert_eq!(sequence.lock().unwrap().as_slice(), ["begin"]);
+    assert_eq!(executor.calls(), 0);
+    assert!(store.terminal_writes().is_empty());
+}
+
+#[test]
+fn in_flight_claim_rejects_indeterminate_recovery_state() {
+    let fixture = authorized_fixture("execution-a", "test");
+    let evidence = recovery_evidence(
+        fixture.request.execution_id.clone(),
+        fixture.operation_digest.clone(),
+        ToolExecutionRecoveryState::Indeterminate,
+    );
+    let sequence = recording_sequence();
+    let store =
+        RecordingStore::with_claim(Ok(ToolExecutionClaim::InFlight(evidence)), sequence.clone());
+    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
+    let use_case = ExecuteDurableTool::new(&store, &executor);
+
+    let error = use_case.execute(fixture.request).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
     assert_eq!(sequence.lock().unwrap().as_slice(), ["begin"]);
     assert_eq!(executor.calls(), 0);
     assert!(store.terminal_writes().is_empty());
@@ -579,6 +605,7 @@ fn indeterminate_claim_stops_after_begin_without_retry_implication() {
     let evidence = recovery_evidence(
         fixture.request.execution_id.clone(),
         fixture.operation_digest.clone(),
+        ToolExecutionRecoveryState::Indeterminate,
     );
     let sequence = recording_sequence();
     let store = RecordingStore::with_claim(
@@ -600,11 +627,39 @@ fn indeterminate_claim_stops_after_begin_without_retry_implication() {
 }
 
 #[test]
+fn indeterminate_claim_rejects_started_recovery_state() {
+    let fixture = authorized_fixture("execution-a", "test");
+    let evidence = recovery_evidence(
+        fixture.request.execution_id.clone(),
+        fixture.operation_digest.clone(),
+        ToolExecutionRecoveryState::Started,
+    );
+    let sequence = recording_sequence();
+    let store = RecordingStore::with_claim(
+        Ok(ToolExecutionClaim::Indeterminate(evidence)),
+        sequence.clone(),
+    );
+    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
+    let use_case = ExecuteDurableTool::new(&store, &executor);
+
+    let error = use_case.execute(fixture.request).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(sequence.lock().unwrap().as_slice(), ["begin"]);
+    assert_eq!(executor.calls(), 0);
+    assert!(store.terminal_writes().is_empty());
+}
+
+#[test]
 fn mismatched_in_flight_response_fails_closed_after_begin() {
     let fixture = authorized_fixture("execution-a", "test");
     let evidence = recovery_evidence(
         ToolExecutionId::new("execution-b").unwrap(),
         fixture.operation_digest.clone(),
+        ToolExecutionRecoveryState::Started,
     );
     let sequence = recording_sequence();
     let store =
@@ -629,6 +684,7 @@ fn mismatched_process_binding_authority_fails_closed_after_begin() {
     let mut evidence = recovery_evidence(
         fixture.request.execution_id.clone(),
         fixture.operation_digest.clone(),
+        ToolExecutionRecoveryState::Started,
     );
     evidence.process_binding = Some(
         AuthoritativeProcessBinding::new(
@@ -691,6 +747,7 @@ fn mismatched_indeterminate_response_fails_closed_after_begin() {
     let mut evidence = recovery_evidence(
         fixture.request.execution_id.clone(),
         fixture.operation_digest.clone(),
+        ToolExecutionRecoveryState::Indeterminate,
     );
     evidence.task_id = TaskId::new("task-2").unwrap();
     let sequence = recording_sequence();
@@ -912,6 +969,7 @@ fn incomplete_listing_returns_authoritative_recovery_evidence_read_only() {
     let evidence = recovery_evidence(
         fixture.request.execution_id.clone(),
         fixture.operation_digest.clone(),
+        ToolExecutionRecoveryState::Indeterminate,
     );
     let records = vec![IncompleteToolExecution::Indeterminate(evidence.clone())];
     let sequence = recording_sequence();
@@ -932,6 +990,7 @@ fn incomplete_listing_returns_authoritative_recovery_evidence_read_only() {
         ArtifactId::new("artifact-request-a").unwrap()
     );
     assert_eq!(evidence.idempotency_class, IdempotencyClass::NonRepeatable);
+    assert_eq!(evidence.state, ToolExecutionRecoveryState::Indeterminate);
     assert_eq!(evidence.process_binding, None);
     assert_eq!(evidence.authority.attempt(), 7);
     assert_eq!(
@@ -1564,12 +1623,14 @@ fn claim_authority(
 fn recovery_evidence(
     execution_id: ToolExecutionId,
     operation_digest: Sha256Digest,
+    state: ToolExecutionRecoveryState,
 ) -> ToolExecutionRecoveryEvidence {
     ToolExecutionRecoveryEvidence {
         authority: claim_authority(execution_id, operation_digest),
         task_id: TaskId::new("task-1").unwrap(),
         canonical_request_artifact_id: ArtifactId::new("artifact-request-a").unwrap(),
         idempotency_class: IdempotencyClass::NonRepeatable,
+        state,
         process_binding: None,
     }
 }

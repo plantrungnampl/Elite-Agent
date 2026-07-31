@@ -8,16 +8,16 @@ mod process;
 pub use process::ProcessRuntime;
 
 use local_agent_terminal_application::{
-    parse_policy_timestamp, ApprovedProcessExecutor, AuthorizedToolRequest, CancellationReceipt,
-    CapabilityFileWriteSessionFactory, CapabilityFilesystem, CapabilityResolver, Clock,
-    DisclosureChannel, DisclosureContextProvider, DisclosureContextRequest, DisclosureOutcome,
-    DisclosurePolicyEvaluator, DisclosureRequest, ExecutorLeaseStore, FileReadRequest,
-    FileWriteEvidenceStore, FileWriteRecoverySnapshot, FileWriteRecoveryStore, FileWriteRequest,
-    GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, PolicyBoundBytes,
-    PolicyDecisionId, PolicyDecisionStore, PortError, RawGitDiffResult, RawGitStatusResult,
-    RecordedPolicyDecision, Retryability, SafeErrorClassification, StructuredGit,
-    StructuredToolExecutor, ToolExecutionId, ToolExecutionResult, VerifiedBytes, VerifiedWrite,
-    WorkspaceWriteCoordinator,
+    parse_policy_timestamp, ApprovedProcessExecutor, AuthoritativeProcessBinding,
+    AuthorizedToolRequest, CancellationReceipt, CapabilityFileWriteSessionFactory,
+    CapabilityFilesystem, CapabilityResolver, Clock, DisclosureChannel, DisclosureContextProvider,
+    DisclosureContextRequest, DisclosureOutcome, DisclosurePolicyEvaluator, DisclosureRequest,
+    ExecutorLeaseStore, FileReadRequest, FileWriteEvidenceStore, FileWriteRecoverySnapshot,
+    FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest,
+    GitStatusResult, PolicyBoundBytes, PolicyDecisionId, PolicyDecisionStore, PortError,
+    RawGitDiffResult, RawGitStatusResult, RecordedPolicyDecision, Retryability,
+    SafeErrorClassification, StructuredGit, StructuredToolExecutor, ToolExecutionId,
+    ToolExecutionResult, VerifiedBytes, VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, PolicyAction, PolicyEffect, PolicyRequest, PolicyResource, TaskId,
@@ -267,6 +267,13 @@ impl StructuredToolExecutor for ToolRuntime<'_> {
 
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
         self.process_executor.cancel(execution_id)
+    }
+
+    fn terminate_retained_process(
+        &self,
+        binding: &AuthoritativeProcessBinding,
+    ) -> Result<CancellationReceipt, PortError> {
+        self.process_executor.terminate_retained_process(binding)
     }
 
     fn file_read(

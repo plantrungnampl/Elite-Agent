@@ -240,6 +240,7 @@ impl<'a> ExecuteDurableTool<'a> {
             ToolExecutionClaim::InFlight(evidence) => {
                 validate_recovery_evidence(
                     &evidence,
+                    false,
                     &execution_id,
                     &operation_digest,
                     &task_id,
@@ -261,6 +262,7 @@ impl<'a> ExecuteDurableTool<'a> {
             ToolExecutionClaim::Indeterminate(evidence) => {
                 validate_recovery_evidence(
                     &evidence,
+                    true,
                     &execution_id,
                     &operation_digest,
                     &task_id,
@@ -385,6 +387,7 @@ fn indeterminate_receipt(
 
 fn validate_recovery_evidence(
     evidence: &crate::ToolExecutionRecoveryEvidence,
+    expected_indeterminate: bool,
     execution_id: &crate::ToolExecutionId,
     operation_digest: &Sha256Digest,
     task_id: &TaskId,
@@ -398,7 +401,18 @@ fn validate_recovery_evidence(
         owner_run_id,
         executor_fencing_token,
     )?;
-    if &evidence.task_id != task_id
+    let state_matches = if expected_indeterminate {
+        evidence.state == crate::ToolExecutionRecoveryState::Indeterminate
+    } else {
+        matches!(
+            evidence.state,
+            crate::ToolExecutionRecoveryState::Claimed | crate::ToolExecutionRecoveryState::Started
+        )
+    };
+    if !state_matches
+        || &evidence.task_id != task_id
+        || (evidence.process_binding.is_some()
+            && evidence.state == crate::ToolExecutionRecoveryState::Claimed)
         || evidence
             .process_binding
             .as_ref()

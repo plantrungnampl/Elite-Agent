@@ -4,13 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use local_agent_terminal_application::{
-    ArtifactId, ArtifactWriteReservation, Clock, DurableToolExecutionReceipt, ImmutableToolRequest,
-    NewToolIntent, OperationIntentSnapshot, PortError, ProcessStatus, ProjectId, ReservedArtifact,
-    Retryability, SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor, TaskId,
-    TaskQuery, ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestPublisher,
-    ToolExecutionCancellationClaim, ToolExecutionId, ToolExecutionResolution,
-    ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal, ToolRequestPublisher,
-    WorkspaceEvidenceStore,
+    ArtifactId, ArtifactWriteReservation, AuthoritativeProcessBinding, Clock,
+    DurableToolExecutionReceipt, ImmutableToolRequest, IncompleteToolExecution, NewToolIntent,
+    OperationIntentSnapshot, PortError, ProcessStatus, ProjectId, ReservedArtifact, Retryability,
+    SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor, TaskId, TaskQuery,
+    ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestPublisher,
+    ToolExecutionCancellationClaim, ToolExecutionId, ToolExecutionRecoveryState,
+    ToolExecutionResolution, ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal,
+    ToolRequestPublisher, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
 use local_agent_terminal_storage_sqlite::SqliteStore;
@@ -19,8 +20,26 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
 type ToolWorkerResult = Result<DurableToolExecutionReceipt, PortError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolRuntimeAvailability {
+    Ready,
+    DegradedReadOnly,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolStartupRecoveryReport {
+    pub recovered: usize,
+    pub interrupted: usize,
+    pub indeterminate: usize,
+    pub terminated_retained_jobs: usize,
+    pub survivor_inspection_failures: usize,
+}
+
 struct ToolRuntimeState {
     dispatch_open: bool,
+    availability: ToolRuntimeAvailability,
+    recovery_report: Option<ToolStartupRecoveryReport>,
     workers: BTreeMap<ToolExecutionId, JoinHandle<ToolWorkerResult>>,
 }
 
@@ -40,11 +59,115 @@ impl ToolRuntime {
             executions,
             executor,
             state: Mutex::new(ToolRuntimeState {
-                dispatch_open: true,
+                dispatch_open: false,
+                availability: ToolRuntimeAvailability::Unavailable,
+                recovery_report: None,
                 workers: BTreeMap::new(),
             }),
             shutdown: Mutex::new(()),
         }
+    }
+
+    pub fn availability(&self) -> Result<ToolRuntimeAvailability, PortError> {
+        self.state
+            .lock()
+            .map(|state| state.availability)
+            .map_err(|_| internal_failure())
+    }
+
+    pub fn recover_startup(&self) -> Result<ToolStartupRecoveryReport, PortError> {
+        let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
+        {
+            let state = self.state.lock().map_err(|_| internal_failure())?;
+            if state.dispatch_open || !state.workers.is_empty() {
+                return Err(conflict());
+            }
+            if let Some(report) = &state.recovery_report {
+                return Ok(report.clone());
+            }
+        }
+
+        let incomplete = self.executions.incomplete()?;
+        let mut report = ToolStartupRecoveryReport::default();
+        let mut availability = ToolRuntimeAvailability::Ready;
+        for incomplete_execution in incomplete {
+            let (evidence, explicit_indeterminate) = match incomplete_execution {
+                IncompleteToolExecution::InFlight(evidence) => (evidence, false),
+                IncompleteToolExecution::Indeterminate(evidence) => (evidence, true),
+            };
+            validate_recovery_state(&evidence, explicit_indeterminate)?;
+            let terminal = match evidence.state {
+                ToolExecutionRecoveryState::Claimed => {
+                    report.interrupted += 1;
+                    Some(ToolExecutionTerminal::interrupted())
+                }
+                ToolExecutionRecoveryState::Started | ToolExecutionRecoveryState::Indeterminate => {
+                    report.indeterminate += 1;
+                    match evidence.process_binding.as_ref() {
+                        Some(binding) => match self.executor.terminate_retained_process(binding) {
+                            Ok(receipt) if exact_termination_receipt(binding, &receipt) => {
+                                report.terminated_retained_jobs += 1;
+                                availability = degrade(availability);
+                                Some(ToolExecutionTerminal::indeterminate(
+                                    SafeToolExecutionError {
+                                        classification: SafeErrorClassification::Unavailable,
+                                        retryability: Retryability::NonRetryable,
+                                    },
+                                ))
+                            }
+                            Ok(_) => {
+                                report.survivor_inspection_failures += 1;
+                                availability = ToolRuntimeAvailability::Unavailable;
+                                None
+                            }
+                            Err(_) => {
+                                report.survivor_inspection_failures += 1;
+                                availability = ToolRuntimeAvailability::Unavailable;
+                                None
+                            }
+                        },
+                        None if evidence.state == ToolExecutionRecoveryState::Indeterminate => {
+                            availability = degrade(availability);
+                            None
+                        }
+                        None => {
+                            report.survivor_inspection_failures += 1;
+                            availability = ToolRuntimeAvailability::Unavailable;
+                            None
+                        }
+                    }
+                }
+            };
+            let Some(terminal) = terminal else {
+                continue;
+            };
+            let resolution = ToolExecutionResolution::new(DurableToolExecutionReceipt::new(
+                evidence.authority,
+                terminal,
+            ));
+            let persisted = self.executions.resolve_terminal(resolution.clone())?;
+            if persisted != *resolution.receipt() {
+                return Err(integrity_failure());
+            }
+            report.recovered += 1;
+        }
+
+        let mut state = self.state.lock().map_err(|_| internal_failure())?;
+        if state.dispatch_open || !state.workers.is_empty() || state.recovery_report.is_some() {
+            return Err(conflict());
+        }
+        state.availability = availability;
+        state.recovery_report = Some(report.clone());
+        Ok(report)
+    }
+
+    pub fn release_dispatch(&self) -> Result<(), PortError> {
+        let mut state = self.state.lock().map_err(|_| internal_failure())?;
+        if state.recovery_report.is_none() || state.availability != ToolRuntimeAvailability::Ready {
+            return Err(unavailable());
+        }
+        state.dispatch_open = true;
+        Ok(())
     }
 
     pub fn dispatch(
@@ -53,7 +176,10 @@ impl ToolRuntime {
         worker: impl FnOnce() -> Result<DurableToolExecutionReceipt, PortError> + Send + 'static,
     ) -> Result<(), PortError> {
         let mut state = self.state.lock().map_err(|_| internal_failure())?;
-        if !state.dispatch_open || state.workers.contains_key(&execution_id) {
+        if !state.dispatch_open
+            || state.availability != ToolRuntimeAvailability::Ready
+            || state.workers.contains_key(&execution_id)
+        {
             return Err(conflict());
         }
         let handle = thread::Builder::new()
@@ -68,6 +194,7 @@ impl ToolRuntime {
         let workers = {
             let mut state = self.state.lock().map_err(|_| internal_failure())?;
             state.dispatch_open = false;
+            state.availability = ToolRuntimeAvailability::Unavailable;
             std::mem::take(&mut state.workers)
         };
         let mut authorities = BTreeMap::new();
@@ -339,6 +466,56 @@ fn validate_reservation(
         return Err(integrity_failure());
     }
     Ok(())
+}
+
+fn validate_recovery_state(
+    evidence: &local_agent_terminal_application::ToolExecutionRecoveryEvidence,
+    explicit_indeterminate: bool,
+) -> Result<(), PortError> {
+    let variant_matches = if explicit_indeterminate {
+        evidence.state == ToolExecutionRecoveryState::Indeterminate
+    } else {
+        matches!(
+            evidence.state,
+            ToolExecutionRecoveryState::Claimed | ToolExecutionRecoveryState::Started
+        )
+    };
+    if !variant_matches
+        || (evidence.state == ToolExecutionRecoveryState::Claimed
+            && evidence.process_binding.is_some())
+        || evidence
+            .process_binding
+            .as_ref()
+            .is_some_and(|binding| binding.authority() != &evidence.authority)
+    {
+        return Err(integrity_failure());
+    }
+    Ok(())
+}
+
+fn exact_termination_receipt(
+    binding: &AuthoritativeProcessBinding,
+    receipt: &local_agent_terminal_application::CancellationReceipt,
+) -> bool {
+    receipt.execution_id == *binding.authority().execution_id()
+        && receipt.status == ProcessStatus::Terminated
+        && receipt.cancelled
+        && receipt.job_receipt.as_ref().is_some_and(|job| {
+            job.root_pid == binding.root_pid()
+                && job.job_id == binding.job_id()
+                && job.kill_on_close
+                && job.no_breakaway
+                && job.tree_terminated
+        })
+}
+
+const fn degrade(availability: ToolRuntimeAvailability) -> ToolRuntimeAvailability {
+    match availability {
+        ToolRuntimeAvailability::Ready => ToolRuntimeAvailability::DegradedReadOnly,
+        ToolRuntimeAvailability::DegradedReadOnly | ToolRuntimeAvailability::Unavailable => {
+            availability
+        }
+    }
 }
 
 fn invalid_input() -> PortError {

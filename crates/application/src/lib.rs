@@ -104,10 +104,10 @@ pub use tool::{
     ResolvedEnvironmentProfile, ResolvedExecutable, ResolvedPrivateRuntimeDirectory,
     SafeToolExecutionError, StructuredGit, StructuredToolExecutor, ToolExecutionCancellationClaim,
     ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId,
-    ToolExecutionOutput, ToolExecutionRecoveryEvidence, ToolExecutionResolution,
-    ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
-    ToolPolicyContext, ToolRequest, ToolRequestBindingDigest, VerifiedBytes,
-    VerifiedFileWriteCompensation, VerifiedWrite,
+    ToolExecutionOutput, ToolExecutionRecoveryEvidence, ToolExecutionRecoveryState,
+    ToolExecutionResolution, ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal,
+    ToolExecutionTerminalKind, ToolPolicyContext, ToolRequest, ToolRequestBindingDigest,
+    VerifiedBytes, VerifiedFileWriteCompensation, VerifiedWrite,
 };
 pub use workspace::{
     ArtifactRootMode, GetWorkspaceDashboard, IdempotencyClass, IntentTransition, NewProject,

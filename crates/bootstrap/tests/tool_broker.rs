@@ -261,6 +261,8 @@ fn stop_all_closes_dispatch_cancels_each_running_execution_once_and_joins_worker
     let execution_port: Arc<dyn ToolExecutionStore> = executions.clone();
     let executor_port: Arc<dyn StructuredToolExecutor> = executor.clone();
     let runtime = ToolRuntime::new(execution_port, executor_port);
+    runtime.recover_startup().unwrap();
+    runtime.release_dispatch().unwrap();
 
     for authority in authorities.clone() {
         let execution_id = authority.execution_id().clone();
@@ -318,6 +320,8 @@ fn stop_all_persists_indeterminate_after_joining_a_panicked_worker() {
     let execution_port: Arc<dyn ToolExecutionStore> = executions.clone();
     let executor_port: Arc<dyn StructuredToolExecutor> = executor.clone();
     let runtime = ToolRuntime::new(execution_port, executor_port);
+    runtime.recover_startup().unwrap();
+    runtime.release_dispatch().unwrap();
     let execution_id = authority.execution_id().clone();
     runtime
         .dispatch(execution_id.clone(), || {
@@ -355,6 +359,8 @@ fn concurrent_stop_all_callers_wait_for_the_same_worker_join() {
     let execution_port: Arc<dyn ToolExecutionStore> = executions;
     let executor_port: Arc<dyn StructuredToolExecutor> = executor.clone();
     let runtime = Arc::new(ToolRuntime::new(execution_port, executor_port));
+    runtime.recover_startup().unwrap();
+    runtime.release_dispatch().unwrap();
     let execution_id = authority.execution_id().clone();
     let worker_execution_id = execution_id.clone();
     let worker_authority = authority.clone();

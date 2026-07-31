@@ -1362,11 +1362,19 @@ impl AuthoritativeProcessBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolExecutionRecoveryState {
+    Claimed,
+    Started,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionRecoveryEvidence {
     pub authority: ToolExecutionClaimAuthority,
     pub task_id: TaskId,
     pub canonical_request_artifact_id: ArtifactId,
     pub idempotency_class: crate::IdempotencyClass,
+    pub state: ToolExecutionRecoveryState,
     pub process_binding: Option<AuthoritativeProcessBinding>,
 }
 
@@ -1782,6 +1790,15 @@ pub trait ProcessLauncher: Send + Sync {
         bindings: &dyn ProcessExecutionBindingStore,
     ) -> Result<ProcessReceipt, PortError>;
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError>;
+    fn terminate_retained_process(
+        &self,
+        _binding: &AuthoritativeProcessBinding,
+    ) -> Result<CancellationReceipt, PortError> {
+        Err(PortError::failure(
+            SafeErrorClassification::Unavailable,
+            Retryability::NonRetryable,
+        ))
+    }
 }
 
 pub trait ProcessExecutionBindingStore: Send + Sync {
@@ -1850,6 +1867,15 @@ pub trait ApprovedProcessExecutor: Send + Sync {
         request: ApprovedProcessRequest,
     ) -> Result<ProcessReceipt, PortError>;
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError>;
+    fn terminate_retained_process(
+        &self,
+        _binding: &AuthoritativeProcessBinding,
+    ) -> Result<CancellationReceipt, PortError> {
+        Err(PortError::failure(
+            SafeErrorClassification::Unavailable,
+            Retryability::NonRetryable,
+        ))
+    }
 }
 
 pub trait ToolExecutionStore: Send + Sync {
@@ -1882,6 +1908,15 @@ pub trait ToolExecutionStore: Send + Sync {
 pub trait StructuredToolExecutor: Send + Sync {
     fn execute(&self, request: AuthorizedToolRequest) -> Result<ToolExecutionResult, PortError>;
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError>;
+    fn terminate_retained_process(
+        &self,
+        _binding: &AuthoritativeProcessBinding,
+    ) -> Result<CancellationReceipt, PortError> {
+        Err(PortError::failure(
+            SafeErrorClassification::Unavailable,
+            Retryability::NonRetryable,
+        ))
+    }
     fn file_read(
         &self,
         request: FileReadRequest,

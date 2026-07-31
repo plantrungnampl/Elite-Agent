@@ -14,8 +14,8 @@ use local_agent_terminal_application::{
     PolicyDecisionId, PolicyRequestBindingDigest, PortError, ProcessExecutionBindingStore,
     Retryability, SafeErrorClassification, SafeToolExecutionError, ToolExecutionCancellationClaim,
     ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId,
-    ToolExecutionOutput, ToolExecutionRecoveryEvidence, ToolExecutionResolution,
-    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
+    ToolExecutionOutput, ToolExecutionRecoveryEvidence, ToolExecutionRecoveryState,
+    ToolExecutionResolution, ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
     VerifiedFileWriteCompensation, WorkspaceMutationRequest,
 };
 use local_agent_terminal_domain::{
@@ -3238,6 +3238,12 @@ fn recovery_evidence(
     let authority = authority_from_intent(execution_id, intent)?;
     let process_binding =
         authoritative_process_binding_from_intent(execution_id, intent, &authority)?;
+    let state = match intent.status.as_str() {
+        "claimed" => ToolExecutionRecoveryState::Claimed,
+        "started" => ToolExecutionRecoveryState::Started,
+        "indeterminate" => ToolExecutionRecoveryState::Indeterminate,
+        _ => return Err(integrity_failure()),
+    };
     Ok(ToolExecutionRecoveryEvidence {
         authority,
         task_id: TaskId::new(intent.task_id.clone()).map_err(|_| integrity_failure())?,
@@ -3245,6 +3251,7 @@ fn recovery_evidence(
             .map_err(|_| integrity_failure())?,
         idempotency_class: IdempotencyClass::parse(&intent.idempotency_class)
             .ok_or_else(integrity_failure)?,
+        state,
         process_binding,
     })
 }

@@ -1,10 +1,11 @@
 use local_agent_terminal_application::{
     validate_and_order_process_writes, ApprovedProcessExecutor, ApprovedProcessRequest,
-    AuthorizedExpectedWrite, AuthorizedProcessRequest, CancellationReceipt, CapabilityRequest,
-    CapabilityResolver, EnforcedNetworkProfile, EnvironmentProfileResolver,
-    ExecutableProfileResolver, NetworkProfileVerifier, PortError, ProcessExecutionBindingStore,
-    ProcessFenceAuthority, ProcessLauncher, ProcessLimits, ProcessReceipt, ProcessWorkingDirectory,
-    Retryability, SafeErrorClassification, ToolExecutionId,
+    AuthoritativeProcessBinding, AuthorizedExpectedWrite, AuthorizedProcessRequest,
+    CancellationReceipt, CapabilityRequest, CapabilityResolver, EnforcedNetworkProfile,
+    EnvironmentProfileResolver, ExecutableProfileResolver, NetworkProfileVerifier, PortError,
+    ProcessExecutionBindingStore, ProcessFenceAuthority, ProcessLauncher, ProcessLimits,
+    ProcessReceipt, ProcessWorkingDirectory, Retryability, SafeErrorClassification,
+    ToolExecutionId,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, ExpectedWrite, LeaseClaim, ProcessTrustTier, TaskId,
@@ -161,6 +162,13 @@ impl<'a> ProcessRuntime<'a> {
         self.launcher.cancel(execution_id)
     }
 
+    pub fn terminate_retained_process(
+        &self,
+        binding: &AuthoritativeProcessBinding,
+    ) -> Result<CancellationReceipt, PortError> {
+        self.launcher.terminate_retained_process(binding)
+    }
+
     fn resolve_expected_writes(
         &self,
         task_id: &TaskId,
@@ -196,6 +204,13 @@ impl ApprovedProcessExecutor for ProcessRuntime<'_> {
 
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
         Self::cancel(self, execution_id)
+    }
+
+    fn terminate_retained_process(
+        &self,
+        binding: &AuthoritativeProcessBinding,
+    ) -> Result<CancellationReceipt, PortError> {
+        Self::terminate_retained_process(self, binding)
     }
 }
 

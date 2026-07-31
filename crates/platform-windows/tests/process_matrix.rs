@@ -141,6 +141,36 @@ struct TestProcessBindings {
     reject_record: bool,
 }
 
+#[cfg(feature = "test-seams")]
+struct CapturingProcessBindings {
+    authority: ToolExecutionClaimAuthority,
+    captured: Arc<Mutex<Option<AuthoritativeProcessBinding>>>,
+}
+
+#[cfg(feature = "test-seams")]
+impl ProcessExecutionBindingStore for CapturingProcessBindings {
+    fn load_claimed_authority(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<ToolExecutionClaimAuthority, PortError> {
+        if self.authority.execution_id() != execution_id {
+            return Err(test_binding_error());
+        }
+        Ok(self.authority.clone())
+    }
+
+    fn record_process_binding(
+        &self,
+        binding: AuthoritativeProcessBinding,
+    ) -> Result<(), PortError> {
+        if binding.authority() != &self.authority {
+            return Err(test_binding_error());
+        }
+        *self.captured.lock().unwrap() = Some(binding);
+        Ok(())
+    }
+}
+
 impl TestProcessBindings {
     fn accepting(authority: ToolExecutionClaimAuthority) -> Self {
         Self {
@@ -1925,6 +1955,112 @@ fn explicit_cancellation_terminates_a_live_real_lpac_root() {
     assert_real_lpac_lifecycle(&execution_id);
     drop(stderr_observation);
     assert!(observe_stderr_marker_for_test(execution_id, started_marker).is_some());
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn retained_process_recovery_validates_exact_authority_and_job_before_termination() {
+    let root = TempDir::new().unwrap();
+    let launcher = Arc::new(registered_lpac_launcher(root.path()));
+    let mut request = request(
+        vec![
+            "--exact".to_owned(),
+            "process_child_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        BTreeMap::from([(
+            "LAT_PROCESS_HELPER".to_owned(),
+            "bounded-inert-wait".to_owned(),
+        )]),
+    );
+    request.execution_id = ToolExecutionId::new("execution-retained-recovery").unwrap();
+    request.timeout_ms = 30_000;
+    let execution_id = request.execution_id.clone();
+    let authority = claimed_authority(&request);
+    let captured = Arc::new(Mutex::new(None));
+    let bindings = CapturingProcessBindings {
+        authority: authority.clone(),
+        captured: Arc::clone(&captured),
+    };
+    let executing = Arc::clone(&launcher);
+    let execution_authority = authority.clone();
+    let execution = thread::spawn(move || {
+        local_agent_terminal_application::ProcessLauncher::execute(
+            executing.as_ref(),
+            request,
+            &execution_authority,
+            &bindings,
+        )
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let binding = loop {
+        if let Some(binding) = captured.lock().unwrap().clone() {
+            break binding;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "process binding was not persisted"
+        );
+        thread::yield_now();
+    };
+    while lpac_lifecycle_counts_for_test(&execution_id).resumes_succeeded != 1 {
+        assert!(Instant::now() < deadline, "retained process did not resume");
+        thread::yield_now();
+    }
+
+    let wrong_authority = ToolExecutionClaimAuthority::from_persisted(
+        authority.execution_id().clone(),
+        authority.operation_digest().clone(),
+        authority.owner_run_id().clone(),
+        authority.attempt() + 1,
+        authority.executor_fencing_token(),
+    )
+    .unwrap();
+    let wrong_authority_binding =
+        AuthoritativeProcessBinding::new(wrong_authority, binding.root_pid(), binding.job_id())
+            .unwrap();
+    assert_eq!(
+        local_agent_terminal_application::ProcessLauncher::terminate_retained_process(
+            launcher.as_ref(),
+            &wrong_authority_binding,
+        )
+        .unwrap_err()
+        .safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert!(process_is_active(binding.root_pid()));
+
+    let wrong_job_binding =
+        AuthoritativeProcessBinding::new(authority, binding.root_pid(), "job-not-retained")
+            .unwrap();
+    assert_eq!(
+        local_agent_terminal_application::ProcessLauncher::terminate_retained_process(
+            launcher.as_ref(),
+            &wrong_job_binding,
+        )
+        .unwrap_err()
+        .safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert!(process_is_active(binding.root_pid()));
+
+    let termination =
+        local_agent_terminal_application::ProcessLauncher::terminate_retained_process(
+            launcher.as_ref(),
+            &binding,
+        )
+        .unwrap();
+    let receipt = execution.join().unwrap().unwrap();
+
+    assert_eq!(termination.execution_id, execution_id);
+    assert_eq!(termination.status, ProcessStatus::Terminated);
+    assert!(termination.cancelled);
+    let job = termination.job_receipt.unwrap();
+    assert_eq!(job.root_pid, binding.root_pid());
+    assert_eq!(job.job_id, binding.job_id());
+    assert!(job.tree_terminated);
+    assert_eq!(receipt.status, ProcessStatus::Terminated);
 }
 
 #[cfg(feature = "test-seams")]

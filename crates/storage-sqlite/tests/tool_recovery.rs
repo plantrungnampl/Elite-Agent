@@ -19,9 +19,9 @@ use local_agent_terminal_application::{
     ResolvedExecutable, SafeToolExecutionError, ToolApprovalOperationV1, ToolApprovalPayloadV1,
     ToolApprovalRequest, ToolExecutionCancellationClaim, ToolExecutionClaim,
     ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
-    ToolExecutionResolution, ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal,
-    ToolExecutionTerminalKind, ToolPolicyContext, ToolRequest, ToolRequestBindingDigest,
-    VerifiedFileWriteCompensation, VerifiedWrite,
+    ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResumeStore,
+    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolPolicyContext,
+    ToolRequest, ToolRequestBindingDigest, VerifiedFileWriteCompensation, VerifiedWrite,
 };
 use local_agent_terminal_domain::{
     combine_policy_rules, ActorId, ActorLocality, ArtifactId, CapabilityRef, EnvironmentProfile,
@@ -320,6 +320,7 @@ fn authoritative_process_binding_starts_only_the_exact_claim() {
     let [IncompleteToolExecution::InFlight(claimed)] = claimed_incomplete.as_slice() else {
         panic!("claimed execution must be reported as in flight");
     };
+    assert_eq!(claimed.state, ToolExecutionRecoveryState::Claimed);
     assert_eq!(claimed.process_binding, None);
     let binding =
         AuthoritativeProcessBinding::new(authority.clone(), 4_242, "job-process-binding").unwrap();
@@ -331,6 +332,7 @@ fn authoritative_process_binding_starts_only_the_exact_claim() {
     let [IncompleteToolExecution::InFlight(started)] = started_incomplete.as_slice() else {
         panic!("started execution must be reported as in flight");
     };
+    assert_eq!(started.state, ToolExecutionRecoveryState::Started);
     assert_eq!(started.process_binding.as_ref(), Some(&binding));
 
     let connection = configured_connection(&database.path);
@@ -1992,11 +1994,17 @@ fn incomplete_is_a_pure_read_for_running_and_explicitly_indeterminate_records() 
 
     assert_eq!(first, second);
     assert_eq!(second, third);
-    assert!(matches!(first[0], IncompleteToolExecution::InFlight(_)));
-    assert!(matches!(
-        first[1],
-        IncompleteToolExecution::Indeterminate(_)
-    ));
+    let IncompleteToolExecution::InFlight(in_flight) = &first[0] else {
+        panic!("started execution must remain in flight");
+    };
+    assert_eq!(in_flight.state, ToolExecutionRecoveryState::Started);
+    let IncompleteToolExecution::Indeterminate(indeterminate) = &first[1] else {
+        panic!("indeterminate execution must retain its explicit state");
+    };
+    assert_eq!(
+        indeterminate.state,
+        ToolExecutionRecoveryState::Indeterminate
+    );
     assert_eq!(durable_read_fingerprint(&database), before);
 }
 
