@@ -5,13 +5,14 @@ use local_agent_terminal_application::{
     canonical_file_write_recovery_request, canonical_policy_binding_digest,
     parse_file_write_recovery_request, parse_tool_request, policy_request_for_tool,
     validate_tool_approval_request, ApprovalDigestPayload, AuthoritativeProcessBinding,
-    AuthorizedToolExecutionClaim, CanonicalEvidenceRef, DeniedToolExecution,
-    DurableToolExecutionArtifact, DurableToolExecutionArtifacts, DurableToolExecutionReceipt,
-    FileWritePreImage, FileWriteRecoveryCompletion, FileWriteRecoveryFailure,
-    FileWriteRecoveryIntent, FileWriteRecoveryRequest, FileWriteRecoverySnapshot,
-    FileWriteRecoveryState, FileWriteRecoveryStore, IdempotencyClass, ImmutableToolRequest,
-    IncompleteToolExecution, NewToolExecution, NewToolIntent, OperationIntentSnapshot,
-    PolicyDecisionId, PolicyRequestBindingDigest, PortError, ProcessExecutionBindingStore,
+    AuthoritativeProcessTermination, AuthorizedToolExecutionClaim, CancellationReceipt,
+    CanonicalEvidenceRef, DeniedToolExecution, DurableToolExecutionArtifact,
+    DurableToolExecutionArtifacts, DurableToolExecutionReceipt, FileWritePreImage,
+    FileWriteRecoveryCompletion, FileWriteRecoveryFailure, FileWriteRecoveryIntent,
+    FileWriteRecoveryRequest, FileWriteRecoverySnapshot, FileWriteRecoveryState,
+    FileWriteRecoveryStore, IdempotencyClass, ImmutableToolRequest, IncompleteToolExecution,
+    JobReceipt, NewToolExecution, NewToolIntent, OperationIntentSnapshot, PolicyDecisionId,
+    PolicyRequestBindingDigest, PortError, ProcessExecutionBindingStore, ProcessStatus,
     Retryability, SafeErrorClassification, SafeToolExecutionError, ToolExecutionCancellationClaim,
     ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId,
     ToolExecutionOutput, ToolExecutionRecoveryEvidence, ToolExecutionRecoveryState,
@@ -912,6 +913,7 @@ impl ToolExecutionStore for SqliteStore {
             }
             return Err(conflict());
         }
+        validate_process_termination_resolution(&execution_id, &intent, resolution.receipt())?;
         let (expected_intent_status, expected_execution_status) = match (
             intent.status.as_str(),
             resolution.receipt().terminal().kind(),
@@ -2072,6 +2074,23 @@ fn authoritative_process_binding_from_intent(
     Ok(Some(binding))
 }
 
+fn validate_process_termination_resolution(
+    execution_id: &ToolExecutionId,
+    intent: &IntentRow,
+    receipt: &DurableToolExecutionReceipt,
+) -> Result<(), PortError> {
+    let Some(termination) = receipt.process_termination() else {
+        return Ok(());
+    };
+    let persisted =
+        authoritative_process_binding_from_intent(execution_id, intent, receipt.authority())?
+            .ok_or_else(integrity_failure)?;
+    if termination.binding() != &persisted {
+        return Err(integrity_failure());
+    }
+    Ok(())
+}
+
 fn incomplete_with_checkpoint(
     store: &SqliteStore,
     after_candidate_read: impl FnOnce(),
@@ -3075,6 +3094,13 @@ fn validate_started_event(
     execution_id: &ToolExecutionId,
     intent: &IntentRow,
 ) -> Result<(), PortError> {
+    let expected_binding = expected_started_process_binding(execution_id, intent)?;
+    let expected_root_pid = expected_binding
+        .as_ref()
+        .map(|binding| i64::from(binding.root_pid()));
+    let expected_job_id = expected_binding
+        .as_ref()
+        .map(AuthoritativeProcessBinding::job_id);
     let valid: bool = connection
         .query_row(
             "SELECT COUNT(*) = 1
@@ -3096,6 +3122,13 @@ fn validate_started_event(
                    (?6 IS NULL
                        AND json_type(payload_json, '$.executorFencingToken') = 'null')
                    OR json_extract(payload_json, '$.executorFencingToken') = ?6
+               )
+               AND (
+                   (?7 IS NULL AND ?8 IS NULL)
+                   OR (
+                       json_extract(payload_json, '$.rootPid') = ?7
+                       AND json_extract(payload_json, '$.jobId') = ?8
+                   )
                )",
             params![
                 intent.task_id,
@@ -3104,6 +3137,8 @@ fn validate_started_event(
                 intent.run_id,
                 intent.attempt_count,
                 intent.fencing_token,
+                expected_root_pid,
+                expected_job_id,
             ],
             |row| row.get(0),
         )
@@ -3113,6 +3148,32 @@ fn validate_started_event(
     } else {
         Err(integrity_failure())
     }
+}
+
+fn expected_started_process_binding(
+    execution_id: &ToolExecutionId,
+    intent: &IntentRow,
+) -> Result<Option<AuthoritativeProcessBinding>, PortError> {
+    let authority = authority_from_intent(execution_id, intent)?;
+    if intent.status == "started" {
+        return authoritative_process_binding_from_intent(execution_id, intent, &authority);
+    }
+    let Some(receipt_json) = intent.external_receipt_json.as_deref() else {
+        return Ok(None);
+    };
+    let value = serde_json::from_str::<Value>(receipt_json).map_err(|_| integrity_failure())?;
+    if value.get("schema").and_then(Value::as_str) != Some("tool-execution-terminal.v2") {
+        return Ok(None);
+    }
+    let receipt = parse_terminal_receipt(receipt_json)?;
+    if receipt.authority() != &authority {
+        return Err(integrity_failure());
+    }
+    receipt
+        .process_termination()
+        .map(|termination| termination.binding().clone())
+        .ok_or_else(integrity_failure)
+        .map(Some)
 }
 
 pub(crate) fn artifact_by_id_on_connection(
@@ -3371,7 +3432,7 @@ fn terminal_receipt_json(receipt: &DurableToolExecutionReceipt) -> String {
 
 fn terminal_receipt_value(receipt: &DurableToolExecutionReceipt) -> serde_json::Value {
     let authority = receipt.authority();
-    json!({
+    let mut value = json!({
         "authority": {
             "attempt": authority.attempt(),
             "executionId": authority.execution_id().as_str(),
@@ -3381,6 +3442,45 @@ fn terminal_receipt_value(receipt: &DurableToolExecutionReceipt) -> serde_json::
         },
         "schema": "tool-execution-terminal.v1",
         "terminal": terminal_value(receipt.terminal()),
+    });
+    if let Some(termination) = receipt.process_termination() {
+        value["schema"] = json!("tool-execution-terminal.v2");
+        value["processTermination"] = process_termination_value(termination);
+    }
+    value
+}
+
+fn process_termination_value(termination: &AuthoritativeProcessTermination) -> serde_json::Value {
+    let binding = termination.binding();
+    let receipt = termination.receipt();
+    let job = receipt
+        .job_receipt
+        .as_ref()
+        .expect("authoritative process termination has a Job receipt");
+    json!({
+        "binding": {
+            "jobId": binding.job_id(),
+            "rootPid": binding.root_pid(),
+        },
+        "receipt": {
+            "cancelled": receipt.cancelled,
+            "executionId": receipt.execution_id.as_str(),
+            "job": {
+                "cpuTimeLimitMs": job.cpu_time_limit_ms,
+                "jobCpuTimeLimit": job.job_cpu_time_limit,
+                "jobId": job.job_id,
+                "jobMemoryLimit": job.job_memory_limit,
+                "killOnClose": job.kill_on_close,
+                "maxActiveProcesses": job.max_active_processes,
+                "memoryLimitBytes": job.memory_limit_bytes,
+                "noBreakaway": job.no_breakaway,
+                "resourceLimitTerminated": job.resource_limit_terminated,
+                "rootPid": job.root_pid,
+                "totalUserTimeMs": job.total_user_time_ms,
+                "treeTerminated": job.tree_terminated,
+            },
+            "status": "terminated",
+        },
     })
 }
 
@@ -3505,7 +3605,11 @@ fn cancellation_event_payload(authority: &ToolExecutionClaimAuthority) -> serde_
 
 fn parse_terminal_receipt(value: &str) -> Result<DurableToolExecutionReceipt, PortError> {
     let value: serde_json::Value = serde_json::from_str(value).map_err(|_| integrity_failure())?;
-    if required_string(&value, "schema")? != "tool-execution-terminal.v1" {
+    let schema = required_string(&value, "schema")?;
+    if !matches!(
+        schema,
+        "tool-execution-terminal.v1" | "tool-execution-terminal.v2"
+    ) {
         return Err(integrity_failure());
     }
     let authority = required_object(&value, "authority")?;
@@ -3557,7 +3661,69 @@ fn parse_terminal_receipt(value: &str) -> Result<DurableToolExecutionReceipt, Po
         _ => Err(integrity_failure()),
     }
     .map_err(|_| integrity_failure())?;
-    Ok(DurableToolExecutionReceipt::new(authority, terminal))
+    match schema {
+        "tool-execution-terminal.v1" => {
+            if value.get("processTermination").is_some() {
+                return Err(integrity_failure());
+            }
+            Ok(DurableToolExecutionReceipt::new(authority, terminal))
+        }
+        "tool-execution-terminal.v2" => {
+            let error = terminal.error().copied().ok_or_else(integrity_failure)?;
+            let termination = parse_process_termination(&value, authority)?;
+            let receipt = DurableToolExecutionReceipt::recovered_process_termination(
+                error.classification,
+                termination,
+            );
+            if receipt.terminal() != &terminal {
+                return Err(integrity_failure());
+            }
+            Ok(receipt)
+        }
+        _ => Err(integrity_failure()),
+    }
+}
+
+fn parse_process_termination(
+    value: &serde_json::Value,
+    authority: ToolExecutionClaimAuthority,
+) -> Result<AuthoritativeProcessTermination, PortError> {
+    let termination = required_object(value, "processTermination")?;
+    let binding = required_object(termination, "binding")?;
+    let root_pid =
+        u32::try_from(required_u64(binding, "rootPid")?).map_err(|_| integrity_failure())?;
+    let binding =
+        AuthoritativeProcessBinding::new(authority, root_pid, required_string(binding, "jobId")?)
+            .map_err(|_| integrity_failure())?;
+
+    let receipt = required_object(termination, "receipt")?;
+    if required_string(receipt, "status")? != "terminated" {
+        return Err(integrity_failure());
+    }
+    let job = required_object(receipt, "job")?;
+    let cancellation = CancellationReceipt {
+        execution_id: ToolExecutionId::new(required_string(receipt, "executionId")?)
+            .map_err(|_| integrity_failure())?,
+        status: ProcessStatus::Terminated,
+        job_receipt: Some(JobReceipt {
+            root_pid: u32::try_from(required_u64(job, "rootPid")?)
+                .map_err(|_| integrity_failure())?,
+            job_id: required_string(job, "jobId")?.to_owned(),
+            kill_on_close: required_bool(job, "killOnClose")?,
+            no_breakaway: required_bool(job, "noBreakaway")?,
+            job_memory_limit: required_bool(job, "jobMemoryLimit")?,
+            job_cpu_time_limit: required_bool(job, "jobCpuTimeLimit")?,
+            memory_limit_bytes: required_u64(job, "memoryLimitBytes")?,
+            cpu_time_limit_ms: required_u64(job, "cpuTimeLimitMs")?,
+            max_active_processes: u32::try_from(required_u64(job, "maxActiveProcesses")?)
+                .map_err(|_| integrity_failure())?,
+            total_user_time_ms: required_u64(job, "totalUserTimeMs")?,
+            resource_limit_terminated: required_bool(job, "resourceLimitTerminated")?,
+            tree_terminated: required_bool(job, "treeTerminated")?,
+        }),
+        cancelled: required_bool(receipt, "cancelled")?,
+    };
+    AuthoritativeProcessTermination::new(binding, cancellation).map_err(|_| integrity_failure())
 }
 
 struct ParsedPersistedReceipt {

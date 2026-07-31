@@ -6,19 +6,19 @@ use std::sync::{Arc, Mutex};
 use local_agent_terminal_application::{
     bind_tool_approval_payload, canonical_approval_payload, canonical_policy_binding_digest,
     canonical_tool_request, parse_tool_request, ApprovalDigestPayload, ApprovedExecutableIdentity,
-    ApprovedProcessRequest, AuthoritativeProcessBinding, AuthorizedToolExecutionClaim,
-    AuthorizedToolRequest, BoundToolApproval, BoundedOutput, CancellationReceipt,
-    DeniedToolExecution, DurableToolCancellationOutcome, DurableToolExecutionArtifact,
-    DurableToolExecutionArtifacts, DurableToolExecutionOutcome, DurableToolExecutionReceipt,
-    ExecuteDurableTool, IdempotencyClass, IncompleteToolExecution, JobReceipt, NewToolExecution,
-    NewToolIntent, OperationIntentSnapshot, PortError, ProcessExecutionBindingStore,
-    ProcessReceipt, ProcessStatus, ResolvedExecutable, Retryability, SafeErrorClassification,
-    SafeToolExecutionError, StructuredToolExecutor, ToolApprovalOperationV1, ToolApprovalPayloadV1,
-    ToolExecutionCancellationClaim, ToolExecutionClaim, ToolExecutionClaimAuthority,
-    ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
-    ToolExecutionRecoveryEvidence, ToolExecutionRecoveryState, ToolExecutionResolution,
-    ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
-    ToolPolicyContext, ToolRequest,
+    ApprovedProcessRequest, AuthoritativeProcessBinding, AuthoritativeProcessTermination,
+    AuthorizedToolExecutionClaim, AuthorizedToolRequest, BoundToolApproval, BoundedOutput,
+    CancellationReceipt, DeniedToolExecution, DurableToolCancellationOutcome,
+    DurableToolExecutionArtifact, DurableToolExecutionArtifacts, DurableToolExecutionOutcome,
+    DurableToolExecutionReceipt, ExecuteDurableTool, IdempotencyClass, IncompleteToolExecution,
+    JobReceipt, NewToolExecution, NewToolIntent, OperationIntentSnapshot, PortError,
+    ProcessExecutionBindingStore, ProcessReceipt, ProcessStatus, ResolvedExecutable, Retryability,
+    SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor,
+    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionCancellationClaim,
+    ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId,
+    ToolExecutionOutput, ToolExecutionRecoveryEvidence, ToolExecutionRecoveryState,
+    ToolExecutionResolution, ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal,
+    ToolExecutionTerminalKind, ToolPolicyContext, ToolRequest,
 };
 use sha2::{Digest, Sha256};
 
@@ -941,6 +941,103 @@ fn terminal_accessors_expose_only_kind_appropriate_evidence() {
     );
     assert_eq!(indeterminate.output(), None);
     assert_eq!(indeterminate.error(), Some(&error));
+}
+
+#[test]
+fn recovered_process_termination_requires_exact_authoritative_evidence() {
+    let authority = claim_authority(
+        ToolExecutionId::new("execution-recovery").unwrap(),
+        digest('a'),
+    );
+    let binding =
+        AuthoritativeProcessBinding::new(authority.clone(), 4_242, "job-recovery").unwrap();
+    let exact = CancellationReceipt {
+        execution_id: authority.execution_id().clone(),
+        status: ProcessStatus::Terminated,
+        job_receipt: Some(JobReceipt {
+            root_pid: binding.root_pid(),
+            job_id: binding.job_id().to_owned(),
+            kill_on_close: true,
+            no_breakaway: true,
+            job_memory_limit: true,
+            job_cpu_time_limit: true,
+            memory_limit_bytes: 64,
+            cpu_time_limit_ms: 32,
+            max_active_processes: 1,
+            total_user_time_ms: 7,
+            resource_limit_terminated: false,
+            tree_terminated: true,
+        }),
+        cancelled: true,
+    };
+    let termination = AuthoritativeProcessTermination::new(binding.clone(), exact.clone()).unwrap();
+    let error = SafeToolExecutionError {
+        classification: SafeErrorClassification::Unavailable,
+        retryability: Retryability::NonRetryable,
+    };
+
+    let durable = DurableToolExecutionReceipt::recovered_process_termination(
+        error.classification,
+        termination.clone(),
+    );
+
+    assert_eq!(durable.authority(), &authority);
+    assert_eq!(
+        durable.terminal().kind(),
+        ToolExecutionTerminalKind::Indeterminate
+    );
+    assert_eq!(durable.terminal().error(), Some(&error));
+    assert_eq!(durable.process_termination(), Some(&termination));
+    assert_eq!(termination.binding(), &binding);
+    assert_eq!(termination.receipt(), &exact);
+    let ordinary_retryable = DurableToolExecutionReceipt::new(
+        authority.clone(),
+        ToolExecutionTerminal::indeterminate(SafeToolExecutionError {
+            classification: SafeErrorClassification::Unavailable,
+            retryability: Retryability::Retryable,
+        }),
+    );
+    assert_eq!(
+        ordinary_retryable.terminal().error().unwrap().retryability,
+        Retryability::Retryable
+    );
+    assert_eq!(ordinary_retryable.process_termination(), None);
+
+    let mut invalid = Vec::new();
+    let mut receipt = exact.clone();
+    receipt.execution_id = ToolExecutionId::new("execution-other").unwrap();
+    invalid.push(receipt);
+    let mut receipt = exact.clone();
+    receipt.status = ProcessStatus::Exited;
+    invalid.push(receipt);
+    let mut receipt = exact.clone();
+    receipt.cancelled = false;
+    invalid.push(receipt);
+    let mut receipt = exact.clone();
+    receipt.job_receipt = None;
+    invalid.push(receipt);
+    for field in [
+        "root_pid",
+        "job_id",
+        "kill_on_close",
+        "no_breakaway",
+        "tree_terminated",
+    ] {
+        let mut receipt = exact.clone();
+        let job = receipt.job_receipt.as_mut().unwrap();
+        match field {
+            "root_pid" => job.root_pid += 1,
+            "job_id" => job.job_id.push_str("-other"),
+            "kill_on_close" => job.kill_on_close = false,
+            "no_breakaway" => job.no_breakaway = false,
+            "tree_terminated" => job.tree_terminated = false,
+            _ => unreachable!(),
+        }
+        invalid.push(receipt);
+    }
+    for receipt in invalid {
+        assert!(AuthoritativeProcessTermination::new(binding.clone(), receipt).is_err());
+    }
 }
 
 #[test]

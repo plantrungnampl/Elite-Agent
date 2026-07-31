@@ -9,13 +9,14 @@ use local_agent_terminal_application::{
     policy_request_for_tool, validate_approval_resume_relation, ApprovalClaim,
     ApprovalDigestPayload, ApprovalId, ApprovalResolution, ApprovalResumeStore, ApprovalStore,
     ApprovedExecutableIdentity, ApprovedProcessRequest, AuthoritativeProcessBinding,
-    AuthorizedToolExecutionClaim, CanonicalEvidenceRef, CapabilityRootIdentity,
-    DurableToolExecutionArtifact, DurableToolExecutionArtifacts, DurableToolExecutionReceipt,
-    ExecutableFileIdentity, FileWritePolicyBinding, FileWritePreImage, FileWriteRecoveryCompletion,
+    AuthoritativeProcessTermination, AuthorizedToolExecutionClaim, CancellationReceipt,
+    CanonicalEvidenceRef, CapabilityRootIdentity, DurableToolExecutionArtifact,
+    DurableToolExecutionArtifacts, DurableToolExecutionReceipt, ExecutableFileIdentity,
+    FileWritePolicyBinding, FileWritePreImage, FileWriteRecoveryCompletion,
     FileWriteRecoveryFailure, FileWriteRecoveryIntent, FileWriteRecoveryRequest,
-    FileWriteRecoveryState, FileWriteRecoveryStore, IncompleteToolExecution, NewApproval,
-    NewToolExecution, NewToolIntent, PolicyDecision, PolicyDecisionStore,
-    ProcessExecutionBindingStore, RecordedPolicyDecision, RelativePathComponents,
+    FileWriteRecoveryState, FileWriteRecoveryStore, IncompleteToolExecution, JobReceipt,
+    NewApproval, NewToolExecution, NewToolIntent, PolicyDecision, PolicyDecisionStore,
+    ProcessExecutionBindingStore, ProcessStatus, RecordedPolicyDecision, RelativePathComponents,
     ResolvedExecutable, SafeToolExecutionError, ToolApprovalOperationV1, ToolApprovalPayloadV1,
     ToolApprovalRequest, ToolExecutionCancellationClaim, ToolExecutionClaim,
     ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
@@ -368,6 +369,206 @@ fn authoritative_process_binding_starts_only_the_exact_claim() {
     assert_integrity_failure(store.record_process_binding(
         AuthoritativeProcessBinding::new(authority, 4_243, "job-process-binding").unwrap(),
     ));
+}
+
+#[test]
+fn recovered_process_termination_round_trips_exact_receipt_and_audit() {
+    let database = TempDatabase::new();
+    let execution_id = "execution-recovered-process";
+    let (store, claim, _, _) = exact_approval_claim_fixture(&database, execution_id);
+    let operation_digest = claim.request_content_digest.clone();
+    let ToolExecutionClaim::Claimed(authority) = store.begin_authorized(claim).unwrap() else {
+        panic!("fresh authorized execution must win the durable claim");
+    };
+    let binding =
+        AuthoritativeProcessBinding::new(authority, 4_242, "job-recovered-process").unwrap();
+    store.record_process_binding(binding.clone()).unwrap();
+    let receipt = recovered_process_receipt(&binding);
+
+    assert_eq!(
+        store
+            .resolve_terminal(ToolExecutionResolution::new(receipt.clone()))
+            .unwrap(),
+        receipt
+    );
+
+    let connection = configured_connection(&database.path);
+    let persisted: String = connection
+        .query_row(
+            "SELECT external_receipt_json FROM operation_intents WHERE id = ?1",
+            [execution_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let wire: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+    assert_eq!(
+        wire,
+        serde_json::json!({
+            "authority": {
+                "attempt": 1,
+                "executionId": execution_id,
+                "executorFencingToken": 19,
+                "operationDigest": operation_digest.as_str(),
+                "ownerRunId": "run-1",
+            },
+            "processTermination": {
+                "binding": {
+                    "jobId": binding.job_id(),
+                    "rootPid": binding.root_pid(),
+                },
+                "receipt": {
+                    "cancelled": true,
+                    "executionId": execution_id,
+                    "job": {
+                        "cpuTimeLimitMs": 32,
+                        "jobCpuTimeLimit": true,
+                        "jobId": binding.job_id(),
+                        "jobMemoryLimit": true,
+                        "killOnClose": true,
+                        "maxActiveProcesses": 1,
+                        "memoryLimitBytes": 64,
+                        "noBreakaway": true,
+                        "resourceLimitTerminated": false,
+                        "rootPid": binding.root_pid(),
+                        "totalUserTimeMs": 7,
+                        "treeTerminated": true,
+                    },
+                    "status": "terminated",
+                },
+            },
+            "schema": "tool-execution-terminal.v2",
+            "terminal": {
+                "error": {
+                    "classification": "unavailable",
+                    "retryability": "non_retryable",
+                },
+                "kind": "indeterminate",
+            },
+        })
+    );
+    let event_payload: String = connection
+        .query_row(
+            "SELECT payload_json FROM events
+             WHERE event_type = 'tool.execution.completed'
+               AND json_extract(payload_json, '$.executionId') = ?1",
+            [execution_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event: serde_json::Value = serde_json::from_str(&event_payload).unwrap();
+    assert_eq!(event["receipt"], wire);
+
+    let reopened = SqliteStore::open(&database.path).unwrap();
+    assert_eq!(
+        reopened
+            .begin(NewToolExecution {
+                execution_id: ToolExecutionId::new(execution_id).unwrap(),
+                operation_digest: operation_digest.clone(),
+            })
+            .unwrap(),
+        ToolExecutionClaim::Completed(receipt)
+    );
+
+    let mut corrupt = wire;
+    corrupt["terminal"]["error"]["retryability"] =
+        serde_json::Value::String("retryable".to_owned());
+    connection
+        .execute(
+            "UPDATE operation_intents SET external_receipt_json = ?1 WHERE id = ?2",
+            params![corrupt.to_string(), execution_id],
+        )
+        .unwrap();
+    let before = durable_read_fingerprint(&database);
+    assert_integrity_failure(reopened.begin(NewToolExecution {
+        execution_id: ToolExecutionId::new(execution_id).unwrap(),
+        operation_digest,
+    }));
+    assert_eq!(durable_read_fingerprint(&database), before);
+}
+
+#[test]
+fn recovered_process_termination_rejects_binding_substitution_on_commit_and_replay() {
+    let database = TempDatabase::new();
+    let execution_id = "execution-recovery-binding-substitution";
+    let (store, claim, _, _) = exact_approval_claim_fixture(&database, execution_id);
+    let operation_digest = claim.request_content_digest.clone();
+    let ToolExecutionClaim::Claimed(authority) = store.begin_authorized(claim).unwrap() else {
+        panic!("fresh authorized execution must win the durable claim");
+    };
+    let persisted_binding =
+        AuthoritativeProcessBinding::new(authority.clone(), 4_242, "job-recovery-binding-original")
+            .unwrap();
+    store
+        .record_process_binding(persisted_binding.clone())
+        .unwrap();
+    let substituted_binding =
+        AuthoritativeProcessBinding::new(authority, 4_243, "job-recovery-binding-substituted")
+            .unwrap();
+    let before = durable_read_fingerprint(&database);
+
+    assert_integrity_failure(store.resolve_terminal(ToolExecutionResolution::new(
+        recovered_process_receipt(&substituted_binding),
+    )));
+    assert_eq!(durable_read_fingerprint(&database), before);
+    assert_eq!(lifecycle_state(&database, execution_id), "running:started");
+
+    store
+        .resolve_terminal(ToolExecutionResolution::new(recovered_process_receipt(
+            &persisted_binding,
+        )))
+        .unwrap();
+    let connection = configured_connection(&database.path);
+    let receipt_json: String = connection
+        .query_row(
+            "SELECT external_receipt_json FROM operation_intents WHERE id = ?1",
+            [execution_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut substituted_receipt: serde_json::Value = serde_json::from_str(&receipt_json).unwrap();
+    substituted_receipt["processTermination"]["binding"]["rootPid"] =
+        serde_json::json!(substituted_binding.root_pid());
+    substituted_receipt["processTermination"]["binding"]["jobId"] =
+        serde_json::json!(substituted_binding.job_id());
+    substituted_receipt["processTermination"]["receipt"]["job"]["rootPid"] =
+        serde_json::json!(substituted_binding.root_pid());
+    substituted_receipt["processTermination"]["receipt"]["job"]["jobId"] =
+        serde_json::json!(substituted_binding.job_id());
+    let event_json: String = connection
+        .query_row(
+            "SELECT payload_json FROM events
+             WHERE event_type = 'tool.execution.completed'
+               AND json_extract(payload_json, '$.executionId') = ?1",
+            [execution_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut substituted_event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+    substituted_event["receipt"] = substituted_receipt.clone();
+    connection
+        .execute_batch("DROP TRIGGER events_update_forbidden;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE operation_intents SET external_receipt_json = ?1 WHERE id = ?2",
+            params![substituted_receipt.to_string(), execution_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE events SET payload_json = ?1
+             WHERE event_type = 'tool.execution.completed'
+               AND json_extract(payload_json, '$.executionId') = ?2",
+            params![substituted_event.to_string(), execution_id],
+        )
+        .unwrap();
+    let before = durable_read_fingerprint(&database);
+
+    assert_integrity_failure(store.begin(NewToolExecution {
+        execution_id: ToolExecutionId::new(execution_id).unwrap(),
+        operation_digest,
+    }));
+    assert_eq!(durable_read_fingerprint(&database), before);
 }
 
 #[test]
@@ -2509,6 +2710,33 @@ fn terminal_fixture(
             })
         }
     }
+}
+
+fn recovered_process_receipt(binding: &AuthoritativeProcessBinding) -> DurableToolExecutionReceipt {
+    let cancellation = CancellationReceipt {
+        execution_id: binding.authority().execution_id().clone(),
+        status: ProcessStatus::Terminated,
+        job_receipt: Some(JobReceipt {
+            root_pid: binding.root_pid(),
+            job_id: binding.job_id().to_owned(),
+            kill_on_close: true,
+            no_breakaway: true,
+            job_memory_limit: true,
+            job_cpu_time_limit: true,
+            memory_limit_bytes: 64,
+            cpu_time_limit_ms: 32,
+            max_active_processes: 1,
+            total_user_time_ms: 7,
+            resource_limit_terminated: false,
+            tree_terminated: true,
+        }),
+        cancelled: true,
+    };
+    let termination = AuthoritativeProcessTermination::new(binding.clone(), cancellation).unwrap();
+    DurableToolExecutionReceipt::recovered_process_termination(
+        local_agent_terminal_application::SafeErrorClassification::Unavailable,
+        termination,
+    )
 }
 
 fn terminal_kind_label(kind: ToolExecutionTerminalKind) -> &'static str {

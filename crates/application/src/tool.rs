@@ -1221,6 +1221,7 @@ impl ToolExecutionTerminal {
 pub struct DurableToolExecutionReceipt {
     authority: ToolExecutionClaimAuthority,
     terminal: ToolExecutionTerminal,
+    process_termination: Option<Box<AuthoritativeProcessTermination>>,
 }
 
 impl DurableToolExecutionReceipt {
@@ -1228,6 +1229,22 @@ impl DurableToolExecutionReceipt {
         Self {
             authority,
             terminal,
+            process_termination: None,
+        }
+    }
+
+    #[must_use]
+    pub fn recovered_process_termination(
+        classification: SafeErrorClassification,
+        process_termination: AuthoritativeProcessTermination,
+    ) -> Self {
+        Self {
+            authority: process_termination.binding.authority.clone(),
+            terminal: ToolExecutionTerminal::indeterminate(SafeToolExecutionError {
+                classification,
+                retryability: Retryability::NonRetryable,
+            }),
+            process_termination: Some(Box::new(process_termination)),
         }
     }
 
@@ -1270,6 +1287,10 @@ impl DurableToolExecutionReceipt {
 
     pub const fn terminal(&self) -> &ToolExecutionTerminal {
         &self.terminal
+    }
+
+    pub fn process_termination(&self) -> Option<&AuthoritativeProcessTermination> {
+        self.process_termination.as_deref()
     }
 }
 
@@ -1358,6 +1379,43 @@ impl AuthoritativeProcessBinding {
 
     pub fn job_id(&self) -> &str {
         &self.job_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoritativeProcessTermination {
+    binding: AuthoritativeProcessBinding,
+    receipt: CancellationReceipt,
+}
+
+impl AuthoritativeProcessTermination {
+    pub fn new(
+        binding: AuthoritativeProcessBinding,
+        receipt: CancellationReceipt,
+    ) -> Result<Self, PortError> {
+        let Some(job) = receipt.job_receipt.as_ref() else {
+            return Err(invalid_input());
+        };
+        if receipt.execution_id != *binding.authority().execution_id()
+            || receipt.status != ProcessStatus::Terminated
+            || !receipt.cancelled
+            || job.root_pid != binding.root_pid()
+            || job.job_id != binding.job_id()
+            || !job.kill_on_close
+            || !job.no_breakaway
+            || !job.tree_terminated
+        {
+            return Err(invalid_input());
+        }
+        Ok(Self { binding, receipt })
+    }
+
+    pub const fn binding(&self) -> &AuthoritativeProcessBinding {
+        &self.binding
+    }
+
+    pub const fn receipt(&self) -> &CancellationReceipt {
+        &self.receipt
     }
 }
 

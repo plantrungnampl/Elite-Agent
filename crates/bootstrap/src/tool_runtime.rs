@@ -4,13 +4,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use local_agent_terminal_application::{
-    ArtifactId, ArtifactWriteReservation, AuthoritativeProcessBinding, Clock,
-    DurableToolExecutionReceipt, ImmutableToolRequest, IncompleteToolExecution, NewToolIntent,
-    OperationIntentSnapshot, PortError, ProcessStatus, ProjectId, ReservedArtifact,
-    RetainedProcessController, Retryability, SafeErrorClassification, SafeToolExecutionError,
-    StructuredToolExecutor, TaskId, TaskQuery, ToolApprovalPublication, ToolApprovalRequest,
-    ToolApprovalRequestPublisher, ToolExecutionCancellationClaim, ToolExecutionId,
-    ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResumeStore,
+    ArtifactId, ArtifactWriteReservation, AuthoritativeProcessBinding,
+    AuthoritativeProcessTermination, Clock, DurableToolExecutionReceipt, ImmutableToolRequest,
+    IncompleteToolExecution, NewToolIntent, OperationIntentSnapshot, PortError, ProcessStatus,
+    ProjectId, ReservedArtifact, RetainedProcessController, Retryability, SafeErrorClassification,
+    SafeToolExecutionError, StructuredToolExecutor, TaskId, TaskQuery, ToolApprovalPublication,
+    ToolApprovalRequest, ToolApprovalRequestPublisher, ToolExecutionCancellationClaim,
+    ToolExecutionId, ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResumeStore,
     ToolExecutionStore, ToolExecutionTerminal, ToolRequestPublisher, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
@@ -133,31 +133,39 @@ impl ToolRuntime {
                 IncompleteToolExecution::Indeterminate(evidence) => (evidence, true),
             };
             validate_recovery_state(&evidence, explicit_indeterminate)?;
-            let terminal = match evidence.state {
+            let receipt = match evidence.state {
                 ToolExecutionRecoveryState::Claimed => {
                     report.interrupted += 1;
-                    Some(ToolExecutionTerminal::interrupted())
+                    Some(DurableToolExecutionReceipt::new(
+                        evidence.authority.clone(),
+                        ToolExecutionTerminal::interrupted(),
+                    ))
                 }
                 ToolExecutionRecoveryState::Started | ToolExecutionRecoveryState::Indeterminate => {
                     report.indeterminate += 1;
                     match evidence.process_binding.as_ref() {
                         Some(binding) => {
                             match self.retained_processes.terminate_retained_process(binding) {
-                                Ok(receipt) if exact_termination_receipt(binding, &receipt) => {
-                                    report.terminated_retained_jobs += 1;
-                                    availability = degrade(availability);
-                                    Some(ToolExecutionTerminal::indeterminate(
-                                        SafeToolExecutionError {
-                                            classification: SafeErrorClassification::Unavailable,
-                                            retryability: Retryability::NonRetryable,
-                                        },
-                                    ))
-                                }
-                                Ok(_) => {
-                                    report.survivor_inspection_failures += 1;
-                                    availability = ToolRuntimeAvailability::Unavailable;
-                                    None
-                                }
+                                Ok(receipt) => match AuthoritativeProcessTermination::new(
+                                    binding.clone(),
+                                    receipt,
+                                ) {
+                                    Ok(termination) => {
+                                        report.terminated_retained_jobs += 1;
+                                        availability = degrade(availability);
+                                        Some(
+                                            DurableToolExecutionReceipt::recovered_process_termination(
+                                                SafeErrorClassification::Unavailable,
+                                                termination,
+                                            ),
+                                        )
+                                    }
+                                    Err(_) => {
+                                        report.survivor_inspection_failures += 1;
+                                        availability = ToolRuntimeAvailability::Unavailable;
+                                        None
+                                    }
+                                },
                                 Err(_) => {
                                     report.survivor_inspection_failures += 1;
                                     availability = ToolRuntimeAvailability::Unavailable;
@@ -177,13 +185,10 @@ impl ToolRuntime {
                     }
                 }
             };
-            let Some(terminal) = terminal else {
+            let Some(receipt) = receipt else {
                 continue;
             };
-            let resolution = ToolExecutionResolution::new(DurableToolExecutionReceipt::new(
-                evidence.authority,
-                terminal,
-            ));
+            let resolution = ToolExecutionResolution::new(receipt);
             let persisted = self.executions.resolve_terminal(resolution.clone())?;
             if persisted != *resolution.receipt() {
                 return Err(integrity_failure());
@@ -534,22 +539,6 @@ fn validate_recovery_state(
         return Err(integrity_failure());
     }
     Ok(())
-}
-
-fn exact_termination_receipt(
-    binding: &AuthoritativeProcessBinding,
-    receipt: &local_agent_terminal_application::CancellationReceipt,
-) -> bool {
-    receipt.execution_id == *binding.authority().execution_id()
-        && receipt.status == ProcessStatus::Terminated
-        && receipt.cancelled
-        && receipt.job_receipt.as_ref().is_some_and(|job| {
-            job.root_pid == binding.root_pid()
-                && job.job_id == binding.job_id()
-                && job.kill_on_close
-                && job.no_breakaway
-                && job.tree_terminated
-        })
 }
 
 const fn degrade(availability: ToolRuntimeAvailability) -> ToolRuntimeAvailability {

@@ -3,16 +3,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use local_agent_terminal_application::{
-    ArtifactId, AuthoritativeProcessBinding, AuthorizedToolExecutionClaim, AuthorizedToolRequest,
-    CancellationReceipt, DeniedToolExecution, DisclosureOutcome, DurableToolExecutionReceipt,
-    FileReadRequest, FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest,
-    GitStatusResult, IdempotencyClass, ImmutableToolRequest, IncompleteToolExecution, JobReceipt,
-    NewToolExecution, NewToolIntent, OperationIntentSnapshot, PolicyBoundBytes, PortError,
-    ProcessStatus, Retryability, SafeErrorClassification, StructuredToolExecutor,
-    ToolExecutionCancellationClaim, ToolExecutionClaim, ToolExecutionClaimAuthority,
-    ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionRecoveryEvidence,
-    ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResult, ToolExecutionStore,
-    ToolExecutionTerminalKind, VerifiedWrite,
+    ArtifactId, AuthoritativeProcessBinding, AuthoritativeProcessTermination,
+    AuthorizedToolExecutionClaim, AuthorizedToolRequest, CancellationReceipt, DeniedToolExecution,
+    DisclosureOutcome, DurableToolExecutionReceipt, FileReadRequest, FileWriteRequest,
+    GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, IdempotencyClass,
+    ImmutableToolRequest, IncompleteToolExecution, JobReceipt, NewToolExecution, NewToolIntent,
+    OperationIntentSnapshot, PolicyBoundBytes, PortError, ProcessStatus, Retryability,
+    SafeErrorClassification, StructuredToolExecutor, ToolExecutionCancellationClaim,
+    ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId,
+    ToolExecutionRecoveryEvidence, ToolExecutionRecoveryState, ToolExecutionResolution,
+    ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminalKind, VerifiedWrite,
 };
 use local_agent_terminal_bootstrap::{ToolRuntime, ToolRuntimeAvailability};
 use local_agent_terminal_domain::{RunId, Sha256Digest, TaskId};
@@ -65,9 +65,10 @@ fn startup_recovery_terminates_exact_retained_job_and_never_relaunches() {
     let store = Arc::new(RecoveryExecutionStore::new(vec![
         IncompleteToolExecution::InFlight(evidence.clone()),
     ]));
+    let cancellation = cancellation_receipt(&binding);
     let executor = Arc::new(RecoveryExecutor::with_cancellation(
         binding.authority().execution_id().clone(),
-        cancellation_receipt(&binding),
+        cancellation.clone(),
     ));
     let runtime = runtime(store.clone(), executor.clone());
 
@@ -86,16 +87,20 @@ fn startup_recovery_terminates_exact_retained_job_and_never_relaunches() {
     );
     assert!(runtime.release_dispatch().is_err());
     assert_eq!(executor.execute_calls(), 0);
-    assert_eq!(executor.terminated_bindings(), vec![binding]);
+    assert_eq!(executor.terminated_bindings(), vec![binding.clone()]);
     assert_eq!(store.incomplete_calls(), 1);
     assert_eq!(store.resolution_count(), 1);
+    let terminal = store.terminal(evidence.authority.execution_id()).unwrap();
     assert_eq!(
-        store
-            .terminal(evidence.authority.execution_id())
-            .unwrap()
-            .terminal()
-            .kind(),
+        terminal.terminal().kind(),
         ToolExecutionTerminalKind::Indeterminate
+    );
+    assert_eq!(
+        terminal.process_termination(),
+        Some(
+            &AuthoritativeProcessTermination::new(binding, cancellation)
+                .expect("the retained-process receipt is authoritative")
+        )
     );
 }
 
