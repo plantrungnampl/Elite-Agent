@@ -3,20 +3,21 @@ use std::path::{Path, PathBuf};
 
 use git2::{IndexAddOption, Repository, RepositoryInitOptions, Signature};
 use local_agent_terminal_application::{
-    AcquireLease, ArtifactRootMode, ArtifactWriteReservation, CanonicalEvidenceRef,
-    CanonicalJsonRequest, Clock, ConfirmDiscardWorkspaceRequestDto, CreateWorktree,
-    DiscardWorktree, ExecutorLeaseStore, ExpectedPresence, IdempotencyClass, InspectRepository,
-    IntentTransition, ManagedWorktreePath, NewProject, NewTask, OnboardRepositoryRequestDto,
-    OperationIntent, OperationIntentStatus, PortError, ProjectSettings, RecoveryAction,
-    RecoveryCandidateRequestDto, RecoveryReason, RepositoryGateway, RepositoryInspectionRecord,
-    ReservedArtifact, RiskLevel, SafeErrorClassification, StartupStateDto, TaskQuery,
-    WorkspaceDashboardRequestDto, WorkspaceRecoveryStore, WorkspaceStateStore, WorktreeIntent,
-    WorktreeState,
+    canonical_approval_payload, AcquireLease, ApprovalDigestPayload, ApprovalId, ApprovalStore,
+    ArtifactRootMode, ArtifactWriteReservation, CanonicalEvidenceRef, CanonicalJsonRequest, Clock,
+    ConfirmDiscardWorkspaceRequestDto, CreateWorktree, DiscardWorktree, ExecutorLeaseStore,
+    ExpectedPresence, IdempotencyClass, InspectRepository, IntentTransition, ManagedWorktreePath,
+    NewApproval, NewProject, NewTask, OnboardRepositoryRequestDto, OperationIntent,
+    OperationIntentStatus, PolicyExceptionApprovalOperationV1, PolicyExceptionApprovalPayloadV1,
+    PortError, ProjectSettings, RecoveryAction, RecoveryCandidateRequestDto, RecoveryReason,
+    RepositoryGateway, RepositoryInspectionRecord, ReservedArtifact, RiskLevel,
+    SafeErrorClassification, StartupStateDto, TaskQuery, WorkspaceDashboardRequestDto,
+    WorkspaceRecoveryStore, WorkspaceStateStore, WorktreeIntent, WorktreeState,
 };
-use local_agent_terminal_bootstrap::{Bootstrap, StartupConfig};
+use local_agent_terminal_bootstrap::{Bootstrap, StartupConfig, ToolRuntimeAvailability};
 use local_agent_terminal_domain::{
-    ActorId, ArtifactId, FencingToken, LeaseClaim, ProjectId, RunId, TaskBranch, TaskId,
-    WorkspaceVersion, WorktreeId,
+    ActorId, ArtifactId, FencingToken, LeaseClaim, ProjectId, RunId, Sha256Digest, TaskBranch,
+    TaskId, WorkspaceVersion, WorktreeId,
 };
 use local_agent_terminal_repository_git::GitRepositoryGateway;
 use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
@@ -25,6 +26,7 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 const PROJECT_ID: &str = "project-1";
+const FENCE_ORDER_PROJECT_ID: &str = "project-fence-order";
 const TASK_ID: &str = "task-1";
 const WORKTREE_ID: &str = "worktree-task-1";
 const WORKTREE_BRANCH: &str = "codex/task-1";
@@ -46,6 +48,14 @@ fn startup_exposes_workspace_runtime_only_after_ordered_recovery() {
 
     assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
     assert!(bootstrap.workspace_runtime().is_some());
+    assert_eq!(
+        bootstrap
+            .tool_runtime()
+            .expect("tool runtime")
+            .availability()
+            .expect("tool availability"),
+        ToolRuntimeAvailability::Unavailable
+    );
     assert!(bootstrap
         .workspace_runtime()
         .expect("runtime")
@@ -65,8 +75,10 @@ fn startup_exposes_workspace_runtime_only_after_ordered_recovery() {
             "startup.artifacts.validated",
             "startup.artifacts.reconciled",
             "startup.leases.fenced",
+            "startup.tools.reconciled",
             "startup.repositories.reconciled",
             "startup.intents.reconciled",
+            "startup.approvals.expired",
             "startup.ready",
         ]
     );
@@ -712,6 +724,39 @@ fn startup_fences_every_preexisting_executor_lease_before_ready() {
     }));
 }
 
+#[test]
+fn startup_fences_stale_leases_before_pending_repository_recovery() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_active_lease();
+    fixture.seed_pending_onboarding(FENCE_ORDER_PROJECT_ID);
+    fixture.install_lease_fence_failure();
+
+    let bootstrap = fixture.start();
+
+    assert_ne!(bootstrap.status().state, StartupStateDto::Ready);
+    assert_eq!(
+        fixture.repository_completion_count(FENCE_ORDER_PROJECT_ID),
+        0
+    );
+}
+
+#[test]
+fn startup_expires_open_approvals_before_ready() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_expired_approval();
+
+    let bootstrap = fixture.start();
+
+    assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
+    assert_eq!(
+        fixture.approval_status("approval-startup-expired"),
+        "expired"
+    );
+    assert!(bootstrap.local_diagnostics().iter().any(|diagnostic| {
+        diagnostic.code == "startup.approvals.expired" && diagnostic.detail.contains("expired=1")
+    }));
+}
+
 struct WorkspaceFixture {
     root: TempDir,
     app_data: PathBuf,
@@ -1172,6 +1217,145 @@ impl WorkspaceFixture {
             })
             .expect("lease");
         assert_eq!(lease.token.get(), 1);
+    }
+
+    fn seed_pending_onboarding(&self, project_id: &str) {
+        let source = self.root.path().join(format!("source-{project_id}"));
+        fs::create_dir(&source).expect("pending source");
+        commit_repository(&source);
+        let gateway =
+            GitRepositoryGateway::open(&self.workspace_root, &[self.app_data.join("artifacts")])
+                .expect("gateway");
+        let locator = gateway.locate(&source).expect("locator");
+        let repository = gateway
+            .inspect(InspectRepository {
+                locator: locator.clone(),
+            })
+            .expect("repository inspection");
+        SqliteStore::open(&self.database_path)
+            .expect("database")
+            .create_project(NewProject {
+                project_id: ProjectId::new(project_id).expect("project id"),
+                name: "Fence ordering fixture".to_owned(),
+                repository,
+                repository_path: locator.canonical_workdir.to_string_lossy().into_owned(),
+                settings: ProjectSettings {
+                    policy_profile_id: "default".to_owned(),
+                    artifact_root_mode: ArtifactRootMode::ApplicationData,
+                    artifact_root_path: self
+                        .app_data
+                        .join("artifacts")
+                        .to_string_lossy()
+                        .into_owned(),
+                },
+                created_at: "2026-07-26T00:00:07Z".to_owned(),
+            })
+            .expect("pending onboarding");
+    }
+
+    fn install_lease_fence_failure(&self) {
+        Connection::open(&self.database_path)
+            .expect("database")
+            .execute_batch(
+                "CREATE TRIGGER fail_startup_lease_fence
+                 BEFORE UPDATE OF status ON executor_leases
+                 WHEN OLD.status = 'active' AND NEW.status = 'revoked'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'fixture lease fence failure');
+                 END;",
+            )
+            .expect("lease fence failure trigger");
+    }
+
+    fn repository_completion_count(&self, project_id: &str) -> i64 {
+        Connection::open(&self.database_path)
+            .expect("database")
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE stream_id = ?1 AND event_type = 'repository.inspected'",
+                [format!("project:{project_id}")],
+                |row| row.get(0),
+            )
+            .expect("repository completion count")
+    }
+
+    fn seed_expired_approval(&self) {
+        let database = SqliteStore::open(&self.database_path).expect("database");
+        let artifacts = ContentAddressedArtifactStore::open(self.app_data.join("artifacts"))
+            .expect("artifact store");
+        let payload = PolicyExceptionApprovalPayloadV1 {
+            schema: "approval-digest.v1".to_owned(),
+            approval_type: "policy_exception".to_owned(),
+            task_id: TASK_ID.to_owned(),
+            operation: PolicyExceptionApprovalOperationV1 {
+                actor_binding_digest: EMPTY_JSON_HASH.to_owned(),
+                purpose: "startup expiry evidence".to_owned(),
+                resource_digest: EMPTY_JSON_HASH.to_owned(),
+                destination: "local-ui".to_owned(),
+                effective_payload_digest: EMPTY_JSON_HASH.to_owned(),
+                redaction_report_digest: EMPTY_JSON_HASH.to_owned(),
+            },
+            policy_snapshot_digest: EMPTY_JSON_HASH.to_owned(),
+            workspace_version: 0,
+            requested_at: "2000-01-01T00:00:00Z".to_owned(),
+            expires_at: "2000-01-02T00:00:00Z".to_owned(),
+            nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+        };
+        let canonical =
+            canonical_approval_payload(&ApprovalDigestPayload::PolicyException(payload.clone()))
+                .expect("canonical approval");
+        let artifact_id = "artifact-startup-expired-approval";
+        let digest = canonical.operation_digest.as_str();
+        JournaledArtifactWriter::new(&artifacts, &database, &FixedClock)
+            .write(
+                ArtifactWriteReservation {
+                    operation_id: "write-startup-expired-approval".to_owned(),
+                    artifact: ReservedArtifact {
+                        artifact_id: artifact_id.to_owned(),
+                        task_id: Some(TaskId::new(TASK_ID).expect("task id")),
+                        project_id: PROJECT_ID.to_owned(),
+                        artifact_type: "approval-payload".to_owned(),
+                        logical_path: "approvals/approval-startup-expired.json".to_owned(),
+                        content_hash: digest.to_owned(),
+                        storage_key: format!("objects/{}/{}", &digest[7..9], &digest[7..]),
+                        size_bytes: u64::try_from(canonical.canonical_bytes.len())
+                            .expect("approval size"),
+                        mime_type: Some("application/json".to_owned()),
+                        created_by_type: "core".to_owned(),
+                        created_by_id: "workspace-coordinator".to_owned(),
+                        created_at: "2000-01-01T00:00:00Z".to_owned(),
+                        supersedes: None,
+                    },
+                    temp_name: "artifact-startup-expired-approval.tmp".to_owned(),
+                    created_at: "2000-01-01T00:00:00Z".to_owned(),
+                },
+                &canonical.canonical_bytes,
+            )
+            .expect("approval artifact");
+        database
+            .request(NewApproval {
+                approval_id: ApprovalId::new("approval-startup-expired").expect("approval id"),
+                operation_digest: canonical.operation_digest,
+                task_id: TaskId::new(TASK_ID).expect("task id"),
+                workspace_version: WorkspaceVersion::new(0),
+                policy_snapshot_digest: Sha256Digest::new(EMPTY_JSON_HASH).expect("policy digest"),
+                fencing_token: None,
+                tool_request_binding_digest: None,
+                expires_at: payload.expires_at,
+                nonce: payload.nonce,
+            })
+            .expect("open approval");
+    }
+
+    fn approval_status(&self, approval_id: &str) -> String {
+        Connection::open(&self.database_path)
+            .expect("database")
+            .query_row(
+                "SELECT status FROM approvals WHERE id = ?1",
+                [approval_id],
+                |row| row.get(0),
+            )
+            .expect("approval status")
     }
 
     fn intent_status(&self) -> String {

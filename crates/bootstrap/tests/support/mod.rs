@@ -366,7 +366,7 @@ impl WorkspaceFixture {
                         approval_type,
                         EMPTY_JSON_HASH,
                         "2026-07-26T00:00:07Z",
-                        "2026-07-26T01:00:07Z",
+                        "2099-07-26T01:00:07Z",
                         "artifact-worktree-request"
                     ],
                 )

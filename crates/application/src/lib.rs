@@ -24,11 +24,11 @@ mod workspace;
 pub use append_events::AppendEvents;
 pub use approval::{
     build_approval_request, canonical_approval_payload, parse_approval_payload, ApprovalCheck,
-    ApprovalClaim, ApprovalDigestPayload, ApprovalId, ApprovalInvalidation, ApprovalRequestBuild,
-    ApprovalResolution, ApprovalSnapshot, ApprovalState, ApprovalStore, CanonicalApprovalPayload,
-    NewApproval, PolicyExceptionApprovalOperationV1, PolicyExceptionApprovalPayloadV1,
-    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolApprovalPublication, ToolApprovalRequest,
-    ToolApprovalRequestPublisher,
+    ApprovalClaim, ApprovalDigestPayload, ApprovalExpiryStore, ApprovalId, ApprovalInvalidation,
+    ApprovalRequestBuild, ApprovalResolution, ApprovalSnapshot, ApprovalState, ApprovalStore,
+    CanonicalApprovalPayload, NewApproval, PolicyExceptionApprovalOperationV1,
+    PolicyExceptionApprovalPayloadV1, ToolApprovalOperationV1, ToolApprovalPayloadV1,
+    ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestPublisher,
 };
 pub use authority::{
     validate_authoritative_tool_request, ToolAuthorityResolver, ToolAuthoritySnapshot,
@@ -102,12 +102,13 @@ pub use tool::{
     ProcessLimits, ProcessReceipt, ProcessStatus, ProcessWorkingDirectory, RawGitDiffResult,
     RawGitStatusResult, RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget,
     ResolvedEnvironmentProfile, ResolvedExecutable, ResolvedPrivateRuntimeDirectory,
-    SafeToolExecutionError, StructuredGit, StructuredToolExecutor, ToolExecutionCancellationClaim,
-    ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId,
-    ToolExecutionOutput, ToolExecutionRecoveryEvidence, ToolExecutionRecoveryState,
-    ToolExecutionResolution, ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal,
-    ToolExecutionTerminalKind, ToolPolicyContext, ToolRequest, ToolRequestBindingDigest,
-    VerifiedBytes, VerifiedFileWriteCompensation, VerifiedWrite,
+    RetainedProcessController, SafeToolExecutionError, StructuredGit, StructuredToolExecutor,
+    ToolExecutionCancellationClaim, ToolExecutionClaim, ToolExecutionClaimAuthority,
+    ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
+    ToolExecutionRecoveryEvidence, ToolExecutionRecoveryState, ToolExecutionResolution,
+    ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
+    ToolPolicyContext, ToolRequest, ToolRequestBindingDigest, VerifiedBytes,
+    VerifiedFileWriteCompensation, VerifiedWrite,
 };
 pub use workspace::{
     ArtifactRootMode, GetWorkspaceDashboard, IdempotencyClass, IntentTransition, NewProject,

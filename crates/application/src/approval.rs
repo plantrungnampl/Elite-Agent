@@ -313,6 +313,10 @@ pub trait ApprovalStore: Send + Sync {
     fn invalidate(&self, request: ApprovalInvalidation) -> Result<u64, PortError>;
 }
 
+pub trait ApprovalExpiryStore: Send + Sync {
+    fn expire_before(&self, observed_at: &str) -> Result<u64, PortError>;
+}
+
 pub fn parse_approval_payload(raw: &str) -> Result<ApprovalDigestPayload, PortError> {
     reject_noncanonical_numbers(raw)?;
     let mut deserializer = serde_json::Deserializer::from_str(raw);

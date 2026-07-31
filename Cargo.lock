@@ -1870,6 +1870,7 @@ dependencies = [
  "git2",
  "local-agent-terminal-application",
  "local-agent-terminal-domain",
+ "local-agent-terminal-platform-windows",
  "local-agent-terminal-repository-git",
  "local-agent-terminal-storage-files",
  "local-agent-terminal-storage-sqlite",

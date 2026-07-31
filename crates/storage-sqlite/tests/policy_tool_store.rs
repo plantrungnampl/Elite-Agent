@@ -5,9 +5,10 @@ use std::sync::{Arc, Barrier};
 
 use local_agent_terminal_application::{
     bind_tool_approval_payload, canonical_approval_payload, ApprovalCheck, ApprovalClaim,
-    ApprovalDigestPayload, ApprovalId, ApprovalInvalidation, ApprovalResolution, ApprovalState,
-    ApprovalStore, ApprovedExecutableIdentity, ApprovedProcessRequest, ExecutableFileIdentity,
-    NewApproval, PolicyDecision, PolicyDecisionStore, RecordedPolicyDecision, ResolvedExecutable,
+    ApprovalDigestPayload, ApprovalExpiryStore, ApprovalId, ApprovalInvalidation,
+    ApprovalResolution, ApprovalState, ApprovalStore, ApprovedExecutableIdentity,
+    ApprovedProcessRequest, ExecutableFileIdentity, NewApproval, PolicyDecision,
+    PolicyDecisionStore, RecordedPolicyDecision, ResolvedExecutable, SafeErrorClassification,
     ToolApprovalOperationV1, ToolApprovalPayloadV1,
 };
 use local_agent_terminal_domain::{
@@ -425,6 +426,121 @@ fn fencing_change_and_expiry_invalidate_grants() {
             expected_status
         );
     }
+}
+
+#[test]
+fn startup_expiry_atomically_invalidates_open_approvals_once() {
+    let database = TestDatabase::new();
+    for (index, expires_at, grant) in [
+        (1, "2026-08-23T12:10:00Z", false),
+        (2, "2026-08-23T12:15:00Z", true),
+        (3, "2026-08-23T12:30:00Z", false),
+    ] {
+        let (mut payload, binding) = approval_payload();
+        payload.expires_at = expires_at.to_owned();
+        payload.nonce = format!("{index:032}");
+        let canonical =
+            canonical_approval_payload(&ApprovalDigestPayload::Tool(payload.clone())).unwrap();
+        let approval_id = ApprovalId::new(format!("approval-expiry-{index}")).unwrap();
+        persist_artifact(
+            &database,
+            &format!("approval-expiry-artifact-{index}"),
+            &format!("approvals/{}.json", approval_id.as_str()),
+            &canonical.canonical_bytes,
+        );
+        database
+            .store
+            .request(NewApproval {
+                approval_id: approval_id.clone(),
+                operation_digest: canonical.operation_digest,
+                task_id: TaskId::new("task-1").unwrap(),
+                workspace_version: WorkspaceVersion::new(4),
+                policy_snapshot_digest: digest('b'),
+                fencing_token: Some(1),
+                tool_request_binding_digest: Some(binding),
+                expires_at: payload.expires_at,
+                nonce: payload.nonce,
+            })
+            .unwrap();
+        if grant {
+            database
+                .store
+                .resolve(ApprovalResolution {
+                    approval_id,
+                    approved: true,
+                })
+                .unwrap();
+        }
+    }
+
+    configured_connection(&database.path)
+        .execute_batch(
+            "DROP TRIGGER approval_request_fields_immutable;
+             UPDATE approvals SET expires_at = 'not-a-timestamp'
+             WHERE id = 'approval-expiry-3';",
+        )
+        .unwrap();
+    assert_eq!(
+        database
+            .store
+            .expire_before("2026-08-23T12:16:00Z")
+            .unwrap_err()
+            .safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(
+        configured_connection(&database.path)
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'approval.expired'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    configured_connection(&database.path)
+        .execute(
+            "UPDATE approvals SET expires_at = '2026-08-23T12:30:00Z'
+             WHERE id = 'approval-expiry-3'",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(
+        database
+            .store
+            .expire_before("2026-08-23T12:16:00Z")
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        database
+            .store
+            .expire_before("2026-08-23T12:16:00Z")
+            .unwrap(),
+        0
+    );
+    let connection = configured_connection(&database.path);
+    assert_eq!(
+        connection
+            .prepare("SELECT status FROM approvals ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        ["expired", "expired", "pending"]
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'approval.expired'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        2
+    );
 }
 
 #[test]

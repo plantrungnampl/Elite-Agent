@@ -1801,6 +1801,25 @@ pub trait ProcessLauncher: Send + Sync {
     }
 }
 
+pub trait RetainedProcessController: Send + Sync {
+    fn terminate_retained_process(
+        &self,
+        binding: &AuthoritativeProcessBinding,
+    ) -> Result<CancellationReceipt, PortError>;
+}
+
+impl<T> RetainedProcessController for T
+where
+    T: ProcessLauncher + ?Sized,
+{
+    fn terminate_retained_process(
+        &self,
+        binding: &AuthoritativeProcessBinding,
+    ) -> Result<CancellationReceipt, PortError> {
+        ProcessLauncher::terminate_retained_process(self, binding)
+    }
+}
+
 pub trait ProcessExecutionBindingStore: Send + Sync {
     fn load_claimed_authority(
         &self,

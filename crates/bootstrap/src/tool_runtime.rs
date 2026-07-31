@@ -6,12 +6,12 @@ use std::thread::{self, JoinHandle};
 use local_agent_terminal_application::{
     ArtifactId, ArtifactWriteReservation, AuthoritativeProcessBinding, Clock,
     DurableToolExecutionReceipt, ImmutableToolRequest, IncompleteToolExecution, NewToolIntent,
-    OperationIntentSnapshot, PortError, ProcessStatus, ProjectId, ReservedArtifact, Retryability,
-    SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor, TaskId, TaskQuery,
-    ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestPublisher,
-    ToolExecutionCancellationClaim, ToolExecutionId, ToolExecutionRecoveryState,
-    ToolExecutionResolution, ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal,
-    ToolRequestPublisher, WorkspaceEvidenceStore,
+    OperationIntentSnapshot, PortError, ProcessStatus, ProjectId, ReservedArtifact,
+    RetainedProcessController, Retryability, SafeErrorClassification, SafeToolExecutionError,
+    StructuredToolExecutor, TaskId, TaskQuery, ToolApprovalPublication, ToolApprovalRequest,
+    ToolApprovalRequestPublisher, ToolExecutionCancellationClaim, ToolExecutionId,
+    ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResumeStore,
+    ToolExecutionStore, ToolExecutionTerminal, ToolRequestPublisher, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
 use local_agent_terminal_storage_sqlite::SqliteStore;
@@ -45,9 +45,23 @@ struct ToolRuntimeState {
 
 pub struct ToolRuntime {
     executions: Arc<dyn ToolExecutionStore>,
-    executor: Arc<dyn StructuredToolExecutor>,
+    executor: Option<Arc<dyn StructuredToolExecutor>>,
+    retained_processes: Arc<dyn RetainedProcessController>,
     state: Mutex<ToolRuntimeState>,
     shutdown: Mutex<()>,
+}
+
+struct StructuredExecutorProcessController {
+    executor: Arc<dyn StructuredToolExecutor>,
+}
+
+impl RetainedProcessController for StructuredExecutorProcessController {
+    fn terminate_retained_process(
+        &self,
+        binding: &AuthoritativeProcessBinding,
+    ) -> Result<local_agent_terminal_application::CancellationReceipt, PortError> {
+        self.executor.terminate_retained_process(binding)
+    }
 }
 
 impl ToolRuntime {
@@ -55,9 +69,28 @@ impl ToolRuntime {
         executions: Arc<dyn ToolExecutionStore>,
         executor: Arc<dyn StructuredToolExecutor>,
     ) -> Self {
+        let retained_processes = Arc::new(StructuredExecutorProcessController {
+            executor: Arc::clone(&executor),
+        });
+        Self::configured(executions, Some(executor), retained_processes)
+    }
+
+    pub fn recovery_only(
+        executions: Arc<dyn ToolExecutionStore>,
+        retained_processes: Arc<dyn RetainedProcessController>,
+    ) -> Self {
+        Self::configured(executions, None, retained_processes)
+    }
+
+    fn configured(
+        executions: Arc<dyn ToolExecutionStore>,
+        executor: Option<Arc<dyn StructuredToolExecutor>>,
+        retained_processes: Arc<dyn RetainedProcessController>,
+    ) -> Self {
         Self {
             executions,
             executor,
+            retained_processes,
             state: Mutex::new(ToolRuntimeState {
                 dispatch_open: false,
                 availability: ToolRuntimeAvailability::Unavailable,
@@ -89,7 +122,11 @@ impl ToolRuntime {
 
         let incomplete = self.executions.incomplete()?;
         let mut report = ToolStartupRecoveryReport::default();
-        let mut availability = ToolRuntimeAvailability::Ready;
+        let mut availability = if self.executor.is_some() {
+            ToolRuntimeAvailability::Ready
+        } else {
+            ToolRuntimeAvailability::Unavailable
+        };
         for incomplete_execution in incomplete {
             let (evidence, explicit_indeterminate) = match incomplete_execution {
                 IncompleteToolExecution::InFlight(evidence) => (evidence, false),
@@ -104,28 +141,30 @@ impl ToolRuntime {
                 ToolExecutionRecoveryState::Started | ToolExecutionRecoveryState::Indeterminate => {
                     report.indeterminate += 1;
                     match evidence.process_binding.as_ref() {
-                        Some(binding) => match self.executor.terminate_retained_process(binding) {
-                            Ok(receipt) if exact_termination_receipt(binding, &receipt) => {
-                                report.terminated_retained_jobs += 1;
-                                availability = degrade(availability);
-                                Some(ToolExecutionTerminal::indeterminate(
-                                    SafeToolExecutionError {
-                                        classification: SafeErrorClassification::Unavailable,
-                                        retryability: Retryability::NonRetryable,
-                                    },
-                                ))
+                        Some(binding) => {
+                            match self.retained_processes.terminate_retained_process(binding) {
+                                Ok(receipt) if exact_termination_receipt(binding, &receipt) => {
+                                    report.terminated_retained_jobs += 1;
+                                    availability = degrade(availability);
+                                    Some(ToolExecutionTerminal::indeterminate(
+                                        SafeToolExecutionError {
+                                            classification: SafeErrorClassification::Unavailable,
+                                            retryability: Retryability::NonRetryable,
+                                        },
+                                    ))
+                                }
+                                Ok(_) => {
+                                    report.survivor_inspection_failures += 1;
+                                    availability = ToolRuntimeAvailability::Unavailable;
+                                    None
+                                }
+                                Err(_) => {
+                                    report.survivor_inspection_failures += 1;
+                                    availability = ToolRuntimeAvailability::Unavailable;
+                                    None
+                                }
                             }
-                            Ok(_) => {
-                                report.survivor_inspection_failures += 1;
-                                availability = ToolRuntimeAvailability::Unavailable;
-                                None
-                            }
-                            Err(_) => {
-                                report.survivor_inspection_failures += 1;
-                                availability = ToolRuntimeAvailability::Unavailable;
-                                None
-                            }
-                        },
+                        }
                         None if evidence.state == ToolExecutionRecoveryState::Indeterminate => {
                             availability = degrade(availability);
                             None
@@ -197,6 +236,10 @@ impl ToolRuntime {
             state.availability = ToolRuntimeAvailability::Unavailable;
             std::mem::take(&mut state.workers)
         };
+        if workers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let executor = self.executor.as_ref().ok_or_else(unavailable)?;
         let mut authorities = BTreeMap::new();
         let mut completed = BTreeMap::new();
         let mut cancellation_errors = BTreeMap::new();
@@ -205,7 +248,7 @@ impl ToolRuntime {
             match self.executions.request_cancellation(execution_id) {
                 Ok(ToolExecutionCancellationClaim::Claimed(authority)) => {
                     authorities.insert(execution_id.clone(), authority);
-                    match self.executor.cancel(execution_id) {
+                    match executor.cancel(execution_id) {
                         Ok(receipt)
                             if receipt.execution_id == *execution_id
                                 && receipt.status == ProcessStatus::Terminated

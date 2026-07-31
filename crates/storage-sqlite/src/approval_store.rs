@@ -1,12 +1,12 @@
 use local_agent_terminal_application::{
     canonical_approval_payload, parse_approval_payload, parse_policy_timestamp, parse_tool_request,
     validate_tool_approval_request, ApprovalCheck, ApprovalClaim, ApprovalDigestPayload,
-    ApprovalId, ApprovalInvalidation, ApprovalResolution, ApprovalResumeSnapshot,
-    ApprovalResumeStore, ApprovalSnapshot, ApprovalState, ApprovalStore, ImmutableToolRequest,
-    NewApproval, OperationIntentStatus, PolicyDecisionId, PolicyRequestBindingDigest, PortError,
-    Retryability, SafeErrorClassification, ToolApprovalPublication, ToolApprovalRequest,
-    ToolExecutionId, ToolExecutionResumeSnapshot, ToolExecutionResumeStore,
-    ToolRequestBindingDigest,
+    ApprovalExpiryStore, ApprovalId, ApprovalInvalidation, ApprovalResolution,
+    ApprovalResumeSnapshot, ApprovalResumeStore, ApprovalSnapshot, ApprovalState, ApprovalStore,
+    ImmutableToolRequest, NewApproval, OperationIntentStatus, PolicyDecisionId,
+    PolicyRequestBindingDigest, PortError, Retryability, SafeErrorClassification,
+    ToolApprovalPublication, ToolApprovalRequest, ToolExecutionId, ToolExecutionResumeSnapshot,
+    ToolExecutionResumeStore, ToolRequestBindingDigest,
 };
 use local_agent_terminal_domain::{
     ArtifactId, FencingToken, RunId, Sha256Digest, TaskId, Timestamp, WorkspaceVersion,
@@ -317,6 +317,47 @@ impl ApprovalStore for SqliteStore {
                 "workspace_version_changed",
                 "approval.invalidated",
             )?;
+        }
+        transaction.commit().map_err(sqlite_error_to_port)?;
+        u64::try_from(ids.len()).map_err(|_| invalid_input())
+    }
+}
+
+impl ApprovalExpiryStore for SqliteStore {
+    fn expire_before(&self, observed_at: &str) -> Result<u64, PortError> {
+        let observed_at = parse_policy_timestamp(observed_at).map_err(|_| invalid_input())?;
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error_to_port)?;
+        let open_approvals = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id, expires_at FROM approvals
+                     WHERE status IN ('pending', 'granted')
+                     ORDER BY id",
+                )
+                .map_err(sqlite_error_to_port)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(sqlite_error_to_port)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_error_to_port)?;
+            rows
+        };
+        let mut ids = Vec::new();
+        for (id, expires_at) in open_approvals {
+            let expires_at =
+                parse_policy_timestamp(&expires_at).map_err(|_| integrity_failure())?;
+            if expires_at.unix_seconds() <= observed_at.unix_seconds() {
+                ids.push(id);
+            }
+        }
+        for id in &ids {
+            let approval_id = ApprovalId::new(id.clone()).map_err(|_| integrity_failure())?;
+            invalidate_one(&transaction, &approval_id, "expired", "approval.expired")?;
         }
         transaction.commit().map_err(sqlite_error_to_port)?;
         u64::try_from(ids.len()).map_err(|_| invalid_input())

@@ -37,7 +37,6 @@ pub struct WorkspaceRuntime {
 }
 
 pub(crate) struct WorkspaceRecoveryReport {
-    pub(crate) fenced_leases: usize,
     pub(crate) repositories_scanned: usize,
     pub(crate) recovery_candidates: Vec<RecoveryCandidate>,
 }
@@ -1028,13 +1027,16 @@ impl WorkspaceRuntime {
     }
 }
 
-pub(crate) fn reconcile_startup(
+pub(crate) fn fence_stale_leases(database: &SqliteStore) -> Result<usize, PortError> {
+    database.fence_stale().map(|leases| leases.len())
+}
+
+pub(crate) fn reconcile_workspace_after_fencing(
     database: &SqliteStore,
     artifacts: &ContentAddressedArtifactStore,
     repositories: &GitRepositoryGateway,
 ) -> Result<WorkspaceRecoveryReport, PortError> {
     reconcile_pending_onboarding(database, artifacts, repositories)?;
-    let fenced_leases = database.fence_stale()?.len();
     let started = database.started_recoveries()?;
     let projects = database
         .recovery_projects()?
@@ -1203,7 +1205,6 @@ pub(crate) fn reconcile_startup(
         }
     }
     Ok(WorkspaceRecoveryReport {
-        fenced_leases,
         repositories_scanned: scanned.len(),
         recovery_candidates,
     })

@@ -1,11 +1,14 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use local_agent_terminal_application::{
-    DiagnosticSeverityDto, LocalDiagnosticDto, ObservationClassDto, PortError,
-    SafeErrorClassification, StartupIssueDto, StartupRecoveryActionDto, StartupStateDto,
-    StartupStatusDto, TrustLabelDto,
+    ApprovalExpiryStore, Clock, DiagnosticSeverityDto, LocalDiagnosticDto, ObservationClassDto,
+    PortError, RetainedProcessController, SafeErrorClassification, StartupIssueDto,
+    StartupRecoveryActionDto, StartupStateDto, StartupStatusDto, ToolExecutionStore, TrustLabelDto,
 };
+#[cfg(windows)]
+use local_agent_terminal_platform_windows::WindowsProcessLauncher;
 use local_agent_terminal_repository_git::GitRepositoryGateway;
 use local_agent_terminal_storage_files::{
     reconcile_artifacts, ContentAddressedArtifactStore, RecoveryLock,
@@ -13,7 +16,10 @@ use local_agent_terminal_storage_files::{
 use local_agent_terminal_storage_sqlite::{DatabaseHealth, DatabaseIssue, OpenError, SqliteStore};
 
 use crate::logging::LocalLog;
-use crate::workspace_runtime::{reconcile_startup, WorkspaceRuntime};
+use crate::tool_runtime::{ToolRuntime, ToolRuntimeAvailability};
+use crate::workspace_runtime::{
+    fence_stale_leases, reconcile_workspace_after_fencing, WorkspaceRuntime,
+};
 
 pub struct StartupConfig {
     pub app_data_dir: PathBuf,
@@ -26,6 +32,39 @@ pub struct Bootstrap {
     status: StartupStatusDto,
     diagnostics: Vec<LocalDiagnosticDto>,
     runtime: Option<WorkspaceRuntime>,
+    tool_runtime: Option<ToolRuntime>,
+    retained_processes: Arc<dyn RetainedProcessController>,
+}
+
+struct StartupRuntimes {
+    workspace: WorkspaceRuntime,
+    tools: ToolRuntime,
+}
+
+#[cfg(windows)]
+fn default_retained_process_controller() -> Arc<dyn RetainedProcessController> {
+    Arc::new(WindowsProcessLauncher::fail_closed())
+}
+
+#[cfg(not(windows))]
+struct UnavailableRetainedProcessController;
+
+#[cfg(not(windows))]
+impl RetainedProcessController for UnavailableRetainedProcessController {
+    fn terminate_retained_process(
+        &self,
+        _binding: &local_agent_terminal_application::AuthoritativeProcessBinding,
+    ) -> Result<local_agent_terminal_application::CancellationReceipt, PortError> {
+        Err(PortError::failure(
+            SafeErrorClassification::Unavailable,
+            local_agent_terminal_application::Retryability::NonRetryable,
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn default_retained_process_controller() -> Arc<dyn RetainedProcessController> {
+    Arc::new(UnavailableRetainedProcessController)
 }
 
 struct StartupFailure {
@@ -53,6 +92,8 @@ impl Bootstrap {
             },
             diagnostics: Vec::new(),
             runtime: None,
+            tool_runtime: None,
+            retained_processes: default_retained_process_controller(),
         };
         bootstrap.retry_startup_validation();
         bootstrap
@@ -95,9 +136,10 @@ impl Bootstrap {
             return &self.status;
         };
         self.runtime = None;
+        self.tool_runtime = None;
         let mut log = LocalLog::new(config.secret_values.clone());
-        match start(config, &mut log) {
-            Ok(runtime) => {
+        match start(config, &mut log, Arc::clone(&self.retained_processes)) {
+            Ok(runtimes) => {
                 log.push(record(
                     "startup.ready",
                     "bootstrap",
@@ -109,7 +151,8 @@ impl Bootstrap {
                     state: StartupStateDto::Ready,
                     issues: Vec::new(),
                 };
-                self.runtime = Some(runtime);
+                self.runtime = Some(runtimes.workspace);
+                self.tool_runtime = Some(runtimes.tools);
             }
             Err(failure) => {
                 log.push(record(
@@ -128,6 +171,7 @@ impl Bootstrap {
                     }],
                 };
                 self.runtime = None;
+                self.tool_runtime = None;
             }
         }
         self.diagnostics = log.into_records();
@@ -140,6 +184,10 @@ impl Bootstrap {
 
     pub fn workspace_runtime(&self) -> Option<&WorkspaceRuntime> {
         self.runtime.as_ref()
+    }
+
+    pub fn tool_runtime(&self) -> Option<&ToolRuntime> {
+        self.tool_runtime.as_ref()
     }
 
     fn failed(failure: StartupFailure) -> Self {
@@ -163,11 +211,17 @@ impl Bootstrap {
             },
             diagnostics: log.into_records(),
             runtime: None,
+            tool_runtime: None,
+            retained_processes: default_retained_process_controller(),
         }
     }
 }
 
-fn start(config: &StartupConfig, log: &mut LocalLog) -> Result<WorkspaceRuntime, StartupFailure> {
+fn start(
+    config: &StartupConfig,
+    log: &mut LocalLog,
+    retained_processes: Arc<dyn RetainedProcessController>,
+) -> Result<StartupRuntimes, StartupFailure> {
     let _recovery_lock =
         RecoveryLock::acquire(&config.app_data_dir).map_err(recovery_lock_failure)?;
     log.push(record(
@@ -225,6 +279,40 @@ fn start(config: &StartupConfig, log: &mut LocalLog) -> Result<WorkspaceRuntime,
         ),
     ));
 
+    let fenced_leases = fence_stale_leases(&database).map_err(workspace_reconciliation_failure)?;
+    log.push(record(
+        "startup.leases.fenced",
+        "storage-sqlite",
+        DiagnosticSeverityDto::Info,
+        None,
+        &format!(
+            "Stale executor lease fencing completed: fenced={}.",
+            fenced_leases
+        ),
+    ));
+
+    let tool_database = SqliteStore::open(config.app_data_dir.join("state.sqlite3"))
+        .map_err(database_open_failure)?;
+    let executions: Arc<dyn ToolExecutionStore> = Arc::new(tool_database);
+    let tools = ToolRuntime::recovery_only(executions, retained_processes);
+    let tool_report = tools.recover_startup().map_err(tool_recovery_failure)?;
+    let tool_availability = tools.availability().map_err(tool_recovery_failure)?;
+    log.push(record(
+        "startup.tools.reconciled",
+        "bootstrap",
+        DiagnosticSeverityDto::Info,
+        None,
+        &format!(
+            "Tool recovery completed: recovered={}, interrupted={}, indeterminate={}, terminated_jobs={}, survivor_failures={}, availability={}.",
+            tool_report.recovered,
+            tool_report.interrupted,
+            tool_report.indeterminate,
+            tool_report.terminated_retained_jobs,
+            tool_report.survivor_inspection_failures,
+            tool_availability_name(tool_availability),
+        ),
+    ));
+
     fs::create_dir_all(&config.trusted_workspace_root).map_err(|_| StartupFailure {
         state: StartupStateDto::RecoverableFailure,
         code: "startup.workspace_root_unavailable",
@@ -236,18 +324,8 @@ fn start(config: &StartupConfig, log: &mut LocalLog) -> Result<WorkspaceRuntime,
     let artifact_root = config.app_data_dir.join("artifacts");
     let repositories = GitRepositoryGateway::open(&config.trusted_workspace_root, &[artifact_root])
         .map_err(workspace_reconciliation_failure)?;
-    let workspace_report = reconcile_startup(&database, &artifacts, &repositories)
+    let workspace_report = reconcile_workspace_after_fencing(&database, &artifacts, &repositories)
         .map_err(workspace_reconciliation_failure)?;
-    log.push(record(
-        "startup.leases.fenced",
-        "storage-sqlite",
-        DiagnosticSeverityDto::Info,
-        None,
-        &format!(
-            "Stale executor lease fencing completed: fenced={}.",
-            workspace_report.fenced_leases
-        ),
-    ));
     log.push(record(
         "startup.repositories.reconciled",
         "repository-git",
@@ -269,12 +347,40 @@ fn start(config: &StartupConfig, log: &mut LocalLog) -> Result<WorkspaceRuntime,
         ),
     ));
 
-    Ok(WorkspaceRuntime::new(
-        database,
-        artifacts,
-        repositories,
-        workspace_report.recovery_candidates,
-    ))
+    let approval_observed_at = database
+        .now_utc()
+        .map_err(approval_reconciliation_failure)?;
+    let expired_approvals = database
+        .expire_before(&approval_observed_at)
+        .map_err(approval_reconciliation_failure)?;
+    log.push(record(
+        "startup.approvals.expired",
+        "storage-sqlite",
+        DiagnosticSeverityDto::Info,
+        None,
+        &format!(
+            "Expired approval reconciliation completed: expired={}.",
+            expired_approvals
+        ),
+    ));
+
+    Ok(StartupRuntimes {
+        workspace: WorkspaceRuntime::new(
+            database,
+            artifacts,
+            repositories,
+            workspace_report.recovery_candidates,
+        ),
+        tools,
+    })
+}
+
+const fn tool_availability_name(availability: ToolRuntimeAvailability) -> &'static str {
+    match availability {
+        ToolRuntimeAvailability::Ready => "ready",
+        ToolRuntimeAvailability::DegradedReadOnly => "degraded_read_only",
+        ToolRuntimeAvailability::Unavailable => "unavailable",
+    }
 }
 
 fn workspace_reconciliation_failure(error: PortError) -> StartupFailure {
@@ -285,6 +391,36 @@ fn workspace_reconciliation_failure(error: PortError) -> StartupFailure {
         category: classification_name(error.safe_classification()),
         detail: format!(
             "Workspace reconciliation failed ({:?}, {:?}).",
+            error.safe_classification(),
+            error.retryability()
+        ),
+        recovery: RecoveryMode::Retry,
+    }
+}
+
+fn tool_recovery_failure(error: PortError) -> StartupFailure {
+    StartupFailure {
+        state: StartupStateDto::Indeterminate,
+        code: "startup.tool_recovery_failed",
+        message: "Tool recovery could not determine a safe startup state.",
+        category: classification_name(error.safe_classification()),
+        detail: format!(
+            "Tool recovery failed ({:?}, {:?}).",
+            error.safe_classification(),
+            error.retryability()
+        ),
+        recovery: RecoveryMode::Retry,
+    }
+}
+
+fn approval_reconciliation_failure(error: PortError) -> StartupFailure {
+    StartupFailure {
+        state: StartupStateDto::Indeterminate,
+        code: "startup.approval_reconciliation_failed",
+        message: "Approval recovery could not determine a safe startup state.",
+        category: classification_name(error.safe_classification()),
+        detail: format!(
+            "Approval reconciliation failed ({:?}, {:?}).",
             error.safe_classification(),
             error.retryability()
         ),
