@@ -1438,7 +1438,8 @@ pub enum DurableToolExecutionOutcome {
 pub struct AuthorizedToolRequest {
     pub execution_id: ToolExecutionId,
     request: ApprovedProcessRequest,
-    approval: BoundToolApproval,
+    request_binding_digest: ToolRequestBindingDigest,
+    approval: Option<BoundToolApproval>,
 }
 
 impl AuthorizedToolRequest {
@@ -1447,34 +1448,52 @@ impl AuthorizedToolRequest {
         approval: BoundToolApproval,
         request: ApprovedProcessRequest,
     ) -> Self {
+        let request_binding_digest = approval.request_binding_digest.clone();
         Self {
             execution_id,
             request,
-            approval,
+            request_binding_digest,
+            approval: Some(approval),
         }
     }
 
+    pub(crate) fn from_immutable(request: &ImmutableToolRequest) -> Result<Self, PortError> {
+        let process = request.request().process().clone();
+        let request_binding_digest = canonical_tool_request_binding(&process)?;
+        Ok(Self {
+            execution_id: request.request().execution_id().clone(),
+            request: process,
+            request_binding_digest,
+            approval: None,
+        })
+    }
+
     pub(crate) fn revalidated_operation_digest(&self) -> Result<Sha256Digest, PortError> {
-        let rebound = bind_process_request(self.approval.payload.clone(), &self.request)?;
-        if rebound != self.approval.payload {
-            return Err(invalid_input());
+        if let Some(approval) = &self.approval {
+            let rebound = bind_process_request(approval.payload.clone(), &self.request)?;
+            if rebound != approval.payload {
+                return Err(invalid_input());
+            }
+            return canonical_approval_payload(&ApprovalDigestPayload::Tool(rebound))
+                .map(|canonical| canonical.operation_digest);
         }
-        canonical_approval_payload(&ApprovalDigestPayload::Tool(rebound))
-            .map(|canonical| canonical.operation_digest)
+        canonical_tool_request_binding(&self.request).map(|binding| binding.as_sha256().clone())
     }
 
     pub(crate) fn revalidated_request_binding_digest(
         &self,
     ) -> Result<&ToolRequestBindingDigest, PortError> {
         let current = canonical_tool_request_binding(&self.request)?;
-        if current != self.approval.request_binding_digest {
+        if current != self.request_binding_digest {
             return Err(invalid_input());
         }
-        Ok(&self.approval.request_binding_digest)
+        Ok(&self.request_binding_digest)
     }
 
-    pub(crate) fn approval_nonce(&self) -> &str {
-        &self.approval.payload.nonce
+    pub(crate) fn approval_nonce(&self) -> Option<&str> {
+        self.approval
+            .as_ref()
+            .map(|approval| approval.payload.nonce.as_str())
     }
 
     pub fn process_request(&self) -> &ApprovedProcessRequest {

@@ -1108,6 +1108,115 @@ fn process_binding_faults_leave_the_execution_claimed_and_suspended() {
 }
 
 #[test]
+fn claimed_execution_can_resolve_no_effect_terminal_before_any_process_binding() {
+    let terminals = [
+        ("interrupted", ToolExecutionTerminal::interrupted()),
+        (
+            "indeterminate",
+            ToolExecutionTerminal::indeterminate(SafeToolExecutionError {
+                classification:
+                    local_agent_terminal_application::SafeErrorClassification::Unavailable,
+                retryability: local_agent_terminal_application::Retryability::Retryable,
+            }),
+        ),
+    ];
+    for (status, terminal) in terminals {
+        let database = TempDatabase::new();
+        let execution_id = format!("execution-{status}-before-binding");
+        let (store, claim, _, _) = exact_approval_claim_fixture(&database, &execution_id);
+        let ToolExecutionClaim::Claimed(authority) = store.begin_authorized(claim).unwrap() else {
+            panic!("fresh authorized execution must win the durable claim");
+        };
+        let receipt = DurableToolExecutionReceipt::new(authority, terminal);
+
+        assert_eq!(
+            store
+                .resolve_terminal(ToolExecutionResolution::new(receipt.clone()))
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            store
+                .resolve_terminal(ToolExecutionResolution::new(receipt.clone()))
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            lifecycle_state(&database, &execution_id),
+            format!("{status}:{status}")
+        );
+        assert_eq!(terminal_event_count(&database), 1);
+    }
+}
+
+#[test]
+fn claimed_execution_cannot_resolve_success_before_a_process_binding() {
+    let database = TempDatabase::new();
+    let execution_id = "execution-success-before-binding";
+    let (store, claim, _, _) = exact_approval_claim_fixture(&database, execution_id);
+    let ToolExecutionClaim::Claimed(authority) = store.begin_authorized(claim).unwrap() else {
+        panic!("fresh authorized execution must win the durable claim");
+    };
+    let before = durable_read_fingerprint(&database);
+    let receipt = DurableToolExecutionReceipt::new(
+        authority,
+        terminal_fixture(ToolExecutionTerminalKind::Succeeded, digest_char('a'), None),
+    );
+
+    let error = store
+        .resolve_terminal(ToolExecutionResolution::new(receipt))
+        .expect_err("an unstarted process cannot report success");
+
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::Conflict
+    );
+    assert_eq!(durable_read_fingerprint(&database), before);
+    assert_eq!(lifecycle_state(&database, execution_id), "pending:claimed");
+    assert_eq!(terminal_event_count(&database), 0);
+}
+
+#[test]
+fn claimed_terminal_faults_leave_the_execution_recoverable() {
+    let faults = [
+        "CREATE TRIGGER injected BEFORE UPDATE ON operation_intents
+         WHEN NEW.status = 'interrupted'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE UPDATE ON tool_executions
+         WHEN NEW.status = 'interrupted'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE INSERT ON events
+         WHEN NEW.event_type = 'tool.execution.completed'
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+        "CREATE TRIGGER injected BEFORE UPDATE ON tasks
+         WHEN NEW.current_sequence = OLD.current_sequence + 1
+         BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+    ];
+    for (index, trigger) in faults.into_iter().enumerate() {
+        let database = TempDatabase::new();
+        let execution_id = format!("execution-claimed-terminal-fault-{index}");
+        let (store, claim, _, _) = exact_approval_claim_fixture(&database, &execution_id);
+        let ToolExecutionClaim::Claimed(authority) = store.begin_authorized(claim).unwrap() else {
+            panic!("fresh authorized execution must win the durable claim");
+        };
+        let before = durable_read_fingerprint(&database);
+        configured_connection(&database.path)
+            .execute_batch(trigger)
+            .unwrap();
+        let resolution = ToolExecutionResolution::new(DurableToolExecutionReceipt::new(
+            authority,
+            ToolExecutionTerminal::interrupted(),
+        ));
+
+        assert!(store.resolve_terminal(resolution).is_err(), "{trigger}");
+        assert_eq!(durable_read_fingerprint(&database), before, "{trigger}");
+        assert_eq!(lifecycle_state(&database, &execution_id), "pending:claimed");
+        assert_eq!(terminal_event_count(&database), 0, "{trigger}");
+        assert_eq!(store.incomplete().unwrap().len(), 1, "{trigger}");
+    }
+}
+
+#[test]
 fn begin_rejects_a_digest_other_than_the_reserved_canonical_intent() {
     let database = TempDatabase::new();
     let operation_digest = persist_request_artifact(&database);

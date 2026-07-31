@@ -3,7 +3,7 @@ use std::fmt;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-const SUPPORTED_SCHEMA_VERSION: i64 = 4;
+const SUPPORTED_SCHEMA_VERSION: i64 = 5;
 const NORMATIVE_SQL: &str =
     include_str!("../../../docs/multi-agent-terminal-design/schemas/sqlite-v1.sql");
 const V1_ADAPTER_HARDENING_SQL: &str = r#"
@@ -236,6 +236,53 @@ ON tool_executions(approval_id)
 WHERE approval_id IS NOT NULL;
 "#;
 
+const V5_PRE_EFFECT_TERMINAL_SQL: &str = r#"
+DROP TRIGGER operation_intent_status_forward_only;
+DROP TRIGGER tool_execution_status_forward_only;
+
+CREATE TRIGGER operation_intent_status_forward_only
+BEFORE UPDATE OF status ON operation_intents
+FOR EACH ROW
+WHEN OLD.status <> NEW.status
+    AND NOT (
+        (OLD.status = 'pending'
+            AND NEW.status IN ('claimed', 'started', 'cancelled'))
+        OR (OLD.status = 'claimed'
+            AND NEW.status IN (
+                'pending', 'started', 'interrupted', 'indeterminate', 'cancelled'
+            ))
+        OR (OLD.status = 'started'
+            AND NEW.status IN (
+                'succeeded', 'failed', 'interrupted', 'indeterminate', 'cancelled'
+            ))
+        OR (OLD.status = 'interrupted' AND NEW.status IN ('pending', 'cancelled'))
+        OR (OLD.status = 'indeterminate'
+            AND NEW.status IN ('succeeded', 'failed', 'cancelled'))
+        OR (OLD.status = 'succeeded'
+            AND NEW.status IN ('interrupted', 'indeterminate'))
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'operation intent status must move forward');
+END;
+
+CREATE TRIGGER tool_execution_status_forward_only
+BEFORE UPDATE OF status ON tool_executions
+FOR EACH ROW
+WHEN OLD.status <> NEW.status
+    AND NOT (
+        (OLD.status = 'pending'
+            AND NEW.status IN ('running', 'interrupted', 'indeterminate', 'denied'))
+        OR (OLD.status = 'running'
+            AND NEW.status IN (
+                'succeeded', 'failed', 'cancelled', 'terminated', 'interrupted',
+                'indeterminate', 'denied'
+            ))
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'tool execution status must move forward');
+END;
+"#;
+
 #[derive(Debug)]
 pub enum OpenError {
     Database(rusqlite::Error),
@@ -275,7 +322,7 @@ impl From<rusqlite::Error> for OpenError {
 }
 
 pub fn migration_checksum() -> String {
-    checksum(V4_TOOL_EXECUTION_LIFECYCLE_SQL)
+    checksum(V5_PRE_EFFECT_TERMINAL_SQL)
 }
 
 fn v1_migration_checksum() -> String {
@@ -288,6 +335,10 @@ fn v2_migration_checksum() -> String {
 
 fn v3_migration_checksum() -> String {
     checksum(V3_POLICY_TOOL_HARDENING_SQL)
+}
+
+fn v4_migration_checksum() -> String {
+    checksum(V4_TOOL_EXECUTION_LIFECYCLE_SQL)
 }
 
 fn checksum(sql: &str) -> String {
@@ -340,24 +391,35 @@ pub(crate) fn validate_or_migrate(connection: &mut Connection) -> Result<(), Ope
             apply_v2_migration(connection)?;
             apply_v3_migration(connection)?;
             apply_v4_migration(connection)?;
+            apply_v5_migration(connection)?;
         }
         2 => {
             validate_checksum(connection, 1, v1_migration_checksum())?;
             validate_checksum(connection, 2, v2_migration_checksum())?;
             apply_v3_migration(connection)?;
             apply_v4_migration(connection)?;
+            apply_v5_migration(connection)?;
         }
         3 => {
             validate_checksum(connection, 1, v1_migration_checksum())?;
             validate_checksum(connection, 2, v2_migration_checksum())?;
             validate_checksum(connection, 3, v3_migration_checksum())?;
             apply_v4_migration(connection)?;
+            apply_v5_migration(connection)?;
+        }
+        4 => {
+            validate_checksum(connection, 1, v1_migration_checksum())?;
+            validate_checksum(connection, 2, v2_migration_checksum())?;
+            validate_checksum(connection, 3, v3_migration_checksum())?;
+            validate_checksum(connection, 4, v4_migration_checksum())?;
+            apply_v5_migration(connection)?;
         }
         SUPPORTED_SCHEMA_VERSION => {
             validate_checksum(connection, 1, v1_migration_checksum())?;
             validate_checksum(connection, 2, v2_migration_checksum())?;
             validate_checksum(connection, 3, v3_migration_checksum())?;
-            validate_checksum(connection, 4, migration_checksum())?;
+            validate_checksum(connection, 4, v4_migration_checksum())?;
+            validate_checksum(connection, 5, migration_checksum())?;
         }
         _ => {
             return Err(OpenError::UnsupportedSchema {
@@ -440,6 +502,18 @@ fn apply_initial_migration(connection: &mut Connection) -> Result<(), OpenError>
             4,
             "tool_execution_lifecycle_v4",
             env!("CARGO_PKG_VERSION"),
+            v4_migration_checksum()
+        ],
+    )?;
+    transaction.execute_batch(V5_PRE_EFFECT_TERMINAL_SQL)?;
+    transaction.execute(
+        "INSERT INTO schema_migrations (
+            version, name, applied_at, application_version, checksum
+         ) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4)",
+        params![
+            5,
+            "pre_effect_terminal_v5",
+            env!("CARGO_PKG_VERSION"),
             migration_checksum()
         ],
     )?;
@@ -493,6 +567,24 @@ fn apply_v4_migration(connection: &mut Connection) -> Result<(), OpenError> {
         params![
             4,
             "tool_execution_lifecycle_v4",
+            env!("CARGO_PKG_VERSION"),
+            v4_migration_checksum()
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn apply_v5_migration(connection: &mut Connection) -> Result<(), OpenError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(V5_PRE_EFFECT_TERMINAL_SQL)?;
+    transaction.execute(
+        "INSERT INTO schema_migrations (
+            version, name, applied_at, application_version, checksum
+         ) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4)",
+        params![
+            5,
+            "pre_effect_terminal_v5",
             env!("CARGO_PKG_VERSION"),
             migration_checksum()
         ],

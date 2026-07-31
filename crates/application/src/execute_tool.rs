@@ -1,15 +1,80 @@
 use crate::{
-    approval::valid_approval_nonce, ApprovalCheck, ApprovalClaim, ApprovalSnapshot, ApprovalState,
-    ApprovalStore, AuthorizedToolRequest, Clock, DurableToolCancellationOutcome,
-    DurableToolExecutionOutcome, DurableToolExecutionReceipt, IncompleteToolExecution,
-    NewToolExecution, PortError, ProcessStatus, Retryability, SafeErrorClassification,
-    SafeToolExecutionError, StructuredToolExecutor, ToolExecutionCancellationClaim,
-    ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionId, ToolExecutionResolution,
-    ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal,
+    approval::valid_approval_nonce, canonical_policy_binding_digest, policy_request_for_tool,
+    validate_tool_approval_request, ApprovalCheck, ApprovalClaim, ApprovalRequestDto,
+    ApprovalSnapshot, ApprovalState, ApprovalStore, AuthorizedToolExecutionClaim,
+    AuthorizedToolRequest, Clock, DeniedToolExecution, DurableToolCancellationOutcome,
+    DurableToolExecutionOutcome, DurableToolExecutionReceipt, ImmutableToolRequest,
+    IncompleteToolExecution, NewToolExecution, PortError, PreEffectOutcome, ProcessStatus,
+    Retryability, SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor,
+    ToolExecutionCancellationClaim, ToolExecutionClaim, ToolExecutionClaimAuthority,
+    ToolExecutionId, ToolExecutionOrchestration, ToolExecutionResolution, ToolExecutionResult,
+    ToolExecutionStore, ToolExecutionTerminal, ToolRequest,
 };
 use local_agent_terminal_domain::{FencingToken, RunId, Sha256Digest, TaskId};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolOutcome {
+    ApprovalRequired(ApprovalRequestDto),
+    Denied(DeniedToolExecution),
+    Execution(DurableToolExecutionOutcome),
+}
+
+pub struct ExecuteTool<'a> {
+    pre_effect: ToolExecutionOrchestration<'a>,
+    executor: &'a dyn StructuredToolExecutor,
+}
+
+impl<'a> ExecuteTool<'a> {
+    pub const fn new(
+        pre_effect: ToolExecutionOrchestration<'a>,
+        executor: &'a dyn StructuredToolExecutor,
+    ) -> Self {
+        Self {
+            pre_effect,
+            executor,
+        }
+    }
+
+    pub fn execute(&self, request: ToolRequest) -> Result<ToolOutcome, PortError> {
+        let outcome = self.pre_effect.execute(request)?;
+        self.finish_pre_effect(outcome)
+    }
+
+    pub fn resume_approved(
+        &self,
+        approval_id: crate::ApprovalId,
+    ) -> Result<ToolOutcome, PortError> {
+        let outcome = self.pre_effect.resume_approved(approval_id)?;
+        self.finish_pre_effect(outcome)
+    }
+
+    pub fn cancel(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<DurableToolCancellationOutcome, PortError> {
+        ExecuteDurableTool::new(self.pre_effect.execution_store(), self.executor)
+            .cancel(execution_id)
+    }
+
+    fn finish_pre_effect(&self, outcome: PreEffectOutcome) -> Result<ToolOutcome, PortError> {
+        match outcome {
+            PreEffectOutcome::ApprovalRequired(request) => {
+                Ok(ToolOutcome::ApprovalRequired(request))
+            }
+            PreEffectOutcome::Denied(denied) => Ok(ToolOutcome::Denied(denied)),
+            PreEffectOutcome::Allowed(ready) => {
+                self.pre_effect.revalidate_ready(&ready)?;
+                let (claim, immutable, authoritative_request) = (*ready).into_authorized_parts();
+                let outcome =
+                    ExecuteDurableTool::new(self.pre_effect.execution_store(), self.executor)
+                        .execute_authorized(claim, immutable, authoritative_request)?;
+                Ok(ToolOutcome::Execution(outcome))
+            }
+        }
+    }
+}
 
 pub struct ExecuteApprovedTool<'a> {
     approvals: &'a dyn ApprovalStore,
@@ -51,7 +116,7 @@ impl<'a> ExecuteApprovedTool<'a> {
             policy_snapshot_digest: check.policy_snapshot_digest,
             fencing_token: check.fencing_token,
             tool_request_binding_digest: request_binding,
-            nonce: request.approval_nonce().to_owned(),
+            nonce: request.approval_nonce().ok_or_else(denied)?.to_owned(),
             claimed_at: now.clone(),
         };
         let approval = self.approvals.claim(claim.clone())?.ok_or_else(denied)?;
@@ -86,10 +151,58 @@ impl<'a> ExecuteDurableTool<'a> {
         let owner_run_id = binding.run_id().clone();
         let executor_fencing_token = request.process_request().process().executor_fencing_token();
         let operation_digest = request.revalidated_operation_digest()?;
-        match self.executions.begin(NewToolExecution {
+        let claim = self.executions.begin(NewToolExecution {
             execution_id: execution_id.clone(),
             operation_digest: operation_digest.clone(),
-        })? {
+        })?;
+        self.execute_claim(
+            claim,
+            request,
+            execution_id,
+            operation_digest,
+            task_id,
+            owner_run_id,
+            executor_fencing_token,
+        )
+    }
+
+    fn execute_authorized(
+        &self,
+        claim: AuthorizedToolExecutionClaim,
+        immutable: ImmutableToolRequest,
+        authoritative_request: ToolRequest,
+    ) -> Result<DurableToolExecutionOutcome, PortError> {
+        validate_authorized_execution_claim(&claim, &immutable, &authoritative_request)?;
+        let execution_id = claim.execution_id.clone();
+        let operation_digest = claim.request_content_digest.clone();
+        let task_id = claim.task_id.clone();
+        let owner_run_id = claim.run_id.clone();
+        let executor_fencing_token = claim.fencing_token;
+        let request = AuthorizedToolRequest::from_immutable(&immutable)?;
+        let execution_claim = self.executions.begin_authorized(claim)?;
+        self.execute_claim(
+            execution_claim,
+            request,
+            execution_id,
+            operation_digest,
+            task_id,
+            owner_run_id,
+            executor_fencing_token,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_claim(
+        &self,
+        claim: ToolExecutionClaim,
+        request: AuthorizedToolRequest,
+        execution_id: ToolExecutionId,
+        operation_digest: Sha256Digest,
+        task_id: TaskId,
+        owner_run_id: RunId,
+        executor_fencing_token: Option<FencingToken>,
+    ) -> Result<DurableToolExecutionOutcome, PortError> {
+        match claim {
             ToolExecutionClaim::Claimed(authority) => {
                 validate_claim_authority(
                     &authority,
@@ -189,6 +302,45 @@ impl<'a> ExecuteDurableTool<'a> {
             }
         }
     }
+}
+
+fn validate_authorized_execution_claim(
+    claim: &AuthorizedToolExecutionClaim,
+    immutable: &ImmutableToolRequest,
+    authoritative_request: &ToolRequest,
+) -> Result<(), PortError> {
+    let request = immutable.request();
+    let process = authoritative_request.process().process();
+    let binding = process.binding();
+    let expected_policy_binding = canonical_policy_binding_digest(&policy_request_for_tool(
+        authoritative_request,
+        claim.checked_at,
+    ))?;
+    if request.execution_id() != authoritative_request.execution_id()
+        || request.process() != authoritative_request.process()
+        || claim.execution_id != *request.execution_id()
+        || claim.request_content_digest != *immutable.binding_digest().as_sha256()
+        || claim.request_binding_digest != *immutable.binding_digest()
+        || claim.task_id != *binding.task_id()
+        || claim.run_id != *binding.run_id()
+        || claim.tool_name != "process.exec"
+        || claim.policy_request_binding_digest != expected_policy_binding
+        || claim.workspace_version != binding.workspace_version()
+        || claim.policy_snapshot_digest != *authoritative_request.policy().policy_snapshot_digest()
+        || claim.fencing_token != process.executor_fencing_token()
+    {
+        return Err(integrity_failure());
+    }
+    if let Some(approval) = &claim.approval {
+        validate_tool_approval_request(
+            authoritative_request,
+            immutable,
+            &claim.request_artifact_id,
+            &claim.policy_request_binding_digest,
+            approval,
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_cancellation_authority(

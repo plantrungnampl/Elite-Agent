@@ -912,12 +912,20 @@ impl ToolExecutionStore for SqliteStore {
             }
             return Err(conflict());
         }
-        if intent.status != "started" {
-            return Err(conflict());
-        }
+        let (expected_intent_status, expected_execution_status) = match (
+            intent.status.as_str(),
+            resolution.receipt().terminal().kind(),
+        ) {
+            ("started", _) => ("started", "running"),
+            (
+                "claimed",
+                ToolExecutionTerminalKind::Interrupted | ToolExecutionTerminalKind::Indeterminate,
+            ) => ("claimed", "pending"),
+            _ => return Err(conflict()),
+        };
         let execution = load_tool_execution(&transaction, &execution_id)?;
         validate_tool_execution_identity(&execution_id, &intent, &execution)?;
-        if execution.status != "running" {
+        if execution.status != expected_execution_status {
             return Err(integrity_failure());
         }
         validate_terminal_artifacts(
@@ -944,13 +952,14 @@ impl ToolExecutionStore for SqliteStore {
                  SET status = ?1, result_artifact_id = ?2, external_receipt_json = ?3,
                      error_json = ?4,
                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE id = ?5 AND status = 'started' AND attempt_count = ?6",
+                 WHERE id = ?5 AND status = ?6 AND attempt_count = ?7",
                 params![
                     outcome.intent_status,
                     result_artifact_id,
                     expected_receipt,
                     error_json,
                     execution_id.as_str(),
+                    expected_intent_status,
                     persisted_authority.attempt(),
                 ],
             )
@@ -961,13 +970,14 @@ impl ToolExecutionStore for SqliteStore {
                  SET status = ?1,
                       completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                       exit_code = ?2, stdout_artifact_id = ?3, stderr_artifact_id = ?4
-                 WHERE id = ?5 AND status = 'running'",
+                 WHERE id = ?5 AND status = ?6",
                 params![
                     outcome.execution_status,
                     exit_code,
                     stdout_artifact_id,
                     stderr_artifact_id,
                     execution_id.as_str(),
+                    expected_execution_status,
                 ],
             )
             .map_err(sqlite_error_to_port)?;
@@ -2969,7 +2979,13 @@ fn validate_tool_intent(
         {
             Ok(())
         }
-        "started" | "succeeded" | "failed" | "cancelled" | "interrupted" | "indeterminate"
+        "interrupted" | "indeterminate"
+            if intent.attempt_count > 0
+                && intent.lease_owner.as_deref() == Some(intent.run_id.as_str()) =>
+        {
+            validate_terminal_origin(connection, execution_id, intent)
+        }
+        "started" | "succeeded" | "failed" | "cancelled"
             if intent.attempt_count > 0
                 && intent.lease_owner.as_deref() == Some(intent.run_id.as_str()) =>
         {
@@ -2977,6 +2993,41 @@ fn validate_tool_intent(
         }
         _ => Err(integrity_failure()),
     }
+}
+
+fn validate_terminal_origin(
+    connection: &rusqlite::Connection,
+    execution_id: &ToolExecutionId,
+    intent: &IntentRow,
+) -> Result<(), PortError> {
+    let started_event_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE event_type = 'tool.execution.started'
+               AND json_extract(payload_json, '$.executionId') = ?1",
+            [execution_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error_to_port)?;
+    match started_event_count {
+        1 => return validate_started_event(connection, execution_id, intent),
+        0 => {}
+        _ => return Err(integrity_failure()),
+    }
+    let execution = load_tool_execution(connection, execution_id)?;
+    validate_tool_execution_identity(execution_id, intent, &execution)?;
+    if intent.external_receipt_json.is_none()
+        || execution.status != intent.status
+        || execution.started_at.is_some()
+        || execution.completed_at.as_deref().is_none_or(str::is_empty)
+        || execution.exit_code.is_some()
+        || execution.stdout_artifact_id.is_some()
+        || execution.stderr_artifact_id.is_some()
+        || intent.result_artifact_id.is_some()
+    {
+        return Err(integrity_failure());
+    }
+    Ok(())
 }
 
 fn validate_started_event(

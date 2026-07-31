@@ -101,14 +101,14 @@ fn first_startup_applies_schema_and_records_checksum() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(latest, (4, migration_checksum()));
+    assert_eq!(latest, (5, migration_checksum()));
     assert_eq!(
         connection
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        4
+        5
     );
     assert_eq!(
         connection
@@ -123,7 +123,7 @@ fn first_startup_applies_schema_and_records_checksum() {
 }
 
 #[test]
-fn exact_prior_v1_database_upgrades_to_v4_without_losing_data() {
+fn exact_prior_v1_database_upgrades_to_v5_without_losing_data() {
     let directory = TempDirectory::new();
     let path = directory.0.join("state.sqlite3");
     let mut connection = Connection::open(&path).unwrap();
@@ -150,7 +150,7 @@ fn exact_prior_v1_database_upgrades_to_v4_without_losing_data() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        4
+        5
     );
     assert!(connection
         .execute("UPDATE tasks SET fencing_epoch = 0 WHERE id = 'task-1'", [])
@@ -183,7 +183,7 @@ fn exact_prior_v2_database_upgrades_without_rewriting_its_checksum() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        4
+        5
     );
     assert_eq!(
         connection
@@ -209,7 +209,7 @@ fn exact_prior_v2_database_upgrades_without_rewriting_its_checksum() {
 }
 
 #[test]
-fn exact_deployed_v3_database_upgrades_to_v4_and_preserves_v3_checksum() {
+fn exact_deployed_v3_database_upgrades_to_v5_and_preserves_v3_checksum() {
     let directory = TempDirectory::new();
     let path = directory.0.join("state.sqlite3");
     let mut connection = Connection::open(&path).unwrap();
@@ -226,7 +226,7 @@ fn exact_deployed_v3_database_upgrades_to_v4_and_preserves_v3_checksum() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        4
+        5
     );
     assert_eq!(
         connection
@@ -256,6 +256,58 @@ fn exact_deployed_v3_database_upgrades_to_v4_and_preserves_v3_checksum() {
         )
         .unwrap();
     assert!(trigger_sql.contains("'cancelled'"));
+}
+
+#[test]
+fn exact_deployed_v4_database_upgrades_to_v5_and_preserves_v4_checksum() {
+    let directory = TempDirectory::new();
+    let path = directory.0.join("state.sqlite3");
+    let mut connection = Connection::open(&path).unwrap();
+    let prior_v4_checksum = install_prior_v4(&mut connection);
+    seed_project_and_task(&connection);
+    drop(connection);
+
+    SqliteStore::open(&path).unwrap();
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version = 4",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        prior_v4_checksum
+    );
+    let intent_trigger_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name = 'operation_intent_status_forward_only'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(intent_trigger_sql.contains("'claimed'"));
+    assert!(intent_trigger_sql.contains("'interrupted'"));
+    let execution_trigger_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name = 'tool_execution_status_forward_only'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(execution_trigger_sql.contains("'pending'"));
+    assert!(execution_trigger_sql.contains("'interrupted'"));
 }
 
 #[test]
@@ -415,7 +467,7 @@ fn malformed_deployed_v3_observed_write_fails_closed_without_mutation() {
 
 #[test]
 fn later_startup_rejects_changed_or_unsupported_schema() {
-    for version in 1..=4 {
+    for version in 1..=5 {
         let mismatch_directory = TempDirectory::new();
         let mismatch_path = mismatch_directory.0.join("state.sqlite3");
         SqliteStore::open(&mismatch_path).unwrap();
@@ -442,7 +494,7 @@ fn later_startup_rejects_changed_or_unsupported_schema() {
              (version, name, applied_at, application_version, checksum)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                5,
+                6,
                 "future",
                 "2026-07-26T00:00:00Z",
                 "9.0.0",
@@ -453,8 +505,8 @@ fn later_startup_rejects_changed_or_unsupported_schema() {
     assert!(matches!(
         SqliteStore::open(&unsupported_path),
         Err(OpenError::UnsupportedSchema {
-            found: 5,
-            supported: 4
+            found: 6,
+            supported: 5
         })
     ));
 }
@@ -953,6 +1005,27 @@ fn install_prior_v3(connection: &mut Connection) {
     transaction.commit().unwrap();
 }
 
+fn install_prior_v4(connection: &mut Connection) -> String {
+    install_prior_v3(connection);
+    let migration = migration_sql("V4_TOOL_EXECUTION_LIFECYCLE_SQL");
+    let checksum = format!("sha256:{:x}", Sha256::digest(migration.as_bytes()));
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    transaction.execute_batch(migration).unwrap();
+    transaction
+        .execute(
+            "INSERT INTO schema_migrations (
+                version, name, applied_at, application_version, checksum
+             ) VALUES (4, 'tool_execution_lifecycle_v4',
+                '2026-07-30T00:00:00Z', '0.1.0', ?1)",
+            [&checksum],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    checksum
+}
+
 fn migration_sql(name: &str) -> &'static str {
     let declaration = format!("const {name}: &str = r#\"");
     let start = MIGRATIONS_SOURCE
@@ -981,7 +1054,7 @@ fn startup_rejects_unknown_nonempty_database_without_mutating_it() {
         SqliteStore::open(&path),
         Err(OpenError::UnsupportedSchema {
             found: 0,
-            supported: 4
+            supported: 5
         })
     ));
 

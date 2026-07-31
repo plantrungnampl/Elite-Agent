@@ -43,7 +43,7 @@ pub use dto::{
     WorkspaceDashboardDto, WorkspaceDashboardRequestDto,
 };
 pub use error::{PortError, Retryability, SafeErrorClassification};
-pub use execute_tool::{ExecuteApprovedTool, ExecuteDurableTool};
+pub use execute_tool::{ExecuteApprovedTool, ExecuteDurableTool, ExecuteTool, ToolOutcome};
 pub use lease::{
     AcquireExecutorLease, AcquireLease, ExecutorLeaseStore, LeaseSnapshot, LeaseState, RevokeLease,
 };

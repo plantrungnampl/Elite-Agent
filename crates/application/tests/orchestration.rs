@@ -4,16 +4,18 @@ use std::sync::Mutex;
 use local_agent_terminal_application::{
     canonical_policy_binding_digest, canonical_tool_request, policy_request_for_tool, ApprovalId,
     ApprovalResumeSnapshot, ApprovalResumeStore, ApprovalState, ArtifactId,
-    AuthorizedToolExecutionClaim, Clock, DeniedToolExecution, DurableToolExecutionReceipt,
-    IdGenerator, ImmutableToolRequest, IncompleteToolExecution, LeaseSnapshot, LeaseState,
+    AuthorizedToolExecutionClaim, AuthorizedToolRequest, BoundedOutput, Clock, DeniedToolExecution,
+    DurableToolExecutionOutcome, DurableToolExecutionReceipt, ExecuteTool, IdGenerator,
+    ImmutableToolRequest, IncompleteToolExecution, JobReceipt, LeaseSnapshot, LeaseState,
     NewToolExecution, NewToolIntent, OperationIntentSnapshot, OperationIntentStatus,
     PolicyDecision, PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator, PortError,
-    PreEffectOutcome, RecordedPolicyDecision, Retryability, SafeErrorClassification,
-    ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestPublisher,
-    ToolAuthorityResolver, ToolAuthoritySnapshot, ToolExecutionClaim, ToolExecutionDenialRequest,
-    ToolExecutionId, ToolExecutionOrchestration, ToolExecutionResolution,
-    ToolExecutionResumeSnapshot, ToolExecutionResumeStore, ToolExecutionStore, ToolPolicyContext,
-    ToolRequest, ToolRequestPublisher,
+    PreEffectOutcome, ProcessReceipt, ProcessStatus, RecordedPolicyDecision, Retryability,
+    SafeErrorClassification, StructuredToolExecutor, ToolApprovalPublication, ToolApprovalRequest,
+    ToolApprovalRequestPublisher, ToolAuthorityResolver, ToolAuthoritySnapshot, ToolExecutionClaim,
+    ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId,
+    ToolExecutionOrchestration, ToolExecutionResolution, ToolExecutionResult,
+    ToolExecutionResumeSnapshot, ToolExecutionResumeStore, ToolExecutionStore,
+    ToolExecutionTerminalKind, ToolOutcome, ToolPolicyContext, ToolRequest, ToolRequestPublisher,
 };
 use local_agent_terminal_domain::{
     combine_policy_rules, ActorLocality, CapabilityRef, EnvironmentProfile, FencingToken,
@@ -188,6 +190,116 @@ fn allow_publishes_before_pre_effect_ready() {
         .as_sha256()
         .as_str()
         .starts_with("sha256:"));
+}
+
+#[test]
+fn execute_tool_claims_exact_current_authorization_before_effect_and_terminal() {
+    let events = Mutex::new(Vec::new());
+    let request = tool_request();
+    let immutable = canonical_tool_request(&request).unwrap();
+    let execution_id = request.execution_id().clone();
+    let operation_digest = immutable.binding_digest().as_sha256().clone();
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let decision_id = PolicyDecisionId::from_decision(&policy_decision(
+        policy_request_for_tool(&request, evaluated_at),
+        PolicyEffect::Allow,
+    ));
+    let authority = RecordingAuthority {
+        events: &events,
+        current: request.clone(),
+    };
+    let claim_authority = ToolExecutionClaimAuthority::from_persisted(
+        execution_id.clone(),
+        operation_digest.clone(),
+        RunId::new("run-1").unwrap(),
+        1,
+        Some(FencingToken::new(19).unwrap()),
+    )
+    .unwrap();
+    let executions = TestExecutionStore::executing(&events, claim_authority);
+    let executor = RecordingStructuredExecutor { events: &events };
+    let outcome =
+        execute_allowed_tool(request, &authority, &events, &executions, &executor).unwrap();
+
+    let ToolOutcome::Execution(DurableToolExecutionOutcome::Completed(receipt)) = outcome else {
+        panic!("allowed execution did not complete");
+    };
+    assert_eq!(
+        receipt.terminal().kind(),
+        ToolExecutionTerminalKind::Succeeded
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "publish",
+            "authority",
+            "clock",
+            "evaluate",
+            "record",
+            "authority",
+            "begin-authorized",
+            "effect",
+            "resolve-terminal",
+        ]
+    );
+    let claims = executions.authorized_claims.into_inner().unwrap();
+    assert_eq!(claims.len(), 1);
+    let claim = &claims[0];
+    assert_eq!(claim.execution_id, execution_id);
+    assert_eq!(claim.request_content_digest, operation_digest);
+    assert_eq!(claim.request_binding_digest, *immutable.binding_digest());
+    assert_eq!(claim.task_id, TaskId::new("task-1").unwrap());
+    assert_eq!(claim.run_id, RunId::new("run-1").unwrap());
+    assert_eq!(claim.tool_name, "process.exec");
+    assert_eq!(claim.policy_decision_id, decision_id);
+    assert_eq!(claim.workspace_version, WorkspaceVersion::new(4));
+    assert_eq!(claim.policy_snapshot_digest, digest('b'));
+    assert_eq!(claim.fencing_token, Some(FencingToken::new(19).unwrap()));
+    assert_eq!(claim.checked_at, evaluated_at);
+    assert!(claim.approval.is_none());
+}
+
+#[test]
+fn authority_change_after_policy_record_stops_before_claim_and_effect() {
+    let events = Mutex::new(Vec::new());
+    let request = tool_request();
+    let immutable = canonical_tool_request(&request).unwrap();
+    let authority = ChangingAuthority {
+        events: &events,
+        current: Mutex::new(VecDeque::from([
+            request.clone(),
+            tool_request_with_resource_class(&request, ResourceClass::Secret),
+        ])),
+    };
+    let claim_authority = ToolExecutionClaimAuthority::from_persisted(
+        request.execution_id().clone(),
+        immutable.binding_digest().as_sha256().clone(),
+        RunId::new("run-1").unwrap(),
+        1,
+        Some(FencingToken::new(19).unwrap()),
+    )
+    .unwrap();
+    let executions = TestExecutionStore::executing(&events, claim_authority);
+    let executor = RecordingStructuredExecutor { events: &events };
+    let error =
+        execute_allowed_tool(request, &authority, &events, &executions, &executor).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "publish",
+            "authority",
+            "clock",
+            "evaluate",
+            "record",
+            "authority",
+        ]
+    );
+    assert!(executions.authorized_claims.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -991,11 +1103,17 @@ fn authoritative_request_mutation_stops_before_policy_evaluation() {
 static NO_DENIALS: TestExecutionStore<'static> = TestExecutionStore {
     events: None,
     denied: Mutex::new(None),
+    claim_authority: None,
+    authorized_claims: Mutex::new(Vec::new()),
+    resolutions: Mutex::new(Vec::new()),
 };
 
 struct TestExecutionStore<'a> {
     events: Option<&'a Mutex<Vec<&'static str>>>,
     denied: Mutex<Option<DeniedToolExecution>>,
+    claim_authority: Option<ToolExecutionClaimAuthority>,
+    authorized_claims: Mutex<Vec<AuthorizedToolExecutionClaim>>,
+    resolutions: Mutex<Vec<ToolExecutionResolution>>,
 }
 
 impl<'a> TestExecutionStore<'a> {
@@ -1003,6 +1121,9 @@ impl<'a> TestExecutionStore<'a> {
         Self {
             events: Some(events),
             denied: Mutex::new(None),
+            claim_authority: None,
+            authorized_claims: Mutex::new(Vec::new()),
+            resolutions: Mutex::new(Vec::new()),
         }
     }
 
@@ -1010,6 +1131,22 @@ impl<'a> TestExecutionStore<'a> {
         Self {
             events: Some(events),
             denied: Mutex::new(Some(denied)),
+            claim_authority: None,
+            authorized_claims: Mutex::new(Vec::new()),
+            resolutions: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn executing(
+        events: &'a Mutex<Vec<&'static str>>,
+        claim_authority: ToolExecutionClaimAuthority,
+    ) -> Self {
+        Self {
+            events: Some(events),
+            denied: Mutex::new(None),
+            claim_authority: Some(claim_authority),
+            authorized_claims: Mutex::new(Vec::new()),
+            resolutions: Mutex::new(Vec::new()),
         }
     }
 }
@@ -1025,9 +1162,19 @@ impl ToolExecutionStore for TestExecutionStore<'_> {
 
     fn begin_authorized(
         &self,
-        _: AuthorizedToolExecutionClaim,
+        request: AuthorizedToolExecutionClaim,
     ) -> Result<ToolExecutionClaim, PortError> {
-        unreachable!("pre-effect orchestration does not begin execution")
+        let authority = self
+            .claim_authority
+            .clone()
+            .unwrap_or_else(|| unreachable!("pre-effect orchestration does not begin execution"));
+        self.events
+            .expect("execution tests must use a recording execution store")
+            .lock()
+            .unwrap()
+            .push("begin-authorized");
+        self.authorized_claims.lock().unwrap().push(request);
+        Ok(ToolExecutionClaim::Claimed(authority))
     }
 
     fn load_denied(
@@ -1058,9 +1205,19 @@ impl ToolExecutionStore for TestExecutionStore<'_> {
 
     fn resolve_terminal(
         &self,
-        _: ToolExecutionResolution,
+        resolution: ToolExecutionResolution,
     ) -> Result<DurableToolExecutionReceipt, PortError> {
-        unreachable!("pre-effect orchestration does not resolve execution")
+        if self.claim_authority.is_none() {
+            unreachable!("pre-effect orchestration does not resolve execution");
+        }
+        self.events
+            .expect("execution tests must use a recording execution store")
+            .lock()
+            .unwrap()
+            .push("resolve-terminal");
+        let receipt = resolution.receipt().clone();
+        self.resolutions.lock().unwrap().push(resolution);
+        Ok(receipt)
     }
 
     fn request_cancellation(
@@ -1072,6 +1229,98 @@ impl ToolExecutionStore for TestExecutionStore<'_> {
 
     fn incomplete(&self) -> Result<Vec<IncompleteToolExecution>, PortError> {
         unreachable!("pre-effect orchestration does not inspect incomplete execution")
+    }
+}
+
+struct RecordingStructuredExecutor<'a> {
+    events: &'a Mutex<Vec<&'static str>>,
+}
+
+impl StructuredToolExecutor for RecordingStructuredExecutor<'_> {
+    fn execute(&self, request: AuthorizedToolRequest) -> Result<ToolExecutionResult, PortError> {
+        self.events.lock().unwrap().push("effect");
+        Ok(ToolExecutionResult {
+            receipt: ProcessReceipt {
+                execution_id: request.execution_id,
+                status: ProcessStatus::Exited,
+                exit_code: Some(0),
+                stdout: BoundedOutput {
+                    bytes: Vec::new(),
+                    truncated: false,
+                },
+                stderr: BoundedOutput {
+                    bytes: Vec::new(),
+                    truncated: false,
+                },
+                duration_ms: 1,
+                job_receipt: JobReceipt {
+                    root_pid: 42,
+                    job_id: "execution-orchestration".to_owned(),
+                    kill_on_close: true,
+                    no_breakaway: true,
+                    job_memory_limit: true,
+                    job_cpu_time_limit: true,
+                    memory_limit_bytes: 1024,
+                    cpu_time_limit_ms: 1000,
+                    max_active_processes: 1,
+                    total_user_time_ms: 1,
+                    resource_limit_terminated: false,
+                    tree_terminated: false,
+                },
+                observed_writes: Vec::new(),
+                output_digest: digest('9'),
+            },
+        })
+    }
+
+    fn cancel(
+        &self,
+        _: &ToolExecutionId,
+    ) -> Result<local_agent_terminal_application::CancellationReceipt, PortError> {
+        unreachable!("execution test does not cancel")
+    }
+
+    fn file_read(
+        &self,
+        _: local_agent_terminal_application::FileReadRequest,
+    ) -> Result<
+        local_agent_terminal_application::DisclosureOutcome<
+            local_agent_terminal_application::PolicyBoundBytes,
+        >,
+        PortError,
+    > {
+        unreachable!("execution test does not read files")
+    }
+
+    fn file_write(
+        &self,
+        _: local_agent_terminal_application::FileWriteRequest,
+    ) -> Result<local_agent_terminal_application::VerifiedWrite, PortError> {
+        unreachable!("execution test does not write files")
+    }
+
+    fn git_status(
+        &self,
+        _: local_agent_terminal_application::GitStatusRequest,
+    ) -> Result<
+        local_agent_terminal_application::DisclosureOutcome<
+            local_agent_terminal_application::GitStatusResult,
+        >,
+        PortError,
+    > {
+        unreachable!("execution test does not query Git status")
+    }
+
+    fn git_diff(
+        &self,
+        _: local_agent_terminal_application::GitDiffRequest,
+    ) -> Result<
+        local_agent_terminal_application::DisclosureOutcome<
+            local_agent_terminal_application::GitDiffResult,
+        >,
+        PortError,
+    > {
+        unreachable!("execution test does not query Git diff")
     }
 }
 
@@ -1089,6 +1338,24 @@ impl ToolAuthorityResolver for RecordingAuthority<'_> {
     fn resolve(&self, _: &ToolRequest) -> Result<ToolAuthoritySnapshot, PortError> {
         self.events.lock().unwrap().push("authority");
         authority_snapshot(self.current.clone())
+    }
+}
+
+struct ChangingAuthority<'a> {
+    events: &'a Mutex<Vec<&'static str>>,
+    current: Mutex<VecDeque<ToolRequest>>,
+}
+
+impl ToolAuthorityResolver for ChangingAuthority<'_> {
+    fn resolve(&self, _: &ToolRequest) -> Result<ToolAuthoritySnapshot, PortError> {
+        self.events.lock().unwrap().push("authority");
+        authority_snapshot(
+            self.current
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("test authority observation"),
+        )
     }
 }
 
@@ -1478,6 +1745,54 @@ fn execute_with_authority(
     )
 }
 
+fn execute_allowed_tool(
+    request: ToolRequest,
+    authority: &dyn ToolAuthorityResolver,
+    events: &Mutex<Vec<&'static str>>,
+    executions: &dyn ToolExecutionStore,
+    executor: &dyn StructuredToolExecutor,
+) -> Result<ToolOutcome, PortError> {
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let decision = policy_decision(
+        policy_request_for_tool(&request, evaluated_at),
+        PolicyEffect::Allow,
+    );
+    let records = Mutex::new(Vec::new());
+    let publisher = RecordingPublisher {
+        events,
+        artifact_id: ArtifactId::new("artifact-tool-request-1").unwrap(),
+    };
+    let clock = RecordingClock {
+        events,
+        value: "2025-07-23T12:00:00Z",
+    };
+    let evaluator = RecordingEvaluator {
+        events,
+        decision: decision.clone(),
+    };
+    let policy_store = RecordingPolicyStore {
+        events,
+        records: &records,
+        decision_id: PolicyDecisionId::from_decision(&decision),
+    };
+    let ids = SequenceIds::new(events);
+    let approval_requests = RecordingApprovalPublisher::new();
+    let resumes = UnusedResumeStore;
+    let pre_effect = ToolExecutionOrchestration::new(
+        &publisher,
+        authority,
+        &clock,
+        &evaluator,
+        &policy_store,
+        &ids,
+        &approval_requests,
+        &resumes,
+        &resumes,
+        executions,
+    );
+    ExecuteTool::new(pre_effect, executor).execute(request)
+}
+
 fn policy_decision(request: PolicyRequest, effect: PolicyEffect) -> PolicyDecision {
     policy_decision_with_digest(request, effect, 'c')
 }
@@ -1594,6 +1909,32 @@ fn tool_request_with_argv(argv: Vec<String>) -> ToolRequest {
             TaskRisk::High,
             "run focused tests",
             digest('b'),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+fn tool_request_with_resource_class(
+    request: &ToolRequest,
+    resource_class: ResourceClass,
+) -> ToolRequest {
+    let policy = request.policy();
+    let resource = policy.resource();
+    ToolRequest::new(
+        request.execution_id().clone(),
+        request.process().clone(),
+        ToolPolicyContext::new(
+            policy.actor().clone(),
+            policy.action().clone(),
+            PolicyResource {
+                capability: resource.capability.clone(),
+                content_digest: resource.content_digest.clone(),
+                resource_class,
+            },
+            policy.task_risk(),
+            policy.purpose(),
+            policy.policy_snapshot_digest().clone(),
         )
         .unwrap(),
     )

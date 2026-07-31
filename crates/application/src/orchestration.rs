@@ -14,9 +14,9 @@ use crate::{
     tool::{logical_capability, process_approval_operation},
     validate_approval_resume_relation, validate_authoritative_tool_request,
     validate_pending_approval_resume, ApprovalId, ApprovalRequestDto, ApprovalResumeSnapshot,
-    ApprovalResumeStore, ArtifactId, Clock, DeniedToolExecution, IdGenerator, ImmutableToolRequest,
-    PolicyDecision, PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator,
-    PolicyRequestBindingDigest, PortError, RecordedPolicyDecision, Retryability,
+    ApprovalResumeStore, ArtifactId, AuthorizedToolExecutionClaim, Clock, DeniedToolExecution,
+    IdGenerator, ImmutableToolRequest, PolicyDecision, PolicyDecisionId, PolicyDecisionStore,
+    PolicyEvaluator, PolicyRequestBindingDigest, PortError, RecordedPolicyDecision, Retryability,
     SafeErrorClassification, ToolAuthorityResolver, ToolExecutionDenialRequest, ToolExecutionId,
     ToolExecutionResumeSnapshot, ToolExecutionResumeStore, ToolExecutionStore, ToolRequest,
     ToolRequestBindingDigest,
@@ -157,13 +157,15 @@ impl<'a> ToolExecutionOrchestration<'a> {
         }
 
         match effect {
-            PolicyEffect::Allow => Ok(PreEffectOutcome::Allowed(PreEffectReady {
-                execution_id: request.execution_id().clone(),
+            PolicyEffect::Allow => Ok(self.ready(
+                immutable,
+                authoritative_request,
                 request_artifact_id,
-                request_binding_digest: immutable.binding_digest().clone(),
-                policy_decision_id: recorded_decision_id,
-                approval_id: None,
-            })),
+                recorded_decision_id,
+                policy_request_binding_digest,
+                evaluated_at,
+                None,
+            )),
             PolicyEffect::Deny | PolicyEffect::AllowWithRedaction => {
                 let denied = self.executions.resolve_denied(ToolExecutionDenialRequest {
                     request_artifact_id: request_artifact_id.clone(),
@@ -190,13 +192,15 @@ impl<'a> ToolExecutionOrchestration<'a> {
                         &policy_request_binding_digest,
                         approval,
                     )?;
-                    Ok(PreEffectOutcome::Allowed(PreEffectReady {
-                        execution_id: request.execution_id().clone(),
+                    Ok(self.ready(
+                        immutable,
+                        authoritative_request,
                         request_artifact_id,
-                        request_binding_digest: immutable.binding_digest().clone(),
-                        policy_decision_id: recorded_decision_id,
-                        approval_id: Some(approval.approval_id().clone()),
-                    }))
+                        recorded_decision_id,
+                        policy_request_binding_digest,
+                        evaluated_at,
+                        Some(approval.clone()),
+                    ))
                 } else {
                     self.request_approval(
                         authoritative_request,
@@ -210,6 +214,57 @@ impl<'a> ToolExecutionOrchestration<'a> {
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ready(
+        &self,
+        immutable: &ImmutableToolRequest,
+        authoritative_request: &ToolRequest,
+        request_artifact_id: ArtifactId,
+        policy_decision_id: PolicyDecisionId,
+        policy_request_binding_digest: PolicyRequestBindingDigest,
+        checked_at: Timestamp,
+        approval: Option<ToolApprovalRequest>,
+    ) -> PreEffectOutcome {
+        let process = authoritative_request.process().process();
+        let binding = process.binding();
+        PreEffectOutcome::Allowed(Box::new(PreEffectReady {
+            claim: AuthorizedToolExecutionClaim {
+                execution_id: authoritative_request.execution_id().clone(),
+                request_artifact_id,
+                request_content_digest: immutable.binding_digest().as_sha256().clone(),
+                request_binding_digest: immutable.binding_digest().clone(),
+                task_id: binding.task_id().clone(),
+                run_id: binding.run_id().clone(),
+                tool_name: "process.exec".to_owned(),
+                policy_decision_id,
+                policy_request_binding_digest,
+                approval,
+                workspace_version: binding.workspace_version(),
+                policy_snapshot_digest: authoritative_request
+                    .policy()
+                    .policy_snapshot_digest()
+                    .clone(),
+                fencing_token: process.executor_fencing_token(),
+                checked_at,
+            },
+            immutable: immutable.clone(),
+            authoritative_request: authoritative_request.clone(),
+        }))
+    }
+
+    pub(crate) fn revalidate_ready(&self, ready: &PreEffectReady) -> Result<(), PortError> {
+        let current = self.authority.resolve(ready.immutable.request())?;
+        validate_authoritative_tool_request(ready.immutable.request(), &current)?;
+        if current.request() != &ready.authoritative_request {
+            return Err(integrity_failure());
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn execution_store(&self) -> &dyn ToolExecutionStore {
+        self.executions
     }
 
     fn observed_at(&self) -> Result<(String, Timestamp), PortError> {
@@ -305,39 +360,50 @@ impl<'a> ToolExecutionOrchestration<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreEffectOutcome {
-    Allowed(PreEffectReady),
+    Allowed(Box<PreEffectReady>),
     Denied(DeniedToolExecution),
     ApprovalRequired(ApprovalRequestDto),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreEffectReady {
-    execution_id: ToolExecutionId,
-    request_artifact_id: ArtifactId,
-    request_binding_digest: ToolRequestBindingDigest,
-    policy_decision_id: PolicyDecisionId,
-    approval_id: Option<ApprovalId>,
+    claim: AuthorizedToolExecutionClaim,
+    immutable: ImmutableToolRequest,
+    authoritative_request: ToolRequest,
 }
 
 impl PreEffectReady {
     pub const fn execution_id(&self) -> &ToolExecutionId {
-        &self.execution_id
+        &self.claim.execution_id
     }
 
     pub const fn request_artifact_id(&self) -> &ArtifactId {
-        &self.request_artifact_id
+        &self.claim.request_artifact_id
     }
 
     pub const fn request_binding_digest(&self) -> &ToolRequestBindingDigest {
-        &self.request_binding_digest
+        &self.claim.request_binding_digest
     }
 
     pub const fn policy_decision_id(&self) -> &PolicyDecisionId {
-        &self.policy_decision_id
+        &self.claim.policy_decision_id
     }
 
     pub const fn approval_id(&self) -> Option<&ApprovalId> {
-        self.approval_id.as_ref()
+        match self.claim.approval.as_ref() {
+            Some(approval) => Some(approval.approval_id()),
+            None => None,
+        }
+    }
+
+    pub(crate) fn into_authorized_parts(
+        self,
+    ) -> (
+        AuthorizedToolExecutionClaim,
+        ImmutableToolRequest,
+        ToolRequest,
+    ) {
+        (self.claim, self.immutable, self.authoritative_request)
     }
 }
 
