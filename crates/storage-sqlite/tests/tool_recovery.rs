@@ -316,11 +316,22 @@ fn authoritative_process_binding_starts_only_the_exact_claim() {
             .unwrap(),
         authority
     );
+    let claimed_incomplete = store.incomplete().unwrap();
+    let [IncompleteToolExecution::InFlight(claimed)] = claimed_incomplete.as_slice() else {
+        panic!("claimed execution must be reported as in flight");
+    };
+    assert_eq!(claimed.process_binding, None);
     let binding =
         AuthoritativeProcessBinding::new(authority.clone(), 4_242, "job-process-binding").unwrap();
 
     store.record_process_binding(binding.clone()).unwrap();
-    store.record_process_binding(binding).unwrap();
+    store.record_process_binding(binding.clone()).unwrap();
+
+    let started_incomplete = store.incomplete().unwrap();
+    let [IncompleteToolExecution::InFlight(started)] = started_incomplete.as_slice() else {
+        panic!("started execution must be reported as in flight");
+    };
+    assert_eq!(started.process_binding.as_ref(), Some(&binding));
 
     let connection = configured_connection(&database.path);
     assert_eq!(
@@ -355,6 +366,36 @@ fn authoritative_process_binding_starts_only_the_exact_claim() {
     assert_integrity_failure(store.record_process_binding(
         AuthoritativeProcessBinding::new(authority, 4_243, "job-process-binding").unwrap(),
     ));
+}
+
+#[test]
+fn incomplete_rejects_corrupt_authoritative_process_binding_without_mutation() {
+    let database = TempDatabase::new();
+    let (store, claim, _, _) = exact_approval_claim_fixture(&database, "execution-corrupt-binding");
+    let ToolExecutionClaim::Claimed(authority) = store.begin_authorized(claim).unwrap() else {
+        panic!("fresh authorized execution must win the durable claim");
+    };
+    store
+        .record_process_binding(
+            AuthoritativeProcessBinding::new(authority, 4_242, "job-corrupt-binding").unwrap(),
+        )
+        .unwrap();
+    configured_connection(&database.path)
+        .execute(
+            "UPDATE operation_intents
+             SET external_receipt_json = json_set(
+                 external_receipt_json,
+                 '$.operationDigest',
+                 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
+             )
+             WHERE id = 'execution-corrupt-binding'",
+            [],
+        )
+        .unwrap();
+    let before = durable_read_fingerprint(&database);
+
+    assert_integrity_failure(store.incomplete());
+    assert_eq!(durable_read_fingerprint(&database), before);
 }
 
 #[test]

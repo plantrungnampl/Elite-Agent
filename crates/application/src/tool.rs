@@ -1367,6 +1367,7 @@ pub struct ToolExecutionRecoveryEvidence {
     pub task_id: TaskId,
     pub canonical_request_artifact_id: ArtifactId,
     pub idempotency_class: crate::IdempotencyClass,
+    pub process_binding: Option<AuthoritativeProcessBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

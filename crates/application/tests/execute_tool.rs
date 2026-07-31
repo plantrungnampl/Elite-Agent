@@ -624,6 +624,41 @@ fn mismatched_in_flight_response_fails_closed_after_begin() {
 }
 
 #[test]
+fn mismatched_process_binding_authority_fails_closed_after_begin() {
+    let fixture = authorized_fixture("execution-a", "test");
+    let mut evidence = recovery_evidence(
+        fixture.request.execution_id.clone(),
+        fixture.operation_digest.clone(),
+    );
+    evidence.process_binding = Some(
+        AuthoritativeProcessBinding::new(
+            claim_authority(
+                ToolExecutionId::new("execution-b").unwrap(),
+                fixture.operation_digest.clone(),
+            ),
+            4_242,
+            "job-mismatched-authority",
+        )
+        .unwrap(),
+    );
+    let sequence = recording_sequence();
+    let store =
+        RecordingStore::with_claim(Ok(ToolExecutionClaim::InFlight(evidence)), sequence.clone());
+    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
+    let use_case = ExecuteDurableTool::new(&store, &executor);
+
+    let error = use_case.execute(fixture.request).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(sequence.lock().unwrap().as_slice(), ["begin"]);
+    assert_eq!(executor.calls(), 0);
+    assert!(store.terminal_writes().is_empty());
+}
+
+#[test]
 fn mismatched_completed_response_fails_closed_after_begin() {
     let fixture = authorized_fixture("execution-a", "test");
     let receipt = durable_receipt(
@@ -897,6 +932,7 @@ fn incomplete_listing_returns_authoritative_recovery_evidence_read_only() {
         ArtifactId::new("artifact-request-a").unwrap()
     );
     assert_eq!(evidence.idempotency_class, IdempotencyClass::NonRepeatable);
+    assert_eq!(evidence.process_binding, None);
     assert_eq!(evidence.authority.attempt(), 7);
     assert_eq!(
         evidence.authority.executor_fencing_token(),
@@ -1534,6 +1570,7 @@ fn recovery_evidence(
         task_id: TaskId::new("task-1").unwrap(),
         canonical_request_artifact_id: ArtifactId::new("artifact-request-a").unwrap(),
         idempotency_class: IdempotencyClass::NonRepeatable,
+        process_binding: None,
     }
 }
 

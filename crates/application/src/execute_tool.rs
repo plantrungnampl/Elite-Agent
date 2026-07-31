@@ -398,7 +398,12 @@ fn validate_recovery_evidence(
         owner_run_id,
         executor_fencing_token,
     )?;
-    if &evidence.task_id != task_id {
+    if &evidence.task_id != task_id
+        || evidence
+            .process_binding
+            .as_ref()
+            .is_some_and(|binding| binding.authority() != &evidence.authority)
+    {
         return Err(integrity_failure());
     }
     Ok(())
