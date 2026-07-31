@@ -15,8 +15,8 @@ use local_agent_terminal_application::{
     ObservedFileImage, OpenFileWriteSession, PolicyApprovedDisclosure, PolicyDecisionId,
     PolicyDecisionStore, PortError, ProcessReceipt, RawGitDiffResult, RawGitStatusResult,
     RecordedPolicyDecision, RelativePathComponents, ResolvedCapability, RevokeLease, StructuredGit,
-    StructuredToolExecutor, ToolExecutionId, TrustedDisclosureContext, VerifiedBytes,
-    VerifiedFileWriteCompensation, VerifiedWrite, WorkspaceWriteCoordinator,
+    StructuredToolExecutor, ToolControlSelfTest, ToolExecutionId, TrustedDisclosureContext,
+    VerifiedBytes, VerifiedFileWriteCompensation, VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     ActorId, ActorLocality, ArtifactId, CapabilityRef, FencingToken, GitObjectId, LeaseClaim,
@@ -920,6 +920,19 @@ fn lease_revocation_after_prepare_blocks_the_write_before_apply() {
     assert!(!harness.recovery.indeterminate.load(Ordering::SeqCst));
 }
 
+#[test]
+fn control_self_test_propagates_process_executor_failure() {
+    let harness = Harness::new(None);
+
+    let error = ToolControlSelfTest::verify_controls(&harness.runtime())
+        .expect_err("the exact process executor self-test must gate the tool runtime");
+
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::Unavailable
+    );
+}
+
 struct Harness {
     log: RecordingLog,
     resolver: Resolver,
@@ -1764,6 +1777,15 @@ impl StructuredGit for RootRecordingGit {
 }
 
 struct Process;
+
+impl ToolControlSelfTest for Process {
+    fn verify_controls(&self) -> Result<(), PortError> {
+        Err(PortError::failure(
+            local_agent_terminal_application::SafeErrorClassification::Unavailable,
+            local_agent_terminal_application::Retryability::NonRetryable,
+        ))
+    }
+}
 
 impl ApprovedProcessExecutor for Process {
     fn execute(

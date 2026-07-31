@@ -437,6 +437,15 @@ impl LpacBoundary {
         Ok(Self { worktrees })
     }
 
+    pub(super) fn verify_controls(&self) -> Result<(), PortError> {
+        for worktree in &self.worktrees {
+            worktree.reverify()?;
+        }
+        let mut profile =
+            AppContainerProfile::create(ToolExecutionId::new("lpac-control-self-test")?)?;
+        profile.delete()
+    }
+
     pub(super) fn prepare(
         &self,
         request: &AuthorizedProcessRequest,
@@ -716,8 +725,9 @@ impl AppContainerProfile {
 
 impl Drop for AppContainerProfile {
     fn drop(&mut self) {
-        while self.active && self.delete().is_err() {
-            std::thread::sleep(Duration::from_millis(1));
+        if self.active {
+            // Drop cannot report cleanup failure; lifecycle owners call delete explicitly.
+            let _ = self.delete();
         }
     }
 }
@@ -1540,4 +1550,57 @@ fn platform_error() -> PortError {
         SafeErrorClassification::Unavailable,
         Retryability::NonRetryable,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    use super::*;
+
+    const PROFILE_DROP_CHILD_ENV: &str = "LAT_LPAC_PROFILE_DROP_CHILD";
+
+    #[test]
+    fn app_container_profile_drop_failure_is_bounded() {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "lpac::tests::app_container_profile_drop_failure_child",
+                "--nocapture",
+            ])
+            .env(PROFILE_DROP_CHILD_ENV, "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                return;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("AppContainer profile cleanup must not block Drop indefinitely");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn app_container_profile_drop_failure_child() {
+        if std::env::var_os(PROFILE_DROP_CHILD_ENV).is_none() {
+            return;
+        }
+        drop(AppContainerProfile {
+            execution_id: ToolExecutionId::new("lpac-profile-drop-test").unwrap(),
+            moniker: vec![0],
+            package_sid: Arc::new(OwnedAppContainerSid(0)),
+            local_app_data: PathBuf::new(),
+            active: true,
+        });
+    }
 }

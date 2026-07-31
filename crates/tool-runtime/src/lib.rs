@@ -16,8 +16,8 @@ use local_agent_terminal_application::{
     FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest,
     GitStatusResult, PolicyBoundBytes, PolicyDecisionId, PolicyDecisionStore, PortError,
     RawGitDiffResult, RawGitStatusResult, RecordedPolicyDecision, Retryability,
-    SafeErrorClassification, StructuredGit, StructuredToolExecutor, ToolExecutionId,
-    ToolExecutionResult, VerifiedBytes, VerifiedWrite, WorkspaceWriteCoordinator,
+    SafeErrorClassification, StructuredGit, StructuredToolExecutor, ToolControlSelfTest,
+    ToolExecutionId, ToolExecutionResult, VerifiedBytes, VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, PolicyAction, PolicyEffect, PolicyRequest, PolicyResource, TaskId,
@@ -299,6 +299,12 @@ impl StructuredToolExecutor for ToolRuntime<'_> {
         request: GitDiffRequest,
     ) -> Result<DisclosureOutcome<GitDiffResult>, PortError> {
         self.diff(request)
+    }
+}
+
+impl ToolControlSelfTest for ToolRuntime<'_> {
+    fn verify_controls(&self) -> Result<(), PortError> {
+        self.process_executor.verify_controls()
     }
 }
 

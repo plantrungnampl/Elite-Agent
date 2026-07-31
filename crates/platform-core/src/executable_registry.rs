@@ -5,7 +5,7 @@ use std::sync::Arc;
 use local_agent_terminal_application::{
     ApprovedExecutableIdentity, ExecutableArtifactInspector, ExecutableProfileResolver,
     ExecutableVerificationGuard, PortError, ResolvedExecutable, Retryability,
-    SafeErrorClassification,
+    SafeErrorClassification, ToolControlSelfTest,
 };
 use local_agent_terminal_domain::Sha256Digest;
 
@@ -140,6 +140,15 @@ impl ExecutableProfileResolver for ExecutableRegistry {
         executable: &ResolvedExecutable,
     ) -> Result<Box<dyn ExecutableVerificationGuard>, PortError> {
         Self::verify_and_retain(self, executable)
+    }
+}
+
+impl ToolControlSelfTest for ExecutableRegistry {
+    fn verify_controls(&self) -> Result<(), PortError> {
+        for registered in self.registrations.values() {
+            drop(self.verify_and_retain(registered.approved.executable())?);
+        }
+        Ok(())
     }
 }
 

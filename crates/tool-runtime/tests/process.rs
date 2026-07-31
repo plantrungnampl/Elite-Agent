@@ -10,8 +10,8 @@ use local_agent_terminal_application::{
     ObservedProcessWrite, PortError, ProcessExecutionBindingStore, ProcessFenceAuthority,
     ProcessLauncher, ProcessReceipt, ProcessStatus, ProcessWorkingDirectory,
     RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget, Retryability,
-    RevokeLease, SafeErrorClassification, ToolExecutionClaimAuthority, ToolExecutionId,
-    VerifiedWrite, WorkspaceWriteCoordinator,
+    RevokeLease, SafeErrorClassification, ToolControlSelfTest, ToolExecutionClaimAuthority,
+    ToolExecutionId, VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken, LeaseClaim, NetworkProfile,
@@ -70,6 +70,74 @@ fn typed_process_exec_resolves_profiles_and_preserves_argv_boundaries() {
         captured.cwd,
         ProcessWorkingDirectory::IsolatedWorktree(_)
     ));
+}
+
+#[test]
+fn control_self_test_propagates_launcher_failure_without_launch() {
+    let executable_path = std::env::current_exe().unwrap();
+    let executables = executable_registry(&executable_path, "test-version");
+    let environments = EnvironmentProfileRegistry::load(vec![TrustedEnvironmentProfile::new(
+        "rust-build",
+        vec![("CI".to_owned(), "1".to_owned())],
+        false,
+    )
+    .unwrap()])
+    .unwrap();
+    let networks = NetworkPolicyAdapter::load(vec![TrustedNetworkProfile::new(
+        "offline",
+        NetworkProfile::Denied,
+        Vec::new(),
+        "firewall-rule-7",
+    )
+    .unwrap()])
+    .unwrap();
+    let enforced_network = networks
+        .prepare(
+            "offline",
+            NetworkProfile::Denied,
+            NetworkEnforcementEvidence::new("firewall-rule-7", true, true).unwrap(),
+        )
+        .unwrap();
+    let claim = LeaseClaim::new(
+        TaskId::new("task-1").unwrap(),
+        RunId::new("run-1").unwrap(),
+        FencingToken::new(7).unwrap(),
+    );
+    let executor_fence = ProcessFenceAuthority::new(
+        Arc::new(CurrentLease {
+            expected: claim,
+            stale: false,
+        }),
+        Arc::new(WorkspaceWriteCoordinator::new()),
+    );
+    let resolver = WorktreeResolver {
+        mutation: CaseMutation::None,
+    };
+    let launcher = CapturingLauncher {
+        control_self_test_failure: true,
+        ..CapturingLauncher::default()
+    };
+    let process_bindings = RecordingProcessBindings::default();
+    let runtime = ProcessRuntime::new(
+        &executables,
+        &environments,
+        &networks,
+        vec![enforced_network],
+        &resolver,
+        &executor_fence,
+        &launcher,
+        &process_bindings,
+    )
+    .unwrap();
+
+    let error = ToolControlSelfTest::verify_controls(&runtime)
+        .expect_err("launcher self-test failure must make process execution unavailable");
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Unavailable
+    );
+    assert_eq!(launcher.calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -634,6 +702,19 @@ struct CapturingLauncher {
     request: Mutex<Option<AuthorizedProcessRequest>>,
     calls: AtomicUsize,
     omit_write_evidence: bool,
+    control_self_test_failure: bool,
+}
+
+impl ToolControlSelfTest for CapturingLauncher {
+    fn verify_controls(&self) -> Result<(), PortError> {
+        if self.control_self_test_failure {
+            return Err(PortError::failure(
+                SafeErrorClassification::Unavailable,
+                Retryability::NonRetryable,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl ProcessLauncher for CapturingLauncher {

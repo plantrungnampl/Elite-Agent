@@ -1840,7 +1840,7 @@ pub trait StructuredGit: Send + Sync {
     fn diff(&self, request: AuthorizedGitDiff) -> Result<RawGitDiffResult, PortError>;
 }
 
-pub trait ProcessLauncher: Send + Sync {
+pub trait ProcessLauncher: ToolControlSelfTest + Send + Sync {
     fn execute(
         &self,
         request: AuthorizedProcessRequest,
@@ -1902,7 +1902,7 @@ pub trait ExecutableArtifactInspector: Send + Sync {
     ) -> Result<(ResolvedExecutable, Box<dyn ExecutableVerificationGuard>), PortError>;
 }
 
-pub trait ExecutableProfileResolver: Send + Sync {
+pub trait ExecutableProfileResolver: ToolControlSelfTest + Send + Sync {
     fn resolve_registered(
         &self,
         toolchain_id: &str,
@@ -1929,7 +1929,7 @@ pub trait PrivateRuntimeDirectoryInspector: Send + Sync {
     >;
 }
 
-pub trait EnvironmentProfileResolver: Send + Sync {
+pub trait EnvironmentProfileResolver: ToolControlSelfTest + Send + Sync {
     fn resolve(
         &self,
         name: &str,
@@ -1941,7 +1941,7 @@ pub trait NetworkProfileVerifier: Send + Sync {
     fn verify(&self, profile: &EnforcedNetworkProfile) -> Result<(), PortError>;
 }
 
-pub trait ApprovedProcessExecutor: Send + Sync {
+pub trait ApprovedProcessExecutor: ToolControlSelfTest + Send + Sync {
     fn execute(
         &self,
         execution_id: ToolExecutionId,

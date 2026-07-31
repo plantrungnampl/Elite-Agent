@@ -32,7 +32,8 @@ use local_agent_terminal_application::{
     ProcessFenceAuthority, ProcessLimits, ProcessReceipt, ProcessStatus, ProcessWorkingDirectory,
     RelativePathComponents, ResolvedCapability, ResolvedCapabilityTarget,
     ResolvedEnvironmentProfile, Retryability, RevokeLease, SafeErrorClassification,
-    ToolExecutionClaimAuthority, ToolExecutionId, VerifiedWrite, WorkspaceWriteCoordinator,
+    ToolControlSelfTest, ToolExecutionClaimAuthority, ToolExecutionId, VerifiedWrite,
+    WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, ExpectedWrite, FencingToken, LeaseClaim, NetworkProfile, ProcessTrustTier,
@@ -1340,6 +1341,32 @@ fn lpac_rejects_physical_cwd_rebind_before_profile_or_child() {
     drop(launcher);
     fs::rename(&registered_parent, &rebound_parent)
         .expect("the ancestor rename must succeed after releasing the retained root handle");
+    assert!(rebound_parent.is_dir());
+}
+
+#[test]
+fn lpac_control_self_test_rejects_rebound_registered_root() {
+    let container = TempDir::new().unwrap();
+    let registered_parent = container.path().join("registered-parent");
+    let registered_root = registered_parent.join("worktree");
+    let rebound_parent = container.path().join("rebound-parent");
+    let relocated_root = registered_parent.join("relocated-worktree");
+    fs::create_dir_all(&registered_root).unwrap();
+    let launcher = registered_lpac_launcher(&registered_root);
+
+    ToolControlSelfTest::verify_controls(&launcher).unwrap();
+    fs::rename(&registered_root, &relocated_root).unwrap();
+    fs::create_dir(&registered_root).unwrap();
+
+    let error = ToolControlSelfTest::verify_controls(&launcher)
+        .expect_err("the retained LPAC root must reject a path rebind");
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    drop(launcher);
+    fs::rename(&registered_parent, &rebound_parent).unwrap();
     assert!(rebound_parent.is_dir());
 }
 

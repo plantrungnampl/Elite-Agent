@@ -6,7 +6,7 @@ use local_agent_terminal_application::{
     DirectoryFileIdentity, ExecutableArtifactInspector, ExecutableFileIdentity,
     ExecutableVerificationGuard, PortError, PrivateRuntimeDirectoryInspector,
     PrivateRuntimeDirectoryVerificationGuard, ResolvedExecutable, ResolvedPrivateRuntimeDirectory,
-    Retryability, SafeErrorClassification,
+    Retryability, SafeErrorClassification, ToolControlSelfTest,
 };
 use local_agent_terminal_domain::NetworkProfile;
 use local_agent_terminal_domain::Sha256Digest;
@@ -64,6 +64,7 @@ fn executable_registry_rejects_path_lookup_version_drift_and_replacement() {
 
     fs::write(&executable, b"attacker replacement").unwrap();
     assert!(registry.verify_and_retain(&resolved).is_err());
+    assert!(registry.verify_controls().is_err());
 }
 
 #[test]
@@ -114,6 +115,8 @@ fn environment_profiles_start_empty_reject_secrets_and_hash_canonically() {
     .unwrap()])
     .unwrap();
     let resolved = registry.resolve("rust-build", &expected_digest).unwrap();
+
+    registry.verify_controls().unwrap();
 
     assert_eq!(resolved.digest, expected_digest);
     assert_eq!(

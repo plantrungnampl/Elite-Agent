@@ -5,7 +5,7 @@ use local_agent_terminal_application::{
     EnvironmentProfileResolver, ExecutableProfileResolver, NetworkProfileVerifier, PortError,
     ProcessExecutionBindingStore, ProcessFenceAuthority, ProcessLauncher, ProcessLimits,
     ProcessReceipt, ProcessWorkingDirectory, Retryability, SafeErrorClassification,
-    ToolExecutionId,
+    ToolControlSelfTest, ToolExecutionId,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, ExpectedWrite, LeaseClaim, ProcessTrustTier, TaskId,
@@ -211,6 +211,17 @@ impl ApprovedProcessExecutor for ProcessRuntime<'_> {
         binding: &AuthoritativeProcessBinding,
     ) -> Result<CancellationReceipt, PortError> {
         Self::terminate_retained_process(self, binding)
+    }
+}
+
+impl ToolControlSelfTest for ProcessRuntime<'_> {
+    fn verify_controls(&self) -> Result<(), PortError> {
+        self.executables.verify_controls()?;
+        self.environments.verify_controls()?;
+        for profile in &self.enforced_networks {
+            self.networks.verify(profile)?;
+        }
+        self.launcher.verify_controls()
     }
 }
 

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use local_agent_terminal_application::{
     EnvironmentProfileResolver, PortError, ResolvedEnvironmentProfile, Retryability,
-    SafeErrorClassification,
+    SafeErrorClassification, ToolControlSelfTest,
 };
 use local_agent_terminal_domain::Sha256Digest;
 use sha2::{Digest, Sha256};
@@ -92,6 +92,17 @@ impl EnvironmentProfileResolver for EnvironmentProfileRegistry {
     }
 }
 
+impl ToolControlSelfTest for EnvironmentProfileRegistry {
+    fn verify_controls(&self) -> Result<(), PortError> {
+        for profile in self.profiles.values() {
+            if environment_digest(&profile.name, &profile.values)? != profile.digest {
+                return Err(integrity_failure());
+            }
+        }
+        Ok(())
+    }
+}
+
 fn environment_digest(
     name: &str,
     values: &BTreeMap<String, String>,
@@ -155,6 +166,13 @@ fn invalid_input() -> PortError {
 fn denied() -> PortError {
     PortError::failure(
         SafeErrorClassification::PermissionDenied,
+        Retryability::NonRetryable,
+    )
+}
+
+fn integrity_failure() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::IntegrityFailure,
         Retryability::NonRetryable,
     )
 }

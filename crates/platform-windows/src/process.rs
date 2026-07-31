@@ -21,7 +21,8 @@ use local_agent_terminal_application::{
     validate_and_order_process_writes, AuthoritativeProcessBinding, AuthorizedProcessRequest,
     BoundedOutput, CancellationReceipt, ObservedProcessWrite, PortError,
     ProcessExecutionBindingStore, ProcessLauncher, ProcessReceipt, ProcessStatus, Retryability,
-    SafeErrorClassification, ToolExecutionClaimAuthority, ToolExecutionId, WorkspaceWritePermit,
+    SafeErrorClassification, ToolControlSelfTest, ToolExecutionClaimAuthority, ToolExecutionId,
+    WorkspaceWritePermit,
 };
 #[cfg(feature = "test-seams")]
 use local_agent_terminal_application::{
@@ -473,6 +474,14 @@ enum PreparedProcessBoundary {
 }
 
 impl ConfiguredProcessBoundary {
+    fn verify_controls(&self) -> Result<(), PortError> {
+        match self {
+            Self::Lpac(boundary) => boundary.verify_controls(),
+            #[cfg(feature = "test-seams")]
+            Self::ClaimOnly(_) => Err(permission_denied()),
+        }
+    }
+
     fn prepare(
         &self,
         request: &AuthorizedProcessRequest,
@@ -612,6 +621,15 @@ impl WindowsProcessLauncher {
 impl Default for WindowsProcessLauncher {
     fn default() -> Self {
         Self::fail_closed()
+    }
+}
+
+impl ToolControlSelfTest for WindowsProcessLauncher {
+    fn verify_controls(&self) -> Result<(), PortError> {
+        self.boundary
+            .as_ref()
+            .ok_or_else(permission_denied)?
+            .verify_controls()
     }
 }
 
