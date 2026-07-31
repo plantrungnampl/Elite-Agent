@@ -62,6 +62,16 @@ fn first_startup_creates_and_validates_required_local_state() {
             "startup.ready",
         ]
     );
+    let tools = bootstrap.tool_runtime().unwrap();
+    assert_eq!(
+        tools.availability().unwrap(),
+        local_agent_terminal_bootstrap::ToolRuntimeAvailability::Unavailable
+    );
+    assert!(bootstrap.local_diagnostics().iter().any(|record| {
+        record.code == "startup.tools.reconciled"
+            && record.detail.contains("control_self_test=not_configured")
+            && record.detail.contains("availability=unavailable")
+    }));
 }
 
 #[test]

@@ -16,7 +16,7 @@ use local_agent_terminal_storage_files::{
 use local_agent_terminal_storage_sqlite::{DatabaseHealth, DatabaseIssue, OpenError, SqliteStore};
 
 use crate::logging::LocalLog;
-use crate::tool_runtime::{ToolRuntime, ToolRuntimeAvailability};
+use crate::tool_runtime::{ToolControlSelfTestStatus, ToolRuntime, ToolRuntimeAvailability};
 use crate::workspace_runtime::{
     fence_stale_leases, reconcile_workspace_after_fencing, WorkspaceRuntime,
 };
@@ -303,7 +303,8 @@ fn start(
         DiagnosticSeverityDto::Info,
         None,
         &format!(
-            "Tool recovery completed: recovered={}, interrupted={}, indeterminate={}, terminated_jobs={}, survivor_failures={}, availability={}.",
+            "Tool recovery completed: control_self_test={}, recovered={}, interrupted={}, indeterminate={}, terminated_jobs={}, survivor_failures={}, availability={}.",
+            tool_control_self_test_name(tool_report.control_self_test),
             tool_report.recovered,
             tool_report.interrupted,
             tool_report.indeterminate,
@@ -380,6 +381,14 @@ const fn tool_availability_name(availability: ToolRuntimeAvailability) -> &'stat
         ToolRuntimeAvailability::Ready => "ready",
         ToolRuntimeAvailability::DegradedReadOnly => "degraded_read_only",
         ToolRuntimeAvailability::Unavailable => "unavailable",
+    }
+}
+
+const fn tool_control_self_test_name(status: ToolControlSelfTestStatus) -> &'static str {
+    match status {
+        ToolControlSelfTestStatus::NotConfigured => "not_configured",
+        ToolControlSelfTestStatus::Passed => "passed",
+        ToolControlSelfTestStatus::Failed => "failed",
     }
 }
 

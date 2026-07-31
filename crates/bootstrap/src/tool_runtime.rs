@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
+
+#[cfg(test)]
+use std::thread;
 
 use local_agent_terminal_application::{
     ArtifactId, ArtifactWriteReservation, AuthoritativeProcessBinding,
@@ -9,9 +12,10 @@ use local_agent_terminal_application::{
     IncompleteToolExecution, NewToolIntent, OperationIntentSnapshot, PortError, ProcessStatus,
     ProjectId, ReservedArtifact, RetainedProcessController, Retryability, SafeErrorClassification,
     SafeToolExecutionError, StructuredToolExecutor, TaskId, TaskQuery, ToolApprovalPublication,
-    ToolApprovalRequest, ToolApprovalRequestPublisher, ToolExecutionCancellationClaim,
-    ToolExecutionId, ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResumeStore,
-    ToolExecutionStore, ToolExecutionTerminal, ToolRequestPublisher, WorkspaceEvidenceStore,
+    ToolApprovalRequest, ToolApprovalRequestPublisher, ToolControlSelfTest,
+    ToolExecutionCancellationClaim, ToolExecutionId, ToolExecutionRecoveryState,
+    ToolExecutionResolution, ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal,
+    ToolRequestPublisher, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
 use local_agent_terminal_storage_sqlite::SqliteStore;
@@ -20,6 +24,10 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
 type ToolWorkerResult = Result<DurableToolExecutionReceipt, PortError>;
 
+pub trait SelfTestingToolExecutor: StructuredToolExecutor + ToolControlSelfTest {}
+
+impl<T> SelfTestingToolExecutor for T where T: StructuredToolExecutor + ToolControlSelfTest {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolRuntimeAvailability {
     Ready,
@@ -27,8 +35,17 @@ pub enum ToolRuntimeAvailability {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolControlSelfTestStatus {
+    #[default]
+    NotConfigured,
+    Passed,
+    Failed,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolStartupRecoveryReport {
+    pub control_self_test: ToolControlSelfTestStatus,
     pub recovered: usize,
     pub interrupted: usize,
     pub indeterminate: usize,
@@ -45,14 +62,14 @@ struct ToolRuntimeState {
 
 pub struct ToolRuntime {
     executions: Arc<dyn ToolExecutionStore>,
-    executor: Option<Arc<dyn StructuredToolExecutor>>,
+    executor: Option<Arc<dyn SelfTestingToolExecutor>>,
     retained_processes: Arc<dyn RetainedProcessController>,
     state: Mutex<ToolRuntimeState>,
     shutdown: Mutex<()>,
 }
 
 struct StructuredExecutorProcessController {
-    executor: Arc<dyn StructuredToolExecutor>,
+    executor: Arc<dyn SelfTestingToolExecutor>,
 }
 
 impl RetainedProcessController for StructuredExecutorProcessController {
@@ -67,7 +84,7 @@ impl RetainedProcessController for StructuredExecutorProcessController {
 impl ToolRuntime {
     pub fn new(
         executions: Arc<dyn ToolExecutionStore>,
-        executor: Arc<dyn StructuredToolExecutor>,
+        executor: Arc<dyn SelfTestingToolExecutor>,
     ) -> Self {
         let retained_processes = Arc::new(StructuredExecutorProcessController {
             executor: Arc::clone(&executor),
@@ -84,7 +101,7 @@ impl ToolRuntime {
 
     fn configured(
         executions: Arc<dyn ToolExecutionStore>,
-        executor: Option<Arc<dyn StructuredToolExecutor>>,
+        executor: Option<Arc<dyn SelfTestingToolExecutor>>,
         retained_processes: Arc<dyn RetainedProcessController>,
     ) -> Self {
         Self {
@@ -120,9 +137,19 @@ impl ToolRuntime {
             }
         }
 
+        let control_self_test = match self.executor.as_ref() {
+            Some(executor) if executor.verify_controls().is_ok() => {
+                ToolControlSelfTestStatus::Passed
+            }
+            Some(_) => ToolControlSelfTestStatus::Failed,
+            None => ToolControlSelfTestStatus::NotConfigured,
+        };
         let incomplete = self.executions.incomplete()?;
-        let mut report = ToolStartupRecoveryReport::default();
-        let mut availability = if self.executor.is_some() {
+        let mut report = ToolStartupRecoveryReport {
+            control_self_test,
+            ..ToolStartupRecoveryReport::default()
+        };
+        let mut availability = if control_self_test == ToolControlSelfTestStatus::Passed {
             ToolRuntimeAvailability::Ready
         } else {
             ToolRuntimeAvailability::Unavailable
@@ -214,7 +241,8 @@ impl ToolRuntime {
         Ok(())
     }
 
-    pub fn dispatch(
+    #[cfg(test)]
+    fn dispatch_test_worker(
         &self,
         execution_id: ToolExecutionId,
         worker: impl FnOnce() -> Result<DurableToolExecutionReceipt, PortError> + Send + 'static,
@@ -603,3 +631,7 @@ fn indeterminate_receipt(
         }),
     )
 }
+
+#[cfg(test)]
+#[path = "tool_runtime_tests.rs"]
+mod tests;

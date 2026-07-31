@@ -1866,6 +1866,10 @@ pub trait RetainedProcessController: Send + Sync {
     ) -> Result<CancellationReceipt, PortError>;
 }
 
+pub trait ToolControlSelfTest: Send + Sync {
+    fn verify_controls(&self) -> Result<(), PortError>;
+}
+
 impl<T> RetainedProcessController for T
 where
     T: ProcessLauncher + ?Sized,

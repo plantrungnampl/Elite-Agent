@@ -14,6 +14,7 @@ pub use local_agent_terminal_application::{
 };
 pub use startup::{Bootstrap, StartupConfig};
 pub use tool_runtime::{
-    ToolArtifactPublisher, ToolRuntime, ToolRuntimeAvailability, ToolStartupRecoveryReport,
+    SelfTestingToolExecutor, ToolArtifactPublisher, ToolControlSelfTestStatus, ToolRuntime,
+    ToolRuntimeAvailability, ToolStartupRecoveryReport,
 };
 pub use workspace_runtime::WorkspaceRuntime;

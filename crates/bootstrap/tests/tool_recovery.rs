@@ -9,12 +9,15 @@ use local_agent_terminal_application::{
     GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, IdempotencyClass,
     ImmutableToolRequest, IncompleteToolExecution, JobReceipt, NewToolExecution, NewToolIntent,
     OperationIntentSnapshot, PolicyBoundBytes, PortError, ProcessStatus, Retryability,
-    SafeErrorClassification, StructuredToolExecutor, ToolExecutionCancellationClaim,
-    ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId,
-    ToolExecutionRecoveryEvidence, ToolExecutionRecoveryState, ToolExecutionResolution,
-    ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminalKind, VerifiedWrite,
+    SafeErrorClassification, StructuredToolExecutor, ToolControlSelfTest,
+    ToolExecutionCancellationClaim, ToolExecutionClaim, ToolExecutionClaimAuthority,
+    ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionRecoveryEvidence,
+    ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResult, ToolExecutionStore,
+    ToolExecutionTerminalKind, VerifiedWrite,
 };
-use local_agent_terminal_bootstrap::{ToolRuntime, ToolRuntimeAvailability};
+use local_agent_terminal_bootstrap::{
+    SelfTestingToolExecutor, ToolControlSelfTestStatus, ToolRuntime, ToolRuntimeAvailability,
+};
 use local_agent_terminal_domain::{RunId, Sha256Digest, TaskId};
 
 #[test]
@@ -34,6 +37,7 @@ fn startup_recovery_interrupts_unstarted_claim_before_dispatch_release() {
 
     let report = runtime.recover_startup().unwrap();
 
+    assert_eq!(report.control_self_test, ToolControlSelfTestStatus::Passed);
     assert_eq!(report.recovered, 1);
     assert_eq!(report.interrupted, 1);
     assert_eq!(report.indeterminate, 0);
@@ -76,6 +80,7 @@ fn startup_recovery_terminates_exact_retained_job_and_never_relaunches() {
     let second = runtime.recover_startup().unwrap();
 
     assert_eq!(first, second);
+    assert_eq!(first.control_self_test, ToolControlSelfTestStatus::Passed);
     assert_eq!(first.recovered, 1);
     assert_eq!(first.interrupted, 0);
     assert_eq!(first.indeterminate, 1);
@@ -165,9 +170,45 @@ fn startup_recovery_retains_started_execution_without_process_binding() {
     assert!(store.terminal(evidence.authority.execution_id()).is_none());
 }
 
+#[test]
+fn failed_control_self_test_keeps_dispatch_closed_after_recovery() {
+    let evidence = recovery_evidence(
+        "execution-control-self-test",
+        ToolExecutionRecoveryState::Claimed,
+    );
+    let store = Arc::new(RecoveryExecutionStore::new(vec![
+        IncompleteToolExecution::InFlight(evidence.clone()),
+    ]));
+    let executor = Arc::new(RecoveryExecutor::with_control_failure());
+    let runtime = runtime(store.clone(), executor.clone());
+
+    let first = runtime.recover_startup().unwrap();
+    let second = runtime.recover_startup().unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(first.control_self_test, ToolControlSelfTestStatus::Failed);
+    assert_eq!(first.recovered, 1);
+    assert_eq!(executor.control_self_test_calls(), 1);
+    assert_eq!(store.incomplete_calls(), 1);
+    assert_eq!(
+        store
+            .terminal(evidence.authority.execution_id())
+            .unwrap()
+            .terminal()
+            .kind(),
+        ToolExecutionTerminalKind::Interrupted
+    );
+    assert_eq!(
+        runtime.availability().unwrap(),
+        ToolRuntimeAvailability::Unavailable
+    );
+    assert!(runtime.release_dispatch().is_err());
+    assert_eq!(executor.execute_calls(), 0);
+}
+
 fn runtime(store: Arc<RecoveryExecutionStore>, executor: Arc<RecoveryExecutor>) -> ToolRuntime {
     let execution_port: Arc<dyn ToolExecutionStore> = store;
-    let executor_port: Arc<dyn StructuredToolExecutor> = executor;
+    let executor_port: Arc<dyn SelfTestingToolExecutor> = executor;
     ToolRuntime::new(execution_port, executor_port)
 }
 
@@ -264,6 +305,8 @@ struct RecoveryExecutor {
     cancellations: Mutex<BTreeMap<ToolExecutionId, CancellationReceipt>>,
     terminated_bindings: Mutex<Vec<AuthoritativeProcessBinding>>,
     execute_calls: AtomicUsize,
+    control_self_test_calls: AtomicUsize,
+    control_failure: bool,
 }
 
 impl RecoveryExecutor {
@@ -272,6 +315,15 @@ impl RecoveryExecutor {
             cancellations: Mutex::new(BTreeMap::from([(execution_id, receipt)])),
             terminated_bindings: Mutex::new(Vec::new()),
             execute_calls: AtomicUsize::new(0),
+            control_self_test_calls: AtomicUsize::new(0),
+            control_failure: false,
+        }
+    }
+
+    fn with_control_failure() -> Self {
+        Self {
+            control_failure: true,
+            ..Self::default()
         }
     }
 
@@ -281,6 +333,19 @@ impl RecoveryExecutor {
 
     fn terminated_bindings(&self) -> Vec<AuthoritativeProcessBinding> {
         self.terminated_bindings.lock().unwrap().clone()
+    }
+
+    fn control_self_test_calls(&self) -> usize {
+        self.control_self_test_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ToolControlSelfTest for RecoveryExecutor {
+    fn verify_controls(&self) -> Result<(), PortError> {
+        self.control_self_test_calls.fetch_add(1, Ordering::SeqCst);
+        (!self.control_failure)
+            .then_some(())
+            .ok_or_else(unavailable)
     }
 }
 
