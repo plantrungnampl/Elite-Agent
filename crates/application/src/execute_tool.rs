@@ -62,8 +62,8 @@ impl<'a> ExecuteTool<'a> {
                 Ok(ToolOutcome::ApprovalRequired(request))
             }
             PreEffectOutcome::Denied(denied) => Ok(ToolOutcome::Denied(denied)),
-            PreEffectOutcome::Allowed(ready) => {
-                self.pre_effect.revalidate_ready(&ready)?;
+            PreEffectOutcome::Allowed(mut ready) => {
+                self.pre_effect.revalidate_ready(&mut ready)?;
                 let (claim, immutable, authoritative_request) = (*ready).into_authorized_parts();
                 let outcome =
                     ExecuteDurableTool::new(self.pre_effect.execution_store(), self.executor)

@@ -254,11 +254,18 @@ impl<'a> ToolExecutionOrchestration<'a> {
         }))
     }
 
-    pub(crate) fn revalidate_ready(&self, ready: &PreEffectReady) -> Result<(), PortError> {
+    pub(crate) fn revalidate_ready(&self, ready: &mut PreEffectReady) -> Result<(), PortError> {
         let current = self.authority.resolve(ready.immutable.request())?;
         validate_authoritative_tool_request(ready.immutable.request(), &current)?;
         if current.request() != &ready.authoritative_request {
             return Err(integrity_failure());
+        }
+        if let Some(approval) = &ready.claim.approval {
+            let checked_at = self.observed_at()?.1;
+            if parse_policy_timestamp(&approval.payload().expires_at)? <= checked_at {
+                return Err(integrity_failure());
+            }
+            ready.claim.checked_at = checked_at;
         }
         Ok(())
     }

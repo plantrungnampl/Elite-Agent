@@ -802,6 +802,192 @@ fn approved_resume_reloads_exact_records_and_reuses_pre_effect_path() {
 }
 
 #[test]
+fn approval_expiring_during_revalidation_stops_before_begin_and_effect() {
+    let request = tool_request();
+    let immutable = canonical_tool_request(&request).unwrap();
+    let initial_approvals = RecordingApprovalPublisher::new();
+    let published = with_require_approval_orchestrator(
+        &request,
+        &initial_approvals,
+        None,
+        |orchestrator, _, _, _| {
+            orchestrator.execute(request.clone()).unwrap();
+            initial_approvals.stored.lock().unwrap().clone().unwrap()
+        },
+    );
+    let request_content_digest = resource_digest(immutable.canonical_bytes());
+    let binding = request.process().process().binding();
+    let expires_at = Timestamp::from_unix_seconds(1_753_272_900);
+    let intent_id = "intent-expiring-approval".to_owned();
+    let approval = ApprovalResumeSnapshot::new(
+        published.approval_id().clone(),
+        published.execution_id().clone(),
+        published.policy_decision_id().clone(),
+        published.policy_request_binding_digest().clone(),
+        published.canonical_payload().operation_digest.clone(),
+        published.tool_request_binding_digest().clone(),
+        binding.task_id().clone(),
+        binding.run_id().clone(),
+        published.tool_request_artifact_id().clone(),
+        request_content_digest.clone(),
+        intent_id.clone(),
+        binding.workspace_version(),
+        request.policy().policy_snapshot_digest().clone(),
+        request.process().process().executor_fencing_token(),
+        expires_at,
+        published.payload().nonce.clone(),
+        ApprovalState::Approved,
+    )
+    .unwrap();
+    let execution = ToolExecutionResumeSnapshot::new(
+        published.execution_id().clone(),
+        published.approval_id().clone(),
+        published.policy_decision_id().clone(),
+        published.canonical_payload().operation_digest.clone(),
+        published.policy_request_binding_digest().clone(),
+        published.tool_request_binding_digest().clone(),
+        binding.task_id().clone(),
+        binding.run_id().clone(),
+        binding.workspace_version(),
+        request.policy().policy_snapshot_digest().clone(),
+        request.process().process().executor_fencing_token(),
+        expires_at,
+        published.payload().nonce.clone(),
+        published.tool_request_artifact_id().clone(),
+        request_content_digest.clone(),
+        request_content_digest.clone(),
+        intent_id,
+        OperationIntentStatus::Pending,
+    )
+    .unwrap();
+    let events = Mutex::new(Vec::new());
+    let records = Mutex::new(Vec::new());
+    let resumes = RecordingResumeStore {
+        events: &events,
+        checked_at: Timestamp::from_unix_seconds(1_753_272_300),
+        approval,
+        execution,
+        approval_request: published.clone(),
+        immutable,
+    };
+    let publisher = RecordingPublisher {
+        events: &events,
+        artifact_id: published.tool_request_artifact_id().clone(),
+    };
+    let authority = RecordingAuthority {
+        events: &events,
+        current: request.clone(),
+    };
+    let clock = AdvancingClock {
+        events: &events,
+        values: Mutex::new(VecDeque::from([
+            "2025-07-23T12:05:00Z",
+            "2025-07-23T12:15:00Z",
+        ])),
+    };
+    let decision = policy_decision_with_digest(
+        policy_request_for_tool(&request, Timestamp::from_unix_seconds(1_753_272_300)),
+        PolicyEffect::RequireApproval,
+        'd',
+    );
+    let policy_store = RecordingPolicyStore {
+        events: &events,
+        records: &records,
+        decision_id: PolicyDecisionId::from_decision(&decision),
+    };
+    let evaluator = RecordingEvaluator {
+        events: &events,
+        decision,
+    };
+    let claim_authority = ToolExecutionClaimAuthority::from_persisted(
+        request.execution_id().clone(),
+        request_content_digest,
+        binding.run_id().clone(),
+        1,
+        request.process().process().executor_fencing_token(),
+    )
+    .unwrap();
+    let executions = TestExecutionStore::executing(&events, claim_authority);
+    let executor = RecordingStructuredExecutor { events: &events };
+    let ids = SequenceIds::new(&events);
+    let approvals = RecordingApprovalPublisher::new();
+    let orchestration = ToolExecutionOrchestration::new(
+        &publisher,
+        &authority,
+        &clock,
+        &evaluator,
+        &policy_store,
+        &ids,
+        &approvals,
+        &resumes,
+        &resumes,
+        &executions,
+    );
+
+    let error = ExecuteTool::new(orchestration, &executor)
+        .resume_approved(published.approval_id().clone())
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "clock",
+            "approval-resume",
+            "execution-resume",
+            "request-artifact",
+            "approval-artifact",
+            "authority",
+            "evaluate",
+            "record",
+            "authority",
+            "clock",
+        ]
+    );
+    assert!(executions.authorized_claims.lock().unwrap().is_empty());
+
+    events.lock().unwrap().clear();
+    let fresh_clock = AdvancingClock {
+        events: &events,
+        values: Mutex::new(VecDeque::from([
+            "2025-07-23T12:05:00Z",
+            "2025-07-23T12:14:00Z",
+        ])),
+    };
+    let orchestration = ToolExecutionOrchestration::new(
+        &publisher,
+        &authority,
+        &fresh_clock,
+        &evaluator,
+        &policy_store,
+        &ids,
+        &approvals,
+        &resumes,
+        &resumes,
+        &executions,
+    );
+
+    ExecuteTool::new(orchestration, &executor)
+        .resume_approved(published.approval_id().clone())
+        .unwrap();
+
+    let claims = executions.authorized_claims.lock().unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(
+        claims[0].checked_at,
+        Timestamp::from_unix_seconds(1_753_272_840)
+    );
+    assert_eq!(
+        claims[0].policy_request_binding_digest,
+        *published.policy_request_binding_digest()
+    );
+    assert_eq!(claims[0].approval.as_ref(), Some(&published));
+}
+
+#[test]
 fn replay_with_changed_full_request_binding_fails_closed() {
     let request = tool_request();
     let approval_requests = RecordingApprovalPublisher::new();
@@ -1452,6 +1638,24 @@ impl ToolRequestPublisher for RecordingPublisher<'_> {
 struct RecordingClock<'a> {
     events: &'a Mutex<Vec<&'static str>>,
     value: &'static str,
+}
+
+struct AdvancingClock<'a> {
+    events: &'a Mutex<Vec<&'static str>>,
+    values: Mutex<VecDeque<&'static str>>,
+}
+
+impl Clock for AdvancingClock<'_> {
+    fn now_utc(&self) -> Result<String, PortError> {
+        self.events.lock().unwrap().push("clock");
+        Ok(self
+            .values
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("test clock observation")
+            .to_owned())
+    }
 }
 
 impl Clock for RecordingClock<'_> {
