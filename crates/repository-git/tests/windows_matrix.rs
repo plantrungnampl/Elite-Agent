@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use git2::{
     IndexAddOption, ObjectFormat as GitObjectFormat, Repository, RepositoryInitOptions, Signature,
@@ -13,6 +14,9 @@ use local_agent_terminal_domain::{
 };
 use local_agent_terminal_repository_git::GitRepositoryGateway;
 use tempfile::TempDir;
+
+// ponytail: serialize fixture writes until libgit2 SHA-256 is safe beside SHA-1 writes.
+static GIT_FIXTURE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn commit_all(repository: &Repository, message: &str) -> String {
     let mut index = repository.index().expect("index");
@@ -67,6 +71,10 @@ fn commit_repository_with_format(
     root: &Path,
     object_format: GitObjectFormat,
 ) -> (Repository, String) {
+    let _write_guard = GIT_FIXTURE_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("git fixture write lock");
     let mut options = RepositoryInitOptions::new();
     options.object_format(object_format);
     let repository = Repository::init_opts(root, &options).expect("init");
