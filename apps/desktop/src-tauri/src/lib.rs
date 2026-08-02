@@ -295,7 +295,10 @@ mod tests {
         let activity = managed
             .with_tool_runtime(|runtime| runtime.activity().map_err(Into::into))
             .unwrap();
-        assert_eq!(activity.availability, ToolRuntimeAvailabilityDto::Ready);
+        assert_eq!(
+            activity.availability,
+            ToolRuntimeAvailabilityDto::DegradedReadOnly
+        );
     }
 
     #[test]
@@ -366,7 +369,10 @@ mod tests {
         let activity = managed
             .with_tool_runtime(|runtime| runtime.activity().map_err(Into::into))
             .unwrap();
-        assert_eq!(activity.availability, ToolRuntimeAvailabilityDto::Ready);
+        assert_eq!(
+            activity.availability,
+            ToolRuntimeAvailabilityDto::DegradedReadOnly
+        );
         assert!(activity.entries.is_empty());
     }
 }
