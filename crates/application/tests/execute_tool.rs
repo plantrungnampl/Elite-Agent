@@ -2108,6 +2108,7 @@ fn tool_request_with_argv(argv: Vec<String>) -> ToolRequest {
         vec![CapabilityRef::worktree(task_id.clone(), "src").unwrap()],
         None,
         None,
+        None,
     )
     .unwrap();
     ToolRequest::new(

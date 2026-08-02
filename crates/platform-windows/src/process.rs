@@ -1518,9 +1518,13 @@ fn validate_request(request: &AuthorizedProcessRequest) -> Result<(), PortError>
         || request.limits.max_stdout_bytes == 0
         || request.limits.max_stderr_bytes == 0
         || request.limits.max_active_processes == 0
+        || request.limits.disk_write_limit_bytes == Some(0)
         || is_shell(&request.executable)
     {
         return Err(permission_denied());
+    }
+    if request.limits.disk_write_limit_bytes.is_some() {
+        return Err(platform_error());
     }
     validate_job_limits(request)
 }

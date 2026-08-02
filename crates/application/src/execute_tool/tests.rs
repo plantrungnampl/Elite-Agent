@@ -156,6 +156,7 @@ fn tool_request_binding_covers_every_canonical_wire_leaf_and_list() {
         "/process/argv",
         "/process/argv/0",
         "/process/cpuTimeLimitMs",
+        "/process/diskWriteLimitBytes",
         "/process/cwd/kind",
         "/process/cwd/path",
         "/process/cwd/taskId",
@@ -1443,6 +1444,7 @@ fn approved_process_request_with(
         Vec::new(),
         None,
         None,
+        None,
     )
     .unwrap()
 }
@@ -1483,6 +1485,7 @@ fn rich_tool_request() -> ToolRequest {
             vec![CapabilityRef::source("revision-1", "src/lib.rs").unwrap()],
             Some(1024),
             Some(500),
+            Some(2048),
         )
         .unwrap(),
         policy_context("agent-1", "run focused tests"),

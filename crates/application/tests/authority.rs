@@ -389,6 +389,7 @@ fn tool_request(fixture: &Fixture) -> ToolRequest {
             .collect(),
         fixture.memory_limit,
         fixture.cpu_limit,
+        None,
     )
     .unwrap();
     ToolRequest::new(

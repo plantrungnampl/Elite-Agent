@@ -237,14 +237,19 @@ fn process_limits(
         max_stdout_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
         max_stderr_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
         max_active_processes: DEFAULT_MAX_ACTIVE_PROCESSES,
+        disk_write_limit_bytes: request.disk_write_limit_bytes(),
     };
     if limits.memory_limit_bytes == 0
         || limits.cpu_time_limit_ms == 0
         || limits.max_stdout_bytes == 0
         || limits.max_stderr_bytes == 0
         || limits.max_active_processes == 0
+        || limits.disk_write_limit_bytes == Some(0)
         || limits.memory_limit_bytes > MAX_SAFE_INTEGER
         || limits.cpu_time_limit_ms > MAX_SAFE_INTEGER
+        || limits
+            .disk_write_limit_bytes
+            .is_some_and(|limit| limit > MAX_SAFE_INTEGER)
     {
         return Err(invalid_input());
     }

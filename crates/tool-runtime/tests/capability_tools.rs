@@ -1087,6 +1087,7 @@ fn authorized_output_request() -> AuthorizedToolRequest {
         Vec::new(),
         None,
         None,
+        None,
     )
     .unwrap();
     let approval = bind_tool_approval_payload(

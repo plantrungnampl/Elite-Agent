@@ -257,6 +257,7 @@ fn arguments_digest_binds_only_argv() {
         RequestMutation::Timeout,
         RequestMutation::MemoryLimit,
         RequestMutation::CpuLimit,
+        RequestMutation::DiskWriteLimit,
     ] {
         let request = authorized_process_request_for(mutation);
         let payload = approved_tool_payload(&request, APPROVAL_NONCE);
@@ -400,6 +401,7 @@ fn process_approval_freezes_digest_version_path_and_file_identity() {
             baseline_request.expected_reads().to_vec(),
             baseline_request.memory_limit_bytes(),
             baseline_request.cpu_time_limit_ms(),
+            baseline_request.disk_write_limit_bytes(),
         )
         .unwrap();
         let changed = approved_tool_binding(&changed_request, APPROVAL_NONCE);
@@ -430,6 +432,7 @@ enum RequestMutation {
     Timeout,
     MemoryLimit,
     CpuLimit,
+    DiskWriteLimit,
 }
 
 fn authorized_process_request_for(mutation: RequestMutation) -> ApprovedProcessRequest {
@@ -547,6 +550,7 @@ fn authorized_process_request_for(mutation: RequestMutation) -> ApprovedProcessR
         },
         (mutation == RequestMutation::MemoryLimit).then_some(1024),
         (mutation == RequestMutation::CpuLimit).then_some(500),
+        (mutation == RequestMutation::DiskWriteLimit).then_some(2048),
     )
     .unwrap()
 }

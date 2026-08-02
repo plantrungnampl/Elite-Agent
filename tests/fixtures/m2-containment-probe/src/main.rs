@@ -63,7 +63,7 @@ fn main() {
         println!("m2-read-{label}={}", read_status(&read));
         println!("m2-write-{label}={}", append_status(&write));
     }
-    for (index, label) in [
+    for (index, default_label) in [
         "junction",
         "symlink",
         "unc",
@@ -77,6 +77,11 @@ fn main() {
     .into_iter()
     .enumerate()
     {
+        let label = if default_label == "symlink" {
+            std::env::var("LAT_M2_SYMLINK_CONTROL").unwrap_or_else(|_| default_label.to_owned())
+        } else {
+            default_label.to_owned()
+        };
         println!(
             "m2-path-{label}={}",
             read_status(&environment_path("LAT_M2_PATH", index))

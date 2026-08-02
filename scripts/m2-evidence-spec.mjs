@@ -90,16 +90,19 @@ export const containmentCases = [
     evidence("platform-windows", "real_lpac_denies_registered_descendant_creation_modes"),
     evidence("platform-windows-seams", "cancellation_terminates_descendants_and_breakaway_is_denied"),
   ]),
-  containment("output/process/memory/CPU/wall/disk budgets", "enforced", [
+  containment("output/process/memory/CPU/wall budgets", "enforced", [
     evidence("platform-windows", "output_overflow_terminates_the_job_and_returns_only_the_bound"),
     evidence("platform-windows", "memory_job_limit_denies_additional_committed_memory"),
     evidence("platform-windows", "cpu_job_limit_terminates_busy_process_before_wall_timeout"),
     evidence("platform-windows", "bounded_inert_helper_outlives_a_short_real_lpac_timeout"),
+  ]),
+  containment("structured file-write size budget", "enforced", [
     evidence("platform-windows", "oversized_write_is_denied_before_target_or_temp_mutation"),
   ]),
   containment("unenforceable boundaries start no process", "fail-closed", [
     evidence("platform-windows", "missing_os_containment_denies_before_child_code_runs"),
     evidence("platform-windows", "lpac_rejects_non_denied_network_before_resume"),
+    evidence("platform-windows-seams", "requested_disk_write_budget_fails_closed_before_child_creation"),
   ]),
   containment("structured read/write/status/diff paths", "policy-bound", [
     evidence("tool-security-matrix", "file_read_forces_resolved_digest_records_authoritative_decision_and_returns_only_effective_bytes"),

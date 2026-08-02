@@ -505,6 +505,7 @@ pub struct ApprovedProcessRequest {
     expected_reads: Vec<CapabilityRef>,
     memory_limit_bytes: Option<u64>,
     cpu_time_limit_ms: Option<u64>,
+    disk_write_limit_bytes: Option<u64>,
 }
 
 impl ApprovedProcessRequest {
@@ -514,6 +515,7 @@ impl ApprovedProcessRequest {
         expected_reads: Vec<CapabilityRef>,
         memory_limit_bytes: Option<u64>,
         cpu_time_limit_ms: Option<u64>,
+        disk_write_limit_bytes: Option<u64>,
     ) -> Result<Self, PortError> {
         let request = Self {
             approved_executable,
@@ -521,6 +523,7 @@ impl ApprovedProcessRequest {
             expected_reads,
             memory_limit_bytes,
             cpu_time_limit_ms,
+            disk_write_limit_bytes,
         };
         validate_approved_process_request(&request)?;
         Ok(request)
@@ -544,6 +547,10 @@ impl ApprovedProcessRequest {
 
     pub const fn cpu_time_limit_ms(&self) -> Option<u64> {
         self.cpu_time_limit_ms
+    }
+
+    pub const fn disk_write_limit_bytes(&self) -> Option<u64> {
+        self.disk_write_limit_bytes
     }
 }
 
@@ -864,6 +871,7 @@ pub struct ProcessLimits {
     pub max_stdout_bytes: u64,
     pub max_stderr_bytes: u64,
     pub max_active_processes: u32,
+    pub disk_write_limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2444,6 +2452,7 @@ struct RawProcessRequest {
     expected_writes: Vec<RawCapability>,
     memory_limit_bytes: Option<u64>,
     cpu_time_limit_ms: Option<u64>,
+    disk_write_limit_bytes: Option<u64>,
     executor_fencing_token: Option<u64>,
 }
 
@@ -2482,6 +2491,7 @@ impl From<&ApprovedProcessRequest> for RawProcessRequest {
                 .collect(),
             memory_limit_bytes: request.memory_limit_bytes(),
             cpu_time_limit_ms: request.cpu_time_limit_ms(),
+            disk_write_limit_bytes: request.disk_write_limit_bytes(),
             executor_fencing_token: process.executor_fencing_token().map(FencingToken::get),
         }
     }
@@ -2545,6 +2555,7 @@ impl TryFrom<RawProcessRequest> for ApprovedProcessRequest {
             expected_reads,
             raw.memory_limit_bytes,
             raw.cpu_time_limit_ms,
+            raw.disk_write_limit_bytes,
         )
     }
 }
@@ -2857,6 +2868,7 @@ fn validate_approved_process_request(request: &ApprovedProcessRequest) -> Result
     if request.process.expected_writes().len() > MAX_PROCESS_WRITE_SCOPES
         || request.memory_limit_bytes == Some(0)
         || request.cpu_time_limit_ms == Some(0)
+        || request.disk_write_limit_bytes == Some(0)
     {
         return Err(invalid_input());
     }
@@ -2929,6 +2941,7 @@ fn validate_safe_integer_fields(request: &ApprovedProcessRequest) -> Result<(), 
             .unwrap_or_default(),
         request.memory_limit_bytes.unwrap_or_default(),
         request.cpu_time_limit_ms.unwrap_or_default(),
+        request.disk_write_limit_bytes.unwrap_or_default(),
     ]
     .into_iter()
     .any(|value| value > MAX_SAFE_INTEGER);

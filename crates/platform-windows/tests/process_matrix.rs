@@ -376,6 +376,31 @@ fn unrepresentable_cpu_limit_is_rejected_before_boundary_preparation() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn requested_disk_write_budget_fails_closed_before_child_creation() {
+    let root = TempDir::new().unwrap();
+    let boundary = Arc::new(TestOnlyBoundary::valid(root.path().to_owned()));
+    let prepare_calls = boundary.prepare_calls.clone();
+    let launcher =
+        WindowsProcessLauncher::with_isolated_worker_boundary(boundary, boundary_binding());
+    let mut request = request(Vec::new(), BTreeMap::new());
+    request.limits.disk_write_limit_bytes = Some(1);
+    let execution_id = request.execution_id.clone();
+
+    let error = launcher.execute(request).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::Unavailable
+    );
+    assert_eq!(prepare_calls.load(Ordering::Acquire), 0);
+    assert_eq!(
+        lpac_lifecycle_counts_for_test(&execution_id),
+        LpacLifecycleCountsForTest::default()
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn cancellation_during_boundary_preparation_is_retained_without_creating_a_child() {
     let root = TempDir::new().unwrap();
     let marker = root.path().join("pending-cancel-must-not-run");
@@ -1058,14 +1083,18 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
     create_junction(repository_owner.path(), &junction);
     let junction_path = junction.join(canaries[0].read.file_name().unwrap());
     let symlink = container.path().join("symlink-escape");
-    let symlink_path = match std::os::windows::fs::symlink_file(&canaries[0].read, &symlink) {
-        Ok(()) => symlink,
-        Err(error) if error.raw_os_error() == Some(1_314) => {
-            create_junction(repository_owner.path(), &symlink);
-            symlink.join(canaries[0].read.file_name().unwrap())
-        }
-        Err(error) => panic!("unable to create symlink control: {error}"),
-    };
+    let (symlink_label, symlink_path) =
+        match std::os::windows::fs::symlink_file(&canaries[0].read, &symlink) {
+            Ok(()) => ("symlink", symlink),
+            Err(error) if error.raw_os_error() == Some(1_314) => {
+                create_junction(repository_owner.path(), &symlink);
+                (
+                    "symlink-junction-fallback",
+                    symlink.join(canaries[0].read.file_name().unwrap()),
+                )
+            }
+            Err(error) => panic!("unable to create symlink control: {error}"),
+        };
     let unc_path = localhost_admin_share_path(&canaries[0].read);
     let extended_path = extended_length_path(&canaries[0].read);
     let case_folded_path = canaries[0]
@@ -1089,7 +1118,7 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
     fs::hard_link(&canaries[0].read, &replacement_path).unwrap();
     let path_variants = [
         ("junction", junction_path),
-        ("symlink", symlink_path),
+        (symlink_label, symlink_path),
         ("unc", unc_path),
         ("device", extended_path),
         ("ads", alternate_stream_path),
@@ -1155,6 +1184,10 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
     for (index, (_, path)) in path_variants.iter().enumerate() {
         environment.insert(format!("LAT_M2_PATH_{index}"), path_text(path));
     }
+    environment.insert(
+        "LAT_M2_SYMLINK_CONTROL".to_owned(),
+        symlink_label.to_owned(),
+    );
 
     let launcher = registered_lpac_launcher(&root);
     let mut request = request(Vec::new(), environment);
@@ -1184,7 +1217,7 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
         .filter_map(|line| line.strip_prefix("m2-"))
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
-    let expected = [
+    let mut expected = [
         "root-enumerate=success",
         "root-file-create=denied",
         "root-directory-create=denied",
@@ -1202,7 +1235,6 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
         "read-capability=denied",
         "write-capability=denied",
         "path-junction=denied",
-        "path-symlink=denied",
         "path-unc=denied",
         "path-device=denied",
         "path-ads=denied",
@@ -1222,6 +1254,7 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
     .into_iter()
     .map(str::to_owned)
     .collect::<BTreeSet<_>>();
+    expected.insert(format!("path-{symlink_label}=denied"));
     let observed_without_network = observed
         .iter()
         .filter(|label| !label.starts_with("network-"))
@@ -5027,6 +5060,7 @@ fn request(argv: Vec<String>, environment: BTreeMap<String, String>) -> Authoriz
             max_stdout_bytes: 64 * 1024,
             max_stderr_bytes: 64 * 1024,
             max_active_processes: 8,
+            disk_write_limit_bytes: None,
         },
         expected_writes: Vec::new(),
         executor_claim: LeaseClaim::new(

@@ -3503,6 +3503,7 @@ fn exact_tool_request(execution_id: &str) -> ToolRequest {
         Vec::new(),
         None,
         None,
+        None,
     )
     .unwrap();
     let policy = ToolPolicyContext::new(

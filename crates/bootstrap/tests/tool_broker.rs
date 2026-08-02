@@ -798,6 +798,7 @@ fn tool_request_for_policy(
         Vec::new(),
         None,
         None,
+        None,
     )
     .unwrap();
     let policy = ToolPolicyContext::new(

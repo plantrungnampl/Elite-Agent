@@ -368,6 +368,7 @@ fn runtime_initial_check_cannot_bypass_final_windows_resume_fence() {
                 Vec::new(),
                 Some(64 * 1024 * 1024),
                 Some(2_000),
+                None,
             )
             .unwrap(),
         )
@@ -682,6 +683,7 @@ fn execute_with_registry(
         },
         Some(64 * 1024 * 1024),
         Some(2_000),
+        None,
     );
     let result = approved.and_then(|approved| runtime.execute(execution_id.clone(), approved));
     let request = launcher.request.lock().unwrap().clone();

@@ -867,6 +867,7 @@ fn approval_payload() -> (
         Vec::new(),
         None,
         None,
+        None,
     )
     .unwrap();
     let bound = bind_tool_approval_payload(
