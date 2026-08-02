@@ -159,6 +159,7 @@ fn authorized_begin_uses_the_exact_effective_policy_id() {
         policy_snapshot_digest: request.policy().policy_snapshot_digest().clone(),
         fencing_token: process.executor_fencing_token(),
         checked_at,
+        approval_checked_at: None,
     };
 
     assert!(matches!(
@@ -211,6 +212,31 @@ fn authorized_begin_rejects_the_approval_time_policy_as_the_fresh_policy() {
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn authorized_begin_keeps_fresh_policy_time_separate_from_approval_revalidation() {
+    let database = TempDatabase::new();
+    let (store, mut claim, _, _) =
+        exact_approval_claim_fixture(&database, "execution-later-approval-check");
+    claim.approval_checked_at = Some(Timestamp::from_unix_seconds(
+        claim.checked_at.unix_seconds() + 60,
+    ));
+
+    assert!(matches!(
+        store.begin_authorized(claim).unwrap(),
+        ToolExecutionClaim::Claimed(_)
+    ));
+}
+
+#[test]
+fn authorized_begin_rejects_approval_without_a_revalidation_time() {
+    let database = TempDatabase::new();
+    let (store, mut claim, _, _) =
+        exact_approval_claim_fixture(&database, "execution-missing-approval-check");
+    claim.approval_checked_at = None;
+
+    assert_integrity_failure(store.begin_authorized(claim));
 }
 
 #[test]
@@ -3782,6 +3808,7 @@ fn exact_approval_claim_fixture(
         policy_snapshot_digest: request.policy().policy_snapshot_digest().clone(),
         fencing_token: process.executor_fencing_token(),
         checked_at,
+        approval_checked_at: Some(checked_at),
     };
     (store, claim, approval_id, effective_policy_id)
 }

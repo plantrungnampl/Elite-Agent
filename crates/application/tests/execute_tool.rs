@@ -981,7 +981,11 @@ fn approval_expiring_during_revalidation_stops_before_begin_and_effect() {
     assert_eq!(claims.len(), 1);
     assert_eq!(
         claims[0].checked_at,
-        Timestamp::from_unix_seconds(1_753_272_840)
+        Timestamp::from_unix_seconds(1_753_272_300)
+    );
+    assert_eq!(
+        claims[0].approval_checked_at,
+        Some(Timestamp::from_unix_seconds(1_753_272_840))
     );
     assert_eq!(
         claims[0].policy_request_binding_digest,

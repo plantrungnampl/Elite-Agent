@@ -1026,6 +1026,7 @@ pub struct AuthorizedToolExecutionClaim {
     pub policy_snapshot_digest: Sha256Digest,
     pub fencing_token: Option<FencingToken>,
     pub checked_at: Timestamp,
+    pub approval_checked_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

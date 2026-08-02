@@ -1,12 +1,13 @@
 use crate::{
-    canonical_policy_binding_digest, policy_request_for_tool, validate_tool_approval_request,
-    ApprovalRequestDto, AuthorizedToolExecutionClaim, AuthorizedToolRequest, DeniedToolExecution,
-    DurableToolCancellationOutcome, DurableToolExecutionOutcome, DurableToolExecutionReceipt,
-    ImmutableToolRequest, PortError, PreEffectOutcome, ProcessStatus, Retryability,
-    SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor,
-    ToolExecutionCancellationClaim, ToolExecutionClaim, ToolExecutionClaimAuthority,
-    ToolExecutionId, ToolExecutionOrchestration, ToolExecutionResolution, ToolExecutionResult,
-    ToolExecutionStore, ToolExecutionTerminal, ToolRequest,
+    canonical_policy_binding_digest, parse_policy_timestamp, policy_request_for_tool,
+    validate_tool_approval_request, ApprovalRequestDto, AuthorizedToolExecutionClaim,
+    AuthorizedToolRequest, DeniedToolExecution, DurableToolCancellationOutcome,
+    DurableToolExecutionOutcome, DurableToolExecutionReceipt, ImmutableToolRequest, PortError,
+    PreEffectOutcome, ProcessStatus, Retryability, SafeErrorClassification, SafeToolExecutionError,
+    StructuredToolExecutor, ToolExecutionCancellationClaim, ToolExecutionClaim,
+    ToolExecutionClaimAuthority, ToolExecutionId, ToolExecutionOrchestration,
+    ToolExecutionResolution, ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal,
+    ToolRequest,
 };
 #[cfg(test)]
 use crate::{IncompleteToolExecution, NewToolExecution};
@@ -284,14 +285,21 @@ fn validate_authorized_execution_claim(
     {
         return Err(integrity_failure());
     }
-    if let Some(approval) = &claim.approval {
-        validate_tool_approval_request(
-            authoritative_request,
-            immutable,
-            &claim.request_artifact_id,
-            &claim.policy_request_binding_digest,
-            approval,
-        )?;
+    match (&claim.approval, claim.approval_checked_at) {
+        (Some(approval), Some(approval_checked_at)) => {
+            if parse_policy_timestamp(&approval.payload().expires_at)? <= approval_checked_at {
+                return Err(integrity_failure());
+            }
+            validate_tool_approval_request(
+                authoritative_request,
+                immutable,
+                &claim.request_artifact_id,
+                &claim.policy_request_binding_digest,
+                approval,
+            )?;
+        }
+        (None, None) => {}
+        _ => return Err(integrity_failure()),
     }
     Ok(())
 }

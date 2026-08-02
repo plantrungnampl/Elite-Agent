@@ -1133,7 +1133,8 @@ fn validate_authorized_request(
     request: &AuthorizedToolExecutionClaim,
     intent: &IntentRow,
 ) -> Result<ImmutableToolRequest, PortError> {
-    if intent.artifact_id != request.request_artifact_id.as_str()
+    if request.approval.is_some() != request.approval_checked_at.is_some()
+        || intent.artifact_id != request.request_artifact_id.as_str()
         || intent.operation_digest != request.request_content_digest.as_str()
         || intent.task_id != request.task_id.as_str()
         || intent.run_id != request.run_id.as_str()
@@ -1657,6 +1658,7 @@ fn validate_exact_approval(
     approval: &local_agent_terminal_application::ToolApprovalRequest,
     expected_state: ExactApprovalState,
 ) -> Result<(), PortError> {
+    let approval_checked_at = request.approval_checked_at.ok_or_else(integrity_failure)?;
     if approval.execution_id() != &request.execution_id
         || approval.tool_request_artifact_id() != &request.request_artifact_id
         || approval.tool_request_binding_digest() != &request.request_binding_digest
@@ -1675,7 +1677,7 @@ fn validate_exact_approval(
              WHERE a.id = ?1",
             params![
                 approval.approval_id().as_str(),
-                request.checked_at.unix_seconds(),
+                approval_checked_at.unix_seconds(),
             ],
             |row| {
                 Ok(ExactApprovalRow {
@@ -1785,7 +1787,7 @@ fn validate_exact_approval(
         approval.policy_decision_id(),
         approval.policy_request_binding_digest(),
         immutable.request(),
-        request.checked_at,
+        approval_checked_at,
         "require_approval",
         match expected_state {
             ExactApprovalState::Granted => PolicyValidationMode::Approval,
@@ -1819,6 +1821,7 @@ fn consume_exact_approval(
     request: &AuthorizedToolExecutionClaim,
     approval: &local_agent_terminal_application::ToolApprovalRequest,
 ) -> Result<(), PortError> {
+    let approval_checked_at = request.approval_checked_at.ok_or_else(integrity_failure)?;
     let changed = transaction
         .execute(
             "UPDATE approvals
@@ -1827,7 +1830,7 @@ fn consume_exact_approval(
                AND unixepoch(expires_at) > ?2",
             params![
                 approval.approval_id().as_str(),
-                request.checked_at.unix_seconds(),
+                approval_checked_at.unix_seconds(),
             ],
         )
         .map_err(sqlite_error_to_port)?;

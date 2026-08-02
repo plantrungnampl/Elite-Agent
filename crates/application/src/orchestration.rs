@@ -229,6 +229,7 @@ impl<'a> ToolExecutionOrchestration<'a> {
     ) -> PreEffectOutcome {
         let process = authoritative_request.process().process();
         let binding = process.binding();
+        let approval_checked_at = approval.as_ref().map(|_| checked_at);
         PreEffectOutcome::Allowed(Box::new(PreEffectReady {
             claim: AuthorizedToolExecutionClaim {
                 execution_id: authoritative_request.execution_id().clone(),
@@ -248,6 +249,7 @@ impl<'a> ToolExecutionOrchestration<'a> {
                     .clone(),
                 fencing_token: process.executor_fencing_token(),
                 checked_at,
+                approval_checked_at,
             },
             immutable: immutable.clone(),
             authoritative_request: authoritative_request.clone(),
@@ -265,7 +267,7 @@ impl<'a> ToolExecutionOrchestration<'a> {
             if parse_policy_timestamp(&approval.payload().expires_at)? <= checked_at {
                 return Err(integrity_failure());
             }
-            ready.claim.checked_at = checked_at;
+            ready.claim.approval_checked_at = Some(checked_at);
         }
         Ok(())
     }
