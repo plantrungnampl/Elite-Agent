@@ -781,7 +781,7 @@ git commit -m "feat: add policy approval and tool activity ui"
 **Interfaces:**
 - Exercises the complete `Tauri -> application use case -> policy/approval -> structured broker -> Windows/Git/filesystem adapter -> SQLite/artifact/event audit` slice with real local boundaries and inert hostile probes. Produces tamper-evident command/evidence output and an independent spec/code-quality decision.
 
-- [ ] **Step 1 - Write the failing complete security matrix**
+- [x] **Step 1 - Write the failing complete security matrix**
 
 The probe attempts each denied action through direct OS APIs rather than cooperating with the broker. Run it through every enabled process profile and exercise every structured read/write/status/diff path. Include canaries in the repository, original checkout, sibling worktree, user profile, application data, credential/registry locations, and capability-adjacent directories; denied loopback/LAN/internet targets; inherited environment/provider credentials; named pipes; junction/symlink, UNC, device, ADS, case-folding, Unicode, long-path, and replacement races; stale fencing; executable/PATH substitution; shell metacharacters; response files; breakaway/detached descendants; and output, process-count, memory, CPU, wall-time, and disk budgets.
 
@@ -795,13 +795,13 @@ cargo test -p local-agent-terminal-bootstrap --test tool_broker_e2e
 
 Expected RED: the aggregate matrix, probe, and some full-slice assertions are absent.
 
-- [ ] **Step 2 - Close only matrix gaps and wire CI**
+- [x] **Step 2 - Close only matrix gaps and wire CI**
 
 Add the smallest fixtures or adapter corrections needed for the matrix. Do not weaken a denied canary, skip a supported Windows runner, grant the probe repository/user-profile access, or reclassify a failed enforcement control as success. CI runs the exact containment tests on the supported Windows profile before any future test may execute untrusted repository code.
 
 Add evidence-contract tests that reject dirty tracked source outside `artifacts/verification/m2/**`, stale/non-ancestor source commits, missing/failed commands, skipped containment cases, mismatched output hashes, changed toolchain/platform, tampered review/limitations artifacts, absent post-final contract output, and any diff under the immutable design directory.
 
-- [ ] **Step 3 - Run the complete M2 gate from a clean source commit**
+- [x] **Step 3 - Run the complete M2 gate from a clean source commit**
 
 Commit the final production/test correction before generating evidence:
 
