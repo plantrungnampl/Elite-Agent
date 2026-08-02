@@ -100,7 +100,7 @@ fn production_runtime_resolves_the_authoritative_task_before_default_deny() {
 
     assert_eq!(
         bootstrap.tool_runtime().unwrap().availability().unwrap(),
-        ToolRuntimeAvailability::Ready
+        ToolRuntimeAvailability::DegradedReadOnly
     );
     let outcome = bootstrap.tool_runtime().unwrap().execute(request).unwrap();
 

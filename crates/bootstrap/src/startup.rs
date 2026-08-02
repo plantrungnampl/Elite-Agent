@@ -489,7 +489,10 @@ fn start(
 }
 
 fn release_tool_dispatch(tools: &ToolRuntime) -> Result<bool, PortError> {
-    if tools.availability()? == ToolRuntimeAvailability::Ready {
+    if matches!(
+        tools.availability()?,
+        ToolRuntimeAvailability::Ready | ToolRuntimeAvailability::DegradedReadOnly
+    ) {
         tools.release_dispatch()?;
         return Ok(true);
     }

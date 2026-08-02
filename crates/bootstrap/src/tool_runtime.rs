@@ -43,6 +43,7 @@ pub struct ToolBrokerConfig {
     policy_bundle_json: String,
     authority: Arc<dyn ToolAuthorityResolver>,
     executor: Arc<dyn SelfTestingToolExecutor>,
+    process_enabled: bool,
 }
 
 impl ToolBrokerConfig {
@@ -55,7 +56,13 @@ impl ToolBrokerConfig {
             policy_bundle_json: policy_bundle_json.into(),
             authority,
             executor,
+            process_enabled: true,
         }
+    }
+
+    pub fn degraded_read_only(mut self) -> Self {
+        self.process_enabled = false;
+        self
     }
 }
 
@@ -106,6 +113,7 @@ pub struct ToolRuntime {
     retained_processes: Arc<dyn RetainedProcessController>,
     state: Arc<Mutex<ToolRuntimeState>>,
     shutdown: Mutex<()>,
+    degraded_read_only: bool,
 }
 
 struct ToolBroker {
@@ -369,7 +377,7 @@ impl ToolRuntime {
         let retained_processes = Arc::new(StructuredExecutorProcessController {
             executor: Arc::clone(&executor),
         });
-        Self::configured(executions, Some(executor), None, retained_processes)
+        Self::configured(executions, Some(executor), None, retained_processes, false)
     }
 
     pub(crate) fn with_broker(
@@ -377,6 +385,7 @@ impl ToolRuntime {
         artifacts: ContentAddressedArtifactStore,
         config: ToolBrokerConfig,
     ) -> Result<Self, PortError> {
+        let degraded_read_only = !config.process_enabled;
         let broker = Arc::new(ToolBroker::new(database, artifacts, config)?);
         let executions: Arc<dyn ToolExecutionStore> = Arc::new(broker.database.clone());
         let executor = Arc::clone(&broker.executor);
@@ -388,6 +397,7 @@ impl ToolRuntime {
             Some(executor),
             Some(broker),
             retained_processes,
+            degraded_read_only,
         ))
     }
 
@@ -395,7 +405,7 @@ impl ToolRuntime {
         executions: Arc<dyn ToolExecutionStore>,
         retained_processes: Arc<dyn RetainedProcessController>,
     ) -> Self {
-        Self::configured(executions, None, None, retained_processes)
+        Self::configured(executions, None, None, retained_processes, false)
     }
 
     fn configured(
@@ -403,6 +413,7 @@ impl ToolRuntime {
         executor: Option<Arc<dyn SelfTestingToolExecutor>>,
         broker: Option<Arc<ToolBroker>>,
         retained_processes: Arc<dyn RetainedProcessController>,
+        degraded_read_only: bool,
     ) -> Self {
         Self {
             executions,
@@ -417,6 +428,7 @@ impl ToolRuntime {
                 workers: BTreeMap::new(),
             })),
             shutdown: Mutex::new(()),
+            degraded_read_only,
         }
     }
 
@@ -460,7 +472,11 @@ impl ToolRuntime {
             ..ToolStartupRecoveryReport::default()
         };
         let mut availability = if control_self_test == ToolControlSelfTestStatus::Passed {
-            ToolRuntimeAvailability::Ready
+            if self.degraded_read_only {
+                ToolRuntimeAvailability::DegradedReadOnly
+            } else {
+                ToolRuntimeAvailability::Ready
+            }
         } else {
             ToolRuntimeAvailability::Unavailable
         };
@@ -578,7 +594,12 @@ impl ToolRuntime {
 
     pub fn release_dispatch(&self) -> Result<(), PortError> {
         let mut state = self.state.lock().map_err(|_| internal_failure())?;
-        if state.recovery_report.is_none() || state.availability != ToolRuntimeAvailability::Ready {
+        if state.recovery_report.is_none()
+            || !matches!(
+                state.availability,
+                ToolRuntimeAvailability::Ready | ToolRuntimeAvailability::DegradedReadOnly
+            )
+        {
             return Err(unavailable());
         }
         state.dispatch_open = true;
@@ -721,7 +742,10 @@ impl ToolRuntime {
     ) -> Result<Arc<ToolWorkerCompletion>, PortError> {
         let mut state = self.state.lock().map_err(|_| internal_failure())?;
         if !state.dispatch_open
-            || state.availability != ToolRuntimeAvailability::Ready
+            || !matches!(
+                state.availability,
+                ToolRuntimeAvailability::Ready | ToolRuntimeAvailability::DegradedReadOnly
+            )
             || state.workers.contains_key(&execution_id)
         {
             return Err(conflict());

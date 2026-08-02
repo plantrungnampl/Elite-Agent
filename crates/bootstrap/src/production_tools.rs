@@ -46,6 +46,7 @@ pub(crate) fn production_tool_broker(config: &StartupConfig) -> ToolBrokerConfig
             writes: Arc::new(WorkspaceWriteCoordinator::new()),
         }),
     )
+    .degraded_read_only()
 }
 
 struct ProductionToolAuthority {
