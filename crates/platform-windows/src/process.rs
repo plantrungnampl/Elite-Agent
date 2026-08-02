@@ -53,7 +53,6 @@ use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICA
 
 use crate::job::{
     create_job, terminate_process, validate_job_limits, ActiveJob, OwnedHandle, RetainedJob,
-    TERMINATED_EXIT_CODE,
 };
 use crate::lpac::{
     record_current_windows_error, record_resume_succeeded, record_suspended_child_created,
@@ -740,9 +739,7 @@ impl ProcessLauncher for WindowsProcessLauncher {
         let stdout = join_output(stdout_reader)?;
         let stderr = join_output(stderr_reader)?;
         let observed_exit_code = child.active.exit_code()?;
-        let terminated = child.active.was_terminated()
-            || resource_limit_terminated
-            || observed_exit_code as u32 == TERMINATED_EXIT_CODE;
+        let terminated = child.active.was_terminated() || resource_limit_terminated;
         let exit_code = if terminated {
             None
         } else {

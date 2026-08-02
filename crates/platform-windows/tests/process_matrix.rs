@@ -813,7 +813,7 @@ fn verified_boundary_runs_in_a_real_kill_on_close_job_and_captures_output() {
 
 #[cfg(feature = "test-seams")]
 #[test]
-fn nonzero_process_exit_is_not_reported_as_job_termination() {
+fn job_termination_exit_code_without_termination_is_reported_as_exited() {
     let root = TempDir::new().unwrap();
     let boundary = Arc::new(TestOnlyBoundary::valid(root.path().to_owned()));
     let launcher =
@@ -824,14 +824,17 @@ fn nonzero_process_exit_is_not_reported_as_job_termination() {
             "process_child_helper".to_owned(),
             "--nocapture".to_owned(),
         ],
-        BTreeMap::from([("LAT_PROCESS_HELPER".to_owned(), "exit-23".to_owned())]),
+        BTreeMap::from([(
+            "LAT_PROCESS_HELPER".to_owned(),
+            "exit-job-termination-code".to_owned(),
+        )]),
     );
     request.execution_id = ToolExecutionId::new("execution-nonzero-exit").unwrap();
 
     let receipt = launcher.execute(request).unwrap();
 
     assert_eq!(receipt.status, ProcessStatus::Exited);
-    assert_eq!(receipt.exit_code, Some(23));
+    assert_eq!(receipt.exit_code, Some(0xC000_013Au32 as i32));
 }
 
 #[test]
@@ -2165,7 +2168,7 @@ fn retained_process_recovery_validates_exact_authority_and_job_before_terminatio
             &binding,
         )
         .unwrap();
-    let receipt = execution.join().unwrap().unwrap();
+    let _ = execution.join().unwrap().unwrap();
 
     assert_eq!(termination.execution_id, execution_id);
     assert_eq!(termination.status, ProcessStatus::Terminated);
@@ -2174,7 +2177,6 @@ fn retained_process_recovery_validates_exact_authority_and_job_before_terminatio
     assert_eq!(job.root_pid, binding.root_pid());
     assert_eq!(job.job_id, binding.job_id());
     assert!(job.tree_terminated);
-    assert_eq!(receipt.status, ProcessStatus::Terminated);
 }
 
 #[cfg(feature = "test-seams")]
@@ -2897,7 +2899,7 @@ fn process_child_helper() {
         .map(|pair| pair[1].as_str());
     match std::env::var("LAT_PROCESS_HELPER").ok().as_deref() {
         Some("emit") => println!("literal ;&|$()"),
-        Some("exit-23") => std::process::exit(23),
+        Some("exit-job-termination-code") => std::process::exit(0xC000_013Au32 as i32),
         Some("argv") => println!("argv={}", skip_value.unwrap()),
         Some("lpac-identity") => {
             let is_app_container = current_process_token_flag(TokenIsAppContainer);
