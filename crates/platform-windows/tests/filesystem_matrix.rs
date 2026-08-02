@@ -252,6 +252,53 @@ fn exact_case_and_missing_reads_have_one_non_disclosing_error() {
 }
 
 #[test]
+fn unicode_normalization_is_exact_and_non_disclosing() {
+    let root_dir = TempDir::new().unwrap();
+    fs::write(root_dir.path().join("café.txt"), b"unicode").unwrap();
+    let task = task("task-1");
+    let root_identity = root("worktree-root");
+    let adapter = WindowsCapabilityAdapter::new(vec![CapabilityRegistration::worktree(
+        root_identity.clone(),
+        task.clone(),
+        root_dir.path(),
+    )
+    .unwrap()])
+    .unwrap();
+
+    assert_eq!(
+        adapter
+            .read(AuthorizedFileRead {
+                task_id: task.clone(),
+                root_identity: root_identity.clone(),
+                relative_components: components("café.txt"),
+                expected_digest: None,
+            })
+            .unwrap()
+            .bytes,
+        b"unicode"
+    );
+    let normalized_error = adapter
+        .read(AuthorizedFileRead {
+            task_id: task.clone(),
+            root_identity: root_identity.clone(),
+            relative_components: components("cafe\u{301}.txt"),
+            expected_digest: None,
+        })
+        .unwrap_err();
+    let missing_error = adapter
+        .read(AuthorizedFileRead {
+            task_id: task,
+            root_identity,
+            relative_components: components("missing.txt"),
+            expected_digest: None,
+        })
+        .unwrap_err();
+
+    assert_eq!(normalized_error, missing_error);
+    assert_non_disclosing(normalized_error);
+}
+
+#[test]
 fn long_paths_are_opened_relative_to_retained_directory_handles() {
     let root_dir = TempDir::new().unwrap();
     let path_components = (0..18)

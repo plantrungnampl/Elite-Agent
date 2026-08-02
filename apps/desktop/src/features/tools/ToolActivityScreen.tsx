@@ -38,7 +38,6 @@ export function ToolActivityScreen({
   );
   const [approvalConfirmed, setApprovalConfirmed] = useState(false);
   const [stopConfirmed, setStopConfirmed] = useState(false);
-  const mainContent = useRef<HTMLElement>(null);
   const approvalDialog = useRef<HTMLDivElement>(null);
   const approvalTrigger = useRef<HTMLButtonElement | null>(null);
   const currentApproval = useRef<ToolApprovalRequestDto | null>(null);
@@ -253,13 +252,6 @@ export function ToolActivityScreen({
 
   return (
     <>
-      <a
-        className="skip-link"
-        href="#tool-activity-main"
-        onClick={() => mainContent.current?.focus()}
-      >
-        Skip to tool activity
-      </a>
       <header className="app-header">
         <div className="shell">
           <p className="product-name">Local Agent Terminal</p>
@@ -267,7 +259,6 @@ export function ToolActivityScreen({
         </div>
       </header>
       <main
-        ref={mainContent}
         className="shell tool-layout"
         id="tool-activity-main"
         tabIndex={-1}

@@ -68,11 +68,10 @@ test("repository adapter rejects PATH lookup", () => {
 });
 
 test("M1 evidence is complete and internally consistent", () => {
-  assert.match(run("scripts/verify-m1-evidence.mjs"), /M1 evidence: ok/);
+  assert.match(run("scripts/verify-m1-evidence.mjs", "--historical"), /M1 evidence: ok/);
 });
 
-test("Windows CI generates, verifies, and uploads fresh M1 evidence", () => {
-  const workflow = readFileSync(".github/workflows/ci.yml", "utf8");
+test("the historical M1 runner retains its complete verification gate", () => {
   const runner = readFileSync("scripts/run-m1-evidence.mjs", "utf8");
   for (const command of [
     "pnpm install --frozen-lockfile",
@@ -93,19 +92,7 @@ test("Windows CI generates, verifies, and uploads fresh M1 evidence", () => {
   ]) {
     assert.match(runner, new RegExp(escapeRegExp(command)), command);
   }
-  const generate = workflow.indexOf("node scripts/run-m1-evidence.mjs");
-  const verify = workflow.indexOf("node scripts/verify-m1-evidence.mjs");
-  const postFinal = workflow.indexOf("node scripts/run-m1-post-final-contracts.mjs");
-  const verifyPostFinal = workflow.indexOf("node scripts/verify-m1-post-final-log.mjs");
-  const upload = workflow.indexOf("actions/upload-artifact@v4");
-  assert.ok(
-    generate >= 0
-      && verify > generate
-      && postFinal > verify
-      && verifyPostFinal > postFinal
-      && upload > verifyPostFinal,
-  );
-  assert.match(workflow, /artifacts\/verification\/m1/);
+  assert.match(readFileSync("artifacts/verification/m1/manifest.json", "utf8"), /"finalized": true/);
 });
 
 test("M1 verifier rejects modified captured output", () => {
@@ -200,7 +187,12 @@ function writeManifest(directory, manifest) {
 function assertVerifierFails(directory, pattern) {
   const result = spawnSync(
     process.execPath,
-    ["scripts/verify-m1-evidence.mjs", "--manifest", join(directory, "manifest.json")],
+    [
+      "scripts/verify-m1-evidence.mjs",
+      "--historical",
+      "--manifest",
+      join(directory, "manifest.json"),
+    ],
     { cwd: process.cwd(), encoding: "utf8" },
   );
   assert.notEqual(result.status, 0);

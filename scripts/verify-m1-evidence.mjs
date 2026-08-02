@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { assertEvidenceOnlyChanges } from "./m1-evidence-worktree.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const historical = process.argv.includes("--historical");
 const manifestArgument = process.argv.indexOf("--manifest");
 const manifestPath =
   manifestArgument === -1
@@ -73,7 +74,7 @@ try {
   assert(manifest.schemaVersion === 2, "unsupported manifest schema");
   assert(manifest.finalized === true, "manifest is not finalized");
   assert(/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(manifest.sourceCommit), "invalid source commit");
-  verifyCommitBinding(manifest.sourceCommit);
+  verifyCommitBinding(manifest.sourceCommit, historical);
   assert(manifest.platform === `${process.platform}-${process.arch}`, "platform mismatch");
   assertDeepEqual(manifest.toolVersions, currentToolVersions(), "toolchain mismatch");
 
@@ -136,8 +137,8 @@ try {
   process.exitCode = 1;
 }
 
-function verifyCommitBinding(sourceCommit) {
-  assertEvidenceOnlyChanges(root);
+function verifyCommitBinding(sourceCommit, allowHistorical) {
+  if (!allowHistorical) assertEvidenceOnlyChanges(root);
   const head = commandOutput("git rev-parse HEAD");
   if (head !== sourceCommit) {
     const ancestor = spawnSync("git", ["merge-base", "--is-ancestor", sourceCommit, head], {
@@ -145,6 +146,7 @@ function verifyCommitBinding(sourceCommit) {
       windowsHide: true,
     });
     assert(ancestor.status === 0, "evidence source commit is not an ancestor of HEAD");
+    if (allowHistorical) return;
     const changed = commandOutput(`git diff --name-only ${sourceCommit}..${head}`)
       .split(/\r?\n/u)
       .filter(Boolean);

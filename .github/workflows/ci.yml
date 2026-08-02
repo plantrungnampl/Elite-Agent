@@ -1,4 +1,4 @@
-name: M1 verification
+name: M2 verification
 
 on:
   pull_request:
@@ -23,12 +23,15 @@ jobs:
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
-      - run: node scripts/run-m1-evidence.mjs
-      - run: node scripts/verify-m1-evidence.mjs
-      - run: node scripts/run-m1-post-final-contracts.mjs
-      - run: node scripts/verify-m1-post-final-log.mjs
+      - run: cargo test -p local-agent-terminal-tool-runtime --test security_matrix
+      - run: cargo test -p local-agent-terminal-platform-windows --features test-seams --test filesystem_matrix --test process_matrix
+      - run: cargo test -p local-agent-terminal-bootstrap --test tool_broker_e2e --test tool_recovery
+      - run: node scripts/run-m2-evidence.mjs
+      - run: node scripts/verify-m2-evidence.mjs
+      - run: node scripts/run-m2-post-final-contracts.mjs
+      - run: node scripts/verify-m2-post-final-log.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: m1-verification-${{ github.sha }}
-          path: artifacts/verification/m1
+          name: m2-verification-${{ github.sha }}
+          path: artifacts/verification/m2

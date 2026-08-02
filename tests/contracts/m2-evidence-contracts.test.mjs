@@ -1,0 +1,198 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
+import {
+  appendFileSync,
+  cpSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+const run = (...args) =>
+  execFileSync(process.execPath, args, { cwd: process.cwd(), encoding: "utf8" });
+
+test("M2 evidence is complete and internally consistent", () => {
+  assert.match(run("scripts/verify-m2-evidence.mjs"), /M2 evidence: ok/u);
+});
+
+test("Windows CI runs containment before fresh M2 evidence verification", () => {
+  const workflow = readFileSync(".github/workflows/ci.yml", "utf8");
+  const containment = workflow.indexOf(
+    "cargo test -p local-agent-terminal-platform-windows --features test-seams --test filesystem_matrix --test process_matrix",
+  );
+  const generate = workflow.indexOf("node scripts/run-m2-evidence.mjs");
+  const verify = workflow.indexOf("node scripts/verify-m2-evidence.mjs");
+  const postFinal = workflow.indexOf("node scripts/run-m2-post-final-contracts.mjs");
+  const verifyPostFinal = workflow.indexOf("node scripts/verify-m2-post-final-log.mjs");
+  const upload = workflow.indexOf("actions/upload-artifact@v4");
+  assert.ok(
+    containment >= 0 &&
+      generate > containment &&
+      verify > generate &&
+      postFinal > verify &&
+      verifyPostFinal > postFinal &&
+      upload > verifyPostFinal,
+  );
+  assert.match(workflow, /artifacts\/verification\/m2/u);
+});
+
+test("M2 verifier rejects modified captured output", () => {
+  withEvidenceCopy((directory, manifest) => {
+    appendFileSync(join(directory, manifest.commands[0].outputFile), "tampered\n");
+    assertVerifierFails(directory, /output hash mismatch/u);
+  });
+});
+
+test("M2 verifier rejects stale and non-ancestor source commits", () => {
+  withEvidenceCopy((directory, manifest) => {
+    manifest.sourceCommit = gitOutput("rev-parse", "HEAD^");
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /stale for the current code/u);
+  });
+  withEvidenceCopy((directory, manifest) => {
+    manifest.sourceCommit = "0".repeat(40);
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /not an ancestor|unable to run/u);
+  });
+});
+
+test("M2 verifier rejects missing, failed, and skipped commands", () => {
+  withEvidenceCopy((directory, manifest) => {
+    manifest.commands.pop();
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /unexpected command evidence count/u);
+  });
+  withEvidenceCopy((directory, manifest) => {
+    manifest.commands[0].exitCode = 1;
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /command did not pass/u);
+  });
+  withEvidenceCopy((directory, manifest) => {
+    const entry = manifest.commands[0];
+    const outputPath = join(directory, entry.outputFile);
+    appendFileSync(outputPath, "# SKIP containment\n");
+    entry.outputSha256 = hash(readFileSync(outputPath));
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /command skipped a case/u);
+  });
+});
+
+test("M2 verifier rejects omitted containment cases", () => {
+  withEvidenceCopy((directory, manifest) => {
+    manifest.containmentCases.pop();
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /containment case mismatch/u);
+  });
+});
+
+test("M2 verifier rejects platform and toolchain drift", () => {
+  withEvidenceCopy((directory, manifest) => {
+    manifest.platform = "other-platform";
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /platform mismatch/u);
+  });
+  withEvidenceCopy((directory, manifest) => {
+    manifest.toolVersions.rustc = "rustc changed";
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /toolchain mismatch/u);
+  });
+});
+
+test("M2 verifier rejects tampered review and limitations artifacts", () => {
+  for (const file of ["review.md", "known-limitations.md"]) {
+    withEvidenceCopy((directory) => {
+      appendFileSync(join(directory, file), "tampered\n");
+      assertVerifierFails(directory, /artifact hash mismatch/u);
+    });
+  }
+});
+
+test("M2 verifier rejects dirty source and immutable design changes", () => {
+  for (const path of [
+    "tests/contracts/fixtures/m2/raw-shell-request.json",
+    "docs/multi-agent-terminal-design/schemas/README.md",
+  ]) {
+    withDirtyFile(path, () => {
+      const result = spawnSync(process.execPath, ["scripts/verify-m2-evidence.mjs"], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+      });
+      assert.notEqual(result.status, 0);
+      assert.match(`${result.stdout}${result.stderr}`, /dirty tracked source/u);
+    });
+  }
+});
+
+test("M2 evidence generation preflight rejects dirty source", () => {
+  withDirtyFile("tests/contracts/fixtures/m2/raw-shell-request.json", () => {
+    const result = spawnSync(
+      process.execPath,
+      ["scripts/check-m2-evidence-worktree.mjs"],
+      { cwd: process.cwd(), encoding: "utf8" },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}${result.stderr}`, /dirty tracked source/u);
+  });
+});
+
+test("M2 post-final verifier rejects an absent log", () => {
+  const missing = join(tmpdir(), `missing-m2-post-final-${process.pid}.log`);
+  const result = spawnSync(
+    process.execPath,
+    ["scripts/verify-m2-post-final-log.mjs", "--log", missing],
+    { cwd: process.cwd(), encoding: "utf8" },
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stdout}${result.stderr}`, /M2 post-final contracts/u);
+});
+
+function withEvidenceCopy(callback) {
+  const directory = mkdtempSync(join(tmpdir(), "m2-evidence-"));
+  try {
+    cpSync("artifacts/verification/m2", directory, { recursive: true });
+    const manifest = JSON.parse(readFileSync(join(directory, "manifest.json"), "utf8"));
+    callback(directory, manifest);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function writeManifest(directory, manifest) {
+  writeFileSync(join(directory, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+function assertVerifierFails(directory, pattern) {
+  const result = spawnSync(
+    process.execPath,
+    ["scripts/verify-m2-evidence.mjs", "--manifest", join(directory, "manifest.json")],
+    { cwd: process.cwd(), encoding: "utf8" },
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stdout}${result.stderr}`, pattern);
+}
+
+function withDirtyFile(path, callback) {
+  const original = readFileSync(path);
+  try {
+    appendFileSync(path, "\nm2-dirty-source-sentinel\n");
+    callback();
+  } finally {
+    writeFileSync(path, original);
+  }
+}
+
+function gitOutput(...arguments_) {
+  return execFileSync("git", arguments_, {
+    cwd: process.cwd(),
+    encoding: "utf8",
+  }).trim();
+}
+
+function hash(value) {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}

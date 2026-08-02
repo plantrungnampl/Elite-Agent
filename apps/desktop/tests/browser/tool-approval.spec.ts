@@ -34,6 +34,29 @@ test("supports a digest-bound keyboard approval flow with focus restoration", as
   expect(await toolCallCount(page, "resolve_tool_approval")).toBe(0);
 });
 
+test("invalidates a replaced approval without resolving the stale digest", async ({
+  page,
+}) => {
+  const initial = activityFixture();
+  const replaced = activityFixture();
+  replaced.entries[0].operationDigest = `sha256:${"b".repeat(64)}`;
+  await openToolActivity(page, [initial, replaced]);
+  const trigger = page.getByRole("button", {
+    name: "Review approval for execution-approval",
+  });
+  await trigger.click();
+  await expect(page.getByRole("dialog", { name: "Approve tool request" })).toBeVisible();
+
+  await expect(page.getByRole("dialog", { name: "Approve tool request" })).toHaveCount(0, {
+    timeout: 7_000,
+  });
+  await expect(page.getByRole("status")).toContainText(
+    "Approval changed and must be reviewed again",
+  );
+  await expect(trigger).toBeFocused();
+  expect(await toolCallCount(page, "resolve_tool_approval")).toBe(0);
+});
+
 test("confirms stop-all and passes reduced-motion, zoom, reflow, contrast, and axe", async ({
   browser,
 }) => {
@@ -89,10 +112,15 @@ test("confirms stop-all and passes reduced-motion, zoom, reflow, contrast, and a
   await context.close();
 });
 
-async function openToolActivity(page: Page) {
+async function openToolActivity(
+  page: Page,
+  activities = [activityFixture()],
+  approval = approvalFixture(),
+) {
   await page.addInitScript(
-    ({ activity, approval }) => {
+    ({ activities, approval }) => {
       const calls: Record<string, number> = {};
+      let activityIndex = 0;
       (
         window as typeof window & {
           __toolCalls: Record<string, number>;
@@ -113,6 +141,8 @@ async function openToolActivity(page: Page) {
             return [];
           }
           if (command === "get_tool_activity") {
+            const activity = activities[Math.min(activityIndex, activities.length - 1)];
+            activityIndex += 1;
             return activity;
           }
           if (command === "get_approval_request") {
@@ -125,7 +155,7 @@ async function openToolActivity(page: Page) {
         },
       };
     },
-    { activity: activityFixture(), approval: approvalFixture() },
+    { activities, approval },
   );
   await page.goto("/");
   await page.getByRole("button", { name: "Tool activity" }).click();

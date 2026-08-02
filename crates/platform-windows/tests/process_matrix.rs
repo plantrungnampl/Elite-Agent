@@ -14,9 +14,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "test-seams")]
 use std::sync::mpsc;
-use std::sync::Arc;
 #[cfg(feature = "test-seams")]
 use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 #[cfg(feature = "test-seams")]
@@ -65,10 +65,11 @@ use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::STILL_ACTIVE;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
-    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION, ERROR_NOT_FOUND,
-    ERROR_NOT_SUPPORTED, ERROR_NOT_SUPPORTED_IN_APPCONTAINER, ERROR_NO_SUCH_LOGON_SESSION,
-    ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_SUCCESS, FILETIME, GENERIC_READ,
-    GENERIC_WRITE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION,
+    ERROR_NOT_ENOUGH_QUOTA, ERROR_NOT_FOUND, ERROR_NOT_SUPPORTED,
+    ERROR_NOT_SUPPORTED_IN_APPCONTAINER, ERROR_NO_SUCH_LOGON_SESSION, ERROR_PIPE_CONNECTED,
+    ERROR_PIPE_LISTENING, ERROR_SUCCESS, FILETIME, GENERIC_READ, GENERIC_WRITE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Networking::WinSock::{
     closesocket, connect, getsockopt, ioctlsocket, socket, WSACleanup, WSAGetLastError, WSAPoll,
@@ -900,6 +901,7 @@ fn real_lpac_denies_registered_descendant_creation_modes() {
     );
     request.execution_id = ToolExecutionId::new("execution-lpac-descendant-denial").unwrap();
     request.timeout_ms = 2_000;
+    request.limits.max_active_processes = 1;
     let execution_id = request.execution_id.clone();
 
     let receipt = launcher.execute(request).unwrap();
@@ -909,8 +911,8 @@ fn real_lpac_denies_registered_descendant_creation_modes() {
         .filter_map(|line| line.strip_prefix("d2d-descendant-"))
         .collect::<BTreeSet<_>>();
     let expected = BTreeSet::from([
-        "ordinary=access-denied",
-        "detached-new-process-group=access-denied",
+        "ordinary=process-limit-denied",
+        "detached-new-process-group=process-limit-denied",
         "breakaway=access-denied",
         "attempts=complete",
     ]);
@@ -922,6 +924,7 @@ fn real_lpac_denies_registered_descendant_creation_modes() {
     assert_ne!(receipt.job_receipt.root_pid, 0);
     assert!(receipt.job_receipt.kill_on_close);
     assert!(receipt.job_receipt.no_breakaway);
+    assert_eq!(receipt.job_receipt.max_active_processes, 1);
     assert!(!receipt.job_receipt.resource_limit_terminated);
     assert!(receipt.job_receipt.tree_terminated);
     assert_real_lpac_lifecycle(&execution_id);
@@ -1020,16 +1023,23 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
     let repository_fixture_root = repository_root.join("target/task7-fixtures");
     fs::create_dir_all(&repository_fixture_root).unwrap();
     let repository_owner = TempDir::new_in(repository_fixture_root).unwrap();
+    let original_owner = TempDir::new_in(&repository_root).unwrap();
     let user_profile = PathBuf::from(std::env::var_os("USERPROFILE").unwrap());
     let user_profile_owner = TempDir::new_in(user_profile).unwrap();
     let application_data = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
     let application_data_owner = TempDir::new_in(application_data).unwrap();
+    let capability_adjacent = container.path().join("capability-adjacent");
+    fs::create_dir(&capability_adjacent).unwrap();
     let canaries = [
         DeniedCanary::new("repository", repository_owner.path()),
+        DeniedCanary::new("original", original_owner.path()),
+        DeniedCanary::new("sibling", &sibling),
         DeniedCanary::new("profile", user_profile_owner.path()),
         DeniedCanary::new("appdata", application_data_owner.path()),
-        DeniedCanary::new("sibling", &sibling),
+        DeniedCanary::new("capability", &capability_adjacent),
     ];
+    let original_snapshot = ["Cargo.toml", ".git/HEAD", ".git/index"]
+        .map(|path| fs::read(repository_root.join(path)).unwrap());
     let registry = RegistryFixture::new();
     let mut credentials = CredentialFixture::new();
     let pipe = NamedPipeFixture::new();
@@ -1040,12 +1050,24 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
     let junction = container.path().join("junction-escape");
     create_junction(repository_owner.path(), &junction);
     let junction_path = junction.join(canaries[0].read.file_name().unwrap());
+    let symlink = container.path().join("symlink-escape");
+    let symlink_path = match std::os::windows::fs::symlink_file(&canaries[0].read, &symlink) {
+        Ok(()) => symlink,
+        Err(error) if error.raw_os_error() == Some(1_314) => {
+            create_junction(repository_owner.path(), &symlink);
+            symlink.join(canaries[0].read.file_name().unwrap())
+        }
+        Err(error) => panic!("unable to create symlink control: {error}"),
+    };
+    let unc_path = localhost_admin_share_path(&canaries[0].read);
     let extended_path = extended_length_path(&canaries[0].read);
     let case_folded_path = canaries[0]
         .read
         .parent()
         .unwrap()
         .join("REPOSITORY-READ.BIN");
+    let unicode_path = repository_owner.path().join("canary-測試-🧪.bin");
+    fs::hard_link(&canaries[0].read, &unicode_path).unwrap();
     let mut long_directory = repository_owner.path().join("long-path");
     for index in 0..6 {
         long_directory.push(format!("segment-{index}-{}", "x".repeat(48)));
@@ -1056,14 +1078,20 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
     assert!(long_path.as_os_str().len() > 260);
     let alternate_stream_path = named_stream_path(&canaries[0].read, "hostile");
     fs::write(&alternate_stream_path, b"alternate stream canary").unwrap();
+    let replacement_path = repository_owner.path().join("replacement-escape.bin");
+    fs::hard_link(&canaries[0].read, &replacement_path).unwrap();
     let path_variants = [
         ("junction", junction_path),
-        ("extended", extended_path),
-        ("casefold", case_folded_path),
-        ("long", long_path),
+        ("symlink", symlink_path),
+        ("unc", unc_path),
+        ("device", extended_path),
         ("ads", alternate_stream_path),
+        ("casefold", case_folded_path),
+        ("unicode", unicode_path),
+        ("long", long_path),
+        ("replacement", replacement_path),
     ];
-    for (_, path) in &path_variants {
+    for (_, path) in path_variants.iter().filter(|(label, _)| *label != "unc") {
         assert!(
             fs::read(path).is_ok(),
             "parent path control failed for {}",
@@ -1080,66 +1108,73 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
     assert!(std::env::var_os("PATH").is_some());
     assert!(std::env::var_os("USERPROFILE").is_some());
     assert!(std::env::var_os("APPDATA").is_some());
-    let _credential_guard =
-        EnvironmentVariableGuard::set("LAT_D2A_PARENT_CREDENTIAL_CANARY", "must-not-cross");
+    let _environment_guards = [
+        EnvironmentVariableGuard::set("LAT_M2_PARENT_SECRET", "must-not-cross"),
+        EnvironmentVariableGuard::set("AWS_ACCESS_KEY_ID", "must-not-cross"),
+        EnvironmentVariableGuard::set("AZURE_CLIENT_SECRET", "must-not-cross"),
+        EnvironmentVariableGuard::set("GITHUB_TOKEN", "must-not-cross"),
+        EnvironmentVariableGuard::set("OPENAI_API_KEY", "must-not-cross"),
+    ];
     let mut environment = BTreeMap::from([
         (
-            "LAT_PROCESS_HELPER".to_owned(),
-            "lpac-hostile-d2a".to_owned(),
-        ),
-        (
-            "LAT_D2A_LOOPBACK".to_owned(),
+            "LAT_M2_LOOPBACK".to_owned(),
             loopback_listener.local_addr().unwrap().to_string(),
         ),
         (
-            "LAT_D2A_LAN".to_owned(),
+            "LAT_M2_LAN".to_owned(),
             lan_listener.local_addr().unwrap().to_string(),
         ),
-        ("LAT_D2A_INTERNET".to_owned(), "1.1.1.1:443".to_owned()),
-        ("LAT_D2B_REGISTRY_KEY".to_owned(), registry.subkey.clone()),
+        ("LAT_M2_INTERNET".to_owned(), "1.1.1.1:443".to_owned()),
+        ("LAT_M2_REGISTRY_KEY".to_owned(), registry.subkey.clone()),
         (
-            "LAT_D2B_CREDENTIAL_PARENT".to_owned(),
+            "LAT_M2_CREDENTIAL_PARENT".to_owned(),
             credentials.parent_target.clone(),
         ),
         (
-            "LAT_D2B_CREDENTIAL_CHILD".to_owned(),
+            "LAT_M2_CREDENTIAL_CHILD".to_owned(),
             credentials.child_target.clone(),
         ),
         (
-            "LAT_D2B_CREDENTIAL_FILTER".to_owned(),
+            "LAT_M2_CREDENTIAL_FILTER".to_owned(),
             credentials.filter.clone(),
         ),
-        ("LAT_D2B_PIPE_READ".to_owned(), pipe.read_name.clone()),
-        ("LAT_D2B_PIPE_WRITE".to_owned(), pipe.write_name.clone()),
+        ("LAT_M2_PIPE_READ".to_owned(), pipe.read_name.clone()),
+        ("LAT_M2_PIPE_WRITE".to_owned(), pipe.write_name.clone()),
     ]);
     for (index, canary) in canaries.iter().enumerate() {
-        environment.insert(format!("LAT_D2A_READ_{index}"), path_text(&canary.read));
-        environment.insert(format!("LAT_D2A_WRITE_{index}"), path_text(&canary.write));
+        environment.insert(format!("LAT_M2_READ_{index}"), path_text(&canary.read));
+        environment.insert(format!("LAT_M2_WRITE_{index}"), path_text(&canary.write));
     }
     for (index, (_, path)) in path_variants.iter().enumerate() {
-        environment.insert(format!("LAT_D2A_PATH_{index}"), path_text(path));
+        environment.insert(format!("LAT_M2_PATH_{index}"), path_text(path));
     }
 
     let launcher = registered_lpac_launcher(&root);
-    let mut request = request(
-        vec![
-            "--exact".to_owned(),
-            "process_child_helper".to_owned(),
-            "--nocapture".to_owned(),
-        ],
-        environment,
+    let mut request = request(Vec::new(), environment);
+    request.executable = registered_executable(
+        "m2-containment-probe",
+        "m2-v1",
+        &containment_probe_executable(),
     );
     request.execution_id = ToolExecutionId::new("execution-lpac-hostile-d2a").unwrap();
     request.timeout_ms = 8_000;
     let execution_id = request.execution_id.clone();
 
-    let receipt = launcher.execute(request).unwrap();
+    let receipt = launcher.execute(request).unwrap_or_else(|error| {
+        #[cfg(feature = "test-seams")]
+        panic!(
+            "{error:?}; lifecycle={:?}",
+            lpac_lifecycle_counts_for_test(&execution_id)
+        );
+        #[cfg(not(feature = "test-seams"))]
+        panic!("{error:?}");
+    });
     credentials.observe_child_ownership();
     let stdout = String::from_utf8(receipt.stdout.bytes).unwrap();
     let stderr = String::from_utf8(receipt.stderr.bytes).unwrap();
     let observed = stdout
         .lines()
-        .filter_map(|line| line.strip_prefix("d2a-"))
+        .filter_map(|line| line.strip_prefix("m2-"))
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
     let expected = [
@@ -1149,17 +1184,25 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
         "root-stream-create=denied",
         "read-repository=denied",
         "write-repository=denied",
+        "read-original=denied",
+        "write-original=denied",
+        "read-sibling=denied",
+        "write-sibling=denied",
         "read-profile=denied",
         "write-profile=denied",
         "read-appdata=denied",
         "write-appdata=denied",
-        "read-sibling=denied",
-        "write-sibling=denied",
+        "read-capability=denied",
+        "write-capability=denied",
         "path-junction=denied",
-        "path-extended=denied",
-        "path-casefold=denied",
-        "path-long=denied",
+        "path-symlink=denied",
+        "path-unc=denied",
+        "path-device=denied",
         "path-ads=denied",
+        "path-casefold=denied",
+        "path-unicode=denied",
+        "path-long=denied",
+        "path-replacement=denied",
         "environment=clean",
         "registry-read=denied",
         "registry-write=denied",
@@ -1197,6 +1240,12 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
     }
     for (_, path) in &path_variants {
         assert!(!stdout.contains(&path_text(path)));
+    }
+    for (index, path) in ["Cargo.toml", ".git/HEAD", ".git/index"].iter().enumerate() {
+        assert_eq!(
+            fs::read(repository_root.join(path)).unwrap(),
+            original_snapshot[index]
+        );
     }
     registry.assert_unchanged();
     assert!(!stdout.contains(&registry.subkey));
@@ -3109,6 +3158,7 @@ fn attempt_registered_descendant(creation_flags: u32) -> &'static str {
         assert_eq!(process_information.dwProcessId, 0);
         return match error {
             ERROR_ACCESS_DENIED => "access-denied",
+            ERROR_NOT_ENOUGH_QUOTA => "process-limit-denied",
             _ => "other-failure",
         };
     }
@@ -3979,6 +4029,32 @@ fn registered_lpac_launcher(root: &std::path::Path) -> WindowsProcessLauncher {
     .unwrap()
 }
 
+fn containment_probe_executable() -> PathBuf {
+    static EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
+    EXECUTABLE
+        .get_or_init(|| {
+            let repository_root =
+                fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+            let fixture = repository_root.join("tests/fixtures/m2-containment-probe");
+            let target = repository_root.join("target/m2-containment-probe");
+            let status = Command::new(env!("CARGO"))
+                .args(["build", "--manifest-path"])
+                .arg(fixture.join("Cargo.toml"))
+                .arg("--target-dir")
+                .arg(&target)
+                .args(["--locked", "--quiet"])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let built = target.join("debug/m2-containment-probe.exe");
+            let standalone = target.join("standalone/m2-containment-probe.exe");
+            fs::create_dir_all(standalone.parent().unwrap()).unwrap();
+            fs::copy(built, &standalone).unwrap();
+            standalone
+        })
+        .clone()
+}
+
 #[cfg(feature = "test-seams")]
 fn assert_real_lpac_lifecycle(execution_id: &ToolExecutionId) {
     assert_eq!(
@@ -4793,6 +4869,15 @@ fn path_text(path: &Path) -> String {
         .to_owned()
 }
 
+fn localhost_admin_share_path(path: &Path) -> PathBuf {
+    let canonical = fs::canonicalize(path).unwrap();
+    let value = canonical.to_string_lossy();
+    let value = value.strip_prefix(r"\\?\").unwrap_or(&value);
+    let drive = value.chars().next().unwrap();
+    let relative = value.get(3..).unwrap();
+    PathBuf::from(format!(r"\\localhost\{drive}$\{relative}"))
+}
+
 fn create_junction(target: &Path, link: &Path) {
     let output = Command::new("cmd.exe")
         .args(["/D", "/C", "mklink", "/J"])
@@ -4837,7 +4922,10 @@ fn assert_no_pending_connection(listener: &TcpListener) {
 fn network_observations(stdout: &str) -> BTreeSet<String> {
     stdout
         .lines()
-        .filter_map(|line| line.strip_prefix("d2a-network-"))
+        .filter_map(|line| {
+            line.strip_prefix("d2a-network-")
+                .or_else(|| line.strip_prefix("m2-network-"))
+        })
         .map(|line| format!("network-{line}"))
         .collect()
 }
@@ -4897,19 +4985,7 @@ fn assert_lpac_rejected_before_resume(
 fn request(argv: Vec<String>, environment: BTreeMap<String, String>) -> AuthorizedProcessRequest {
     let task_id = TaskId::new("task-1").unwrap();
     let executable_path = std::env::current_exe().unwrap();
-    let executable_digest = digest(&fs::read(&executable_path).unwrap());
-    let executables = ExecutableRegistry::load(
-        vec![TrustedExecutableRegistration::new(
-            "test-helper",
-            "test-version",
-            &executable_path,
-            executable_digest,
-        )
-        .unwrap()],
-        Arc::new(WindowsExecutableInspector),
-    )
-    .unwrap();
-    let executable = executables.resolve("test-helper", "test-version").unwrap();
+    let executable = registered_executable("test-helper", "test-version", &executable_path);
     let network_digest = digest(b"network-profile");
     AuthorizedProcessRequest {
         execution_id: ToolExecutionId::new(format!(
@@ -4957,6 +5033,20 @@ fn request(argv: Vec<String>, environment: BTreeMap<String, String>) -> Authoriz
         )
         .binding(),
     }
+}
+
+fn registered_executable(
+    name: &str,
+    version: &str,
+    path: &Path,
+) -> local_agent_terminal_application::ResolvedExecutable {
+    let executable_digest = digest(&fs::read(path).unwrap());
+    let executables = ExecutableRegistry::load(
+        vec![TrustedExecutableRegistration::new(name, version, path, executable_digest).unwrap()],
+        Arc::new(WindowsExecutableInspector),
+    )
+    .unwrap();
+    executables.resolve(name, version).unwrap()
 }
 
 fn authorized_write(path: &str, root_identity: &str) -> AuthorizedExpectedWrite {

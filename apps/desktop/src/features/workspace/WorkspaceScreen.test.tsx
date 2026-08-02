@@ -223,7 +223,6 @@ describe("WorkspaceScreen", () => {
   });
 
   it("uses semantic landmarks, native controls, and has no obvious axe violations", async () => {
-    const user = userEvent.setup();
     const { container } = render(
       <WorkspaceScreen initialProjectId="project-1" />,
     );
@@ -235,11 +234,6 @@ describe("WorkspaceScreen", () => {
     expect(screen.getByRole("banner")).toBeVisible();
     expect(screen.getByRole("main")).toHaveAttribute("id", "workspace-main");
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
-    const skipLink = screen.getByRole("link", { name: "Skip to workspace" });
-    await user.tab();
-    expect(skipLink).toHaveFocus();
-    await user.keyboard("{Enter}");
-    expect(screen.getByRole("main")).toHaveFocus();
     expect(screen.getAllByRole("definition").length).toBeGreaterThan(0);
     expect(container.querySelector("ol")).not.toBeNull();
     expect(container.querySelector("time")).not.toBeNull();

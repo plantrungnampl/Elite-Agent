@@ -40,7 +40,6 @@ export function WorkspaceScreen({
   const [loading, setLoading] = useState(initialProjectId !== "");
   const [error, setError] = useState<string | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
-  const mainContent = useRef<HTMLElement>(null);
   const statusHeading = useRef<HTMLHeadingElement>(null);
   const mutationInFlight = useRef(false);
   const refreshInFlight = useRef(false);
@@ -255,13 +254,6 @@ export function WorkspaceScreen({
 
   return (
     <>
-      <a
-        className="skip-link"
-        href="#workspace-main"
-        onClick={() => mainContent.current?.focus()}
-      >
-        Skip to workspace
-      </a>
       <header className="app-header">
         <div className="shell">
           <p className="product-name">Local Agent Terminal</p>
@@ -269,7 +261,6 @@ export function WorkspaceScreen({
         </div>
       </header>
       <main
-        ref={mainContent}
         className="shell workspace-layout"
         id="workspace-main"
         tabIndex={-1}

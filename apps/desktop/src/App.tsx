@@ -15,6 +15,12 @@ function App() {
 
   return (
     <>
+      <a
+        className="skip-link"
+        href={view === "workspace" ? "#workspace-main" : "#tool-activity-main"}
+      >
+        {view === "workspace" ? "Skip to workspace" : "Skip to tool activity"}
+      </a>
       <nav className="view-navigation" aria-label="Application views">
         <button
           className="view-navigation-button"
