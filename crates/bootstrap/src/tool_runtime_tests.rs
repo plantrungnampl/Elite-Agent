@@ -8,15 +8,77 @@ use local_agent_terminal_application::{
     DurableToolExecutionReceipt, FileReadRequest, FileWriteRequest, GitDiffRequest, GitDiffResult,
     GitStatusRequest, GitStatusResult, ImmutableToolRequest, IncompleteToolExecution,
     NewToolExecution, NewToolIntent, OperationIntentSnapshot, PolicyBoundBytes, PortError,
-    ProcessStatus, Retryability, SafeErrorClassification, StructuredToolExecutor,
+    ProcessStatus, Retryability, SafeErrorClassification, StartupStateDto, StructuredToolExecutor,
     ToolControlSelfTest, ToolExecutionCancellationClaim, ToolExecutionClaim,
     ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
     ToolExecutionResolution, ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal,
     ToolExecutionTerminalKind, VerifiedWrite,
 };
 use local_agent_terminal_domain::{ArtifactId, RunId, Sha256Digest};
+use tempfile::TempDir;
+
+use crate::startup::{Bootstrap, StartupConfig};
 
 use super::{SelfTestingToolExecutor, ToolRuntime};
+
+#[test]
+fn configured_startup_exposes_ready_before_releasing_dispatch() {
+    let root = TempDir::new().unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let executor: Arc<dyn SelfTestingToolExecutor> =
+        Arc::new(BlockingCancellationExecutor::new(events));
+    let bootstrap = Bootstrap::with_tool_executor(startup_config(&root), executor);
+
+    assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
+    assert!(bootstrap.workspace_runtime().is_some());
+    assert!(bootstrap.tool_runtime().is_some());
+    let codes = bootstrap
+        .local_diagnostics()
+        .iter()
+        .map(|record| record.code.as_str())
+        .collect::<Vec<_>>();
+    let ready = codes
+        .iter()
+        .position(|code| *code == "startup.ready")
+        .unwrap();
+    let released = codes
+        .iter()
+        .position(|code| *code == "startup.tools.dispatch_released")
+        .unwrap();
+    assert!(ready < released);
+
+    assert_eq!(
+        bootstrap
+            .tool_runtime()
+            .unwrap()
+            .recover_startup()
+            .unwrap_err()
+            .safe_classification(),
+        SafeErrorClassification::Conflict,
+    );
+}
+
+#[test]
+fn configured_startup_keeps_unavailable_dispatch_closed_without_failing_startup() {
+    let root = TempDir::new().unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let executor: Arc<dyn SelfTestingToolExecutor> = Arc::new(
+        BlockingCancellationExecutor::with_unavailable_controls(events),
+    );
+    let bootstrap = Bootstrap::with_tool_executor(startup_config(&root), executor);
+
+    assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
+    let runtime = bootstrap.tool_runtime().unwrap();
+    assert_eq!(
+        runtime.availability().unwrap(),
+        super::ToolRuntimeAvailability::Unavailable
+    );
+    assert!(runtime.recover_startup().is_ok());
+    assert!(!bootstrap
+        .local_diagnostics()
+        .iter()
+        .any(|record| record.code == "startup.tools.dispatch_released"));
+}
 
 #[test]
 fn stop_all_closes_dispatch_cancels_each_running_execution_once_and_joins_workers() {
@@ -299,6 +361,7 @@ impl ToolExecutionStore for RecordingExecutionStore {
 }
 
 struct BlockingCancellationExecutor {
+    controls_available: bool,
     cancelled: Mutex<BTreeSet<ToolExecutionId>>,
     cancel_counts: Mutex<BTreeMap<ToolExecutionId, usize>>,
     cancellation: Condvar,
@@ -308,11 +371,18 @@ struct BlockingCancellationExecutor {
 impl BlockingCancellationExecutor {
     fn new(events: Arc<Mutex<Vec<String>>>) -> Self {
         Self {
+            controls_available: true,
             cancelled: Mutex::new(BTreeSet::new()),
             cancel_counts: Mutex::new(BTreeMap::new()),
             cancellation: Condvar::new(),
             events,
         }
+    }
+
+    fn with_unavailable_controls(events: Arc<Mutex<Vec<String>>>) -> Self {
+        let mut executor = Self::new(events);
+        executor.controls_available = false;
+        executor
     }
 
     fn wait_until_cancelled(&self, execution_id: &ToolExecutionId) {
@@ -334,7 +404,9 @@ impl BlockingCancellationExecutor {
 
 impl ToolControlSelfTest for BlockingCancellationExecutor {
     fn verify_controls(&self) -> Result<(), PortError> {
-        Ok(())
+        self.controls_available
+            .then_some(())
+            .ok_or_else(unavailable)
     }
 }
 
@@ -444,6 +516,21 @@ fn not_found() -> PortError {
         SafeErrorClassification::NotFound,
         Retryability::NonRetryable,
     )
+}
+
+fn unavailable() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::Unavailable,
+        Retryability::NonRetryable,
+    )
+}
+
+fn startup_config(root: &TempDir) -> StartupConfig {
+    StartupConfig {
+        app_data_dir: root.path().join("app-data"),
+        trusted_workspace_root: root.path().join("workspaces"),
+        secret_values: Vec::new(),
+    }
 }
 
 fn digest(marker: char) -> Sha256Digest {

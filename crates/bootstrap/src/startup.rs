@@ -16,7 +16,9 @@ use local_agent_terminal_storage_files::{
 use local_agent_terminal_storage_sqlite::{DatabaseHealth, DatabaseIssue, OpenError, SqliteStore};
 
 use crate::logging::LocalLog;
-use crate::tool_runtime::{ToolControlSelfTestStatus, ToolRuntime, ToolRuntimeAvailability};
+use crate::tool_runtime::{
+    SelfTestingToolExecutor, ToolControlSelfTestStatus, ToolRuntime, ToolRuntimeAvailability,
+};
 use crate::workspace_runtime::{
     fence_stale_leases, reconcile_workspace_after_fencing, WorkspaceRuntime,
 };
@@ -33,6 +35,7 @@ pub struct Bootstrap {
     diagnostics: Vec<LocalDiagnosticDto>,
     runtime: Option<WorkspaceRuntime>,
     tool_runtime: Option<ToolRuntime>,
+    tool_executor: Option<Arc<dyn SelfTestingToolExecutor>>,
     retained_processes: Arc<dyn RetainedProcessController>,
 }
 
@@ -84,6 +87,20 @@ enum RecoveryMode {
 
 impl Bootstrap {
     pub fn new(config: StartupConfig) -> Self {
+        Self::configured(config, None)
+    }
+
+    pub fn with_tool_executor(
+        config: StartupConfig,
+        executor: Arc<dyn SelfTestingToolExecutor>,
+    ) -> Self {
+        Self::configured(config, Some(executor))
+    }
+
+    fn configured(
+        config: StartupConfig,
+        tool_executor: Option<Arc<dyn SelfTestingToolExecutor>>,
+    ) -> Self {
         let mut bootstrap = Self {
             config: Some(config),
             status: StartupStatusDto {
@@ -93,6 +110,7 @@ impl Bootstrap {
             diagnostics: Vec::new(),
             runtime: None,
             tool_runtime: None,
+            tool_executor,
             retained_processes: default_retained_process_controller(),
         };
         bootstrap.retry_startup_validation();
@@ -138,8 +156,19 @@ impl Bootstrap {
         self.runtime = None;
         self.tool_runtime = None;
         let mut log = LocalLog::new(config.secret_values.clone());
-        match start(config, &mut log, Arc::clone(&self.retained_processes)) {
+        match start(
+            config,
+            &mut log,
+            self.tool_executor.clone(),
+            Arc::clone(&self.retained_processes),
+        ) {
             Ok(runtimes) => {
+                self.status = StartupStatusDto {
+                    state: StartupStateDto::Ready,
+                    issues: Vec::new(),
+                };
+                self.runtime = Some(runtimes.workspace);
+                self.tool_runtime = Some(runtimes.tools);
                 log.push(record(
                     "startup.ready",
                     "bootstrap",
@@ -147,32 +176,23 @@ impl Bootstrap {
                     None,
                     "Startup validation completed.",
                 ));
-                self.status = StartupStatusDto {
-                    state: StartupStateDto::Ready,
-                    issues: Vec::new(),
-                };
-                self.runtime = Some(runtimes.workspace);
-                self.tool_runtime = Some(runtimes.tools);
+                let release = self
+                    .tool_runtime
+                    .as_ref()
+                    .expect("successful startup always attaches the tool runtime before release");
+                match release_tool_dispatch(release) {
+                    Ok(true) => log.push(record(
+                        "startup.tools.dispatch_released",
+                        "bootstrap",
+                        DiagnosticSeverityDto::Info,
+                        None,
+                        "Tool dispatch released after startup recovery completed.",
+                    )),
+                    Ok(false) => {}
+                    Err(error) => self.record_failure(&mut log, tool_recovery_failure(error)),
+                }
             }
-            Err(failure) => {
-                log.push(record(
-                    failure.code,
-                    "bootstrap",
-                    DiagnosticSeverityDto::Error,
-                    Some(failure.category),
-                    &failure.detail,
-                ));
-                self.status = StartupStatusDto {
-                    state: failure.state,
-                    issues: vec![StartupIssueDto {
-                        code: failure.code.to_owned(),
-                        message: failure.message.to_owned(),
-                        recovery_actions: recovery_actions(failure.recovery),
-                    }],
-                };
-                self.runtime = None;
-                self.tool_runtime = None;
-            }
+            Err(failure) => self.record_failure(&mut log, failure),
         }
         self.diagnostics = log.into_records();
         &self.status
@@ -188,6 +208,26 @@ impl Bootstrap {
 
     pub fn tool_runtime(&self) -> Option<&ToolRuntime> {
         self.tool_runtime.as_ref()
+    }
+
+    fn record_failure(&mut self, log: &mut LocalLog, failure: StartupFailure) {
+        log.push(record(
+            failure.code,
+            "bootstrap",
+            DiagnosticSeverityDto::Error,
+            Some(failure.category),
+            &failure.detail,
+        ));
+        self.status = StartupStatusDto {
+            state: failure.state,
+            issues: vec![StartupIssueDto {
+                code: failure.code.to_owned(),
+                message: failure.message.to_owned(),
+                recovery_actions: recovery_actions(failure.recovery),
+            }],
+        };
+        self.runtime = None;
+        self.tool_runtime = None;
     }
 
     fn failed(failure: StartupFailure) -> Self {
@@ -212,6 +252,7 @@ impl Bootstrap {
             diagnostics: log.into_records(),
             runtime: None,
             tool_runtime: None,
+            tool_executor: None,
             retained_processes: default_retained_process_controller(),
         }
     }
@@ -220,6 +261,7 @@ impl Bootstrap {
 fn start(
     config: &StartupConfig,
     log: &mut LocalLog,
+    tool_executor: Option<Arc<dyn SelfTestingToolExecutor>>,
     retained_processes: Arc<dyn RetainedProcessController>,
 ) -> Result<StartupRuntimes, StartupFailure> {
     let _recovery_lock =
@@ -294,7 +336,10 @@ fn start(
     let tool_database = SqliteStore::open(config.app_data_dir.join("state.sqlite3"))
         .map_err(database_open_failure)?;
     let executions: Arc<dyn ToolExecutionStore> = Arc::new(tool_database);
-    let tools = ToolRuntime::recovery_only(executions, retained_processes);
+    let tools = match tool_executor {
+        Some(executor) => ToolRuntime::new(executions, executor),
+        None => ToolRuntime::recovery_only(executions, retained_processes),
+    };
     let tool_report = tools.recover_startup().map_err(tool_recovery_failure)?;
     let tool_availability = tools.availability().map_err(tool_recovery_failure)?;
     log.push(record(
@@ -374,6 +419,14 @@ fn start(
         ),
         tools,
     })
+}
+
+fn release_tool_dispatch(tools: &ToolRuntime) -> Result<bool, PortError> {
+    if tools.availability()? == ToolRuntimeAvailability::Ready {
+        tools.release_dispatch()?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 const fn tool_availability_name(availability: ToolRuntimeAvailability) -> &'static str {
