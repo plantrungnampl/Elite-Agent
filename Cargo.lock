@@ -1885,6 +1885,7 @@ name = "local-agent-terminal-desktop"
 version = "0.1.0"
 dependencies = [
  "local-agent-terminal-bootstrap",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tempfile",

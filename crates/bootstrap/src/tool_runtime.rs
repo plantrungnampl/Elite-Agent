@@ -6,18 +6,22 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use local_agent_terminal_application::{
-    parse_policy_timestamp, ApprovalId, ApprovalResumeStore, ArtifactId, ArtifactWriteReservation,
-    AuthoritativeProcessBinding, AuthoritativeProcessTermination, Clock,
+    parse_policy_timestamp, ApprovalId, ApprovalResolution, ApprovalResumeStore, ApprovalStore,
+    ArtifactId, ArtifactWriteReservation, AuthoritativeProcessBinding,
+    AuthoritativeProcessTermination, CancelToolExecutionRequestDto, Clock,
     DurableToolCancellationOutcome, DurableToolExecutionOutcome, DurableToolExecutionReceipt,
     ExecuteTool, IdGenerator, ImmutableToolRequest, IncompleteToolExecution, NewToolIntent,
     OperationIntentSnapshot, PortError, ProcessStatus, ProjectId, ReservedArtifact,
-    RetainedProcessController, Retryability, SafeErrorClassification, SafeToolExecutionError,
-    StructuredToolExecutor, TaskId, TaskQuery, ToolApprovalPublication, ToolApprovalRequest,
-    ToolApprovalRequestPublisher, ToolAuthorityResolver, ToolControlSelfTest,
-    ToolExecutionCancellationClaim, ToolExecutionId, ToolExecutionOrchestration,
-    ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResumeStore,
-    ToolExecutionStore, ToolExecutionTerminal, ToolOutcome, ToolRequest, ToolRequestPublisher,
-    WorkspaceEvidenceStore,
+    ResolveToolApprovalRequestDto, RetainedProcessController, Retryability,
+    SafeErrorClassification, SafeToolExecutionError, StopAllToolsReceiptDto,
+    StructuredToolExecutor, TaskId, TaskQuery, ToolActivityDto, ToolActivityStatusDto,
+    ToolApprovalDecisionDto, ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestDto,
+    ToolApprovalRequestPublisher, ToolApprovalResolutionDto, ToolAuthorityResolver,
+    ToolCancellationReceiptDto, ToolControlSelfTest, ToolExecutionCancellationClaim,
+    ToolExecutionId, ToolExecutionOrchestration, ToolExecutionRecoveryState,
+    ToolExecutionResolution, ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal,
+    ToolExecutionTerminalKind, ToolOutcome, ToolRequest, ToolRequestPublisher,
+    ToolRuntimeAvailabilityDto, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_policy_engine::VersionedPolicyEngine;
 use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
@@ -165,6 +169,50 @@ impl ToolBroker {
         execution_id: &ToolExecutionId,
     ) -> Result<DurableToolCancellationOutcome, PortError> {
         self.with_execute_tool(|execute| execute.cancel(execution_id))
+    }
+
+    fn activity_entries(
+        &self,
+    ) -> Result<Vec<local_agent_terminal_application::ToolActivityEntryDto>, PortError> {
+        self.database.tool_activity_entries()
+    }
+
+    fn approval_request(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<ToolApprovalRequestDto, PortError> {
+        let entry = self
+            .database
+            .tool_activity_entry_for_approval(approval_id)?;
+        if entry.status != ToolActivityStatusDto::ApprovalRequired {
+            return Err(conflict());
+        }
+        Ok(ToolApprovalRequestDto {
+            approval_id: approval_id.as_str().to_owned(),
+            execution_id: entry.execution_id,
+            summary: entry.summary,
+            operation_digest: entry.operation_digest,
+            expires_at: entry.expires_at.ok_or_else(integrity_failure)?,
+            scopes: entry.scopes,
+            actor_id: entry.actor_id,
+            reason: entry.reason,
+            environment_profile_digest: entry.environment_profile_digest,
+            network_profile: entry.network_profile,
+            fencing_token: entry.fencing_token,
+            policy_rules: entry.policy_rules,
+            redaction_state: entry.redaction_state,
+        })
+    }
+
+    fn resolve_approval(&self, approval_id: ApprovalId, approved: bool) -> Result<(), PortError> {
+        ApprovalStore::resolve(
+            &self.database,
+            ApprovalResolution {
+                approval_id,
+                approved,
+            },
+        )?;
+        Ok(())
     }
 
     fn approval_execution_id(
@@ -454,6 +502,60 @@ impl ToolRuntime {
         self.dispatch_and_wait(execution_id, move || broker.resume_approved(approval_id))
     }
 
+    pub fn activity(&self) -> Result<ToolActivityDto, PortError> {
+        let (availability, entries) = match &self.broker {
+            Some(broker) => (
+                runtime_availability_dto(self.availability()?),
+                broker.activity_entries()?,
+            ),
+            None => (ToolRuntimeAvailabilityDto::Unavailable, Vec::new()),
+        };
+        Ok(ToolActivityDto {
+            availability,
+            entries,
+        })
+    }
+
+    pub fn approval_request(
+        &self,
+        approval_id: ApprovalId,
+    ) -> Result<ToolApprovalRequestDto, PortError> {
+        self.broker
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .approval_request(&approval_id)
+    }
+
+    pub fn resolve_approval(
+        &self,
+        request: ResolveToolApprovalRequestDto,
+    ) -> Result<ToolApprovalResolutionDto, PortError> {
+        if self.availability()? != ToolRuntimeAvailability::Ready {
+            return Err(unavailable());
+        }
+        if !valid_sha256_digest(&request.expected_operation_digest) {
+            return Err(invalid_input());
+        }
+        let approval_id = ApprovalId::new(request.approval_id.clone())?;
+        let detail = self.approval_request(approval_id.clone())?;
+        if detail.operation_digest != request.expected_operation_digest {
+            return Err(conflict());
+        }
+        let broker = Arc::clone(self.broker.as_ref().ok_or_else(unavailable)?);
+        let approved = request.decision == ToolApprovalDecisionDto::Approve;
+        broker.resolve_approval(approval_id.clone(), approved)?;
+        let status = if approved {
+            tool_outcome_status(&self.resume_approved(approval_id.clone())?)
+        } else {
+            ToolActivityStatusDto::Denied
+        };
+        Ok(ToolApprovalResolutionDto {
+            approval_id: approval_id.as_str().to_owned(),
+            execution_id: detail.execution_id,
+            status,
+        })
+    }
+
     pub fn cancel(
         &self,
         execution_id: &ToolExecutionId,
@@ -462,6 +564,40 @@ impl ToolRuntime {
             .as_ref()
             .ok_or_else(unavailable)?
             .cancel(execution_id)
+    }
+
+    pub fn cancel_for_ui(
+        &self,
+        request: CancelToolExecutionRequestDto,
+    ) -> Result<ToolCancellationReceiptDto, PortError> {
+        let execution_id = ToolExecutionId::new(request.execution_id)?;
+        match self.cancel(&execution_id)? {
+            DurableToolCancellationOutcome::Requested { receipt, .. } => {
+                Ok(ToolCancellationReceiptDto {
+                    execution_id: receipt.execution_id.as_str().to_owned(),
+                    status: ToolActivityStatusDto::Cancelling,
+                    cancelled: receipt.cancelled,
+                })
+            }
+            DurableToolCancellationOutcome::InFlight(authority) => Ok(ToolCancellationReceiptDto {
+                execution_id: authority.execution_id().as_str().to_owned(),
+                status: ToolActivityStatusDto::Cancelling,
+                cancelled: false,
+            }),
+            DurableToolCancellationOutcome::Completed(receipt) => {
+                Ok(cancellation_receipt_dto(&receipt))
+            }
+        }
+    }
+
+    pub fn stop_all_for_ui(&self) -> Result<StopAllToolsReceiptDto, PortError> {
+        Ok(StopAllToolsReceiptDto {
+            receipts: self
+                .stop_all()?
+                .iter()
+                .map(cancellation_receipt_dto)
+                .collect(),
+        })
     }
 
     fn dispatch_and_wait(
@@ -1009,6 +1145,65 @@ fn invalid_input() -> PortError {
         SafeErrorClassification::InvalidInput,
         Retryability::NonRetryable,
     )
+}
+
+const fn runtime_availability_dto(
+    availability: ToolRuntimeAvailability,
+) -> ToolRuntimeAvailabilityDto {
+    match availability {
+        ToolRuntimeAvailability::Ready => ToolRuntimeAvailabilityDto::Ready,
+        ToolRuntimeAvailability::DegradedReadOnly => ToolRuntimeAvailabilityDto::DegradedReadOnly,
+        ToolRuntimeAvailability::Unavailable => ToolRuntimeAvailabilityDto::Unavailable,
+    }
+}
+
+fn tool_outcome_status(outcome: &ToolOutcome) -> ToolActivityStatusDto {
+    match outcome {
+        ToolOutcome::ApprovalRequired(_) => ToolActivityStatusDto::ApprovalRequired,
+        ToolOutcome::Denied(_) => ToolActivityStatusDto::Denied,
+        ToolOutcome::Execution(DurableToolExecutionOutcome::InFlight(_)) => {
+            ToolActivityStatusDto::Running
+        }
+        ToolOutcome::Execution(DurableToolExecutionOutcome::Completed(receipt)) => {
+            terminal_status(receipt.terminal().kind())
+        }
+        ToolOutcome::Execution(
+            DurableToolExecutionOutcome::Indeterminate(_)
+            | DurableToolExecutionOutcome::TerminalPersistenceUnresolved { .. },
+        ) => ToolActivityStatusDto::Indeterminate,
+    }
+}
+
+const fn terminal_status(kind: ToolExecutionTerminalKind) -> ToolActivityStatusDto {
+    match kind {
+        ToolExecutionTerminalKind::Succeeded => ToolActivityStatusDto::Succeeded,
+        ToolExecutionTerminalKind::Failed => ToolActivityStatusDto::Failed,
+        ToolExecutionTerminalKind::Cancelled | ToolExecutionTerminalKind::Terminated => {
+            ToolActivityStatusDto::Terminated
+        }
+        ToolExecutionTerminalKind::Interrupted => ToolActivityStatusDto::Interrupted,
+        ToolExecutionTerminalKind::Indeterminate => ToolActivityStatusDto::Indeterminate,
+    }
+}
+
+fn cancellation_receipt_dto(receipt: &DurableToolExecutionReceipt) -> ToolCancellationReceiptDto {
+    let kind = receipt.terminal().kind();
+    ToolCancellationReceiptDto {
+        execution_id: receipt.authority().execution_id().as_str().to_owned(),
+        status: terminal_status(kind),
+        cancelled: matches!(
+            kind,
+            ToolExecutionTerminalKind::Cancelled | ToolExecutionTerminalKind::Terminated
+        ),
+    }
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn integrity_failure() -> PortError {

@@ -1,11 +1,14 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use local_agent_terminal_bootstrap::{
-    Bootstrap, CommandErrorDto, ConfirmDiscardWorkspaceRequestDto, CreateTaskWorkspaceRequestDto,
-    LocalDiagnosticDto, OnboardRepositoryRequestDto, ProjectSnapshot, RecoveryCandidateRequestDto,
-    StartupConfig, StartupStatusDto, TaskSnapshot, WorkspaceDashboardDto,
-    WorkspaceDashboardRequestDto, WorkspaceRuntime,
+    Bootstrap, CancelToolExecutionRequestDto, CommandErrorDto, ConfirmDiscardWorkspaceRequestDto,
+    CreateTaskWorkspaceRequestDto, GetApprovalRequestDto, LocalDiagnosticDto,
+    OnboardRepositoryRequestDto, ProjectSnapshot, RecoveryCandidateRequestDto,
+    ResolveToolApprovalRequestDto, StartupConfig, StartupStatusDto, StopAllToolsReceiptDto,
+    TaskSnapshot, ToolActivityDto, ToolApprovalRequestDto, ToolApprovalResolutionDto,
+    ToolCancellationReceiptDto, ToolRuntime, WorkspaceDashboardDto, WorkspaceDashboardRequestDto,
+    WorkspaceRuntime,
 };
 use tauri::Manager;
 
@@ -59,6 +62,19 @@ impl ManagedBootstrap {
             .map_err(|_| CommandErrorDto::internal_state_unavailable())?;
         let runtime = bootstrap
             .workspace_runtime()
+            .ok_or_else(CommandErrorDto::startup_not_ready)?;
+        operation(runtime)
+    }
+
+    fn with_tool_runtime<T>(
+        &self,
+        operation: impl FnOnce(Arc<ToolRuntime>) -> Result<T, CommandErrorDto>,
+    ) -> Result<T, CommandErrorDto> {
+        let runtime = self
+            .0
+            .lock()
+            .map_err(|_| CommandErrorDto::internal_state_unavailable())?
+            .tool_runtime_handle()
             .ok_or_else(CommandErrorDto::startup_not_ready)?;
         operation(runtime)
     }
@@ -154,6 +170,59 @@ fn discard_workspace(
     })
 }
 
+#[tauri::command]
+fn get_tool_activity(
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<ToolActivityDto, CommandErrorDto> {
+    state.with_tool_runtime(|runtime| runtime.activity().map_err(CommandErrorDto::from))
+}
+
+#[tauri::command]
+fn get_approval_request(
+    request: GetApprovalRequestDto,
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<ToolApprovalRequestDto, CommandErrorDto> {
+    state.with_tool_runtime(|runtime| {
+        runtime
+            .approval_request(
+                local_agent_terminal_bootstrap::ApprovalId::new(request.approval_id)
+                    .map_err(CommandErrorDto::from)?,
+            )
+            .map_err(CommandErrorDto::from)
+    })
+}
+
+#[tauri::command]
+fn resolve_tool_approval(
+    request: ResolveToolApprovalRequestDto,
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<ToolApprovalResolutionDto, CommandErrorDto> {
+    state.with_tool_runtime(|runtime| {
+        runtime
+            .resolve_approval(request)
+            .map_err(CommandErrorDto::from)
+    })
+}
+
+#[tauri::command]
+fn cancel_tool_execution(
+    request: CancelToolExecutionRequestDto,
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<ToolCancellationReceiptDto, CommandErrorDto> {
+    state.with_tool_runtime(|runtime| {
+        runtime
+            .cancel_for_ui(request)
+            .map_err(CommandErrorDto::from)
+    })
+}
+
+#[tauri::command]
+fn stop_all_tools(
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<StopAllToolsReceiptDto, CommandErrorDto> {
+    state.with_tool_runtime(|runtime| runtime.stop_all_for_ui().map_err(CommandErrorDto::from))
+}
+
 fn config(app_data_dir: PathBuf) -> StartupConfig {
     StartupConfig {
         trusted_workspace_root: app_data_dir.join("workspaces"),
@@ -180,7 +249,12 @@ pub fn run() {
             create_task_workspace,
             reconcile_workspace,
             preserve_workspace,
-            discard_workspace
+            discard_workspace,
+            get_tool_activity,
+            get_approval_request,
+            resolve_tool_approval,
+            cancel_tool_execution,
+            stop_all_tools
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -190,7 +264,10 @@ pub fn run() {
 mod tests {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    use local_agent_terminal_bootstrap::StartupStateDto;
+    use local_agent_terminal_bootstrap::{
+        CancelToolExecutionRequestDto, GetApprovalRequestDto, ResolveToolApprovalRequestDto,
+        StartupStateDto, ToolRuntimeAvailabilityDto,
+    };
     use tempfile::TempDir;
 
     use super::ManagedBootstrap;
@@ -246,5 +323,57 @@ mod tests {
                 .state,
             StartupStateDto::Ready
         );
+    }
+
+    #[test]
+    fn tool_command_requests_reject_replacement_payloads_and_unknown_fields() {
+        assert!(
+            serde_json::from_value::<ResolveToolApprovalRequestDto>(serde_json::json!({
+                "approvalId": "approval-1",
+                "expectedOperationDigest": format!("sha256:{}", "a".repeat(64)),
+                "decision": "approve",
+                "toolArguments": ["replacement"]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CancelToolExecutionRequestDto>(serde_json::json!({
+                "executionId": "execution-1",
+                "force": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<GetApprovalRequestDto>(serde_json::json!({
+                "approvalId": "approval-1",
+                "operationDigest": format!("sha256:{}", "b".repeat(64))
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unconfigured_tool_boundary_is_read_only_and_reported_unavailable() {
+        let parent = TempDir::new().unwrap();
+        let managed = ManagedBootstrap::resolve_with(|| Some(parent.path().join("app-data")));
+
+        let activity = managed
+            .with_tool_runtime(|runtime| runtime.activity().map_err(Into::into))
+            .unwrap();
+        assert_eq!(
+            activity.availability,
+            ToolRuntimeAvailabilityDto::Unavailable
+        );
+        assert!(activity.entries.is_empty());
+        let error = managed
+            .with_tool_runtime(|runtime| {
+                runtime
+                    .cancel_for_ui(CancelToolExecutionRequestDto {
+                        execution_id: "execution-1".to_owned(),
+                    })
+                    .map_err(Into::into)
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "unavailable");
     }
 }

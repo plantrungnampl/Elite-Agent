@@ -123,7 +123,8 @@ button:disabled {
 }
 
 .startup-layout,
-.workspace-layout {
+.workspace-layout,
+.tool-layout {
   padding-block: var(--space-7);
 }
 
@@ -404,13 +405,165 @@ code {
   background: var(--color-danger);
 }
 
+.view-navigation {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-5);
+  border-block-end: 0.0625rem solid var(--color-border);
+  background: var(--color-raised);
+}
+
+.view-navigation-button,
+.secondary-button {
+  border-color: var(--color-strong);
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+.view-navigation-button[aria-pressed="true"] {
+  background: var(--color-strong);
+  color: var(--color-inverse);
+}
+
+.tool-status,
+.tool-controls,
+.tool-activity {
+  margin-block-start: var(--space-5);
+}
+
+.tool-controls,
+.tool-activity {
+  padding: var(--space-4) var(--space-5);
+}
+
+.confirmation-label {
+  display: flex;
+  align-items: center;
+  min-block-size: 2.75rem;
+  margin-block: var(--space-3);
+}
+
+.confirmation-label input {
+  flex: 0 0 auto;
+  inline-size: 1.25rem;
+  min-block-size: 1.25rem;
+  margin-inline-end: var(--space-2);
+}
+
+.table-scroll {
+  max-inline-size: 100%;
+  margin-block-start: var(--space-4);
+  overflow-x: auto;
+  border: 0.0625rem solid var(--color-border);
+}
+
+.table-scroll:focus-visible {
+  outline-offset: 0.1rem;
+}
+
+table {
+  inline-size: 100%;
+  min-inline-size: 58rem;
+  border-collapse: collapse;
+  background: var(--color-surface);
+}
+
+th,
+td {
+  padding: var(--space-3);
+  border-block-end: 0.0625rem solid var(--color-border);
+  text-align: start;
+  vertical-align: top;
+}
+
+thead th {
+  background: var(--color-raised);
+}
+
+.activity-details,
+.approval-details {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.activity-details div,
+.approval-details div {
+  display: grid;
+  grid-template-columns: minmax(10rem, 0.35fr) minmax(0, 1fr);
+  gap: var(--space-3);
+}
+
+.activity-details dt,
+.approval-details dt {
+  color: var(--color-muted);
+  font-weight: 700;
+}
+
+.activity-details dd,
+.approval-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.state-badge {
+  display: block;
+  font-weight: 750;
+}
+
+.state-badge + .state-badge {
+  margin-block-start: var(--space-1);
+}
+
+.dialog-backdrop {
+  position: fixed;
+  z-index: 2;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: var(--space-4);
+  overflow-y: auto;
+  background: rgb(23 23 23 / 70%);
+}
+
+.approval-dialog {
+  inline-size: min(100%, 48rem);
+  max-block-size: calc(100vh - 2 * var(--space-4));
+  padding: var(--space-5);
+  overflow-y: auto;
+  border: 0.125rem solid var(--color-strong);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+}
+
+.dialog-warning {
+  padding: var(--space-3);
+  border-inline-start: 0.35rem solid var(--color-strong);
+  background: var(--color-raised);
+  font-weight: 700;
+}
+
+.dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-3);
+  margin-block-start: var(--space-5);
+}
+
+.tool-activity tbody tr {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 12rem;
+}
+
 @media (max-width: 36rem) {
   .shell {
     inline-size: min(calc(100% - 2 * var(--space-4)), 72rem);
   }
 
   .startup-layout,
-  .workspace-layout {
+  .workspace-layout,
+  .tool-layout {
     padding-block: var(--space-6);
   }
 
@@ -422,6 +575,8 @@ code {
 
   .diagnostic dl div,
   .summary-list div,
+  .activity-details div,
+  .approval-details div,
   .compact-form {
     grid-template-columns: 1fr;
     gap: 0;
@@ -430,6 +585,10 @@ code {
   .compact-form button,
   .stacked-form button,
   .danger-button {
+    inline-size: 100%;
+  }
+
+  .dialog-actions button {
     inline-size: 100%;
   }
 }

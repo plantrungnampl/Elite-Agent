@@ -22,4 +22,5 @@ local-agent-terminal-bootstrap = { path = "../../../crates/bootstrap" }
 tauri = { version = "2", features = [] }
 
 [dev-dependencies]
+serde_json = "1.0"
 tempfile = "3.27"

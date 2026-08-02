@@ -13,12 +13,13 @@ use local_agent_terminal_application::{
     AuthorizedToolRequest, CancellationReceipt, DisclosureOutcome, FileReadRequest,
     FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult,
     PolicyBoundBytes, PolicyDecision, PolicyDecisionStore, PortError, ProcessExecutionBindingStore,
-    ProcessStatus, RecordedPolicyDecision, ResolvedExecutable, Retryability,
-    SafeErrorClassification, StructuredToolExecutor, ToolApprovalOperationV1,
-    ToolApprovalPayloadV1, ToolApprovalPublication, ToolApprovalRequest,
-    ToolApprovalRequestPublisher, ToolAuthorityResolver, ToolAuthoritySnapshot,
-    ToolControlSelfTest, ToolExecutionResult, ToolExecutionResumeStore, ToolOutcome,
-    ToolPolicyContext, ToolRequest, ToolRequestPublisher, VerifiedWrite,
+    ProcessStatus, RecordedPolicyDecision, ResolveToolApprovalRequestDto, ResolvedExecutable,
+    Retryability, SafeErrorClassification, StructuredToolExecutor, ToolActivityStatusDto,
+    ToolApprovalDecisionDto, ToolApprovalOperationV1, ToolApprovalPayloadV1,
+    ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestPublisher,
+    ToolAuthorityResolver, ToolAuthoritySnapshot, ToolControlSelfTest, ToolExecutionResult,
+    ToolExecutionResumeStore, ToolOutcome, ToolPolicyContext, ToolRequest, ToolRequestPublisher,
+    VerifiedWrite,
 };
 use local_agent_terminal_bootstrap::{
     Bootstrap, StartupConfig, ToolArtifactPublisher, ToolBrokerConfig, ToolRuntimeAvailability,
@@ -121,6 +122,48 @@ fn stop_all_cancels_and_joins_a_runtime_owned_execution() {
 }
 
 #[test]
+fn reconfigure_stops_and_joins_the_previous_runtime_before_replacement() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let policy = VersionedPolicyEngine::from_json(ALLOW_PROCESS_POLICY).unwrap();
+    let request = tool_request_for_policy(
+        "execution-runtime-reconfigure",
+        policy.snapshot_digest().clone(),
+    );
+    let executor = Arc::new(RecordingExecutor::blocking(
+        SqliteStore::open(&fixture.database_path).unwrap(),
+    ));
+    let config = || StartupConfig {
+        app_data_dir: fixture.app_data.clone(),
+        trusted_workspace_root: fixture.workspace_root.clone(),
+        secret_values: Vec::new(),
+    };
+    let mut bootstrap = Bootstrap::with_tool_broker(
+        config(),
+        ToolBrokerConfig::new(
+            ALLOW_PROCESS_POLICY,
+            Arc::new(EchoAuthority),
+            executor.clone(),
+        ),
+    );
+    let runtime = bootstrap.tool_runtime_handle().unwrap();
+
+    std::thread::scope(|scope| {
+        let execution = scope.spawn(move || runtime.execute(request));
+        executor.wait_until_started();
+        let status = bootstrap.reconfigure(config()).clone();
+        executor.release();
+        execution.join().unwrap().unwrap();
+
+        assert_eq!(
+            status.state,
+            local_agent_terminal_application::StartupStateDto::Ready
+        );
+        assert_eq!(executor.cancel_calls.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
 fn stop_all_cancels_started_workers_while_an_earlier_worker_is_still_registering() {
     let fixture = WorkspaceFixture::new();
     fixture.seed_present_workspace();
@@ -208,6 +251,120 @@ fn configured_runtime_resumes_an_approved_request_through_execute_tool() {
         )
     ));
     assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn configured_runtime_projects_exact_approval_context_and_rejects_a_stale_digest() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let policy = VersionedPolicyEngine::from_json(APPROVE_PROCESS_POLICY).unwrap();
+    let request = tool_request_for_policy(
+        "execution-runtime-activity",
+        policy.snapshot_digest().clone(),
+    );
+    let executor = Arc::new(RecordingExecutor::failing(
+        SqliteStore::open(&fixture.database_path).unwrap(),
+    ));
+    let bootstrap = Bootstrap::with_tool_broker(
+        StartupConfig {
+            app_data_dir: fixture.app_data.clone(),
+            trusted_workspace_root: fixture.workspace_root.clone(),
+            secret_values: Vec::new(),
+        },
+        ToolBrokerConfig::new(
+            APPROVE_PROCESS_POLICY,
+            Arc::new(EchoAuthority),
+            executor.clone(),
+        ),
+    );
+    let runtime = bootstrap.tool_runtime().unwrap();
+    let ToolOutcome::ApprovalRequired(published) = runtime.execute(request).unwrap() else {
+        panic!("approval policy must publish one immutable request");
+    };
+
+    let activity = runtime.activity().unwrap();
+    assert_eq!(activity.entries.len(), 1);
+    let entry = &activity.entries[0];
+    assert_eq!(entry.execution_id, "execution-runtime-activity");
+    assert_eq!(entry.status, ToolActivityStatusDto::ApprovalRequired);
+    assert_eq!(entry.summary, "process.exec toolchain:cargo [\"test\"]");
+    assert_eq!(entry.actor_id, "agent-1");
+    assert_eq!(entry.reason, "run focused tests");
+    assert_eq!(entry.network_profile, "denied");
+    assert_eq!(entry.policy_rules, ["approve-process"]);
+
+    let approval_id = ApprovalId::new(published.approval_id.clone()).unwrap();
+    let detail = runtime.approval_request(approval_id.clone()).unwrap();
+    assert_eq!(detail.execution_id, "execution-runtime-activity");
+    assert_eq!(detail.operation_digest, published.operation_digest);
+    assert_eq!(detail.scopes, ["worktree:task-1"]);
+
+    let error = runtime
+        .resolve_approval(ResolveToolApprovalRequestDto {
+            approval_id: published.approval_id.clone(),
+            expected_operation_digest: format!("sha256:{}", "f".repeat(64)),
+            decision: ToolApprovalDecisionDto::Approve,
+        })
+        .unwrap_err();
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 0);
+
+    let resolved = runtime
+        .resolve_approval(ResolveToolApprovalRequestDto {
+            approval_id: published.approval_id,
+            expected_operation_digest: published.operation_digest,
+            decision: ToolApprovalDecisionDto::Approve,
+        })
+        .unwrap();
+    assert_eq!(resolved.execution_id, "execution-runtime-activity");
+    assert_eq!(resolved.status, ToolActivityStatusDto::Indeterminate);
+    assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn denying_a_projected_approval_never_calls_the_executor() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let policy = VersionedPolicyEngine::from_json(APPROVE_PROCESS_POLICY).unwrap();
+    let request = tool_request_for_policy(
+        "execution-runtime-denied-approval",
+        policy.snapshot_digest().clone(),
+    );
+    let executor = Arc::new(RecordingExecutor::default());
+    let bootstrap = Bootstrap::with_tool_broker(
+        StartupConfig {
+            app_data_dir: fixture.app_data.clone(),
+            trusted_workspace_root: fixture.workspace_root.clone(),
+            secret_values: Vec::new(),
+        },
+        ToolBrokerConfig::new(
+            APPROVE_PROCESS_POLICY,
+            Arc::new(EchoAuthority),
+            executor.clone(),
+        ),
+    );
+    let runtime = bootstrap.tool_runtime().unwrap();
+    let ToolOutcome::ApprovalRequired(published) = runtime.execute(request).unwrap() else {
+        panic!("approval policy must publish one immutable request");
+    };
+
+    let resolved = runtime
+        .resolve_approval(ResolveToolApprovalRequestDto {
+            approval_id: published.approval_id,
+            expected_operation_digest: published.operation_digest,
+            decision: ToolApprovalDecisionDto::Deny,
+        })
+        .unwrap();
+
+    assert_eq!(resolved.status, ToolActivityStatusDto::Denied);
+    assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        runtime.activity().unwrap().entries[0].status,
+        ToolActivityStatusDto::Denied
+    );
 }
 
 #[test]

@@ -35,12 +35,17 @@ pub use authority::{
 };
 pub use canonical_json::{canonical_evidence, CanonicalEvidenceRef, CanonicalJsonRequest};
 pub use dto::{
-    ApprovalRequestDto, ApproveOperationRequestDto, CancelToolExecutionRequestDto, CommandErrorDto,
-    ConfirmDiscardWorkspaceRequestDto, CreateTaskWorkspaceRequestDto, DiagnosticSeverityDto,
-    EvidenceSummaryDto, LocalDiagnosticDto, ObservationClassDto, OnboardRepositoryRequestDto,
-    RecoveryActionCodeDto, RecoveryActionDto, RecoveryCandidateRequestDto, StartupIssueDto,
-    StartupRecoveryActionDto, StartupStateDto, StartupStatusDto, TimelineEntryDto, TrustLabelDto,
-    WorkspaceDashboardDto, WorkspaceDashboardRequestDto,
+    tool_request_context, ApprovalRequestDto, ApproveOperationRequestDto,
+    CancelToolExecutionRequestDto, CommandErrorDto, ConfirmDiscardWorkspaceRequestDto,
+    CreateTaskWorkspaceRequestDto, DiagnosticSeverityDto, EvidenceSummaryDto,
+    GetApprovalRequestDto, LocalDiagnosticDto, ObservationClassDto, OnboardRepositoryRequestDto,
+    RecoveryActionCodeDto, RecoveryActionDto, RecoveryCandidateRequestDto,
+    ResolveToolApprovalRequestDto, StartupIssueDto, StartupRecoveryActionDto, StartupStateDto,
+    StartupStatusDto, StopAllToolsReceiptDto, TimelineEntryDto, ToolActivityDto,
+    ToolActivityEntryDto, ToolActivityStatusDto, ToolApprovalDecisionDto, ToolApprovalRequestDto,
+    ToolApprovalResolutionDto, ToolCancellationReceiptDto, ToolRedactionStateDto,
+    ToolRequestContextDto, ToolRuntimeAvailabilityDto, TrustLabelDto, WorkspaceDashboardDto,
+    WorkspaceDashboardRequestDto,
 };
 pub use error::{PortError, Retryability, SafeErrorClassification};
 pub use execute_tool::{ExecuteTool, ToolOutcome};

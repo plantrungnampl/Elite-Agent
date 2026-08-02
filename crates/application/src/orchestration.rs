@@ -11,8 +11,8 @@ use crate::{
     canonical_approval_payload,
     canonical_json::sha256_digest,
     canonical_policy_binding_digest, canonical_tool_request, parse_policy_timestamp,
-    tool::{logical_capability, process_approval_operation},
-    validate_approval_resume_relation, validate_authoritative_tool_request,
+    tool::process_approval_operation,
+    tool_request_context, validate_approval_resume_relation, validate_authoritative_tool_request,
     validate_pending_approval_resume, ApprovalId, ApprovalRequestDto, ApprovalResumeSnapshot,
     ApprovalResumeStore, ArtifactId, AuthorizedToolExecutionClaim, Clock, DeniedToolExecution,
     IdGenerator, ImmutableToolRequest, PolicyDecision, PolicyDecisionId, PolicyDecisionStore,
@@ -537,35 +537,17 @@ fn approval_dto(
     request: &ToolRequest,
     published: &ToolApprovalRequest,
 ) -> Result<ApprovalRequestDto, PortError> {
-    let process = request.process().process();
-    let argv = serde_json::to_string(process.argv()).map_err(|_| invalid_input())?;
-    let operation = &published.payload().operation;
-    let mut scopes = Vec::with_capacity(
-        1 + request.process().expected_reads().len() + operation.expected_writes.len(),
-    );
-    scopes.push(operation.cwd_capability.clone());
-    scopes.extend(
-        request
-            .process()
-            .expected_reads()
-            .iter()
-            .map(logical_capability),
-    );
-    scopes.extend(operation.expected_writes.iter().cloned());
+    let context = tool_request_context(request)?;
     Ok(ApprovalRequestDto {
         approval_id: published.approval_id().as_str().to_owned(),
-        summary: format!(
-            "{} {} {argv}",
-            operation.tool,
-            logical_capability(process.executable())
-        ),
+        summary: context.summary,
         operation_digest: published
             .canonical_payload()
             .operation_digest
             .as_str()
             .to_owned(),
         expires_at: published.payload().expires_at.clone(),
-        scopes,
+        scopes: context.scopes,
     })
 }
 

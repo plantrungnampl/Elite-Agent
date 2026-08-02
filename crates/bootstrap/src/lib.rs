@@ -7,10 +7,13 @@ mod workspace_monitor;
 mod workspace_runtime;
 
 pub use local_agent_terminal_application::{
-    CommandErrorDto, ConfirmDiscardWorkspaceRequestDto, CreateTaskWorkspaceRequestDto,
-    LocalDiagnosticDto, OnboardRepositoryRequestDto, ProjectSnapshot, RecoveryCandidateRequestDto,
-    StartupStateDto, StartupStatusDto, TaskSnapshot, WorkspaceDashboardDto,
-    WorkspaceDashboardRequestDto,
+    ApprovalId, CancelToolExecutionRequestDto, CommandErrorDto, ConfirmDiscardWorkspaceRequestDto,
+    CreateTaskWorkspaceRequestDto, GetApprovalRequestDto, LocalDiagnosticDto,
+    OnboardRepositoryRequestDto, ProjectSnapshot, RecoveryCandidateRequestDto,
+    ResolveToolApprovalRequestDto, StartupStateDto, StartupStatusDto, StopAllToolsReceiptDto,
+    TaskSnapshot, ToolActivityDto, ToolApprovalDecisionDto, ToolApprovalRequestDto,
+    ToolApprovalResolutionDto, ToolCancellationReceiptDto, ToolRuntimeAvailabilityDto,
+    WorkspaceDashboardDto, WorkspaceDashboardRequestDto,
 };
 pub use startup::{Bootstrap, StartupConfig};
 pub use tool_runtime::{

@@ -9,6 +9,7 @@ mod migrations;
 mod policy_store;
 mod project_store;
 mod task_query;
+mod tool_activity;
 mod tool_execution_store;
 mod workspace_store;
 

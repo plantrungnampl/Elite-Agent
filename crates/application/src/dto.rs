@@ -1,10 +1,11 @@
-use local_agent_terminal_domain::ProjectId;
+use local_agent_terminal_domain::{NetworkProfile, ProjectId, TrustTier};
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::{
-    ExpectedPresence, PortError, ProjectSnapshot, RecoveryAction, RecoveryCandidate,
-    RecoveryReason, RepositorySnapshot, Retryability, SafeErrorClassification, TaskLeaseState,
-    TaskSnapshot, WorktreeSnapshot, WorktreeState,
+    canonical_json::invalid_input, tool::logical_capability, ExpectedPresence, PortError,
+    ProjectSnapshot, RecoveryAction, RecoveryCandidate, RecoveryReason, RepositorySnapshot,
+    Retryability, SafeErrorClassification, TaskLeaseState, TaskSnapshot, ToolRequest,
+    WorktreeSnapshot, WorktreeState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -141,6 +142,186 @@ pub struct ApproveOperationRequestDto {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CancelToolExecutionRequestDto {
     pub execution_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetApprovalRequestDto {
+    pub approval_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalDecisionDto {
+    Approve,
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolveToolApprovalRequestDto {
+    pub approval_id: String,
+    pub expected_operation_digest: String,
+    pub decision: ToolApprovalDecisionDto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRuntimeAvailabilityDto {
+    Ready,
+    DegradedReadOnly,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolActivityStatusDto {
+    Denied,
+    ApprovalRequired,
+    Running,
+    Cancelling,
+    Succeeded,
+    Terminated,
+    Failed,
+    Interrupted,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRedactionStateDto {
+    None,
+    Redacted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolActivityEntryDto {
+    pub execution_id: String,
+    pub approval_id: Option<String>,
+    pub tool_name: String,
+    pub status: ToolActivityStatusDto,
+    pub summary: String,
+    pub actor_id: String,
+    pub effective_role: String,
+    pub reason: String,
+    pub operation_digest: String,
+    pub policy_decision_id: Option<String>,
+    pub policy_snapshot_digest: String,
+    pub scopes: Vec<String>,
+    pub environment_profile_digest: String,
+    pub network_profile: String,
+    pub expires_at: Option<String>,
+    pub fencing_token: Option<u64>,
+    pub policy_rules: Vec<String>,
+    pub redaction_state: ToolRedactionStateDto,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolActivityDto {
+    pub availability: ToolRuntimeAvailabilityDto,
+    pub entries: Vec<ToolActivityEntryDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolApprovalRequestDto {
+    pub approval_id: String,
+    pub execution_id: String,
+    pub summary: String,
+    pub operation_digest: String,
+    pub expires_at: String,
+    pub scopes: Vec<String>,
+    pub actor_id: String,
+    pub reason: String,
+    pub environment_profile_digest: String,
+    pub network_profile: String,
+    pub fencing_token: Option<u64>,
+    pub policy_rules: Vec<String>,
+    pub redaction_state: ToolRedactionStateDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolApprovalResolutionDto {
+    pub approval_id: String,
+    pub execution_id: String,
+    pub status: ToolActivityStatusDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCancellationReceiptDto {
+    pub execution_id: String,
+    pub status: ToolActivityStatusDto,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopAllToolsReceiptDto {
+    pub receipts: Vec<ToolCancellationReceiptDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRequestContextDto {
+    pub summary: String,
+    pub actor_id: String,
+    pub fallback_role: String,
+    pub reason: String,
+    pub policy_snapshot_digest: String,
+    pub scopes: Vec<String>,
+    pub environment_profile_digest: String,
+    pub network_profile: String,
+    pub fencing_token: Option<u64>,
+}
+
+pub fn tool_request_context(request: &ToolRequest) -> Result<ToolRequestContextDto, PortError> {
+    let process = request.process().process();
+    let argv = serde_json::to_string(process.argv()).map_err(|_| invalid_input())?;
+    let mut scopes = Vec::with_capacity(
+        1 + request.process().expected_reads().len() + process.expected_writes().len(),
+    );
+    scopes.push(logical_capability(process.cwd()));
+    scopes.extend(
+        request
+            .process()
+            .expected_reads()
+            .iter()
+            .map(logical_capability),
+    );
+    scopes.extend(
+        process
+            .expected_writes()
+            .iter()
+            .map(|write| logical_capability(write.capability())),
+    );
+    Ok(ToolRequestContextDto {
+        summary: format!(
+            "process.exec {} {argv}",
+            logical_capability(process.executable())
+        ),
+        actor_id: request.policy().actor().agent_id.clone(),
+        fallback_role: trust_tier_name(request.policy().actor().trust_tier).to_owned(),
+        reason: request.policy().purpose().to_owned(),
+        policy_snapshot_digest: request
+            .policy()
+            .policy_snapshot_digest()
+            .as_str()
+            .to_owned(),
+        scopes,
+        environment_profile_digest: process
+            .binding()
+            .environment_profile()
+            .digest()
+            .as_str()
+            .to_owned(),
+        network_profile: network_profile_name(process.network()).to_owned(),
+        fencing_token: process.executor_fencing_token().map(|token| token.get()),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -592,6 +773,22 @@ const fn classification_name(classification: SafeErrorClassification) -> &'stati
         SafeErrorClassification::IntegrityFailure => "integrity_failure",
         SafeErrorClassification::StorageFull => "storage_full",
         SafeErrorClassification::Internal => "internal",
+    }
+}
+
+const fn trust_tier_name(trust_tier: TrustTier) -> &'static str {
+    match trust_tier {
+        TrustTier::CoreAdapter => "core_adapter",
+        TrustTier::BrokeredProcess => "brokered_process",
+        TrustTier::IsolatedWorker => "isolated_worker",
+    }
+}
+
+const fn network_profile_name(network_profile: NetworkProfile) -> &'static str {
+    match network_profile {
+        NetworkProfile::Denied => "denied",
+        NetworkProfile::ProviderEndpointOnly => "provider_endpoint_only",
+        NetworkProfile::ApprovedDestinations => "approved_destinations",
     }
 }
 

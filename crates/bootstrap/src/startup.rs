@@ -34,7 +34,7 @@ pub struct Bootstrap {
     status: StartupStatusDto,
     diagnostics: Vec<LocalDiagnosticDto>,
     runtime: Option<WorkspaceRuntime>,
-    tool_runtime: Option<ToolRuntime>,
+    tool_runtime: Option<Arc<ToolRuntime>>,
     tool_broker: Option<ToolBrokerConfig>,
     retained_processes: Arc<dyn RetainedProcessController>,
 }
@@ -144,25 +144,38 @@ impl Bootstrap {
     }
 
     pub fn retry_startup_validation(&mut self) -> &StartupStatusDto {
-        let Some(config) = self.config.as_ref() else {
+        let Some(secret_values) = self
+            .config
+            .as_ref()
+            .map(|config| config.secret_values.clone())
+        else {
             return &self.status;
         };
+        let mut log = LocalLog::new(secret_values);
         self.runtime = None;
-        self.tool_runtime = None;
-        let mut log = LocalLog::new(config.secret_values.clone());
-        match start(
-            config,
+        if let Some(runtime) = self.tool_runtime.take() {
+            if let Err(error) = runtime.stop_all() {
+                self.record_failure(&mut log, tool_recovery_failure(error));
+                self.diagnostics = log.into_records();
+                return &self.status;
+            }
+        }
+        let result = start(
+            self.config
+                .as_ref()
+                .expect("configuration was checked before runtime shutdown"),
             &mut log,
             self.tool_broker.clone(),
             Arc::clone(&self.retained_processes),
-        ) {
+        );
+        match result {
             Ok(runtimes) => {
                 self.status = StartupStatusDto {
                     state: StartupStateDto::Ready,
                     issues: Vec::new(),
                 };
                 self.runtime = Some(runtimes.workspace);
-                self.tool_runtime = Some(runtimes.tools);
+                self.tool_runtime = Some(Arc::new(runtimes.tools));
                 log.push(record(
                     "startup.ready",
                     "bootstrap",
@@ -201,7 +214,11 @@ impl Bootstrap {
     }
 
     pub fn tool_runtime(&self) -> Option<&ToolRuntime> {
-        self.tool_runtime.as_ref()
+        self.tool_runtime.as_deref()
+    }
+
+    pub fn tool_runtime_handle(&self) -> Option<Arc<ToolRuntime>> {
+        self.tool_runtime.clone()
     }
 
     fn record_failure(&mut self, log: &mut LocalLog, failure: StartupFailure) {
