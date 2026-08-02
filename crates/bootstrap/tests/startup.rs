@@ -55,10 +55,12 @@ fn first_startup_creates_and_validates_required_local_state() {
             "startup.artifacts.validated",
             "startup.artifacts.reconciled",
             "startup.leases.fenced",
-            "startup.tools.reconciled",
+            "startup.tools.survivors_inspected",
             "startup.repositories.reconciled",
+            "startup.tools.reconciled",
             "startup.intents.reconciled",
             "startup.approvals.expired",
+            "startup.approvals.revalidated",
             "startup.ready",
         ]
     );
@@ -68,8 +70,11 @@ fn first_startup_creates_and_validates_required_local_state() {
         local_agent_terminal_bootstrap::ToolRuntimeAvailability::Unavailable
     );
     assert!(bootstrap.local_diagnostics().iter().any(|record| {
-        record.code == "startup.tools.reconciled"
+        record.code == "startup.tools.survivors_inspected"
             && record.detail.contains("control_self_test=not_configured")
+    }));
+    assert!(bootstrap.local_diagnostics().iter().any(|record| {
+        record.code == "startup.tools.reconciled"
             && record.detail.contains("availability=unavailable")
     }));
 }

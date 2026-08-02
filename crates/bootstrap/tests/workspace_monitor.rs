@@ -148,6 +148,7 @@ fn out_of_band_change_enters_workspace_dirty_once_with_atomic_evidence() {
     let original_source = fs::read(fixture.source.join("README.md")).expect("source");
     let bootstrap = fixture.start();
     let runtime = bootstrap.workspace_runtime().expect("runtime");
+    fixture.seed_open_approvals("-revalidated", "2026-07-26T00:00:08Z");
     let lease = runtime
         .acquire_lease(acquire("run-lease-1", 0))
         .expect("lease");

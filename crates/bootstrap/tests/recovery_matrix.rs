@@ -75,10 +75,12 @@ fn startup_exposes_workspace_runtime_only_after_ordered_recovery() {
             "startup.artifacts.validated",
             "startup.artifacts.reconciled",
             "startup.leases.fenced",
-            "startup.tools.reconciled",
+            "startup.tools.survivors_inspected",
             "startup.repositories.reconciled",
+            "startup.tools.reconciled",
             "startup.intents.reconciled",
             "startup.approvals.expired",
+            "startup.approvals.revalidated",
             "startup.ready",
         ]
     );
@@ -743,7 +745,11 @@ fn startup_fences_stale_leases_before_pending_repository_recovery() {
 #[test]
 fn startup_expires_open_approvals_before_ready() {
     let fixture = WorkspaceFixture::new();
-    fixture.seed_expired_approval();
+    fixture.seed_approval(
+        "approval-startup-expired",
+        "2000-01-01T00:00:00Z",
+        "2000-01-02T00:00:00Z",
+    );
 
     let bootstrap = fixture.start();
 
@@ -754,6 +760,28 @@ fn startup_expires_open_approvals_before_ready() {
     );
     assert!(bootstrap.local_diagnostics().iter().any(|diagnostic| {
         diagnostic.code == "startup.approvals.expired" && diagnostic.detail.contains("expired=1")
+    }));
+}
+
+#[test]
+fn startup_invalidates_open_approvals_that_cannot_be_revalidated() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_approval(
+        "approval-startup-unverifiable",
+        "2026-07-23T12:00:00Z",
+        "2099-07-23T12:00:00Z",
+    );
+
+    let bootstrap = fixture.start();
+
+    assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
+    assert_eq!(
+        fixture.approval_status("approval-startup-unverifiable"),
+        "invalidated"
+    );
+    assert!(bootstrap.local_diagnostics().iter().any(|diagnostic| {
+        diagnostic.code == "startup.approvals.revalidated"
+            && diagnostic.detail.contains("invalidated=1")
     }));
 }
 
@@ -1279,7 +1307,7 @@ impl WorkspaceFixture {
             .expect("repository completion count")
     }
 
-    fn seed_expired_approval(&self) {
+    fn seed_approval(&self, approval_id: &str, requested_at: &str, expires_at: &str) {
         let database = SqliteStore::open(&self.database_path).expect("database");
         let artifacts = ContentAddressedArtifactStore::open(self.app_data.join("artifacts"))
             .expect("artifact store");
@@ -1297,25 +1325,25 @@ impl WorkspaceFixture {
             },
             policy_snapshot_digest: EMPTY_JSON_HASH.to_owned(),
             workspace_version: 0,
-            requested_at: "2000-01-01T00:00:00Z".to_owned(),
-            expires_at: "2000-01-02T00:00:00Z".to_owned(),
+            requested_at: requested_at.to_owned(),
+            expires_at: expires_at.to_owned(),
             nonce: "0123456789abcdef0123456789abcdef".to_owned(),
         };
         let canonical =
             canonical_approval_payload(&ApprovalDigestPayload::PolicyException(payload.clone()))
                 .expect("canonical approval");
-        let artifact_id = "artifact-startup-expired-approval";
+        let artifact_id = format!("artifact-{approval_id}");
         let digest = canonical.operation_digest.as_str();
         JournaledArtifactWriter::new(&artifacts, &database, &FixedClock)
             .write(
                 ArtifactWriteReservation {
-                    operation_id: "write-startup-expired-approval".to_owned(),
+                    operation_id: format!("write-{approval_id}"),
                     artifact: ReservedArtifact {
-                        artifact_id: artifact_id.to_owned(),
+                        artifact_id: artifact_id.clone(),
                         task_id: Some(TaskId::new(TASK_ID).expect("task id")),
                         project_id: PROJECT_ID.to_owned(),
                         artifact_type: "approval-payload".to_owned(),
-                        logical_path: "approvals/approval-startup-expired.json".to_owned(),
+                        logical_path: format!("approvals/{approval_id}.json"),
                         content_hash: digest.to_owned(),
                         storage_key: format!("objects/{}/{}", &digest[7..9], &digest[7..]),
                         size_bytes: u64::try_from(canonical.canonical_bytes.len())
@@ -1323,18 +1351,18 @@ impl WorkspaceFixture {
                         mime_type: Some("application/json".to_owned()),
                         created_by_type: "core".to_owned(),
                         created_by_id: "workspace-coordinator".to_owned(),
-                        created_at: "2000-01-01T00:00:00Z".to_owned(),
+                        created_at: requested_at.to_owned(),
                         supersedes: None,
                     },
-                    temp_name: "artifact-startup-expired-approval.tmp".to_owned(),
-                    created_at: "2000-01-01T00:00:00Z".to_owned(),
+                    temp_name: format!("artifact-{approval_id}.tmp"),
+                    created_at: requested_at.to_owned(),
                 },
                 &canonical.canonical_bytes,
             )
             .expect("approval artifact");
         database
             .request(NewApproval {
-                approval_id: ApprovalId::new("approval-startup-expired").expect("approval id"),
+                approval_id: ApprovalId::new(approval_id).expect("approval id"),
                 operation_digest: canonical.operation_digest,
                 task_id: TaskId::new(TASK_ID).expect("task id"),
                 workspace_version: WorkspaceVersion::new(0),

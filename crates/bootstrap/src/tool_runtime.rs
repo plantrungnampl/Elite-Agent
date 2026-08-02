@@ -56,8 +56,16 @@ pub struct ToolStartupRecoveryReport {
 struct ToolRuntimeState {
     dispatch_open: bool,
     availability: ToolRuntimeAvailability,
+    startup_inspection: Option<ToolStartupInspection>,
     recovery_report: Option<ToolStartupRecoveryReport>,
     workers: BTreeMap<ToolExecutionId, JoinHandle<ToolWorkerResult>>,
+}
+
+#[derive(Clone)]
+struct ToolStartupInspection {
+    report: ToolStartupRecoveryReport,
+    availability: ToolRuntimeAvailability,
+    resolutions: Vec<ToolExecutionResolution>,
 }
 
 pub struct ToolRuntime {
@@ -111,6 +119,7 @@ impl ToolRuntime {
             state: Mutex::new(ToolRuntimeState {
                 dispatch_open: false,
                 availability: ToolRuntimeAvailability::Unavailable,
+                startup_inspection: None,
                 recovery_report: None,
                 workers: BTreeMap::new(),
             }),
@@ -126,6 +135,11 @@ impl ToolRuntime {
     }
 
     pub fn recover_startup(&self) -> Result<ToolStartupRecoveryReport, PortError> {
+        self.inspect_survivors()?;
+        self.reconcile_intents()
+    }
+
+    pub fn inspect_survivors(&self) -> Result<ToolStartupRecoveryReport, PortError> {
         let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
         {
             let state = self.state.lock().map_err(|_| internal_failure())?;
@@ -134,6 +148,9 @@ impl ToolRuntime {
             }
             if let Some(report) = &state.recovery_report {
                 return Ok(report.clone());
+            }
+            if let Some(inspection) = &state.startup_inspection {
+                return Ok(inspection.report.clone());
             }
         }
 
@@ -154,6 +171,7 @@ impl ToolRuntime {
         } else {
             ToolRuntimeAvailability::Unavailable
         };
+        let mut resolutions = Vec::new();
         for incomplete_execution in incomplete {
             let (evidence, explicit_indeterminate) = match incomplete_execution {
                 IncompleteToolExecution::InFlight(evidence) => (evidence, false),
@@ -215,7 +233,39 @@ impl ToolRuntime {
             let Some(receipt) = receipt else {
                 continue;
             };
-            let resolution = ToolExecutionResolution::new(receipt);
+            resolutions.push(ToolExecutionResolution::new(receipt));
+        }
+
+        let mut state = self.state.lock().map_err(|_| internal_failure())?;
+        if state.dispatch_open
+            || !state.workers.is_empty()
+            || state.startup_inspection.is_some()
+            || state.recovery_report.is_some()
+        {
+            return Err(conflict());
+        }
+        state.startup_inspection = Some(ToolStartupInspection {
+            report: report.clone(),
+            availability,
+            resolutions,
+        });
+        Ok(report)
+    }
+
+    pub fn reconcile_intents(&self) -> Result<ToolStartupRecoveryReport, PortError> {
+        let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
+        let inspection = {
+            let state = self.state.lock().map_err(|_| internal_failure())?;
+            if state.dispatch_open || !state.workers.is_empty() {
+                return Err(conflict());
+            }
+            if let Some(report) = &state.recovery_report {
+                return Ok(report.clone());
+            }
+            state.startup_inspection.clone().ok_or_else(conflict)?
+        };
+        let mut report = inspection.report;
+        for resolution in inspection.resolutions {
             let persisted = self.executions.resolve_terminal(resolution.clone())?;
             if persisted != *resolution.receipt() {
                 return Err(integrity_failure());
@@ -227,7 +277,8 @@ impl ToolRuntime {
         if state.dispatch_open || !state.workers.is_empty() || state.recovery_report.is_some() {
             return Err(conflict());
         }
-        state.availability = availability;
+        state.availability = inspection.availability;
+        state.startup_inspection = None;
         state.recovery_report = Some(report.clone());
         Ok(report)
     }

@@ -315,6 +315,7 @@ pub trait ApprovalStore: Send + Sync {
 
 pub trait ApprovalExpiryStore: Send + Sync {
     fn expire_before(&self, observed_at: &str) -> Result<u64, PortError>;
+    fn invalidate_unrevalidated(&self) -> Result<u64, PortError>;
 }
 
 pub fn parse_approval_payload(raw: &str) -> Result<ApprovalDigestPayload, PortError> {

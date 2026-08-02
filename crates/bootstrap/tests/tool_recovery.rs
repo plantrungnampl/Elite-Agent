@@ -110,6 +110,41 @@ fn startup_recovery_terminates_exact_retained_job_and_never_relaunches() {
 }
 
 #[test]
+fn survivor_inspection_terminates_jobs_before_intent_reconciliation() {
+    let mut evidence = recovery_evidence(
+        "execution-phased-recovery",
+        ToolExecutionRecoveryState::Started,
+    );
+    let binding =
+        AuthoritativeProcessBinding::new(evidence.authority.clone(), 4_242, "job-phased-recovery")
+            .unwrap();
+    evidence.process_binding = Some(binding.clone());
+    let store = Arc::new(RecoveryExecutionStore::new(vec![
+        IncompleteToolExecution::InFlight(evidence),
+    ]));
+    let executor = Arc::new(RecoveryExecutor::with_cancellation(
+        binding.authority().execution_id().clone(),
+        cancellation_receipt(&binding),
+    ));
+    let runtime = runtime(store.clone(), executor.clone());
+
+    let inspected = runtime.inspect_survivors().unwrap();
+
+    assert_eq!(inspected.terminated_retained_jobs, 1);
+    assert_eq!(executor.terminated_bindings(), vec![binding]);
+    assert_eq!(store.resolution_count(), 0);
+    assert_eq!(
+        runtime.availability().unwrap(),
+        ToolRuntimeAvailability::Unavailable
+    );
+
+    let reconciled = runtime.reconcile_intents().unwrap();
+
+    assert_eq!(reconciled.recovered, 1);
+    assert_eq!(store.resolution_count(), 1);
+}
+
+#[test]
 fn startup_recovery_fails_closed_on_untrusted_survivor_receipt() {
     let mut evidence = recovery_evidence("execution-mismatch", ToolExecutionRecoveryState::Started);
     let binding =

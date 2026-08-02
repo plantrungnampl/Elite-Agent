@@ -362,6 +362,39 @@ impl ApprovalExpiryStore for SqliteStore {
         transaction.commit().map_err(sqlite_error_to_port)?;
         u64::try_from(ids.len()).map_err(|_| invalid_input())
     }
+
+    fn invalidate_unrevalidated(&self) -> Result<u64, PortError> {
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error_to_port)?;
+        let ids = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id FROM approvals
+                     WHERE status IN ('pending', 'granted')
+                     ORDER BY id",
+                )
+                .map_err(sqlite_error_to_port)?;
+            let ids = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(sqlite_error_to_port)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_error_to_port)?;
+            ids
+        };
+        for id in &ids {
+            let approval_id = ApprovalId::new(id.clone()).map_err(|_| integrity_failure())?;
+            invalidate_one(
+                &transaction,
+                &approval_id,
+                "startup_revalidation_required",
+                "approval.invalidated",
+            )?;
+        }
+        transaction.commit().map_err(sqlite_error_to_port)?;
+        u64::try_from(ids.len()).map_err(|_| invalid_input())
+    }
 }
 
 impl SqliteStore {

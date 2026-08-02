@@ -346,6 +346,11 @@ impl WorkspaceFixture {
                 ],
             )
             .expect("implementation projection");
+        self.seed_open_approvals("", "2026-07-26T00:00:07Z");
+    }
+
+    pub fn seed_open_approvals(&self, suffix: &str, requested_at: &str) {
+        let connection = self.database();
         for (id, approval_type) in [
             ("approval-plan", "plan"),
             ("approval-tool", "tool"),
@@ -359,13 +364,13 @@ impl WorkspaceFixture {
                         invalidation_reason
                      ) VALUES (
                         ?1, ?2, ?3, 'v1', ?4, 'pending', ?5, NULL, NULL, ?6, ?7, NULL
-                     )",
+                    )",
                     params![
-                        id,
+                        format!("{id}{suffix}"),
                         TASK_ID,
                         approval_type,
                         EMPTY_JSON_HASH,
-                        "2026-07-26T00:00:07Z",
+                        requested_at,
                         "2099-07-26T01:00:07Z",
                         "artifact-worktree-request"
                     ],

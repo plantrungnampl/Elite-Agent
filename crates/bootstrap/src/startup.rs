@@ -340,22 +340,19 @@ fn start(
         Some(executor) => ToolRuntime::new(executions, executor),
         None => ToolRuntime::recovery_only(executions, retained_processes),
     };
-    let tool_report = tools.recover_startup().map_err(tool_recovery_failure)?;
-    let tool_availability = tools.availability().map_err(tool_recovery_failure)?;
+    let survivor_report = tools.inspect_survivors().map_err(tool_recovery_failure)?;
     log.push(record(
-        "startup.tools.reconciled",
+        "startup.tools.survivors_inspected",
         "bootstrap",
         DiagnosticSeverityDto::Info,
         None,
         &format!(
-            "Tool recovery completed: control_self_test={}, recovered={}, interrupted={}, indeterminate={}, terminated_jobs={}, survivor_failures={}, availability={}.",
-            tool_control_self_test_name(tool_report.control_self_test),
-            tool_report.recovered,
-            tool_report.interrupted,
-            tool_report.indeterminate,
-            tool_report.terminated_retained_jobs,
-            tool_report.survivor_inspection_failures,
-            tool_availability_name(tool_availability),
+            "Tool survivor inspection completed: control_self_test={}, interrupted={}, indeterminate={}, terminated_jobs={}, survivor_failures={}.",
+            tool_control_self_test_name(survivor_report.control_self_test),
+            survivor_report.interrupted,
+            survivor_report.indeterminate,
+            survivor_report.terminated_retained_jobs,
+            survivor_report.survivor_inspection_failures,
         ),
     ));
 
@@ -380,6 +377,20 @@ fn start(
         &format!(
             "Managed repository reconciliation completed: scanned={}.",
             workspace_report.repositories_scanned
+        ),
+    ));
+
+    let tool_report = tools.reconcile_intents().map_err(tool_recovery_failure)?;
+    let tool_availability = tools.availability().map_err(tool_recovery_failure)?;
+    log.push(record(
+        "startup.tools.reconciled",
+        "bootstrap",
+        DiagnosticSeverityDto::Info,
+        None,
+        &format!(
+            "Tool intent reconciliation completed: recovered={}, availability={}.",
+            tool_report.recovered,
+            tool_availability_name(tool_availability),
         ),
     ));
     log.push(record(
@@ -407,6 +418,19 @@ fn start(
         &format!(
             "Expired approval reconciliation completed: expired={}.",
             expired_approvals
+        ),
+    ));
+    let invalidated_approvals = database
+        .invalidate_unrevalidated()
+        .map_err(approval_reconciliation_failure)?;
+    log.push(record(
+        "startup.approvals.revalidated",
+        "storage-sqlite",
+        DiagnosticSeverityDto::Info,
+        None,
+        &format!(
+            "Open approval revalidation completed: invalidated={}.",
+            invalidated_approvals
         ),
     ));
 
