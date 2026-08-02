@@ -118,6 +118,7 @@ export const containmentCases = [
     evidence("tool-broker-e2e", "stop_all_cancels_and_joins_a_runtime_owned_execution"),
     evidence("tool-broker-e2e", "startup_recovery_terminates_exact_retained_job_and_never_relaunches"),
     evidence("platform-windows-seams", "explicit_cancellation_terminates_a_live_real_lpac_root"),
+    evidence("platform-windows-seams", "app_exit_and_crash_kill_a_live_real_lpac_root"),
   ]),
   containment("stale approval UI and accessibility", "supported", [
     evidence("browser-tests", "invalidates a replaced approval without resolving the stale digest"),
