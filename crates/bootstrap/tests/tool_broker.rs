@@ -11,16 +11,17 @@ use local_agent_terminal_application::{
     bind_tool_approval_payload, canonical_policy_binding_digest, canonical_tool_request,
     policy_request_for_tool, ApprovalId, ApprovalResolution, ApprovalResumeStore, ApprovalStore,
     ApprovedExecutableIdentity, ApprovedProcessRequest, AuthoritativeProcessBinding,
-    AuthorizedToolRequest, CancellationReceipt, DisclosureOutcome, FileReadRequest,
-    FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult,
-    PolicyBoundBytes, PolicyDecision, PolicyDecisionStore, PortError, ProcessExecutionBindingStore,
+    AuthorizedToolRequest, BoundedOutput, CancellationReceipt, DisclosedToolExecutionArtifacts,
+    DisclosureOutcome, DurableToolExecutionArtifact, FileReadRequest, FileWriteRequest,
+    GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, JobReceipt, PolicyBoundBytes,
+    PolicyDecision, PolicyDecisionStore, PortError, ProcessExecutionBindingStore, ProcessReceipt,
     ProcessStatus, RecordedPolicyDecision, ResolveToolApprovalRequestDto, ResolvedExecutable,
     Retryability, SafeErrorClassification, StructuredToolExecutor, ToolActivityStatusDto,
     ToolApprovalDecisionDto, ToolApprovalOperationV1, ToolApprovalPayloadV1,
     ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestPublisher,
-    ToolAuthorityResolver, ToolAuthoritySnapshot, ToolControlSelfTest, ToolExecutionResult,
-    ToolExecutionResumeStore, ToolOutcome, ToolPolicyContext, ToolRequest, ToolRequestPublisher,
-    VerifiedWrite,
+    ToolAuthorityResolver, ToolAuthoritySnapshot, ToolControlSelfTest,
+    ToolExecutionArtifactEvidence, ToolExecutionResult, ToolExecutionResumeStore, ToolOutcome,
+    ToolPolicyContext, ToolRequest, ToolRequestPublisher, VerifiedWrite, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_bootstrap::{
     Bootstrap, StartupConfig, ToolArtifactPublisher, ToolBrokerConfig, ToolRuntimeAvailability,
@@ -46,6 +47,8 @@ const ALLOW_PROCESS_POLICY: &str =
 const APPROVE_PROCESS_POLICY: &str = r#"{"version":1,"rules":[{"id":"approve-process","effect":"require_approval","action":"process.exec"}]}"#;
 const EMPTY_BYTES_HASH: &str =
     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const SAFE_STDOUT_HASH: &str =
+    "sha256:5683b63cb0db3f8a44813f2683e87a8ac594d153595d23fdae5b1cc5eb2f5de2";
 
 #[test]
 fn configured_runtime_routes_typed_requests_through_execute_tool() {
@@ -76,6 +79,55 @@ fn configured_runtime_routes_typed_requests_through_execute_tool() {
 
     assert!(matches!(outcome, ToolOutcome::Denied(_)));
     assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn completed_process_publishes_scanned_stream_artifacts_before_terminal_audit() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let policy = VersionedPolicyEngine::from_json(ALLOW_PROCESS_POLICY).unwrap();
+    let request =
+        tool_request_for_policy("execution-runtime-output", policy.snapshot_digest().clone());
+    let bootstrap = Bootstrap::with_tool_broker(
+        StartupConfig {
+            app_data_dir: fixture.app_data.clone(),
+            trusted_workspace_root: fixture.workspace_root.clone(),
+            secret_values: Vec::new(),
+        },
+        ToolBrokerConfig::new(
+            ALLOW_PROCESS_POLICY,
+            Arc::new(EchoAuthority),
+            Arc::new(CompletingExecutor {
+                bindings: SqliteStore::open(&fixture.database_path).unwrap(),
+            }),
+        ),
+    );
+
+    let outcome = bootstrap.tool_runtime().unwrap().execute(request).unwrap();
+
+    let ToolOutcome::Execution(
+        local_agent_terminal_application::DurableToolExecutionOutcome::Completed(receipt),
+    ) = outcome
+    else {
+        panic!("allowed process must produce a durable terminal receipt: {outcome:?}");
+    };
+    let output = receipt.terminal().output().unwrap();
+    assert!(matches!(
+        output.artifacts.stdout(),
+        DurableToolExecutionArtifact::Available(_)
+    ));
+    assert!(matches!(
+        output.artifacts.stderr(),
+        DurableToolExecutionArtifact::Available(_)
+    ));
+    assert!(output.artifacts.observed_writes().is_empty());
+    let database = SqliteStore::open(&fixture.database_path).unwrap();
+    for artifact in [output.artifacts.stdout(), output.artifacts.stderr()] {
+        let DurableToolExecutionArtifact::Available(artifact_id) = artifact else {
+            unreachable!()
+        };
+        assert!(database.available_evidence(artifact_id).unwrap().is_some());
+    }
 }
 
 #[test]
@@ -288,7 +340,8 @@ fn configured_runtime_projects_exact_approval_context_and_rejects_a_stale_digest
     let entry = &activity.entries[0];
     assert_eq!(entry.execution_id, "execution-runtime-activity");
     assert_eq!(entry.status, ToolActivityStatusDto::ApprovalRequired);
-    assert_eq!(entry.summary, "process.exec toolchain:cargo [\"test\"]");
+    assert_eq!(entry.summary, "process.exec toolchain:cargo (1 argument)");
+    assert!(!entry.summary.contains("test"));
     assert_eq!(entry.actor_id, "agent-1");
     assert_eq!(entry.reason, "run focused tests");
     assert_eq!(entry.network_profile, "denied");
@@ -822,6 +875,115 @@ impl ToolAuthorityResolver for BlockingAuthority {
             }
         }
         ToolAuthoritySnapshot::new(request.clone(), b"", None)
+    }
+}
+
+struct CompletingExecutor {
+    bindings: SqliteStore,
+}
+
+impl ToolControlSelfTest for CompletingExecutor {
+    fn verify_controls(&self) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
+impl StructuredToolExecutor for CompletingExecutor {
+    fn execute(&self, request: AuthorizedToolRequest) -> Result<ToolExecutionResult, PortError> {
+        let authority = self
+            .bindings
+            .load_claimed_authority(&request.execution_id)?;
+        self.bindings
+            .record_process_binding(AuthoritativeProcessBinding::new(
+                authority,
+                1,
+                "completed-output-job",
+            )?)?;
+        let stdout = policy_bound_output('1', b"safe stdout");
+        let stderr = policy_bound_output('2', b"");
+        Ok(ToolExecutionResult {
+            receipt: ProcessReceipt {
+                execution_id: request.execution_id,
+                status: ProcessStatus::Exited,
+                exit_code: Some(0),
+                stdout: BoundedOutput {
+                    bytes: stdout.bytes.clone(),
+                    truncated: false,
+                },
+                stderr: BoundedOutput {
+                    bytes: stderr.bytes.clone(),
+                    truncated: false,
+                },
+                duration_ms: 1,
+                job_receipt: JobReceipt {
+                    root_pid: 1,
+                    job_id: "completed-output-job".to_owned(),
+                    kill_on_close: true,
+                    no_breakaway: true,
+                    job_memory_limit: true,
+                    job_cpu_time_limit: true,
+                    memory_limit_bytes: 1,
+                    cpu_time_limit_ms: 1,
+                    max_active_processes: 1,
+                    total_user_time_ms: 1,
+                    resource_limit_terminated: false,
+                    tree_terminated: false,
+                },
+                observed_writes: Vec::new(),
+                output_digest: digest('3'),
+            },
+            artifacts: ToolExecutionArtifactEvidence::Disclosed(
+                DisclosedToolExecutionArtifacts::new(stdout, stderr, Vec::new()),
+            ),
+        })
+    }
+
+    fn cancel(
+        &self,
+        _: &local_agent_terminal_application::ToolExecutionId,
+    ) -> Result<CancellationReceipt, PortError> {
+        unreachable!()
+    }
+
+    fn file_read(
+        &self,
+        _: FileReadRequest,
+    ) -> Result<DisclosureOutcome<PolicyBoundBytes>, PortError> {
+        unreachable!()
+    }
+
+    fn file_write(&self, _: FileWriteRequest) -> Result<VerifiedWrite, PortError> {
+        unreachable!()
+    }
+
+    fn git_status(
+        &self,
+        _: GitStatusRequest,
+    ) -> Result<DisclosureOutcome<GitStatusResult>, PortError> {
+        unreachable!()
+    }
+
+    fn git_diff(&self, _: GitDiffRequest) -> Result<DisclosureOutcome<GitDiffResult>, PortError> {
+        unreachable!()
+    }
+}
+
+fn policy_bound_output(marker: char, bytes: &[u8]) -> PolicyBoundBytes {
+    let content_digest = if bytes.is_empty() {
+        Sha256Digest::new(EMPTY_BYTES_HASH).unwrap()
+    } else {
+        assert_eq!(bytes, b"safe stdout");
+        Sha256Digest::new(SAFE_STDOUT_HASH).unwrap()
+    };
+    PolicyBoundBytes {
+        policy_decision_id: local_agent_terminal_application::PolicyDecisionId::from_persisted(
+            format!("policy-decision:{}", marker.to_string().repeat(64)),
+        )
+        .unwrap(),
+        original_digest: content_digest.clone(),
+        redaction_report_digest: digest('4'),
+        digest: content_digest,
+        bytes: bytes.to_vec(),
     }
 }
 

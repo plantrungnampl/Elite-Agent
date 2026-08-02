@@ -10,14 +10,15 @@ pub use process::ProcessRuntime;
 use local_agent_terminal_application::{
     parse_policy_timestamp, ApprovedProcessExecutor, AuthoritativeProcessBinding,
     AuthorizedToolRequest, CancellationReceipt, CapabilityFileWriteSessionFactory,
-    CapabilityFilesystem, CapabilityResolver, Clock, DisclosureChannel, DisclosureContextProvider,
-    DisclosureContextRequest, DisclosureOutcome, DisclosurePolicyEvaluator, DisclosureRequest,
-    ExecutorLeaseStore, FileReadRequest, FileWriteEvidenceStore, FileWriteRecoverySnapshot,
-    FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest,
-    GitStatusResult, PolicyBoundBytes, PolicyDecisionId, PolicyDecisionStore, PortError,
-    RawGitDiffResult, RawGitStatusResult, RecordedPolicyDecision, Retryability,
-    SafeErrorClassification, StructuredGit, StructuredToolExecutor, ToolControlSelfTest,
-    ToolExecutionId, ToolExecutionResult, VerifiedBytes, VerifiedWrite, WorkspaceWriteCoordinator,
+    CapabilityFilesystem, CapabilityResolver, Clock, DisclosedToolExecutionArtifacts,
+    DisclosureChannel, DisclosureContextProvider, DisclosureContextRequest, DisclosureOutcome,
+    DisclosurePolicyEvaluator, DisclosureRequest, ExecutorLeaseStore, FileReadRequest,
+    FileWriteEvidenceStore, FileWriteRecoverySnapshot, FileWriteRecoveryStore, FileWriteRequest,
+    GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, PolicyBoundBytes,
+    PolicyDecisionId, PolicyDecisionStore, PortError, RawGitDiffResult, RawGitStatusResult,
+    RecordedPolicyDecision, Retryability, SafeErrorClassification, StructuredGit,
+    StructuredToolExecutor, ToolControlSelfTest, ToolExecutionArtifactEvidence, ToolExecutionId,
+    ToolExecutionResult, VerifiedBytes, VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, PolicyAction, PolicyEffect, PolicyRequest, PolicyResource, TaskId,
@@ -260,9 +261,49 @@ impl<'a> ToolRuntime<'a> {
 impl StructuredToolExecutor for ToolRuntime<'_> {
     fn execute(&self, request: AuthorizedToolRequest) -> Result<ToolExecutionResult, PortError> {
         let execution_id = request.execution_id.clone();
-        self.process_executor
-            .execute(execution_id, request.into_process_request())
-            .map(|receipt| ToolExecutionResult { receipt })
+        let task_id = request
+            .process_request()
+            .process()
+            .binding()
+            .task_id()
+            .clone();
+        let capability = request.process_request().process().cwd().clone();
+        let mut receipt = self
+            .process_executor
+            .execute(execution_id, request.into_process_request())?;
+        let stdout = self.disclose_required_artifact(
+            task_id.clone(),
+            capability.clone(),
+            receipt.stdout.bytes.clone(),
+        )?;
+        let stderr = self.disclose_required_artifact(
+            task_id.clone(),
+            capability.clone(),
+            receipt.stderr.bytes.clone(),
+        )?;
+        let observed_writes = receipt
+            .observed_writes
+            .iter()
+            .map(|write| {
+                let evidence = write.canonical_evidence()?;
+                self.disclose(
+                    task_id.clone(),
+                    capability.clone(),
+                    DisclosureChannel::Artifact,
+                    evidence,
+                )
+                .and_then(require_disclosed)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        receipt.stdout.bytes = stdout.bytes.clone();
+        receipt.stderr.bytes = stderr.bytes.clone();
+        receipt.output_digest = process_output_digest(&receipt.stdout.bytes, &receipt.stderr.bytes);
+        Ok(ToolExecutionResult {
+            receipt,
+            artifacts: ToolExecutionArtifactEvidence::Disclosed(
+                DisclosedToolExecutionArtifacts::new(stdout, stderr, observed_writes),
+            ),
+        })
     }
 
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
@@ -302,6 +343,26 @@ impl StructuredToolExecutor for ToolRuntime<'_> {
     }
 }
 
+impl ToolRuntime<'_> {
+    fn disclose_required_artifact(
+        &self,
+        task_id: TaskId,
+        capability: CapabilityRef,
+        bytes: Vec<u8>,
+    ) -> Result<PolicyBoundBytes, PortError> {
+        self.disclose(
+            task_id,
+            capability,
+            DisclosureChannel::Artifact,
+            VerifiedBytes {
+                digest: digest_bytes(&bytes),
+                bytes,
+            },
+        )
+        .and_then(require_disclosed)
+    }
+}
+
 impl ToolControlSelfTest for ToolRuntime<'_> {
     fn verify_controls(&self) -> Result<(), PortError> {
         self.process_executor.verify_controls()
@@ -311,6 +372,33 @@ impl ToolControlSelfTest for ToolRuntime<'_> {
 fn digest_bytes(bytes: &[u8]) -> local_agent_terminal_domain::Sha256Digest {
     local_agent_terminal_domain::Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes)))
         .expect("SHA-256 formatting always satisfies the domain invariant")
+}
+
+fn process_output_digest(
+    stdout: &[u8],
+    stderr: &[u8],
+) -> local_agent_terminal_domain::Sha256Digest {
+    let mut hasher = Sha256::new();
+    hasher.update((stdout.len() as u64).to_le_bytes());
+    hasher.update(stdout);
+    hasher.update((stderr.len() as u64).to_le_bytes());
+    hasher.update(stderr);
+    local_agent_terminal_domain::Sha256Digest::new(format!("sha256:{:x}", hasher.finalize()))
+        .expect("SHA-256 formatting always satisfies the domain invariant")
+}
+
+fn require_disclosed(
+    outcome: DisclosureOutcome<PolicyBoundBytes>,
+) -> Result<PolicyBoundBytes, PortError> {
+    match outcome {
+        DisclosureOutcome::Disclosed(bytes) => Ok(bytes),
+        DisclosureOutcome::Denied | DisclosureOutcome::ApprovalRequired { .. } => {
+            Err(PortError::failure(
+                SafeErrorClassification::PermissionDenied,
+                Retryability::NonRetryable,
+            ))
+        }
+    }
 }
 
 fn integrity_failure() -> PortError {

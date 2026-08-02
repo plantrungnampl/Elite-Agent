@@ -170,11 +170,26 @@ impl DisclosurePolicyEvaluator for VersionedPolicyEngine {
                     local_agent_terminal_application::DisclosureChannel::FileRead => {
                         DisclosureChannel::DirectRead
                     }
+                    local_agent_terminal_application::DisclosureChannel::ListMetadata => {
+                        DisclosureChannel::ListMetadata
+                    }
                     local_agent_terminal_application::DisclosureChannel::GitStatus => {
                         DisclosureChannel::GitStatus
                     }
                     local_agent_terminal_application::DisclosureChannel::GitDiff => {
                         DisclosureChannel::GitDiff
+                    }
+                    local_agent_terminal_application::DisclosureChannel::Diagnostic => {
+                        DisclosureChannel::Diagnostic
+                    }
+                    local_agent_terminal_application::DisclosureChannel::Artifact => {
+                        DisclosureChannel::Artifact
+                    }
+                    local_agent_terminal_application::DisclosureChannel::Summary => {
+                        DisclosureChannel::Summary
+                    }
+                    local_agent_terminal_application::DisclosureChannel::FinalSerializedPayload => {
+                        DisclosureChannel::FinalSerializedPayload
                     }
                 },
                 request.bytes,

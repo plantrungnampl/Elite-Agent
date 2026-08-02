@@ -21,7 +21,8 @@ use crate::approval::{
 };
 use crate::canonical_json::{invalid_input, sha256_digest};
 use crate::{
-    PolicyDecisionId, PolicyRequestBindingDigest, PortError, Retryability, SafeErrorClassification,
+    PolicyBoundBytes, PolicyDecisionId, PolicyRequestBindingDigest, PortError, Retryability,
+    SafeErrorClassification,
 };
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -744,6 +745,28 @@ impl ObservedProcessWrite {
     pub const fn write(&self) -> &VerifiedWrite {
         &self.write
     }
+
+    pub fn canonical_evidence(&self) -> Result<VerifiedBytes, PortError> {
+        let target = match &self.target {
+            ResolvedCapabilityTarget::Root => json!({"kind": "root"}),
+            ResolvedCapabilityTarget::Relative(components) => {
+                json!({"kind": "relative", "components": components.as_slice()})
+            }
+        };
+        let bytes = serde_json_canonicalizer::to_vec(&json!({
+            "capability": capability_value(&self.capability),
+            "contentDigest": self.write.digest.as_str(),
+            "rootIdentity": self.root_identity.as_str(),
+            "schema": "process-write-evidence.v1",
+            "sizeBytes": self.write.size_bytes,
+            "target": target,
+        }))
+        .map_err(|_| invalid_input())?;
+        Ok(VerifiedBytes {
+            digest: Sha256Digest::new(sha256_digest(&bytes)).map_err(|_| invalid_input())?,
+            bytes,
+        })
+    }
 }
 
 /// Validates process write evidence as an exact set and returns it in approval order.
@@ -1053,6 +1076,45 @@ pub struct DurableToolExecutionArtifacts {
     observed_writes: Vec<DurableToolExecutionArtifact>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisclosedToolExecutionArtifacts {
+    stdout: PolicyBoundBytes,
+    stderr: PolicyBoundBytes,
+    observed_writes: Vec<PolicyBoundBytes>,
+}
+
+impl DisclosedToolExecutionArtifacts {
+    pub fn new(
+        stdout: PolicyBoundBytes,
+        stderr: PolicyBoundBytes,
+        observed_writes: Vec<PolicyBoundBytes>,
+    ) -> Self {
+        Self {
+            stdout,
+            stderr,
+            observed_writes,
+        }
+    }
+
+    pub const fn stdout(&self) -> &PolicyBoundBytes {
+        &self.stdout
+    }
+
+    pub const fn stderr(&self) -> &PolicyBoundBytes {
+        &self.stderr
+    }
+
+    pub fn observed_writes(&self) -> &[PolicyBoundBytes] {
+        &self.observed_writes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolExecutionArtifactEvidence {
+    Disclosed(DisclosedToolExecutionArtifacts),
+    Published(DurableToolExecutionArtifacts),
+}
+
 impl DurableToolExecutionArtifacts {
     pub fn new(
         stdout: DurableToolExecutionArtifact,
@@ -1251,8 +1313,23 @@ impl DurableToolExecutionReceipt {
     pub(crate) fn from_process_receipt(
         authority: ToolExecutionClaimAuthority,
         receipt: ProcessReceipt,
+        artifacts: DurableToolExecutionArtifacts,
     ) -> Result<Self, PortError> {
-        if authority.execution_id != receipt.execution_id {
+        if authority.execution_id != receipt.execution_id
+            || matches!(
+                artifacts.stdout(),
+                DurableToolExecutionArtifact::Unavailable
+            )
+            || matches!(
+                artifacts.stderr(),
+                DurableToolExecutionArtifact::Unavailable
+            )
+            || artifacts.observed_writes().len() != receipt.observed_writes.len()
+            || artifacts
+                .observed_writes()
+                .iter()
+                .any(|artifact| matches!(artifact, DurableToolExecutionArtifact::Unavailable))
+        {
             return Err(invalid_input());
         }
         let ProcessReceipt {
@@ -1260,17 +1337,8 @@ impl DurableToolExecutionReceipt {
             exit_code,
             duration_ms,
             output_digest,
-            observed_writes,
             ..
         } = receipt;
-        let artifacts = DurableToolExecutionArtifacts::new(
-            DurableToolExecutionArtifact::Unavailable,
-            DurableToolExecutionArtifact::Unavailable,
-            observed_writes
-                .into_iter()
-                .map(|_| DurableToolExecutionArtifact::Unavailable)
-                .collect(),
-        );
         let output = ToolExecutionOutput {
             exit_code,
             output_digest,
@@ -1560,6 +1628,7 @@ impl AuthorizedToolRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionResult {
     pub receipt: ProcessReceipt,
+    pub artifacts: ToolExecutionArtifactEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

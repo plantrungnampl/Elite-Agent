@@ -15,11 +15,12 @@ use crate::{
     NewToolExecution, NewToolIntent, OperationIntentSnapshot, PortError,
     ProcessExecutionBindingStore, ProcessReceipt, ProcessStatus, ResolvedExecutable, Retryability,
     SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor,
-    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionCancellationClaim,
-    ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId,
-    ToolExecutionOutput, ToolExecutionRecoveryEvidence, ToolExecutionRecoveryState,
-    ToolExecutionResolution, ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal,
-    ToolExecutionTerminalKind, ToolPolicyContext, ToolRequest,
+    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionArtifactEvidence,
+    ToolExecutionCancellationClaim, ToolExecutionClaim, ToolExecutionClaimAuthority,
+    ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
+    ToolExecutionRecoveryEvidence, ToolExecutionRecoveryState, ToolExecutionResolution,
+    ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
+    ToolPolicyContext, ToolRequest,
 };
 use sha2::{Digest, Sha256};
 
@@ -473,7 +474,7 @@ fn claimed_execution_orders_begin_effect_resolve_and_preserves_claim_authority()
             exit_code: Some(0),
             output_digest: digest('9'),
             duration_ms: 25,
-            artifacts: unavailable_process_artifacts(),
+            artifacts: published_process_artifacts(),
         })
         .unwrap()
     );
@@ -1129,7 +1130,7 @@ fn assert_failed_process_outcome(exit_code: Option<i32>) {
             exit_code,
             output_digest: digest('9'),
             duration_ms: 25,
-            artifacts: unavailable_process_artifacts(),
+            artifacts: published_process_artifacts(),
         })
         .unwrap()
     );
@@ -1309,7 +1310,10 @@ struct RecordingExecutor {
 impl RecordingExecutor {
     fn succeeding(receipt: ProcessReceipt, sequence: RecordingSequence) -> Self {
         Self {
-            result: Mutex::new(Some(Ok(ToolExecutionResult { receipt }))),
+            result: Mutex::new(Some(Ok(ToolExecutionResult {
+                receipt,
+                artifacts: ToolExecutionArtifactEvidence::Published(published_process_artifacts()),
+            }))),
             calls: AtomicUsize::new(0),
             cancel_calls: AtomicUsize::new(0),
             sequence,
@@ -1724,16 +1728,8 @@ fn process_output(exit_code: Option<i32>) -> ToolExecutionOutput {
         exit_code,
         output_digest: digest('9'),
         duration_ms: 25,
-        artifacts: unavailable_process_artifacts(),
+        artifacts: published_process_artifacts(),
     }
-}
-
-fn unavailable_process_artifacts() -> DurableToolExecutionArtifacts {
-    DurableToolExecutionArtifacts::new(
-        DurableToolExecutionArtifact::Unavailable,
-        DurableToolExecutionArtifact::Unavailable,
-        Vec::new(),
-    )
 }
 
 fn available_process_artifacts() -> DurableToolExecutionArtifacts {
@@ -1743,6 +1739,14 @@ fn available_process_artifacts() -> DurableToolExecutionArtifacts {
         vec![DurableToolExecutionArtifact::Available(
             ArtifactId::new("artifact-write-0").unwrap(),
         )],
+    )
+}
+
+fn published_process_artifacts() -> DurableToolExecutionArtifacts {
+    DurableToolExecutionArtifacts::new(
+        DurableToolExecutionArtifact::Available(ArtifactId::new("artifact-stdout").unwrap()),
+        DurableToolExecutionArtifact::Available(ArtifactId::new("artifact-stderr").unwrap()),
+        Vec::new(),
     )
 }
 

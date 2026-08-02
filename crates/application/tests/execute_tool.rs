@@ -7,17 +7,19 @@ use local_agent_terminal_application::{
     canonical_policy_binding_digest, canonical_tool_request, policy_request_for_tool, ApprovalId,
     ApprovalResumeSnapshot, ApprovalResumeStore, ApprovalState, ArtifactId,
     AuthorizedToolExecutionClaim, AuthorizedToolRequest, BoundedOutput, Clock, DeniedToolExecution,
-    DurableToolExecutionOutcome, DurableToolExecutionReceipt, ExecuteTool, IdGenerator,
-    ImmutableToolRequest, IncompleteToolExecution, JobReceipt, LeaseSnapshot, LeaseState,
-    NewToolExecution, NewToolIntent, OperationIntentSnapshot, OperationIntentStatus,
-    PolicyDecision, PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator, PortError,
-    PreEffectOutcome, ProcessReceipt, ProcessStatus, RecordedPolicyDecision, Retryability,
-    SafeErrorClassification, StructuredToolExecutor, ToolApprovalPublication, ToolApprovalRequest,
-    ToolApprovalRequestPublisher, ToolAuthorityResolver, ToolAuthoritySnapshot, ToolExecutionClaim,
-    ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId,
-    ToolExecutionOrchestration, ToolExecutionResolution, ToolExecutionResult,
-    ToolExecutionResumeSnapshot, ToolExecutionResumeStore, ToolExecutionStore,
-    ToolExecutionTerminalKind, ToolOutcome, ToolPolicyContext, ToolRequest, ToolRequestPublisher,
+    DurableToolExecutionArtifact, DurableToolExecutionArtifacts, DurableToolExecutionOutcome,
+    DurableToolExecutionReceipt, ExecuteTool, IdGenerator, ImmutableToolRequest,
+    IncompleteToolExecution, JobReceipt, LeaseSnapshot, LeaseState, NewToolExecution,
+    NewToolIntent, OperationIntentSnapshot, OperationIntentStatus, PolicyDecision,
+    PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator, PortError, PreEffectOutcome,
+    ProcessReceipt, ProcessStatus, RecordedPolicyDecision, Retryability, SafeErrorClassification,
+    StructuredToolExecutor, ToolApprovalPublication, ToolApprovalRequest,
+    ToolApprovalRequestPublisher, ToolAuthorityResolver, ToolAuthoritySnapshot,
+    ToolExecutionArtifactEvidence, ToolExecutionClaim, ToolExecutionClaimAuthority,
+    ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOrchestration,
+    ToolExecutionResolution, ToolExecutionResult, ToolExecutionResumeSnapshot,
+    ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminalKind, ToolOutcome,
+    ToolPolicyContext, ToolRequest, ToolRequestPublisher,
 };
 use local_agent_terminal_domain::{
     combine_policy_rules, ActorLocality, CapabilityRef, EnvironmentProfile, FencingToken,
@@ -486,7 +488,8 @@ fn require_approval_constructs_core_owned_canonical_terms_after_policy_recording
                 published.canonical_payload().operation_digest.as_str()
             );
             assert_eq!(dto.expires_at, "2025-07-23T12:15:00Z");
-            assert_eq!(dto.summary, "process.exec toolchain:cargo [\"test\"]");
+            assert_eq!(dto.summary, "process.exec toolchain:cargo (1 argument)");
+            assert!(!dto.summary.contains("test"));
             assert_eq!(dto.scopes, ["worktree:task-1", "worktree:task-1:src"]);
         },
     );
@@ -1458,6 +1461,17 @@ impl StructuredToolExecutor for RecordingStructuredExecutor<'_> {
                 observed_writes: Vec::new(),
                 output_digest: digest('9'),
             },
+            artifacts: ToolExecutionArtifactEvidence::Published(
+                DurableToolExecutionArtifacts::new(
+                    DurableToolExecutionArtifact::Available(
+                        ArtifactId::new("artifact-stdout").unwrap(),
+                    ),
+                    DurableToolExecutionArtifact::Available(
+                        ArtifactId::new("artifact-stderr").unwrap(),
+                    ),
+                    Vec::new(),
+                ),
+            ),
         })
     }
 

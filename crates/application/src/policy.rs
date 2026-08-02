@@ -79,8 +79,13 @@ pub trait PolicyEvaluator: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisclosureChannel {
     FileRead,
+    ListMetadata,
     GitStatus,
     GitDiff,
+    Diagnostic,
+    Artifact,
+    Summary,
+    FinalSerializedPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,7 +192,12 @@ pub fn bind_disclosure_channel(
 const fn disclosure_channel_name(channel: DisclosureChannel) -> &'static str {
     match channel {
         DisclosureChannel::FileRead => "file_read",
+        DisclosureChannel::ListMetadata => "list_metadata",
         DisclosureChannel::GitStatus => "git_status",
         DisclosureChannel::GitDiff => "git_diff",
+        DisclosureChannel::Diagnostic => "diagnostic",
+        DisclosureChannel::Artifact => "artifact",
+        DisclosureChannel::Summary => "summary",
+        DisclosureChannel::FinalSerializedPayload => "final_serialized_payload",
     }
 }

@@ -313,9 +313,14 @@ fn receipt_from_executor_result(
 ) -> DurableToolExecutionReceipt {
     match result {
         Ok(result) if result.receipt.execution_id == *authority.execution_id() => {
+            let crate::ToolExecutionArtifactEvidence::Published(artifacts) = result.artifacts
+            else {
+                return indeterminate_receipt(authority, integrity_error());
+            };
             match DurableToolExecutionReceipt::from_process_receipt(
                 authority.clone(),
                 result.receipt,
+                artifacts,
             ) {
                 Ok(receipt) => receipt,
                 Err(_) => indeterminate_receipt(authority, integrity_error()),

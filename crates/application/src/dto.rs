@@ -2,10 +2,9 @@ use local_agent_terminal_domain::{NetworkProfile, ProjectId, TrustTier};
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::{
-    canonical_json::invalid_input, tool::logical_capability, ExpectedPresence, PortError,
-    ProjectSnapshot, RecoveryAction, RecoveryCandidate, RecoveryReason, RepositorySnapshot,
-    Retryability, SafeErrorClassification, TaskLeaseState, TaskSnapshot, ToolRequest,
-    WorktreeSnapshot, WorktreeState,
+    tool::logical_capability, ExpectedPresence, PortError, ProjectSnapshot, RecoveryAction,
+    RecoveryCandidate, RecoveryReason, RepositorySnapshot, Retryability, SafeErrorClassification,
+    TaskLeaseState, TaskSnapshot, ToolRequest, WorktreeSnapshot, WorktreeState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -281,7 +280,6 @@ pub struct ToolRequestContextDto {
 
 pub fn tool_request_context(request: &ToolRequest) -> Result<ToolRequestContextDto, PortError> {
     let process = request.process().process();
-    let argv = serde_json::to_string(process.argv()).map_err(|_| invalid_input())?;
     let mut scopes = Vec::with_capacity(
         1 + request.process().expected_reads().len() + process.expected_writes().len(),
     );
@@ -299,10 +297,16 @@ pub fn tool_request_context(request: &ToolRequest) -> Result<ToolRequestContextD
             .iter()
             .map(|write| logical_capability(write.capability())),
     );
+    let argument_count = process.argv().len();
+    let argument_label = if argument_count == 1 {
+        "argument"
+    } else {
+        "arguments"
+    };
     Ok(ToolRequestContextDto {
         summary: format!(
-            "process.exec {} {argv}",
-            logical_capability(process.executable())
+            "process.exec {} ({argument_count} {argument_label})",
+            logical_capability(process.executable()),
         ),
         actor_id: request.policy().actor().agent_id.clone(),
         fallback_role: trust_tier_name(request.policy().actor().trust_tier).to_owned(),

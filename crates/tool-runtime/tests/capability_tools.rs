@@ -2,26 +2,32 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use local_agent_terminal_application::{
-    canonical_file_write_recovery_request, AcquireLease, ApprovedProcessExecutor,
-    ApprovedProcessRequest, AuthorizedFileRead, AuthorizedGitDiff, AuthorizedGitStatus,
-    CapabilityFileWriteSession, CapabilityFileWriteSessionFactory, CapabilityFilesystem,
-    CapabilityRequest, CapabilityResolver, CapabilityRootIdentity, CaptureFileWritePostEvidence,
-    CaptureFileWritePreEvidence, Clock, DisclosureContextProvider, DisclosureContextRequest,
-    DisclosureOutcome, DisclosurePolicyEvaluator, DisclosureRequest, ExecutorLeaseStore,
-    FileReadRequest, FileWriteEvidenceStore, FileWritePolicyBinding, FileWritePostExpectation,
-    FileWritePreImage, FileWriteRecoveryCompletion, FileWriteRecoveryFailure,
-    FileWriteRecoveryIntent, FileWriteRecoverySnapshot, FileWriteRecoveryState,
-    FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest, GitStatusRequest, LeaseSnapshot,
-    ObservedFileImage, OpenFileWriteSession, PolicyApprovedDisclosure, PolicyDecisionId,
-    PolicyDecisionStore, PortError, ProcessReceipt, RawGitDiffResult, RawGitStatusResult,
-    RecordedPolicyDecision, RelativePathComponents, ResolvedCapability, RevokeLease, StructuredGit,
-    StructuredToolExecutor, ToolControlSelfTest, ToolExecutionId, TrustedDisclosureContext,
-    VerifiedBytes, VerifiedFileWriteCompensation, VerifiedWrite, WorkspaceWriteCoordinator,
+    bind_tool_approval_payload, canonical_file_write_recovery_request, AcquireLease,
+    ApprovedExecutableIdentity, ApprovedProcessExecutor, ApprovedProcessRequest,
+    AuthorizedFileRead, AuthorizedGitDiff, AuthorizedGitStatus, AuthorizedToolRequest,
+    BoundedOutput, CapabilityFileWriteSession, CapabilityFileWriteSessionFactory,
+    CapabilityFilesystem, CapabilityRequest, CapabilityResolver, CapabilityRootIdentity,
+    CaptureFileWritePostEvidence, CaptureFileWritePreEvidence, Clock, DisclosureContextProvider,
+    DisclosureContextRequest, DisclosureOutcome, DisclosurePolicyEvaluator, DisclosureRequest,
+    ExecutableFileIdentity, ExecutorLeaseStore, FileReadRequest, FileWriteEvidenceStore,
+    FileWritePolicyBinding, FileWritePostExpectation, FileWritePreImage,
+    FileWriteRecoveryCompletion, FileWriteRecoveryFailure, FileWriteRecoveryIntent,
+    FileWriteRecoverySnapshot, FileWriteRecoveryState, FileWriteRecoveryStore, FileWriteRequest,
+    GitDiffRequest, GitStatusRequest, JobReceipt, LeaseSnapshot, ObservedFileImage,
+    ObservedProcessWrite, OpenFileWriteSession, PolicyApprovedDisclosure, PolicyDecisionId,
+    PolicyDecisionStore, PortError, ProcessReceipt, ProcessStatus, RawGitDiffResult,
+    RawGitStatusResult, RecordedPolicyDecision, RelativePathComponents, ResolvedCapability,
+    ResolvedCapabilityTarget, ResolvedExecutable, RevokeLease, StructuredGit,
+    StructuredToolExecutor, ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolControlSelfTest,
+    ToolExecutionArtifactEvidence, ToolExecutionId, TrustedDisclosureContext, VerifiedBytes,
+    VerifiedFileWriteCompensation, VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
-    ActorId, ActorLocality, ArtifactId, CapabilityRef, FencingToken, GitObjectId, LeaseClaim,
-    PolicyActor, PolicyEffect, ProjectId, ResourceClass, RunId, Sequence, Sha256Digest, TaskId,
-    TaskRisk, TrustTier, WorkspaceFingerprint,
+    ActorId, ActorLocality, ArtifactId, CapabilityRef, EnvironmentProfile, FencingToken,
+    GitObjectId, LeaseClaim, NetworkProfile, Phase, PlanStepId, PolicyActor, PolicyEffect,
+    ProcessBinding, ProcessInvocation, ProcessToolRequest, ProcessTrustTier, ProjectId,
+    ResourceClass, RunId, Sequence, Sha256Digest, TaskId, TaskRisk, TrustTier,
+    WorkspaceFingerprint, WorkspaceVersion,
 };
 use local_agent_terminal_policy_engine::{ScanFailurePoint, VersionedPolicyEngine};
 use local_agent_terminal_tool_runtime::ToolRuntime;
@@ -931,6 +937,200 @@ fn control_self_test_propagates_process_executor_failure() {
         error.safe_classification(),
         local_agent_terminal_application::SafeErrorClassification::Unavailable
     );
+}
+
+#[test]
+fn process_streams_are_scanned_and_redacted_before_the_executor_result_crosses_the_runtime() {
+    let mut harness = Harness::new(None);
+    harness.disclosure_policy = disclosure_engine("allow_with_redaction", "local");
+    harness.disclosure_context.snapshot_digest =
+        harness.disclosure_policy.snapshot_digest().clone();
+    let process = OutputProcess;
+    let runtime = ToolRuntime::new(
+        &harness.resolver,
+        &harness.reads,
+        &harness.sessions,
+        &harness.git,
+        &harness.leases,
+        &process,
+        &harness.evidence,
+        &harness.recovery,
+        &harness.writes,
+        &harness.disclosure_context,
+        &harness.disclosure_policy,
+        &harness.policy_decisions,
+        &harness.clock,
+    );
+
+    let result = StructuredToolExecutor::execute(&runtime, authorized_output_request()).unwrap();
+
+    assert!(!String::from_utf8_lossy(&result.receipt.stdout.bytes).contains("tok_test_7f89ac"));
+    let ToolExecutionArtifactEvidence::Disclosed(artifacts) = result.artifacts else {
+        panic!("tool runtime must return policy-bound output evidence");
+    };
+    assert_eq!(
+        artifacts.stdout().original_digest,
+        digest(b"x tok_test_7f89ac y")
+    );
+    assert_eq!(artifacts.stdout().bytes, result.receipt.stdout.bytes);
+    assert_ne!(
+        artifacts.stdout().original_digest,
+        artifacts.stdout().digest
+    );
+    assert_eq!(artifacts.observed_writes().len(), 1);
+    assert!(
+        !String::from_utf8_lossy(&artifacts.observed_writes()[0].bytes).contains("tok_test_7f89ac")
+    );
+    assert_eq!(harness.policy_decisions.recorded.lock().unwrap().len(), 3);
+}
+
+struct OutputProcess;
+
+impl ToolControlSelfTest for OutputProcess {
+    fn verify_controls(&self) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
+impl ApprovedProcessExecutor for OutputProcess {
+    fn execute(
+        &self,
+        execution_id: ToolExecutionId,
+        _: ApprovedProcessRequest,
+    ) -> Result<ProcessReceipt, PortError> {
+        Ok(ProcessReceipt {
+            execution_id,
+            status: ProcessStatus::Exited,
+            exit_code: Some(0),
+            stdout: BoundedOutput {
+                bytes: b"x tok_test_7f89ac y".to_vec(),
+                truncated: false,
+            },
+            stderr: BoundedOutput {
+                bytes: Vec::new(),
+                truncated: false,
+            },
+            duration_ms: 1,
+            job_receipt: JobReceipt {
+                root_pid: 1,
+                job_id: "output-job".to_owned(),
+                kill_on_close: true,
+                no_breakaway: true,
+                job_memory_limit: true,
+                job_cpu_time_limit: true,
+                memory_limit_bytes: 1,
+                cpu_time_limit_ms: 1,
+                max_active_processes: 1,
+                total_user_time_ms: 1,
+                resource_limit_terminated: false,
+                tree_terminated: false,
+            },
+            observed_writes: vec![ObservedProcessWrite::new(
+                CapabilityRef::worktree(task(), "tok_test_7f89ac.txt").unwrap(),
+                CapabilityRootIdentity::new("output-root").unwrap(),
+                ResolvedCapabilityTarget::Relative(
+                    RelativePathComponents::new(vec!["tok_test_7f89ac.txt".to_owned()]).unwrap(),
+                ),
+                VerifiedWrite {
+                    digest: digest(b"written bytes"),
+                    size_bytes: 13,
+                },
+            )],
+            output_digest: digest(b"raw output"),
+        })
+    }
+
+    fn cancel(
+        &self,
+        _: &ToolExecutionId,
+    ) -> Result<local_agent_terminal_application::CancellationReceipt, PortError> {
+        unreachable!()
+    }
+}
+
+fn authorized_output_request() -> AuthorizedToolRequest {
+    let task_id = task();
+    let approved = ApprovedProcessRequest::new(
+        ApprovedExecutableIdentity::new(
+            ResolvedExecutable {
+                canonical_path: output_executable_path(),
+                sha256: digest(b"output executable"),
+                file_identity: ExecutableFileIdentity::new("output-executable").unwrap(),
+                toolchain_id: "output-probe".to_owned(),
+            },
+            "1",
+        )
+        .unwrap(),
+        ProcessToolRequest::new(
+            ProcessBinding::new(
+                task_id.clone(),
+                RunId::new("run-1").unwrap(),
+                PlanStepId::new("step-1").unwrap(),
+                Phase::Implementation,
+                WorkspaceVersion::new(1),
+                EnvironmentProfile::new("empty", digest(b"environment")).unwrap(),
+                1_000,
+            )
+            .unwrap(),
+            ProcessInvocation::new(
+                CapabilityRef::toolchain("output-probe").unwrap(),
+                vec!["run".to_owned()],
+                CapabilityRef::worktree(task_id, ".").unwrap(),
+                ProcessTrustTier::IsolatedWorker,
+                NetworkProfile::Denied,
+                Vec::new(),
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        Vec::new(),
+        None,
+        None,
+    )
+    .unwrap();
+    let approval = bind_tool_approval_payload(
+        ToolApprovalPayloadV1 {
+            schema: "approval-digest.v1".to_owned(),
+            approval_type: "tool".to_owned(),
+            task_id: "bound-by-core".to_owned(),
+            operation: ToolApprovalOperationV1 {
+                run_id: "bound-by-core".to_owned(),
+                plan_step_id: "bound-by-core".to_owned(),
+                tool: "process.exec".to_owned(),
+                executable_digest: None,
+                arguments_digest: digest(b"placeholder").to_string(),
+                script_digest: None,
+                cwd_capability: "bound-by-core".to_owned(),
+                environment_profile_digest: digest(b"placeholder").to_string(),
+                network_profile: "denied".to_owned(),
+                expected_writes: Vec::new(),
+                executor_fencing_token: None,
+            },
+            policy_snapshot_digest: digest(b"policy").to_string(),
+            workspace_version: 1,
+            requested_at: "2026-08-02T00:00:00Z".to_owned(),
+            expires_at: "2026-08-02T00:15:00Z".to_owned(),
+            nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+        },
+        &approved,
+    )
+    .unwrap();
+    AuthorizedToolRequest::new(
+        ToolExecutionId::new("output-1").unwrap(),
+        approval,
+        approved,
+    )
+}
+
+#[cfg(windows)]
+fn output_executable_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(r"\\?\C:\trusted\output-probe.exe")
+}
+
+#[cfg(not(windows))]
+fn output_executable_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/trusted/output-probe")
 }
 
 struct Harness {

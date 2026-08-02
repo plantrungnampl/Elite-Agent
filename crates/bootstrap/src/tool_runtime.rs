@@ -9,19 +9,21 @@ use local_agent_terminal_application::{
     parse_policy_timestamp, ApprovalId, ApprovalResolution, ApprovalResumeStore, ApprovalStore,
     ArtifactId, ArtifactWriteReservation, AuthoritativeProcessBinding,
     AuthoritativeProcessTermination, CancelToolExecutionRequestDto, Clock,
-    DurableToolCancellationOutcome, DurableToolExecutionOutcome, DurableToolExecutionReceipt,
-    ExecuteTool, IdGenerator, ImmutableToolRequest, IncompleteToolExecution, NewToolIntent,
-    OperationIntentSnapshot, PortError, ProcessStatus, ProjectId, ReservedArtifact,
-    ResolveToolApprovalRequestDto, RetainedProcessController, Retryability,
-    SafeErrorClassification, SafeToolExecutionError, StopAllToolsReceiptDto,
+    DisclosedToolExecutionArtifacts, DisclosureOutcome, DurableToolCancellationOutcome,
+    DurableToolExecutionArtifact, DurableToolExecutionArtifacts, DurableToolExecutionOutcome,
+    DurableToolExecutionReceipt, ExecuteTool, FileReadRequest, FileWriteRequest, GitDiffRequest,
+    GitDiffResult, GitStatusRequest, GitStatusResult, IdGenerator, ImmutableToolRequest,
+    IncompleteToolExecution, NewToolIntent, OperationIntentSnapshot, PortError, ProcessStatus,
+    ProjectId, ReservedArtifact, ResolveToolApprovalRequestDto, RetainedProcessController,
+    Retryability, SafeErrorClassification, SafeToolExecutionError, StopAllToolsReceiptDto,
     StructuredToolExecutor, TaskId, TaskQuery, ToolActivityDto, ToolActivityStatusDto,
     ToolApprovalDecisionDto, ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestDto,
     ToolApprovalRequestPublisher, ToolApprovalResolutionDto, ToolAuthorityResolver,
-    ToolCancellationReceiptDto, ToolControlSelfTest, ToolExecutionCancellationClaim,
-    ToolExecutionId, ToolExecutionOrchestration, ToolExecutionRecoveryState,
-    ToolExecutionResolution, ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal,
-    ToolExecutionTerminalKind, ToolOutcome, ToolRequest, ToolRequestPublisher,
-    ToolRuntimeAvailabilityDto, WorkspaceEvidenceStore,
+    ToolCancellationReceiptDto, ToolControlSelfTest, ToolExecutionArtifactEvidence,
+    ToolExecutionCancellationClaim, ToolExecutionId, ToolExecutionOrchestration,
+    ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResumeStore,
+    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolOutcome, ToolRequest,
+    ToolRequestPublisher, ToolRuntimeAvailabilityDto, VerifiedWrite, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_policy_engine::VersionedPolicyEngine;
 use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
@@ -112,6 +114,11 @@ struct ToolBroker {
     policies: VersionedPolicyEngine,
     authority: Arc<dyn ToolAuthorityResolver>,
     executor: Arc<dyn SelfTestingToolExecutor>,
+}
+
+struct PublishingStructuredExecutor<'a, 'storage> {
+    executor: &'a dyn SelfTestingToolExecutor,
+    publisher: &'a ToolArtifactPublisher<'storage>,
 }
 
 struct ToolWorker {
@@ -249,7 +256,76 @@ impl ToolBroker {
             &self.database,
             &self.database,
         );
-        operation(ExecuteTool::new(orchestration, self.executor.as_ref()))
+        let executor = PublishingStructuredExecutor {
+            executor: self.executor.as_ref(),
+            publisher: &publisher,
+        };
+        operation(ExecuteTool::new(orchestration, &executor))
+    }
+}
+
+impl StructuredToolExecutor for PublishingStructuredExecutor<'_, '_> {
+    fn execute(
+        &self,
+        request: local_agent_terminal_application::AuthorizedToolRequest,
+    ) -> Result<local_agent_terminal_application::ToolExecutionResult, PortError> {
+        let task_id = request
+            .process_request()
+            .process()
+            .binding()
+            .task_id()
+            .clone();
+        let mut result = self.executor.execute(request)?;
+        let ToolExecutionArtifactEvidence::Disclosed(disclosed) = result.artifacts else {
+            return Err(integrity_failure());
+        };
+        result.artifacts =
+            ToolExecutionArtifactEvidence::Published(self.publisher.publish_tool_outputs(
+                &task_id,
+                &result.receipt.execution_id,
+                &disclosed,
+            )?);
+        Ok(result)
+    }
+
+    fn cancel(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<local_agent_terminal_application::CancellationReceipt, PortError> {
+        self.executor.cancel(execution_id)
+    }
+
+    fn terminate_retained_process(
+        &self,
+        binding: &AuthoritativeProcessBinding,
+    ) -> Result<local_agent_terminal_application::CancellationReceipt, PortError> {
+        self.executor.terminate_retained_process(binding)
+    }
+
+    fn file_read(
+        &self,
+        request: FileReadRequest,
+    ) -> Result<DisclosureOutcome<local_agent_terminal_application::PolicyBoundBytes>, PortError>
+    {
+        self.executor.file_read(request)
+    }
+
+    fn file_write(&self, request: FileWriteRequest) -> Result<VerifiedWrite, PortError> {
+        self.executor.file_write(request)
+    }
+
+    fn git_status(
+        &self,
+        request: GitStatusRequest,
+    ) -> Result<DisclosureOutcome<GitStatusResult>, PortError> {
+        self.executor.git_status(request)
+    }
+
+    fn git_diff(
+        &self,
+        request: GitDiffRequest,
+    ) -> Result<DisclosureOutcome<GitDiffResult>, PortError> {
+        self.executor.git_diff(request)
     }
 }
 
@@ -986,7 +1062,7 @@ impl<'a> ToolArtifactPublisher<'a> {
                     content_hash: artifact.digest.to_owned(),
                     storage_key,
                     size_bytes: artifact.bytes.len() as u64,
-                    mime_type: Some("application/json".to_owned()),
+                    mime_type: Some(artifact.mime_type.to_owned()),
                     created_by_type: "tool".to_owned(),
                     created_by_id: artifact.created_by_id.to_owned(),
                     created_at: created_at.clone(),
@@ -1011,6 +1087,87 @@ impl<'a> ToolArtifactPublisher<'a> {
             return Err(integrity_failure());
         }
         Ok(task.project_id)
+    }
+
+    fn publish_tool_outputs(
+        &self,
+        task_id: &TaskId,
+        execution_id: &ToolExecutionId,
+        disclosed: &DisclosedToolExecutionArtifacts,
+    ) -> Result<DurableToolExecutionArtifacts, PortError> {
+        let project_id = self.project_id(task_id)?;
+        let stdout = self.publish_tool_output(
+            task_id,
+            &project_id,
+            execution_id,
+            "stdout",
+            0,
+            "application/octet-stream",
+            disclosed.stdout(),
+        )?;
+        let stderr = self.publish_tool_output(
+            task_id,
+            &project_id,
+            execution_id,
+            "stderr",
+            0,
+            "application/octet-stream",
+            disclosed.stderr(),
+        )?;
+        let observed_writes = disclosed
+            .observed_writes()
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                self.publish_tool_output(
+                    task_id,
+                    &project_id,
+                    execution_id,
+                    "write",
+                    index,
+                    "application/json",
+                    output,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(DurableToolExecutionArtifacts::new(
+            DurableToolExecutionArtifact::Available(stdout),
+            DurableToolExecutionArtifact::Available(stderr),
+            observed_writes
+                .into_iter()
+                .map(DurableToolExecutionArtifact::Available)
+                .collect(),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_tool_output(
+        &self,
+        task_id: &TaskId,
+        project_id: &ProjectId,
+        execution_id: &ToolExecutionId,
+        kind: &'static str,
+        index: usize,
+        mime_type: &'static str,
+        output: &local_agent_terminal_application::PolicyBoundBytes,
+    ) -> Result<ArtifactId, PortError> {
+        let artifact_id = ArtifactId::new(format!(
+            "tool-output-{kind}-{index}-{}",
+            output.policy_decision_id.as_str()
+        ))
+        .map_err(|_| invalid_input())?;
+        self.publish_artifact(JournaledToolArtifact {
+            artifact_id: &artifact_id,
+            task_id,
+            project_id,
+            artifact_type: kind,
+            logical_path: format!("tool-outputs/{}.bin", artifact_id.as_str()),
+            created_by_id: execution_id.as_str(),
+            digest: output.digest.as_str(),
+            bytes: &output.bytes,
+            mime_type,
+        })?;
+        Ok(artifact_id)
     }
 }
 
@@ -1039,6 +1196,7 @@ impl ToolRequestPublisher for ToolArtifactPublisher<'_> {
             created_by_id: tool_request.execution_id().as_str(),
             digest: digest.as_str(),
             bytes: request.canonical_bytes(),
+            mime_type: "application/json",
         })?;
         let persisted = self.database.load_request_artifact(&artifact_id)?;
         if persisted != *request {
@@ -1079,6 +1237,7 @@ impl ToolApprovalRequestPublisher for ToolArtifactPublisher<'_> {
             created_by_id: request.approval_id().as_str(),
             digest: digest.as_str(),
             bytes: &request.canonical_payload().canonical_bytes,
+            mime_type: "application/json",
         })?;
         self.database.record_tool_approval_request(request)
     }
@@ -1093,6 +1252,7 @@ struct JournaledToolArtifact<'a> {
     created_by_id: &'a str,
     digest: &'a str,
     bytes: &'a [u8],
+    mime_type: &'static str,
 }
 
 fn validate_reservation(
