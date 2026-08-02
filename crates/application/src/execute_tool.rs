@@ -1,18 +1,16 @@
 use crate::{
-    approval::valid_approval_nonce, canonical_policy_binding_digest, policy_request_for_tool,
-    validate_tool_approval_request, ApprovalCheck, ApprovalClaim, ApprovalRequestDto,
-    ApprovalSnapshot, ApprovalState, ApprovalStore, AuthorizedToolExecutionClaim,
-    AuthorizedToolRequest, Clock, DeniedToolExecution, DurableToolCancellationOutcome,
-    DurableToolExecutionOutcome, DurableToolExecutionReceipt, ImmutableToolRequest,
-    IncompleteToolExecution, NewToolExecution, PortError, PreEffectOutcome, ProcessStatus,
-    Retryability, SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor,
+    canonical_policy_binding_digest, policy_request_for_tool, validate_tool_approval_request,
+    ApprovalRequestDto, AuthorizedToolExecutionClaim, AuthorizedToolRequest, DeniedToolExecution,
+    DurableToolCancellationOutcome, DurableToolExecutionOutcome, DurableToolExecutionReceipt,
+    ImmutableToolRequest, PortError, PreEffectOutcome, ProcessStatus, Retryability,
+    SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor,
     ToolExecutionCancellationClaim, ToolExecutionClaim, ToolExecutionClaimAuthority,
     ToolExecutionId, ToolExecutionOrchestration, ToolExecutionResolution, ToolExecutionResult,
     ToolExecutionStore, ToolExecutionTerminal, ToolRequest,
 };
+#[cfg(test)]
+use crate::{IncompleteToolExecution, NewToolExecution};
 use local_agent_terminal_domain::{FencingToken, RunId, Sha256Digest, TaskId};
-use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolOutcome {
@@ -76,62 +74,13 @@ impl<'a> ExecuteTool<'a> {
     }
 }
 
-pub struct ExecuteApprovedTool<'a> {
-    approvals: &'a dyn ApprovalStore,
-    executor: &'a dyn StructuredToolExecutor,
-    clock: &'a dyn Clock,
-}
-
-impl<'a> ExecuteApprovedTool<'a> {
-    pub const fn new(
-        approvals: &'a dyn ApprovalStore,
-        executor: &'a dyn StructuredToolExecutor,
-        clock: &'a dyn Clock,
-    ) -> Self {
-        Self {
-            approvals,
-            executor,
-            clock,
-        }
-    }
-
-    pub fn execute(
-        &self,
-        check: ApprovalCheck,
-        request: AuthorizedToolRequest,
-    ) -> Result<ToolExecutionResult, PortError> {
-        let now = self.clock.now_utc()?;
-        let request_binding = request
-            .revalidated_request_binding_digest()
-            .map_err(|_| denied())?
-            .clone();
-        if !same_instant(&now, &check.checked_at) || !request_matches(&request, &check) {
-            return Err(denied());
-        }
-        let claim = ApprovalClaim {
-            approval_id: check.approval_id,
-            expected_operation_digest: check.expected_operation_digest,
-            task_id: check.task_id,
-            workspace_version: check.workspace_version,
-            policy_snapshot_digest: check.policy_snapshot_digest,
-            fencing_token: check.fencing_token,
-            tool_request_binding_digest: request_binding,
-            nonce: request.approval_nonce().ok_or_else(denied)?.to_owned(),
-            claimed_at: now.clone(),
-        };
-        let approval = self.approvals.claim(claim.clone())?.ok_or_else(denied)?;
-        validate_claimed_approval(&approval, &claim)?;
-        self.executor.execute(request)
-    }
-}
-
-pub struct ExecuteDurableTool<'a> {
+struct ExecuteDurableTool<'a> {
     executions: &'a dyn ToolExecutionStore,
     executor: &'a dyn StructuredToolExecutor,
 }
 
 impl<'a> ExecuteDurableTool<'a> {
-    pub const fn new(
+    const fn new(
         executions: &'a dyn ToolExecutionStore,
         executor: &'a dyn StructuredToolExecutor,
     ) -> Self {
@@ -141,7 +90,8 @@ impl<'a> ExecuteDurableTool<'a> {
         }
     }
 
-    pub fn execute(
+    #[cfg(test)]
+    fn execute(
         &self,
         request: AuthorizedToolRequest,
     ) -> Result<DurableToolExecutionOutcome, PortError> {
@@ -274,11 +224,12 @@ impl<'a> ExecuteDurableTool<'a> {
         }
     }
 
-    pub fn incomplete(&self) -> Result<Vec<IncompleteToolExecution>, PortError> {
+    #[cfg(test)]
+    fn incomplete(&self) -> Result<Vec<IncompleteToolExecution>, PortError> {
         self.executions.incomplete()
     }
 
-    pub fn cancel(
+    fn cancel(
         &self,
         execution_id: &ToolExecutionId,
     ) -> Result<DurableToolCancellationOutcome, PortError> {
@@ -451,66 +402,5 @@ fn integrity_error() -> SafeToolExecutionError {
     SafeToolExecutionError::from_error(&integrity_failure())
 }
 
-fn validate_claimed_approval(
-    approval: &ApprovalSnapshot,
-    claim: &ApprovalClaim,
-) -> Result<(), PortError> {
-    if approval.state != ApprovalState::Consumed || !approval_bindings_match(approval, claim) {
-        return Err(denied());
-    }
-    Ok(())
-}
-
-fn approval_bindings_match(approval: &ApprovalSnapshot, claim: &ApprovalClaim) -> bool {
-    approval.approval_id == claim.approval_id
-        && !is_expired(&approval.expires_at, &claim.claimed_at)
-        && approval.operation_digest == claim.expected_operation_digest
-        && approval.task_id == claim.task_id
-        && approval.workspace_version == claim.workspace_version
-        && approval.policy_snapshot_digest == claim.policy_snapshot_digest
-        && approval.fencing_token == claim.fencing_token
-        && approval.tool_request_binding_digest.as_ref() == Some(&claim.tool_request_binding_digest)
-        && valid_approval_nonce(&approval.nonce)
-        && approval.nonce == claim.nonce
-}
-
-fn request_matches(request: &AuthorizedToolRequest, check: &ApprovalCheck) -> bool {
-    let process_request = request.process_request();
-    let process = process_request.process();
-    request
-        .revalidated_operation_digest()
-        .is_ok_and(|digest| digest == check.expected_operation_digest)
-        && process.binding().task_id() == &check.task_id
-        && process.binding().workspace_version() == check.workspace_version
-        && process.executor_fencing_token().map(|token| token.get()) == check.fencing_token
-        && process_request.expected_reads().iter().all(|capability| {
-            capability
-                .worktree_task_id()
-                .is_none_or(|task_id| task_id == &check.task_id)
-        })
-}
-
-fn same_instant(left: &str, right: &str) -> bool {
-    match (parse_timestamp(left), parse_timestamp(right)) {
-        (Some(left), Some(right)) => left == right,
-        _ => false,
-    }
-}
-
-fn is_expired(expires_at: &str, now: &str) -> bool {
-    match (parse_timestamp(expires_at), parse_timestamp(now)) {
-        (Some(expires_at), Some(now)) => expires_at <= now,
-        _ => true,
-    }
-}
-
-fn parse_timestamp(value: &str) -> Option<OffsetDateTime> {
-    OffsetDateTime::parse(value, &Rfc3339).ok()
-}
-
-fn denied() -> PortError {
-    PortError::failure(
-        SafeErrorClassification::PermissionDenied,
-        crate::Retryability::NonRetryable,
-    )
-}
+#[cfg(test)]
+mod tests;

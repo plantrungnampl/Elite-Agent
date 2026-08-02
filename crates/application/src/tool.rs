@@ -1535,6 +1535,7 @@ impl AuthorizedToolRequest {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn revalidated_operation_digest(&self) -> Result<Sha256Digest, PortError> {
         if let Some(approval) = &self.approval {
             let rebound = bind_process_request(approval.payload.clone(), &self.request)?;
@@ -1545,22 +1546,6 @@ impl AuthorizedToolRequest {
                 .map(|canonical| canonical.operation_digest);
         }
         canonical_tool_request_binding(&self.request).map(|binding| binding.as_sha256().clone())
-    }
-
-    pub(crate) fn revalidated_request_binding_digest(
-        &self,
-    ) -> Result<&ToolRequestBindingDigest, PortError> {
-        let current = canonical_tool_request_binding(&self.request)?;
-        if current != self.request_binding_digest {
-            return Err(invalid_input());
-        }
-        Ok(&self.request_binding_digest)
-    }
-
-    pub(crate) fn approval_nonce(&self) -> Option<&str> {
-        self.approval
-            .as_ref()
-            .map(|approval| approval.payload.nonce.as_str())
     }
 
     pub fn process_request(&self) -> &ApprovedProcessRequest {

@@ -1,1354 +1,1285 @@
-use std::collections::BTreeSet;
-use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+//! Canonical `ExecuteTool` orchestration tests.
+
+use std::collections::VecDeque;
+use std::sync::Mutex;
 
 use local_agent_terminal_application::{
-    bind_tool_approval_payload, canonical_approval_payload, canonical_policy_binding_digest,
-    canonical_tool_request, parse_tool_request, ApprovalDigestPayload, ApprovedExecutableIdentity,
-    ApprovedProcessRequest, AuthoritativeProcessBinding, AuthoritativeProcessTermination,
-    AuthorizedToolExecutionClaim, AuthorizedToolRequest, BoundToolApproval, BoundedOutput,
-    CancellationReceipt, DeniedToolExecution, DurableToolCancellationOutcome,
-    DurableToolExecutionArtifact, DurableToolExecutionArtifacts, DurableToolExecutionOutcome,
-    DurableToolExecutionReceipt, ExecuteDurableTool, IdempotencyClass, IncompleteToolExecution,
-    JobReceipt, NewToolExecution, NewToolIntent, OperationIntentSnapshot, PortError,
-    ProcessExecutionBindingStore, ProcessReceipt, ProcessStatus, ResolvedExecutable, Retryability,
-    SafeErrorClassification, SafeToolExecutionError, StructuredToolExecutor,
-    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionCancellationClaim,
-    ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId,
-    ToolExecutionOutput, ToolExecutionRecoveryEvidence, ToolExecutionRecoveryState,
-    ToolExecutionResolution, ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal,
-    ToolExecutionTerminalKind, ToolPolicyContext, ToolRequest,
+    canonical_policy_binding_digest, canonical_tool_request, policy_request_for_tool, ApprovalId,
+    ApprovalResumeSnapshot, ApprovalResumeStore, ApprovalState, ArtifactId,
+    AuthorizedToolExecutionClaim, AuthorizedToolRequest, BoundedOutput, Clock, DeniedToolExecution,
+    DurableToolExecutionOutcome, DurableToolExecutionReceipt, ExecuteTool, IdGenerator,
+    ImmutableToolRequest, IncompleteToolExecution, JobReceipt, LeaseSnapshot, LeaseState,
+    NewToolExecution, NewToolIntent, OperationIntentSnapshot, OperationIntentStatus,
+    PolicyDecision, PolicyDecisionId, PolicyDecisionStore, PolicyEvaluator, PortError,
+    PreEffectOutcome, ProcessReceipt, ProcessStatus, RecordedPolicyDecision, Retryability,
+    SafeErrorClassification, StructuredToolExecutor, ToolApprovalPublication, ToolApprovalRequest,
+    ToolApprovalRequestPublisher, ToolAuthorityResolver, ToolAuthoritySnapshot, ToolExecutionClaim,
+    ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId,
+    ToolExecutionOrchestration, ToolExecutionResolution, ToolExecutionResult,
+    ToolExecutionResumeSnapshot, ToolExecutionResumeStore, ToolExecutionStore,
+    ToolExecutionTerminalKind, ToolOutcome, ToolPolicyContext, ToolRequest, ToolRequestPublisher,
+};
+use local_agent_terminal_domain::{
+    combine_policy_rules, ActorLocality, CapabilityRef, EnvironmentProfile, FencingToken,
+    MatchedPolicyRule, NetworkProfile, Phase, PlanStepId, PolicyAction, PolicyActor, PolicyEffect,
+    PolicyRequest, PolicyResource, PolicyRuleId, PolicyVersion, ProcessBinding, ProcessInvocation,
+    ProcessToolRequest, ProcessTrustTier, ResourceClass, RunId, Sha256Digest, TaskId, TaskRisk,
+    Timestamp, TrustTier, WorkspaceVersion,
 };
 use sha2::{Digest, Sha256};
 
+const AUTHORITY_RESOURCE_BYTES: &[u8] = b"orchestration authority";
+
 #[test]
-fn immutable_tool_request_round_trips_without_approval_material() {
-    let request = tool_request("test");
-    let canonical = canonical_tool_request(&request).unwrap();
+fn policy_request_maps_exact_validated_tool_identity() {
+    let request = tool_request();
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+
+    let actual = policy_request_for_tool(&request, evaluated_at);
 
     assert_eq!(
-        parse_tool_request(canonical.canonical_bytes()).unwrap(),
-        canonical
-    );
-    assert_eq!(canonical.request(), &request);
-    assert!(std::str::from_utf8(canonical.canonical_bytes())
-        .unwrap()
-        .contains(r#""schema":"tool-request.v1""#));
-    let wire: serde_json::Value = serde_json::from_slice(canonical.canonical_bytes()).unwrap();
-    assert!(wire.get("approval").is_none());
-    for approval_field in [
-        "approvalId",
-        "summary",
-        "requestedAt",
-        "expiresAt",
-        "nonce",
-        "scopes",
-    ] {
-        assert!(wire.get(approval_field).is_none());
-    }
-    assert_ne!(
-        canonical.binding_digest().as_sha256(),
-        &canonical_approval_payload(&ApprovalDigestPayload::Tool(
-            approved_tool_binding(request.process()).payload().clone()
-        ))
-        .unwrap()
-        .operation_digest
+        actual,
+        PolicyRequest {
+            task_id: TaskId::new("task-1").unwrap(),
+            actor: PolicyActor {
+                connection_id: "connection-1".to_owned(),
+                agent_id: "agent-1".to_owned(),
+                trust_tier: TrustTier::IsolatedWorker,
+                locality: ActorLocality::Local,
+            },
+            action: PolicyAction::new("process.exec").unwrap(),
+            resource: PolicyResource {
+                capability: CapabilityRef::worktree(TaskId::new("task-1").unwrap(), ".",).unwrap(),
+                content_digest: resource_digest(AUTHORITY_RESOURCE_BYTES),
+                resource_class: ResourceClass::InternalCode,
+            },
+            task_risk: TaskRisk::High,
+            workflow_phase: "Implementation".to_owned(),
+            purpose: "run focused tests".to_owned(),
+            policy_snapshot_digest: digest('b'),
+            evaluated_at,
+        }
     );
 }
 
 #[test]
-fn exact_authorized_begin_is_part_of_the_object_safe_store_contract() {
-    fn accepts(_: &dyn ToolExecutionStore) {}
-    let _ = accepts;
-    let _ = <dyn ToolExecutionStore>::begin_authorized;
-    let _ = <dyn ToolExecutionStore>::load_denied;
-    let _ = <dyn ToolExecutionStore>::resolve_denied;
-    let _ = <dyn ToolExecutionStore>::request_cancellation;
-}
+fn evaluation_time_is_injected_but_not_echoed_into_policy_identity() {
+    let request = tool_request();
+    let first_time = Timestamp::from_unix_seconds(1_753_272_000);
+    let second_time = Timestamp::from_unix_seconds(1_753_272_060);
 
-#[test]
-fn cancellation_claim_precedes_and_permits_exactly_one_executor_call() {
-    let execution_id = ToolExecutionId::new("execution-cancel").unwrap();
-    let authority = claim_authority(execution_id.clone(), digest('a'));
-    let sequence = recording_sequence();
-    let store = RecordingStore::with_cancellation_claim(
-        ToolExecutionCancellationClaim::Claimed(authority.clone()),
-        sequence.clone(),
-    );
-    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
-    let use_case = ExecuteDurableTool::new(&store, &executor);
+    let first = policy_request_for_tool(&request, first_time);
+    let second = policy_request_for_tool(&request, second_time);
 
-    let outcome = use_case.cancel(&execution_id).unwrap();
-
-    let DurableToolCancellationOutcome::Requested {
-        authority: observed_authority,
-        receipt,
-    } = outcome
-    else {
-        panic!("the cancellation claimant must call the executor");
-    };
-    assert_eq!(observed_authority, authority);
-    assert_eq!(receipt.execution_id, execution_id);
-    assert_eq!(receipt.status, ProcessStatus::Terminated);
-    assert!(receipt.cancelled);
-    assert_eq!(executor.cancel_calls(), 1);
+    assert_eq!(first.evaluated_at, first_time);
+    assert_eq!(second.evaluated_at, second_time);
     assert_eq!(
-        sequence.lock().unwrap().as_slice(),
-        ["cancel_claim", "cancel_effect"]
-    );
-
-    store.set_cancellation_claim(ToolExecutionCancellationClaim::InFlight(authority.clone()));
-    assert_eq!(
-        use_case.cancel(&execution_id).unwrap(),
-        DurableToolCancellationOutcome::InFlight(authority)
-    );
-    assert_eq!(executor.cancel_calls(), 1);
-}
-
-#[test]
-fn authoritative_process_binding_contract_is_object_safe_and_validated() {
-    fn accepts(_: &dyn ProcessExecutionBindingStore) {}
-    let _ = accepts;
-    let _ = <dyn ProcessExecutionBindingStore>::load_claimed_authority;
-    let _ = <dyn ProcessExecutionBindingStore>::record_process_binding;
-    let authority = claim_authority(
-        ToolExecutionId::new("binding-contract").unwrap(),
-        digest('a'),
-    );
-
-    assert!(AuthoritativeProcessBinding::new(authority.clone(), 0, "job-1").is_err());
-    assert!(AuthoritativeProcessBinding::new(authority.clone(), 1, "").is_err());
-    assert!(AuthoritativeProcessBinding::new(authority.clone(), 1, "bad\0job").is_err());
-    assert!(AuthoritativeProcessBinding::new(authority.clone(), 1, "x".repeat(257)).is_err());
-    let binding = AuthoritativeProcessBinding::new(authority.clone(), 42, "job-1").unwrap();
-    assert_eq!(binding.authority(), &authority);
-    assert_eq!(binding.root_pid(), 42);
-    assert_eq!(binding.job_id(), "job-1");
-}
-
-#[test]
-fn tool_request_binding_covers_every_canonical_wire_leaf_and_list() {
-    let canonical = canonical_tool_request(&rich_tool_request()).unwrap();
-    let wire: serde_json::Value = serde_json::from_slice(canonical.canonical_bytes()).unwrap();
-    let expected_paths = [
-        "/executionId",
-        "/policy/action",
-        "/policy/actor/agentId",
-        "/policy/actor/connectionId",
-        "/policy/actor/locality",
-        "/policy/actor/trustTier",
-        "/policy/policySnapshotDigest",
-        "/policy/purpose",
-        "/policy/resource/capability/kind",
-        "/policy/resource/capability/path",
-        "/policy/resource/capability/taskId",
-        "/policy/resource/contentDigest",
-        "/policy/resource/resourceClass",
-        "/policy/taskRisk",
-        "/process/approvedExecutable/canonicalPath",
-        "/process/approvedExecutable/fileIdentity",
-        "/process/approvedExecutable/sha256",
-        "/process/approvedExecutable/toolchainId",
-        "/process/approvedExecutable/version",
-        "/process/argv",
-        "/process/argv/0",
-        "/process/cpuTimeLimitMs",
-        "/process/cwd/kind",
-        "/process/cwd/path",
-        "/process/cwd/taskId",
-        "/process/environmentProfile/digest",
-        "/process/environmentProfile/name",
-        "/process/executable/kind",
-        "/process/executable/name",
-        "/process/executorFencingToken",
-        "/process/expectedReads",
-        "/process/expectedReads/0/kind",
-        "/process/expectedReads/0/path",
-        "/process/expectedReads/0/revision",
-        "/process/expectedWrites",
-        "/process/expectedWrites/0/kind",
-        "/process/expectedWrites/0/path",
-        "/process/expectedWrites/0/taskId",
-        "/process/memoryLimitBytes",
-        "/process/networkProfile",
-        "/process/planStepId",
-        "/process/runId",
-        "/process/schema",
-        "/process/taskId",
-        "/process/timeoutMs",
-        "/process/trustTier",
-        "/process/workflowPhase",
-        "/process/workspaceVersion",
-        "/schema",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect::<BTreeSet<_>>();
-    let actual_paths = canonical_wire_binding_paths(&wire);
-
-    assert_eq!(actual_paths, expected_paths);
-    assert_eq!(
-        canonical.binding_digest().as_sha256(),
-        &canonical_wire_digest(&wire)
-    );
-
-    for path in actual_paths {
-        let mut mutated = wire.clone();
-        mutate_binding_path(&mut mutated, &path);
-        assert_ne!(
-            canonical_wire_digest(&mutated),
-            *canonical.binding_digest().as_sha256(),
-            "{path} was not bound"
-        );
-    }
-}
-
-#[test]
-fn immutable_tool_request_parser_rejects_unknown_fields_and_noncanonical_json() {
-    let request = tool_request("test");
-    let canonical = canonical_tool_request(&request).unwrap();
-    let original =
-        serde_json::from_slice::<serde_json::Value>(canonical.canonical_bytes()).unwrap();
-    let mut unknown = original.clone();
-    unknown
-        .as_object_mut()
-        .unwrap()
-        .insert("unknown".to_owned(), serde_json::Value::Bool(true));
-    assert!(parse_tool_request(serde_json::to_string(&unknown).unwrap().as_bytes()).is_err());
-
-    let noncanonical = serde_json::to_string_pretty(&original).unwrap();
-    assert!(parse_tool_request(noncanonical.as_bytes()).is_err());
-
-    let raw = std::str::from_utf8(canonical.canonical_bytes()).unwrap();
-    let duplicate = raw.replacen(
-        r#""schema":"tool-request.v1""#,
-        r#""schema":"tool-request.v1","schema":"tool-request.v1""#,
-        1,
-    );
-    assert!(parse_tool_request(duplicate.as_bytes()).is_err());
-}
-
-#[test]
-fn approved_executable_identity_accepts_only_canonical_resolver_path_shapes() {
-    #[cfg(windows)]
-    assert!(
-        approved_executable_identity_at(r"C:\approved\cargo.exe").is_ok(),
-        "ordinary disk path was rejected"
-    );
-    assert!(
-        approved_executable_identity_at(resolver_canonical_executable_path()).is_ok(),
-        "authoritative resolver path was rejected"
-    );
-    for (name, path) in rejected_canonical_executable_paths() {
-        assert!(
-            approved_executable_identity_at(path).is_err(),
-            "{name} path was accepted"
-        );
-    }
-}
-
-#[test]
-fn tool_request_parser_rejects_every_domain_invalid_process_shape() {
-    let canonical = canonical_tool_request(&tool_request("test")).unwrap();
-    let base: serde_json::Value = serde_json::from_slice(canonical.canonical_bytes()).unwrap();
-    let write = serde_json::json!({"kind": "worktree", "taskId": "task-1", "path": "target/out"});
-    let field_cases: [(&str, &[&str], serde_json::Value); 17] = [
-        ("timeout zero", &["timeoutMs"], serde_json::json!(0)),
-        ("argv empty", &["argv"], serde_json::json!([])),
-        (
-            "executable is not toolchain",
-            &["executable"],
-            serde_json::json!({"kind": "worktree", "taskId": "task-1", "path": "."}),
-        ),
-        (
-            "cwd is not worktree",
-            &["cwd"],
-            serde_json::json!({"kind": "toolchain", "name": "cargo"}),
-        ),
-        (
-            "cwd belongs to another task",
-            &["cwd"],
-            serde_json::json!({"kind": "worktree", "taskId": "task-2", "path": "."}),
-        ),
-        (
-            "brokered process",
-            &["trustTier"],
-            serde_json::json!("brokered_process"),
-        ),
-        (
-            "invalid expected write",
-            &["expectedWrites"],
-            serde_json::json!([{"kind": "toolchain", "name": "cargo"}]),
-        ),
-        (
-            "duplicate expected writes",
-            &["expectedWrites"],
-            serde_json::json!([write.clone(), write.clone()]),
-        ),
-        (
-            "too many expected writes",
-            &["expectedWrites"],
-            serde_json::Value::Array(vec![write.clone(); 1_025]),
-        ),
-        (
-            "cross-task expected write",
-            &["expectedWrites"],
-            serde_json::json!([{"kind": "worktree", "taskId": "task-2", "path": "target/out"}]),
-        ),
-        (
-            "zero fence",
-            &["executorFencingToken"],
-            serde_json::json!(0),
-        ),
-        (
-            "zero memory limit",
-            &["memoryLimitBytes"],
-            serde_json::json!(0),
-        ),
-        ("zero cpu limit", &["cpuTimeLimitMs"], serde_json::json!(0)),
-        (
-            "absolute cwd path",
-            &["cwd", "path"],
-            serde_json::json!(r"C:\absolute"),
-        ),
-        (
-            "traversing cwd path",
-            &["cwd", "path"],
-            serde_json::json!("../escape"),
-        ),
-        (
-            "toolchain identity mismatch",
-            &["approvedExecutable", "toolchainId"],
-            serde_json::json!("rustc"),
-        ),
-        (
-            "nul canonical path",
-            &["approvedExecutable", "canonicalPath"],
-            serde_json::json!("C:\\approved\\cargo\0.exe"),
-        ),
-    ];
-
-    for (name, path, value) in field_cases {
-        let wire = mutate_wire_field(&base, path, value);
-        let bytes = serde_json_canonicalizer::to_vec(&wire).unwrap();
-        assert!(parse_tool_request(&bytes).is_err(), "{name} was accepted");
-    }
-    for (name, path) in rejected_canonical_executable_paths() {
-        let wire = mutate_wire_field(
-            &base,
-            &["approvedExecutable", "canonicalPath"],
-            serde_json::json!(path),
-        );
-        let bytes = serde_json_canonicalizer::to_vec(&wire).unwrap();
-        assert!(
-            parse_tool_request(&bytes).is_err(),
-            "{name} canonical path was accepted"
-        );
-    }
-
-    let mut writes_without_fence = base;
-    writes_without_fence["process"]["expectedWrites"] = serde_json::json!([write]);
-    writes_without_fence["process"]["executorFencingToken"] = serde_json::Value::Null;
-    let bytes = serde_json_canonicalizer::to_vec(&writes_without_fence).unwrap();
-    assert!(
-        parse_tool_request(&bytes).is_err(),
-        "writes without fence was accepted"
+        canonical_policy_binding_digest(&first).unwrap(),
+        canonical_policy_binding_digest(&second).unwrap()
     );
 }
 
 #[test]
-fn policy_binding_excludes_evaluation_time_but_binds_stable_identity() {
-    let request = tool_request("test");
-    let binding = request.process().process().binding();
+fn mismatched_policy_task_is_invalid_before_policy_request_mapping() {
+    let request = tool_request();
     let policy = request.policy();
-    let policy_request = local_agent_terminal_domain::PolicyRequest {
-        task_id: binding.task_id().clone(),
-        actor: policy.actor().clone(),
-        action: policy.action().clone(),
-        resource: policy.resource().clone(),
-        task_risk: policy.task_risk(),
-        workflow_phase: binding.workflow_phase().as_str().to_owned(),
-        purpose: policy.purpose().to_owned(),
-        policy_snapshot_digest: policy.policy_snapshot_digest().clone(),
-        evaluated_at: Timestamp::from_unix_seconds(1_753_272_000),
+    let mismatched_policy = ToolPolicyContext::new(
+        policy.actor().clone(),
+        policy.action().clone(),
+        PolicyResource {
+            capability: CapabilityRef::worktree(TaskId::new("task-2").unwrap(), ".").unwrap(),
+            content_digest: policy.resource().content_digest.clone(),
+            resource_class: policy.resource().resource_class,
+        },
+        policy.task_risk(),
+        policy.purpose(),
+        policy.policy_snapshot_digest().clone(),
+    )
+    .unwrap();
+
+    let error = ToolRequest::new(
+        ToolExecutionId::new("execution-mismatched-policy-task").unwrap(),
+        request.process().clone(),
+        mismatched_policy,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::InvalidInput
+    );
+}
+
+#[test]
+fn approval_publication_port_is_object_safe() {
+    fn accepts(_: &dyn ToolApprovalRequestPublisher) {}
+
+    let publisher = RecordingApprovalPublisher::new();
+    accepts(&publisher);
+}
+
+/// RED contract for the shared pre-effect boundary.
+///
+/// Initial execution and approval resume must converge on this boundary before
+/// any durable execution claim or executor invocation is possible.
+#[test]
+fn allow_publishes_before_pre_effect_ready() {
+    let events = Mutex::new(Vec::new());
+    let records = Mutex::new(Vec::new());
+    let publisher = RecordingPublisher {
+        events: &events,
+        artifact_id: ArtifactId::new("artifact-tool-request-1").unwrap(),
     };
-    let expected = canonical_policy_binding_digest(&policy_request).unwrap();
-    assert!(expected.as_sha256().as_str().starts_with("sha256:"));
+    let request = tool_request();
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let decision = policy_decision(
+        policy_request_for_tool(&request, evaluated_at),
+        PolicyEffect::Allow,
+    );
+    let decision_id = PolicyDecisionId::from_decision(&decision);
+    let clock = RecordingClock {
+        events: &events,
+        value: "2025-07-23T12:00:00Z",
+    };
+    let evaluator = RecordingEvaluator {
+        events: &events,
+        decision: decision.clone(),
+    };
+    let policy_store = RecordingPolicyStore {
+        events: &events,
+        records: &records,
+        decision_id: decision_id.clone(),
+    };
+    let authority = RecordingAuthority {
+        events: &events,
+        current: request.clone(),
+    };
+    let ids = SequenceIds::new(&events);
+    let approval_requests = RecordingApprovalPublisher::new();
+    let resumes = UnusedResumeStore;
+    let orchestrator = ToolExecutionOrchestration::new(
+        &publisher,
+        &authority,
+        &clock,
+        &evaluator,
+        &policy_store,
+        &ids,
+        &approval_requests,
+        &resumes,
+        &resumes,
+        &NO_DENIALS,
+    );
 
-    let mut later = policy_request.clone();
-    later.evaluated_at = Timestamp::from_unix_seconds(1_753_272_060);
-    assert_eq!(canonical_policy_binding_digest(&later).unwrap(), expected);
+    let execution_id = request.execution_id().clone();
+    let outcome = orchestrator.execute(request).unwrap();
+    let PreEffectOutcome::Allowed(ready) = outcome else {
+        panic!("allow decision did not produce a ready outcome");
+    };
 
+    assert_eq!(
+        events.into_inner().unwrap(),
+        ["publish", "authority", "clock", "evaluate", "record"]
+    );
+    assert_eq!(records.into_inner().unwrap()[0].recorded_at, evaluated_at);
+    assert_eq!(ready.execution_id(), &execution_id);
+    assert_eq!(
+        ready.request_artifact_id().as_str(),
+        "artifact-tool-request-1"
+    );
+    assert_eq!(ready.policy_decision_id(), &decision_id);
+    assert!(ready
+        .request_binding_digest()
+        .as_sha256()
+        .as_str()
+        .starts_with("sha256:"));
+}
+
+#[test]
+fn execute_tool_claims_exact_current_authorization_before_effect_and_terminal() {
+    let events = Mutex::new(Vec::new());
+    let request = tool_request();
+    let immutable = canonical_tool_request(&request).unwrap();
+    let execution_id = request.execution_id().clone();
+    let operation_digest = immutable.binding_digest().as_sha256().clone();
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let decision_id = PolicyDecisionId::from_decision(&policy_decision(
+        policy_request_for_tool(&request, evaluated_at),
+        PolicyEffect::Allow,
+    ));
+    let authority = RecordingAuthority {
+        events: &events,
+        current: request.clone(),
+    };
+    let claim_authority = ToolExecutionClaimAuthority::from_persisted(
+        execution_id.clone(),
+        operation_digest.clone(),
+        RunId::new("run-1").unwrap(),
+        1,
+        Some(FencingToken::new(19).unwrap()),
+    )
+    .unwrap();
+    let executions = TestExecutionStore::executing(&events, claim_authority);
+    let executor = RecordingStructuredExecutor { events: &events };
+    let outcome =
+        execute_allowed_tool(request, &authority, &events, &executions, &executor).unwrap();
+
+    let ToolOutcome::Execution(DurableToolExecutionOutcome::Completed(receipt)) = outcome else {
+        panic!("allowed execution did not complete");
+    };
+    assert_eq!(
+        receipt.terminal().kind(),
+        ToolExecutionTerminalKind::Succeeded
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "publish",
+            "authority",
+            "clock",
+            "evaluate",
+            "record",
+            "authority",
+            "begin-authorized",
+            "effect",
+            "resolve-terminal",
+        ]
+    );
+    let claims = executions.authorized_claims.into_inner().unwrap();
+    assert_eq!(claims.len(), 1);
+    let claim = &claims[0];
+    assert_eq!(claim.execution_id, execution_id);
+    assert_eq!(claim.request_content_digest, operation_digest);
+    assert_eq!(claim.request_binding_digest, *immutable.binding_digest());
+    assert_eq!(claim.task_id, TaskId::new("task-1").unwrap());
+    assert_eq!(claim.run_id, RunId::new("run-1").unwrap());
+    assert_eq!(claim.tool_name, "process.exec");
+    assert_eq!(claim.policy_decision_id, decision_id);
+    assert_eq!(claim.workspace_version, WorkspaceVersion::new(4));
+    assert_eq!(claim.policy_snapshot_digest, digest('b'));
+    assert_eq!(claim.fencing_token, Some(FencingToken::new(19).unwrap()));
+    assert_eq!(claim.checked_at, evaluated_at);
+    assert!(claim.approval.is_none());
+}
+
+#[test]
+fn authority_change_after_policy_record_stops_before_claim_and_effect() {
+    let events = Mutex::new(Vec::new());
+    let request = tool_request();
+    let immutable = canonical_tool_request(&request).unwrap();
+    let authority = ChangingAuthority {
+        events: &events,
+        current: Mutex::new(VecDeque::from([
+            request.clone(),
+            tool_request_with_resource_class(&request, ResourceClass::Secret),
+        ])),
+    };
+    let claim_authority = ToolExecutionClaimAuthority::from_persisted(
+        request.execution_id().clone(),
+        immutable.binding_digest().as_sha256().clone(),
+        RunId::new("run-1").unwrap(),
+        1,
+        Some(FencingToken::new(19).unwrap()),
+    )
+    .unwrap();
+    let executions = TestExecutionStore::executing(&events, claim_authority);
+    let executor = RecordingStructuredExecutor { events: &events };
+    let error =
+        execute_allowed_tool(request, &authority, &events, &executions, &executor).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "publish",
+            "authority",
+            "clock",
+            "evaluate",
+            "record",
+            "authority",
+        ]
+    );
+    assert!(executions.authorized_claims.lock().unwrap().is_empty());
+}
+
+#[test]
+fn deny_is_recorded_once_before_typed_branch() {
+    let request = tool_request();
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let decision = policy_decision(
+        policy_request_for_tool(&request, evaluated_at),
+        PolicyEffect::Deny,
+    );
+    let decision_id = PolicyDecisionId::from_decision(&decision);
+    let (result, events, records) = execute_with_decision(decision, decision_id.clone());
+
+    assert_eq!(
+        result.unwrap(),
+        PreEffectOutcome::Denied(DeniedToolExecution::new(
+            ToolExecutionId::new("execution-orchestration").unwrap(),
+            ArtifactId::new("artifact-tool-request-1").unwrap(),
+            decision_id,
+        ))
+    );
+    assert_eq!(
+        events,
+        [
+            "publish",
+            "authority",
+            "clock",
+            "evaluate",
+            "record",
+            "resolve-denied",
+        ]
+    );
+    assert_eq!(records.len(), 1);
+}
+
+#[test]
+fn replayed_denial_skips_clock_policy_and_approval_publication() {
+    let events = Mutex::new(Vec::new());
+    let records = Mutex::new(Vec::new());
+    let request = tool_request();
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let decision = policy_decision(
+        policy_request_for_tool(&request, evaluated_at),
+        PolicyEffect::Deny,
+    );
+    let decision_id = PolicyDecisionId::from_decision(&decision);
+    let artifact_id = ArtifactId::new("artifact-tool-request-1").unwrap();
+    let executions = TestExecutionStore::replaying(
+        &events,
+        DeniedToolExecution::new(
+            request.execution_id().clone(),
+            artifact_id.clone(),
+            decision_id.clone(),
+        ),
+    );
+    let publisher = RecordingPublisher {
+        events: &events,
+        artifact_id,
+    };
+    let authority = RecordingAuthority {
+        events: &events,
+        current: request.clone(),
+    };
+    let clock = RecordingClock {
+        events: &events,
+        value: "2025-07-23T12:00:00Z",
+    };
+    let evaluator = RecordingEvaluator {
+        events: &events,
+        decision,
+    };
+    let policy_store = RecordingPolicyStore {
+        events: &events,
+        records: &records,
+        decision_id,
+    };
+    let ids = SequenceIds::new(&events);
+    let approval_requests = RecordingApprovalPublisher::new();
+    let resumes = UnusedResumeStore;
+    let orchestrator = ToolExecutionOrchestration::new(
+        &publisher,
+        &authority,
+        &clock,
+        &evaluator,
+        &policy_store,
+        &ids,
+        &approval_requests,
+        &resumes,
+        &resumes,
+        &executions,
+    );
+
+    assert!(matches!(
+        orchestrator.execute(request).unwrap(),
+        PreEffectOutcome::Denied(_)
+    ));
+    assert_eq!(events.into_inner().unwrap(), ["publish", "authority"]);
+    assert!(records.into_inner().unwrap().is_empty());
+    assert!(approval_requests
+        .candidates
+        .into_inner()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn require_approval_constructs_core_owned_canonical_terms_after_policy_recording() {
+    let request = tool_request();
+    let immutable = canonical_tool_request(&request).unwrap();
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let policy_binding =
+        canonical_policy_binding_digest(&policy_request_for_tool(&request, evaluated_at)).unwrap();
+    let approval_requests = RecordingApprovalPublisher::new();
+
+    with_require_approval_orchestrator(
+        &request,
+        &approval_requests,
+        None,
+        |orchestrator, events, records, decision_id| {
+            let outcome = orchestrator.execute(request.clone()).unwrap();
+            let PreEffectOutcome::ApprovalRequired(dto) = outcome else {
+                panic!("require-approval decision did not return the immutable request");
+            };
+            let published = approval_requests.stored.lock().unwrap().clone().unwrap();
+
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    "publish",
+                    "authority",
+                    "clock",
+                    "evaluate",
+                    "record",
+                    "id",
+                    "id",
+                    "id"
+                ]
+            );
+            assert_eq!(records.lock().unwrap().len(), 1);
+            assert_eq!(published.approval_id().as_str(), "approval-1");
+            assert_eq!(
+                published.approval_artifact_id().as_str(),
+                "approval-artifact-1"
+            );
+            assert_eq!(published.execution_id().as_str(), "execution-orchestration");
+            assert_eq!(published.policy_decision_id(), decision_id);
+            assert_eq!(published.policy_request_binding_digest(), &policy_binding);
+            assert_eq!(
+                published.tool_request_artifact_id().as_str(),
+                "artifact-tool-request-1"
+            );
+            assert_eq!(
+                published.tool_request_binding_digest(),
+                immutable.binding_digest()
+            );
+            assert_eq!(published.payload().requested_at, "2025-07-23T12:00:00Z");
+            assert_eq!(published.payload().expires_at, "2025-07-23T12:15:00Z");
+            assert_eq!(
+                published.payload().nonce,
+                "0123456789abcdef0123456789abcdef"
+            );
+            assert_eq!(published.payload().operation.tool, "process.exec");
+            assert_eq!(
+                published.payload().operation.executable_digest.as_deref(),
+                Some(digest('f').as_str())
+            );
+            assert_eq!(
+                published.payload().policy_snapshot_digest,
+                digest('b').as_str()
+            );
+            assert_ne!(
+                published.canonical_payload().operation_digest.as_str(),
+                immutable.binding_digest().as_sha256().as_str()
+            );
+            assert_ne!(
+                published.canonical_payload().operation_digest.as_str(),
+                policy_binding.as_sha256().as_str()
+            );
+            assert_eq!(dto.approval_id, "approval-1");
+            assert_eq!(
+                dto.operation_digest,
+                published.canonical_payload().operation_digest.as_str()
+            );
+            assert_eq!(dto.expires_at, "2025-07-23T12:15:00Z");
+            assert_eq!(dto.summary, "process.exec toolchain:cargo [\"test\"]");
+            assert_eq!(dto.scopes, ["worktree:task-1", "worktree:task-1:src"]);
+        },
+    );
+}
+
+#[test]
+fn approval_expiry_never_outlives_the_policy_decision() {
+    let request = tool_request();
+    let approval_requests = RecordingApprovalPublisher::new();
+    with_require_approval_orchestrator(
+        &request,
+        &approval_requests,
+        Some(Timestamp::from_unix_seconds(1_753_272_300)),
+        |orchestrator, _, _, _| {
+            let PreEffectOutcome::ApprovalRequired(dto) =
+                orchestrator.execute(request.clone()).unwrap()
+            else {
+                panic!("require-approval decision did not return an approval request");
+            };
+            assert_eq!(dto.expires_at, "2025-07-23T12:05:00Z");
+        },
+    );
+}
+
+#[test]
+fn repeated_execution_id_replays_one_immutable_approval_request() {
+    let request = tool_request();
+    let approval_requests = RecordingApprovalPublisher::new();
+    with_require_approval_orchestrator(
+        &request,
+        &approval_requests,
+        None,
+        |orchestrator, _, _, _| {
+            let first = orchestrator.execute(request.clone()).unwrap();
+            let second = orchestrator.execute(request.clone()).unwrap();
+
+            assert_eq!(first, second);
+            assert_eq!(*approval_requests.inserts.lock().unwrap(), 1);
+            let candidates = approval_requests.candidates.lock().unwrap();
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(candidates[0].approval_id().as_str(), "approval-1");
+            assert_eq!(candidates[1].approval_id().as_str(), "approval-2");
+            assert_ne!(candidates[0].payload().nonce, candidates[1].payload().nonce);
+        },
+    );
+}
+
+#[test]
+fn replay_keeps_original_policy_decision_separate_from_fresh_decision() {
+    let request = tool_request();
+    let approval_requests = RecordingApprovalPublisher::new();
+    let run = |clock_value: &'static str,
+               evaluated_at: Timestamp,
+               decision_digest: char,
+               id_values: [&'static str; 3]| {
+        let events = Mutex::new(Vec::new());
+        let records = Mutex::new(Vec::new());
+        let publisher = RecordingPublisher {
+            events: &events,
+            artifact_id: ArtifactId::new("artifact-tool-request-1").unwrap(),
+        };
+        let clock = RecordingClock {
+            events: &events,
+            value: clock_value,
+        };
+        let decision = policy_decision_with_digest(
+            policy_request_for_tool(&request, evaluated_at),
+            PolicyEffect::RequireApproval,
+            decision_digest,
+        );
+        let decision_id = PolicyDecisionId::from_decision(&decision);
+        let evaluator = RecordingEvaluator {
+            events: &events,
+            decision,
+        };
+        let policy_store = RecordingPolicyStore {
+            events: &events,
+            records: &records,
+            decision_id: decision_id.clone(),
+        };
+        let authority = RecordingAuthority {
+            events: &events,
+            current: request.clone(),
+        };
+        let ids = SequenceIds::with_values(&events, id_values);
+        let resumes = UnusedResumeStore;
+        let orchestrator = ToolExecutionOrchestration::new(
+            &publisher,
+            &authority,
+            &clock,
+            &evaluator,
+            &policy_store,
+            &ids,
+            &approval_requests,
+            &resumes,
+            &resumes,
+            &NO_DENIALS,
+        );
+        (orchestrator.execute(request.clone()).unwrap(), decision_id)
+    };
+
+    let (first, original_policy_decision_id) = run(
+        "2025-07-23T12:00:00Z",
+        Timestamp::from_unix_seconds(1_753_272_000),
+        'c',
+        [
+            "approval-1",
+            "approval-artifact-1",
+            "0123456789abcdef0123456789abcdef",
+        ],
+    );
+    let (replayed, fresh_policy_decision_id) = run(
+        "2025-07-23T12:01:00Z",
+        Timestamp::from_unix_seconds(1_753_272_060),
+        'd',
+        [
+            "approval-2",
+            "approval-artifact-2",
+            "fedcba9876543210fedcba9876543210",
+        ],
+    );
+
+    assert_ne!(original_policy_decision_id, fresh_policy_decision_id);
+    assert_eq!(
+        approval_requests
+            .stored
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .policy_decision_id(),
+        &original_policy_decision_id
+    );
+    assert_eq!(first, replayed);
+    assert_eq!(*approval_requests.inserts.lock().unwrap(), 1);
+}
+
+#[test]
+fn approved_resume_reloads_exact_records_and_reuses_pre_effect_path() {
+    let request = tool_request();
+    let immutable = canonical_tool_request(&request).unwrap();
+    let initial_approvals = RecordingApprovalPublisher::new();
+    let published = with_require_approval_orchestrator(
+        &request,
+        &initial_approvals,
+        None,
+        |orchestrator, _, _, _| {
+            orchestrator.execute(request.clone()).unwrap();
+            initial_approvals.stored.lock().unwrap().clone().unwrap()
+        },
+    );
+    let request_content_digest = resource_digest(immutable.canonical_bytes());
+    let binding = request.process().process().binding();
+    let expires_at = Timestamp::from_unix_seconds(1_753_272_900);
+    let intent_id = "intent-orchestration-1".to_owned();
+    let approval = ApprovalResumeSnapshot::new(
+        published.approval_id().clone(),
+        published.execution_id().clone(),
+        published.policy_decision_id().clone(),
+        published.policy_request_binding_digest().clone(),
+        published.canonical_payload().operation_digest.clone(),
+        published.tool_request_binding_digest().clone(),
+        binding.task_id().clone(),
+        binding.run_id().clone(),
+        published.tool_request_artifact_id().clone(),
+        request_content_digest.clone(),
+        intent_id.clone(),
+        binding.workspace_version(),
+        request.policy().policy_snapshot_digest().clone(),
+        request.process().process().executor_fencing_token(),
+        expires_at,
+        published.payload().nonce.clone(),
+        ApprovalState::Approved,
+    )
+    .unwrap();
+    let execution = ToolExecutionResumeSnapshot::new(
+        published.execution_id().clone(),
+        published.approval_id().clone(),
+        published.policy_decision_id().clone(),
+        published.canonical_payload().operation_digest.clone(),
+        published.policy_request_binding_digest().clone(),
+        published.tool_request_binding_digest().clone(),
+        binding.task_id().clone(),
+        binding.run_id().clone(),
+        binding.workspace_version(),
+        request.policy().policy_snapshot_digest().clone(),
+        request.process().process().executor_fencing_token(),
+        expires_at,
+        published.payload().nonce.clone(),
+        published.tool_request_artifact_id().clone(),
+        request_content_digest.clone(),
+        request_content_digest,
+        intent_id,
+        OperationIntentStatus::Pending,
+    )
+    .unwrap();
+
+    let events = Mutex::new(Vec::new());
+    let records = Mutex::new(Vec::new());
+    let mut resumes = RecordingResumeStore {
+        events: &events,
+        checked_at: Timestamp::from_unix_seconds(1_753_272_300),
+        approval,
+        execution,
+        approval_request: published.clone(),
+        immutable,
+    };
+    let publisher = RecordingPublisher {
+        events: &events,
+        artifact_id: published.tool_request_artifact_id().clone(),
+    };
+    let authority = RecordingAuthority {
+        events: &events,
+        current: request.clone(),
+    };
+    let clock = RecordingClock {
+        events: &events,
+        value: "2025-07-23T12:05:00Z",
+    };
+    let decision = policy_decision_with_digest(
+        policy_request_for_tool(&request, Timestamp::from_unix_seconds(1_753_272_300)),
+        PolicyEffect::RequireApproval,
+        'd',
+    );
+    let fresh_policy_decision_id = PolicyDecisionId::from_decision(&decision);
+    let evaluator = RecordingEvaluator {
+        events: &events,
+        decision,
+    };
+    let policy_store = RecordingPolicyStore {
+        events: &events,
+        records: &records,
+        decision_id: fresh_policy_decision_id.clone(),
+    };
+    let ids = SequenceIds::new(&events);
+    let replay_publications = RecordingApprovalPublisher::new();
+    {
+        let orchestrator = ToolExecutionOrchestration::new(
+            &publisher,
+            &authority,
+            &clock,
+            &evaluator,
+            &policy_store,
+            &ids,
+            &replay_publications,
+            &resumes,
+            &resumes,
+            &NO_DENIALS,
+        );
+
+        let outcome = orchestrator
+            .resume_approved(published.approval_id().clone())
+            .unwrap();
+        let PreEffectOutcome::Allowed(ready) = outcome else {
+            panic!("approved resume did not reach pre-effect ready");
+        };
+
+        assert_eq!(ready.approval_id(), Some(published.approval_id()));
+        assert_eq!(ready.policy_decision_id(), &fresh_policy_decision_id);
+        assert_ne!(ready.policy_decision_id(), published.policy_decision_id());
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "clock",
+                "approval-resume",
+                "execution-resume",
+                "request-artifact",
+                "approval-artifact",
+                "authority",
+                "evaluate",
+                "record"
+            ]
+        );
+        assert!(replay_publications.candidates.lock().unwrap().is_empty());
+    }
+
+    events.lock().unwrap().clear();
+    records.lock().unwrap().clear();
+    resumes.immutable =
+        canonical_tool_request(&tool_request_with_argv(vec!["check".to_owned()])).unwrap();
+    let orchestrator = ToolExecutionOrchestration::new(
+        &publisher,
+        &authority,
+        &clock,
+        &evaluator,
+        &policy_store,
+        &ids,
+        &replay_publications,
+        &resumes,
+        &resumes,
+        &NO_DENIALS,
+    );
+
+    let error = orchestrator
+        .resume_approved(published.approval_id().clone())
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "clock",
+            "approval-resume",
+            "execution-resume",
+            "request-artifact",
+            "approval-artifact"
+        ]
+    );
+    assert!(records.lock().unwrap().is_empty());
+}
+
+#[test]
+fn replay_with_changed_full_request_binding_fails_closed() {
+    let request = tool_request();
+    let approval_requests = RecordingApprovalPublisher::new();
+    with_require_approval_orchestrator(
+        &request,
+        &approval_requests,
+        None,
+        |orchestrator, _, _, _| {
+            orchestrator.execute(request.clone()).unwrap();
+            let error = orchestrator
+                .execute(tool_request_with_argv(vec!["check".to_owned()]))
+                .unwrap_err();
+
+            assert_eq!(
+                error.safe_classification(),
+                SafeErrorClassification::IntegrityFailure
+            );
+            assert_eq!(*approval_requests.inserts.lock().unwrap(), 1);
+        },
+    );
+}
+
+#[test]
+fn created_approval_term_mutations_are_rejected() {
+    for mutation in [
+        ApprovalTermMutation::ApprovalId,
+        ApprovalTermMutation::Nonce,
+        ApprovalTermMutation::Expiry,
+    ] {
+        let request = tool_request();
+        let approval_requests = TamperingApprovalPublisher { mutation };
+        with_require_approval_orchestrator(
+            &request,
+            &approval_requests,
+            None,
+            |orchestrator, _, _, _| {
+                let error = orchestrator.execute(request.clone()).unwrap_err();
+                assert_eq!(
+                    error.safe_classification(),
+                    SafeErrorClassification::IntegrityFailure
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn approval_publication_failure_is_propagated_after_policy_recording() {
+    let request = tool_request();
+    let approval_requests = FailingApprovalPublisher;
+    with_require_approval_orchestrator(
+        &request,
+        &approval_requests,
+        None,
+        |orchestrator, _, records, _| {
+            let error = orchestrator.execute(request.clone()).unwrap_err();
+            assert_eq!(
+                error.safe_classification(),
+                SafeErrorClassification::Unavailable
+            );
+            assert_eq!(records.lock().unwrap().len(), 1);
+        },
+    );
+}
+
+#[test]
+fn allow_with_redaction_fails_closed_for_process_execution() {
+    let request = tool_request();
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let decision = policy_decision(
+        policy_request_for_tool(&request, evaluated_at),
+        PolicyEffect::AllowWithRedaction,
+    );
+    let decision_id = PolicyDecisionId::from_decision(&decision);
+    let (result, events, records) = execute_with_decision(decision, decision_id.clone());
+
+    assert_eq!(
+        result.unwrap(),
+        PreEffectOutcome::Denied(DeniedToolExecution::new(
+            ToolExecutionId::new("execution-orchestration").unwrap(),
+            ArtifactId::new("artifact-tool-request-1").unwrap(),
+            decision_id,
+        ))
+    );
+    assert_eq!(
+        events,
+        [
+            "publish",
+            "authority",
+            "clock",
+            "evaluate",
+            "record",
+            "resolve-denied",
+        ]
+    );
+    assert_eq!(records.len(), 1);
+}
+
+#[test]
+fn evaluator_echo_mutations_fail_integrity_before_recording() {
+    let request =
+        policy_request_for_tool(&tool_request(), Timestamp::from_unix_seconds(1_753_272_000));
     let mut mutations = Vec::new();
-    let mut changed = later.clone();
+
+    let mut changed = request.clone();
     changed.task_id = TaskId::new("task-2").unwrap();
     mutations.push(changed);
-    let mut changed = later.clone();
+    let mut changed = request.clone();
     changed.actor.connection_id = "connection-2".to_owned();
     mutations.push(changed);
-    let mut changed = later.clone();
+    let mut changed = request.clone();
     changed.actor.agent_id = "agent-2".to_owned();
     mutations.push(changed);
-    let mut changed = later.clone();
-    changed.actor.trust_tier = TrustTier::BrokeredProcess;
+    let mut changed = request.clone();
+    changed.actor.trust_tier = TrustTier::CoreAdapter;
     mutations.push(changed);
-    let mut changed = later.clone();
+    let mut changed = request.clone();
     changed.actor.locality = ActorLocality::Cloud;
     mutations.push(changed);
-    let mut changed = later.clone();
+    let mut changed = request.clone();
     changed.action = PolicyAction::new("process.check").unwrap();
     mutations.push(changed);
-    let mut changed = later.clone();
+    let mut changed = request.clone();
     changed.resource.capability =
         CapabilityRef::worktree(TaskId::new("task-1").unwrap(), "src").unwrap();
     mutations.push(changed);
-    let mut changed = later.clone();
+    let mut changed = request.clone();
     changed.resource.content_digest = digest('c');
     mutations.push(changed);
-    let mut changed = later.clone();
-    changed.resource.resource_class = ResourceClass::Restricted;
-    mutations.push(changed);
-    let mut changed = later.clone();
+    let mut changed = request.clone();
     changed.task_risk = TaskRisk::Critical;
     mutations.push(changed);
-    let mut changed = later.clone();
-    changed.workflow_phase = Phase::Verification.as_str().to_owned();
+    let mut changed = request.clone();
+    changed.workflow_phase = "Verification".to_owned();
     mutations.push(changed);
-    let mut changed = later.clone();
-    changed.purpose = "different purpose".to_owned();
+    let mut changed = request.clone();
+    changed.purpose = "mutated purpose".to_owned();
     mutations.push(changed);
-    let mut changed = later;
+    let mut changed = request.clone();
     changed.policy_snapshot_digest = digest('c');
+    mutations.push(changed);
+    let mut changed = request;
+    changed.evaluated_at = Timestamp::from_unix_seconds(1_753_272_001);
     mutations.push(changed);
 
     for mutation in mutations {
-        assert_ne!(
-            canonical_policy_binding_digest(&mutation).unwrap(),
-            expected
+        let decision = policy_decision(mutation, PolicyEffect::Allow);
+        let expected_id = PolicyDecisionId::from_decision(&decision);
+        let (result, events, records) = execute_with_decision(decision, expected_id);
+
+        assert_eq!(
+            result.unwrap_err().safe_classification(),
+            SafeErrorClassification::IntegrityFailure
         );
+        assert_eq!(events, ["publish", "authority", "clock", "evaluate"]);
+        assert!(records.is_empty());
     }
 }
 
-use local_agent_terminal_domain::{
-    ActorLocality, ArtifactId, CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken,
-    NetworkProfile, Phase, PlanStepId, PolicyAction, PolicyActor, PolicyResource, ProcessBinding,
-    ProcessInvocation, ProcessToolRequest, ProcessTrustTier, ResourceClass, RunId, Sha256Digest,
-    TaskId, TaskRisk, Timestamp, TrustTier, WorkspaceVersion,
+#[test]
+fn evaluator_resource_class_may_upgrade_but_not_downgrade() {
+    let request =
+        policy_request_for_tool(&tool_request(), Timestamp::from_unix_seconds(1_753_272_000));
+
+    let mut upgraded = request.clone();
+    upgraded.resource.resource_class = ResourceClass::Secret;
+    let upgraded_decision = policy_decision(upgraded, PolicyEffect::Allow);
+    let upgraded_id = PolicyDecisionId::from_decision(&upgraded_decision);
+    let (result, events, records) = execute_with_decision(upgraded_decision, upgraded_id.clone());
+    let PreEffectOutcome::Allowed(ready) = result.unwrap() else {
+        panic!("resource-class upgrade did not remain allowable");
+    };
+    assert_eq!(ready.policy_decision_id(), &upgraded_id);
+    assert_eq!(
+        events,
+        ["publish", "authority", "clock", "evaluate", "record"]
+    );
+    assert_eq!(records.len(), 1);
+
+    let mut downgraded = request;
+    downgraded.resource.resource_class = ResourceClass::Public;
+    let downgraded_decision = policy_decision(downgraded, PolicyEffect::Allow);
+    let downgraded_id = PolicyDecisionId::from_decision(&downgraded_decision);
+    let (result, events, records) = execute_with_decision(downgraded_decision, downgraded_id);
+    assert_eq!(
+        result.unwrap_err().safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(events, ["publish", "authority", "clock", "evaluate"]);
+    assert!(records.is_empty());
+}
+
+#[test]
+fn decision_id_mismatch_fails_integrity_after_one_record() {
+    let request = tool_request();
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let decision = policy_decision(
+        policy_request_for_tool(&request, evaluated_at),
+        PolicyEffect::Allow,
+    );
+    let wrong_id = PolicyDecisionId::from_decision(&policy_decision_with_digest(
+        policy_request_for_tool(&request, evaluated_at),
+        PolicyEffect::Allow,
+        'd',
+    ));
+    let (result, events, records) = execute_with_decision(decision, wrong_id);
+
+    assert_eq!(
+        result.unwrap_err().safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(
+        events,
+        ["publish", "authority", "clock", "evaluate", "record"]
+    );
+    assert_eq!(records.len(), 1);
+}
+
+#[test]
+fn invalid_clock_timestamp_stops_before_policy_evaluation() {
+    let request = tool_request();
+    let events = Mutex::new(Vec::new());
+    let records = Mutex::new(Vec::new());
+    let publisher = RecordingPublisher {
+        events: &events,
+        artifact_id: ArtifactId::new("artifact-tool-request-1").unwrap(),
+    };
+    let clock = RecordingClock {
+        events: &events,
+        value: "not-a-timestamp",
+    };
+    let evaluator = RecordingEvaluator {
+        events: &events,
+        decision: policy_decision(
+            policy_request_for_tool(&request, Timestamp::from_unix_seconds(1_753_272_000)),
+            PolicyEffect::Allow,
+        ),
+    };
+    let policy_store = RecordingPolicyStore {
+        events: &events,
+        records: &records,
+        decision_id: PolicyDecisionId::from_decision(&evaluator.decision),
+    };
+    let authority = RecordingAuthority {
+        events: &events,
+        current: request.clone(),
+    };
+    let ids = SequenceIds::new(&events);
+    let approval_requests = RecordingApprovalPublisher::new();
+    let resumes = UnusedResumeStore;
+    let orchestrator = ToolExecutionOrchestration::new(
+        &publisher,
+        &authority,
+        &clock,
+        &evaluator,
+        &policy_store,
+        &ids,
+        &approval_requests,
+        &resumes,
+        &resumes,
+        &NO_DENIALS,
+    );
+
+    let result = orchestrator.execute(request);
+
+    assert_eq!(
+        result.unwrap_err().safe_classification(),
+        SafeErrorClassification::InvalidInput
+    );
+    assert_eq!(
+        events.into_inner().unwrap(),
+        ["publish", "authority", "clock"]
+    );
+    assert!(records.into_inner().unwrap().is_empty());
+}
+
+#[test]
+fn authoritative_request_mutation_stops_before_policy_evaluation() {
+    let request = tool_request();
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let decision = policy_decision(
+        policy_request_for_tool(&request, evaluated_at),
+        PolicyEffect::Allow,
+    );
+    let decision_id = PolicyDecisionId::from_decision(&decision);
+
+    let (result, events, records) = execute_with_authority(
+        tool_request_with_argv(vec!["check".to_owned()]),
+        decision,
+        decision_id,
+    );
+
+    assert_eq!(
+        result.unwrap_err().safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(events, ["publish", "authority"]);
+    assert!(records.is_empty());
+}
+
+static NO_DENIALS: TestExecutionStore<'static> = TestExecutionStore {
+    events: None,
+    denied: Mutex::new(None),
+    claim_authority: None,
+    authorized_claims: Mutex::new(Vec::new()),
+    resolutions: Mutex::new(Vec::new()),
 };
 
-#[test]
-fn claimed_execution_orders_begin_effect_resolve_and_preserves_claim_authority() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let authority = claim_authority(
-        fixture.request.execution_id.clone(),
-        fixture.operation_digest.clone(),
-    );
-    let sequence = recording_sequence();
-    let store = RecordingStore::claiming(authority.clone(), sequence.clone());
-    let executor = RecordingExecutor::succeeding(
-        process_receipt(
-            fixture.request.execution_id.clone(),
-            ProcessStatus::Exited,
-            Some(0),
-        ),
-        sequence.clone(),
-    );
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let outcome = use_case.execute(fixture.request).unwrap();
-
-    assert_eq!(
-        sequence.lock().unwrap().as_slice(),
-        ["begin", "effect", "resolve"]
-    );
-    assert_eq!(executor.calls(), 1);
-    let writes = store.terminal_writes();
-    assert_eq!(writes.len(), 1);
-    assert_eq!(writes[0].authority(), &authority);
-    assert_eq!(
-        writes[0].receipt().terminal(),
-        &ToolExecutionTerminal::succeeded(ToolExecutionOutput {
-            exit_code: Some(0),
-            output_digest: digest('9'),
-            duration_ms: 25,
-            artifacts: unavailable_process_artifacts(),
-        })
-        .unwrap()
-    );
-    assert_eq!(
-        outcome,
-        DurableToolExecutionOutcome::Completed(writes[0].receipt().clone())
-    );
+struct TestExecutionStore<'a> {
+    events: Option<&'a Mutex<Vec<&'static str>>>,
+    denied: Mutex<Option<DeniedToolExecution>>,
+    claim_authority: Option<ToolExecutionClaimAuthority>,
+    authorized_claims: Mutex<Vec<AuthorizedToolExecutionClaim>>,
+    resolutions: Mutex<Vec<ToolExecutionResolution>>,
 }
 
-#[test]
-fn operation_digest_is_revalidated_before_begin_and_distinguishes_duplicates() {
-    let first = authorized_fixture("execution-a", "test");
-    let second = authorized_fixture("execution-a", "check");
-    assert_ne!(first.operation_digest, second.operation_digest);
-    let sequence = recording_sequence();
-    let completed = durable_receipt(
-        claim_authority(
-            ToolExecutionId::new("execution-a").unwrap(),
-            first.operation_digest.clone(),
-        ),
-        ToolExecutionTerminal::interrupted(),
-    );
-    let store = RecordingStore::digest_checking(completed, sequence.clone());
-    let executor = RecordingExecutor::failing(internal_failure(), sequence);
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    use_case.execute(first.request).unwrap();
-    let error = use_case.execute(second.request).unwrap_err();
-
-    assert_eq!(
-        error.safe_classification(),
-        SafeErrorClassification::Conflict
-    );
-    assert_eq!(
-        store
-            .begin_requests()
-            .iter()
-            .map(|request| request.operation_digest.clone())
-            .collect::<Vec<_>>(),
-        vec![first.operation_digest, second.operation_digest]
-    );
-    assert_eq!(executor.calls(), 0);
-}
-
-#[test]
-fn in_flight_claim_stops_after_begin() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let evidence = recovery_evidence(
-        fixture.request.execution_id.clone(),
-        fixture.operation_digest.clone(),
-        ToolExecutionRecoveryState::Started,
-    );
-    let sequence = recording_sequence();
-    let store = RecordingStore::with_claim(
-        Ok(ToolExecutionClaim::InFlight(evidence.clone())),
-        sequence.clone(),
-    );
-    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let outcome = use_case.execute(fixture.request).unwrap();
-
-    assert_eq!(outcome, DurableToolExecutionOutcome::InFlight(evidence));
-    assert_eq!(sequence.lock().unwrap().as_slice(), ["begin"]);
-    assert_eq!(executor.calls(), 0);
-    assert!(store.terminal_writes().is_empty());
-}
-
-#[test]
-fn in_flight_claim_rejects_indeterminate_recovery_state() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let evidence = recovery_evidence(
-        fixture.request.execution_id.clone(),
-        fixture.operation_digest.clone(),
-        ToolExecutionRecoveryState::Indeterminate,
-    );
-    let sequence = recording_sequence();
-    let store =
-        RecordingStore::with_claim(Ok(ToolExecutionClaim::InFlight(evidence)), sequence.clone());
-    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let error = use_case.execute(fixture.request).unwrap_err();
-
-    assert_eq!(
-        error.safe_classification(),
-        SafeErrorClassification::IntegrityFailure
-    );
-    assert_eq!(sequence.lock().unwrap().as_slice(), ["begin"]);
-    assert_eq!(executor.calls(), 0);
-    assert!(store.terminal_writes().is_empty());
-}
-
-#[test]
-fn completed_claim_stops_after_begin_and_returns_exact_durable_receipt() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let authority = claim_authority(
-        fixture.request.execution_id.clone(),
-        fixture.operation_digest.clone(),
-    );
-    let receipt = durable_receipt(
-        authority,
-        ToolExecutionTerminal::failed(ToolExecutionOutput {
-            exit_code: Some(3),
-            output_digest: digest('7'),
-            duration_ms: 91,
-            artifacts: available_process_artifacts(),
-        })
-        .unwrap(),
-    );
-    let sequence = recording_sequence();
-    let store = RecordingStore::with_claim(
-        Ok(ToolExecutionClaim::Completed(receipt.clone())),
-        sequence.clone(),
-    );
-    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let outcome = use_case.execute(fixture.request).unwrap();
-
-    assert_eq!(outcome, DurableToolExecutionOutcome::Completed(receipt));
-    assert_eq!(sequence.lock().unwrap().as_slice(), ["begin"]);
-    assert_eq!(executor.calls(), 0);
-    assert!(store.terminal_writes().is_empty());
-}
-
-#[test]
-fn indeterminate_claim_stops_after_begin_without_retry_implication() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let evidence = recovery_evidence(
-        fixture.request.execution_id.clone(),
-        fixture.operation_digest.clone(),
-        ToolExecutionRecoveryState::Indeterminate,
-    );
-    let sequence = recording_sequence();
-    let store = RecordingStore::with_claim(
-        Ok(ToolExecutionClaim::Indeterminate(evidence.clone())),
-        sequence.clone(),
-    );
-    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let outcome = use_case.execute(fixture.request).unwrap();
-
-    assert_eq!(
-        outcome,
-        DurableToolExecutionOutcome::Indeterminate(evidence)
-    );
-    assert_eq!(sequence.lock().unwrap().as_slice(), ["begin"]);
-    assert_eq!(executor.calls(), 0);
-    assert!(store.terminal_writes().is_empty());
-}
-
-#[test]
-fn indeterminate_claim_rejects_started_recovery_state() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let evidence = recovery_evidence(
-        fixture.request.execution_id.clone(),
-        fixture.operation_digest.clone(),
-        ToolExecutionRecoveryState::Started,
-    );
-    let sequence = recording_sequence();
-    let store = RecordingStore::with_claim(
-        Ok(ToolExecutionClaim::Indeterminate(evidence)),
-        sequence.clone(),
-    );
-    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let error = use_case.execute(fixture.request).unwrap_err();
-
-    assert_eq!(
-        error.safe_classification(),
-        SafeErrorClassification::IntegrityFailure
-    );
-    assert_eq!(sequence.lock().unwrap().as_slice(), ["begin"]);
-    assert_eq!(executor.calls(), 0);
-    assert!(store.terminal_writes().is_empty());
-}
-
-#[test]
-fn mismatched_in_flight_response_fails_closed_after_begin() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let evidence = recovery_evidence(
-        ToolExecutionId::new("execution-b").unwrap(),
-        fixture.operation_digest.clone(),
-        ToolExecutionRecoveryState::Started,
-    );
-    let sequence = recording_sequence();
-    let store =
-        RecordingStore::with_claim(Ok(ToolExecutionClaim::InFlight(evidence)), sequence.clone());
-    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let error = use_case.execute(fixture.request).unwrap_err();
-
-    assert_eq!(
-        error.safe_classification(),
-        SafeErrorClassification::IntegrityFailure
-    );
-    assert_eq!(sequence.lock().unwrap().as_slice(), ["begin"]);
-    assert_eq!(executor.calls(), 0);
-    assert!(store.terminal_writes().is_empty());
-}
-
-#[test]
-fn mismatched_process_binding_authority_fails_closed_after_begin() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let mut evidence = recovery_evidence(
-        fixture.request.execution_id.clone(),
-        fixture.operation_digest.clone(),
-        ToolExecutionRecoveryState::Started,
-    );
-    evidence.process_binding = Some(
-        AuthoritativeProcessBinding::new(
-            claim_authority(
-                ToolExecutionId::new("execution-b").unwrap(),
-                fixture.operation_digest.clone(),
-            ),
-            4_242,
-            "job-mismatched-authority",
-        )
-        .unwrap(),
-    );
-    let sequence = recording_sequence();
-    let store =
-        RecordingStore::with_claim(Ok(ToolExecutionClaim::InFlight(evidence)), sequence.clone());
-    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let error = use_case.execute(fixture.request).unwrap_err();
-
-    assert_eq!(
-        error.safe_classification(),
-        SafeErrorClassification::IntegrityFailure
-    );
-    assert_eq!(sequence.lock().unwrap().as_slice(), ["begin"]);
-    assert_eq!(executor.calls(), 0);
-    assert!(store.terminal_writes().is_empty());
-}
-
-#[test]
-fn mismatched_completed_response_fails_closed_after_begin() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let receipt = durable_receipt(
-        claim_authority(
-            ToolExecutionId::new("execution-b").unwrap(),
-            fixture.operation_digest.clone(),
-        ),
-        ToolExecutionTerminal::interrupted(),
-    );
-    let sequence = recording_sequence();
-    let store =
-        RecordingStore::with_claim(Ok(ToolExecutionClaim::Completed(receipt)), sequence.clone());
-    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let error = use_case.execute(fixture.request).unwrap_err();
-
-    assert_eq!(
-        error.safe_classification(),
-        SafeErrorClassification::IntegrityFailure
-    );
-    assert_eq!(sequence.lock().unwrap().as_slice(), ["begin"]);
-    assert_eq!(executor.calls(), 0);
-    assert!(store.terminal_writes().is_empty());
-}
-
-#[test]
-fn mismatched_indeterminate_response_fails_closed_after_begin() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let mut evidence = recovery_evidence(
-        fixture.request.execution_id.clone(),
-        fixture.operation_digest.clone(),
-        ToolExecutionRecoveryState::Indeterminate,
-    );
-    evidence.task_id = TaskId::new("task-2").unwrap();
-    let sequence = recording_sequence();
-    let store = RecordingStore::with_claim(
-        Ok(ToolExecutionClaim::Indeterminate(evidence)),
-        sequence.clone(),
-    );
-    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let error = use_case.execute(fixture.request).unwrap_err();
-
-    assert_eq!(
-        error.safe_classification(),
-        SafeErrorClassification::IntegrityFailure
-    );
-    assert_eq!(sequence.lock().unwrap().as_slice(), ["begin"]);
-    assert_eq!(executor.calls(), 0);
-    assert!(store.terminal_writes().is_empty());
-}
-
-#[test]
-fn begin_failure_stops_after_begin() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let sequence = recording_sequence();
-    let store = RecordingStore::with_claim(Err(unavailable()), sequence.clone());
-    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let error = use_case.execute(fixture.request).unwrap_err();
-
-    assert_eq!(error, unavailable());
-    assert_eq!(sequence.lock().unwrap().as_slice(), ["begin"]);
-    assert_eq!(executor.calls(), 0);
-    assert!(store.terminal_writes().is_empty());
-}
-
-#[test]
-fn generic_executor_error_resolves_indeterminate_with_safe_metadata() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let authority = claim_authority(
-        fixture.request.execution_id.clone(),
-        fixture.operation_digest.clone(),
-    );
-    let sequence = recording_sequence();
-    let store = RecordingStore::claiming(authority.clone(), sequence.clone());
-    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let outcome = use_case.execute(fixture.request).unwrap();
-
-    assert_eq!(
-        sequence.lock().unwrap().as_slice(),
-        ["begin", "effect", "resolve"]
-    );
-    let writes = store.terminal_writes();
-    assert_eq!(writes.len(), 1);
-    assert_eq!(writes[0].authority(), &authority);
-    assert_eq!(
-        writes[0].receipt().terminal(),
-        &ToolExecutionTerminal::indeterminate(SafeToolExecutionError {
-            classification: SafeErrorClassification::Internal,
-            retryability: Retryability::NonRetryable,
-        })
-    );
-    assert_eq!(
-        outcome,
-        DurableToolExecutionOutcome::Completed(writes[0].receipt().clone())
-    );
-}
-
-#[test]
-fn terminal_persistence_failure_returns_typed_unresolved_outcome() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let authority = claim_authority(
-        fixture.request.execution_id.clone(),
-        fixture.operation_digest.clone(),
-    );
-    let sequence = recording_sequence();
-    let store = RecordingStore::claiming(authority.clone(), sequence.clone())
-        .with_resolution_error(unavailable());
-    let executor = RecordingExecutor::succeeding(
-        process_receipt(
-            fixture.request.execution_id.clone(),
-            ProcessStatus::Exited,
-            Some(0),
-        ),
-        sequence.clone(),
-    );
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let outcome = use_case.execute(fixture.request).unwrap();
-
-    let attempted_resolution = store.terminal_writes()[0].clone();
-    assert_eq!(
-        outcome,
-        DurableToolExecutionOutcome::TerminalPersistenceUnresolved {
-            resolution: attempted_resolution,
-            error: SafeToolExecutionError {
-                classification: SafeErrorClassification::Unavailable,
-                retryability: Retryability::Retryable,
-            },
+impl<'a> TestExecutionStore<'a> {
+    fn recording(events: &'a Mutex<Vec<&'static str>>) -> Self {
+        Self {
+            events: Some(events),
+            denied: Mutex::new(None),
+            claim_authority: None,
+            authorized_claims: Mutex::new(Vec::new()),
+            resolutions: Mutex::new(Vec::new()),
         }
-    );
-    assert_eq!(
-        sequence.lock().unwrap().as_slice(),
-        ["begin", "effect", "resolve"]
-    );
-}
+    }
 
-#[test]
-fn executor_receipt_for_b_resolves_a_as_indeterminate_and_never_writes_b() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let authority = claim_authority(
-        fixture.request.execution_id.clone(),
-        fixture.operation_digest.clone(),
-    );
-    let sequence = recording_sequence();
-    let store = RecordingStore::claiming(authority.clone(), sequence.clone());
-    let executor = RecordingExecutor::succeeding(
-        process_receipt(
-            ToolExecutionId::new("execution-b").unwrap(),
-            ProcessStatus::Exited,
-            Some(0),
-        ),
-        sequence.clone(),
-    );
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let outcome = use_case.execute(fixture.request).unwrap();
-
-    let writes = store.terminal_writes();
-    assert_eq!(writes.len(), 1);
-    assert_eq!(writes[0].authority(), &authority);
-    assert_eq!(
-        writes[0].receipt(),
-        &DurableToolExecutionReceipt::new(
-            authority.clone(),
-            ToolExecutionTerminal::indeterminate(SafeToolExecutionError {
-                classification: SafeErrorClassification::IntegrityFailure,
-                retryability: Retryability::NonRetryable,
-            }),
-        )
-    );
-    assert!(writes
-        .iter()
-        .all(|write| write.authority().execution_id().as_str() != "execution-b"));
-    assert_eq!(
-        outcome,
-        DurableToolExecutionOutcome::Completed(writes[0].receipt().clone())
-    );
-    assert_eq!(
-        sequence.lock().unwrap().as_slice(),
-        ["begin", "effect", "resolve"]
-    );
-}
-
-#[test]
-fn nonzero_exit_is_failed_and_retains_safe_durable_evidence() {
-    assert_failed_process_outcome(Some(23));
-}
-
-#[test]
-fn absent_exit_code_is_failed_and_retains_safe_durable_evidence() {
-    assert_failed_process_outcome(None);
-}
-
-#[test]
-fn process_terminal_constructors_reject_contradictory_exit_states() {
-    assert!(ToolExecutionTerminal::succeeded(process_output(Some(9))).is_err());
-    assert!(ToolExecutionTerminal::succeeded(process_output(None)).is_err());
-    assert!(ToolExecutionTerminal::failed(process_output(Some(0))).is_err());
-    assert!(ToolExecutionTerminal::terminated(process_output(Some(0))).is_err());
-}
-
-#[test]
-fn terminal_accessors_expose_only_kind_appropriate_evidence() {
-    let failed = ToolExecutionTerminal::failed(process_output(Some(9))).unwrap();
-    assert_eq!(failed.kind(), ToolExecutionTerminalKind::Failed);
-    assert_eq!(failed.output().unwrap().exit_code, Some(9));
-    assert_eq!(failed.error(), None);
-
-    let error = SafeToolExecutionError {
-        classification: SafeErrorClassification::Unavailable,
-        retryability: Retryability::Retryable,
-    };
-    let indeterminate = ToolExecutionTerminal::indeterminate(error);
-    assert_eq!(
-        indeterminate.kind(),
-        ToolExecutionTerminalKind::Indeterminate
-    );
-    assert_eq!(indeterminate.output(), None);
-    assert_eq!(indeterminate.error(), Some(&error));
-}
-
-#[test]
-fn recovered_process_termination_requires_exact_authoritative_evidence() {
-    let authority = claim_authority(
-        ToolExecutionId::new("execution-recovery").unwrap(),
-        digest('a'),
-    );
-    let binding =
-        AuthoritativeProcessBinding::new(authority.clone(), 4_242, "job-recovery").unwrap();
-    let exact = CancellationReceipt {
-        execution_id: authority.execution_id().clone(),
-        status: ProcessStatus::Terminated,
-        job_receipt: Some(JobReceipt {
-            root_pid: binding.root_pid(),
-            job_id: binding.job_id().to_owned(),
-            kill_on_close: true,
-            no_breakaway: true,
-            job_memory_limit: true,
-            job_cpu_time_limit: true,
-            memory_limit_bytes: 64,
-            cpu_time_limit_ms: 32,
-            max_active_processes: 1,
-            total_user_time_ms: 7,
-            resource_limit_terminated: false,
-            tree_terminated: true,
-        }),
-        cancelled: true,
-    };
-    let termination = AuthoritativeProcessTermination::new(binding.clone(), exact.clone()).unwrap();
-    let error = SafeToolExecutionError {
-        classification: SafeErrorClassification::Unavailable,
-        retryability: Retryability::NonRetryable,
-    };
-
-    let durable = DurableToolExecutionReceipt::recovered_process_termination(
-        error.classification,
-        termination.clone(),
-    );
-
-    assert_eq!(durable.authority(), &authority);
-    assert_eq!(
-        durable.terminal().kind(),
-        ToolExecutionTerminalKind::Indeterminate
-    );
-    assert_eq!(durable.terminal().error(), Some(&error));
-    assert_eq!(durable.process_termination(), Some(&termination));
-    assert_eq!(termination.binding(), &binding);
-    assert_eq!(termination.receipt(), &exact);
-    let ordinary_retryable = DurableToolExecutionReceipt::new(
-        authority.clone(),
-        ToolExecutionTerminal::indeterminate(SafeToolExecutionError {
-            classification: SafeErrorClassification::Unavailable,
-            retryability: Retryability::Retryable,
-        }),
-    );
-    assert_eq!(
-        ordinary_retryable.terminal().error().unwrap().retryability,
-        Retryability::Retryable
-    );
-    assert_eq!(ordinary_retryable.process_termination(), None);
-
-    let mut invalid = Vec::new();
-    let mut receipt = exact.clone();
-    receipt.execution_id = ToolExecutionId::new("execution-other").unwrap();
-    invalid.push(receipt);
-    let mut receipt = exact.clone();
-    receipt.status = ProcessStatus::Exited;
-    invalid.push(receipt);
-    let mut receipt = exact.clone();
-    receipt.cancelled = false;
-    invalid.push(receipt);
-    let mut receipt = exact.clone();
-    receipt.job_receipt = None;
-    invalid.push(receipt);
-    for field in [
-        "root_pid",
-        "job_id",
-        "kill_on_close",
-        "no_breakaway",
-        "tree_terminated",
-    ] {
-        let mut receipt = exact.clone();
-        let job = receipt.job_receipt.as_mut().unwrap();
-        match field {
-            "root_pid" => job.root_pid += 1,
-            "job_id" => job.job_id.push_str("-other"),
-            "kill_on_close" => job.kill_on_close = false,
-            "no_breakaway" => job.no_breakaway = false,
-            "tree_terminated" => job.tree_terminated = false,
-            _ => unreachable!(),
+    fn replaying(events: &'a Mutex<Vec<&'static str>>, denied: DeniedToolExecution) -> Self {
+        Self {
+            events: Some(events),
+            denied: Mutex::new(Some(denied)),
+            claim_authority: None,
+            authorized_claims: Mutex::new(Vec::new()),
+            resolutions: Mutex::new(Vec::new()),
         }
-        invalid.push(receipt);
-    }
-    for receipt in invalid {
-        assert!(AuthoritativeProcessTermination::new(binding.clone(), receipt).is_err());
-    }
-}
-
-#[test]
-fn artifact_evidence_has_fixed_stream_slots_and_ordered_observed_writes() {
-    let artifacts = available_process_artifacts();
-
-    assert_eq!(
-        artifacts.stdout(),
-        &DurableToolExecutionArtifact::Available(ArtifactId::new("artifact-stdout").unwrap())
-    );
-    assert_eq!(
-        artifacts.stderr(),
-        &DurableToolExecutionArtifact::Available(ArtifactId::new("artifact-stderr").unwrap())
-    );
-    assert_eq!(
-        artifacts.observed_writes(),
-        &[DurableToolExecutionArtifact::Available(
-            ArtifactId::new("artifact-write-0").unwrap()
-        )]
-    );
-}
-
-#[test]
-fn incomplete_listing_returns_authoritative_recovery_evidence_read_only() {
-    let fixture = authorized_fixture("execution-a", "test");
-    let evidence = recovery_evidence(
-        fixture.request.execution_id.clone(),
-        fixture.operation_digest.clone(),
-        ToolExecutionRecoveryState::Indeterminate,
-    );
-    let records = vec![IncompleteToolExecution::Indeterminate(evidence.clone())];
-    let sequence = recording_sequence();
-    let store = RecordingStore::with_incomplete(records.clone(), sequence.clone());
-    let executor = RecordingExecutor::failing(internal_failure(), sequence.clone());
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let observed = use_case.incomplete().unwrap();
-
-    assert_eq!(observed, records);
-    assert_eq!(evidence.task_id, TaskId::new("task-1").unwrap());
-    assert_eq!(
-        evidence.authority.owner_run_id(),
-        &RunId::new("run-1").unwrap()
-    );
-    assert_eq!(
-        evidence.canonical_request_artifact_id,
-        ArtifactId::new("artifact-request-a").unwrap()
-    );
-    assert_eq!(evidence.idempotency_class, IdempotencyClass::NonRepeatable);
-    assert_eq!(evidence.state, ToolExecutionRecoveryState::Indeterminate);
-    assert_eq!(evidence.process_binding, None);
-    assert_eq!(evidence.authority.attempt(), 7);
-    assert_eq!(
-        evidence.authority.executor_fencing_token(),
-        Some(FencingToken::new(19).unwrap())
-    );
-    assert_eq!(sequence.lock().unwrap().as_slice(), ["incomplete"]);
-    assert!(store.terminal_writes().is_empty());
-    assert_eq!(executor.calls(), 0);
-}
-
-fn assert_failed_process_outcome(exit_code: Option<i32>) {
-    let fixture = authorized_fixture("execution-a", "test");
-    let authority = claim_authority(
-        fixture.request.execution_id.clone(),
-        fixture.operation_digest.clone(),
-    );
-    let sequence = recording_sequence();
-    let store = RecordingStore::claiming(authority, sequence.clone());
-    let executor = RecordingExecutor::succeeding(
-        process_receipt(
-            fixture.request.execution_id.clone(),
-            ProcessStatus::Exited,
-            exit_code,
-        ),
-        sequence,
-    );
-    let use_case = ExecuteDurableTool::new(&store, &executor);
-
-    let outcome = use_case.execute(fixture.request).unwrap();
-
-    let DurableToolExecutionOutcome::Completed(receipt) = outcome else {
-        panic!("expected a durably resolved process failure");
-    };
-    assert_eq!(
-        receipt.terminal(),
-        &ToolExecutionTerminal::failed(ToolExecutionOutput {
-            exit_code,
-            output_digest: digest('9'),
-            duration_ms: 25,
-            artifacts: unavailable_process_artifacts(),
-        })
-        .unwrap()
-    );
-}
-
-type RecordingSequence = Arc<Mutex<Vec<&'static str>>>;
-
-fn recording_sequence() -> RecordingSequence {
-    Arc::new(Mutex::new(Vec::new()))
-}
-
-struct RecordingStore {
-    claim: Result<ToolExecutionClaim, PortError>,
-    cancellation_claim: Mutex<Result<ToolExecutionCancellationClaim, PortError>>,
-    incomplete: Vec<IncompleteToolExecution>,
-    sequence: RecordingSequence,
-    begin_requests: Mutex<Vec<NewToolExecution>>,
-    terminal_writes: Mutex<Vec<ToolExecutionResolution>>,
-    resolution_error: Option<PortError>,
-    enforce_first_digest: bool,
-}
-
-impl RecordingStore {
-    fn claiming(authority: ToolExecutionClaimAuthority, sequence: RecordingSequence) -> Self {
-        Self::with_claim(Ok(ToolExecutionClaim::Claimed(authority)), sequence)
     }
 
-    fn with_claim(
-        claim: Result<ToolExecutionClaim, PortError>,
-        sequence: RecordingSequence,
+    fn executing(
+        events: &'a Mutex<Vec<&'static str>>,
+        claim_authority: ToolExecutionClaimAuthority,
     ) -> Self {
         Self {
-            claim,
-            cancellation_claim: Mutex::new(Err(unavailable())),
-            incomplete: Vec::new(),
-            sequence,
-            begin_requests: Mutex::new(Vec::new()),
-            terminal_writes: Mutex::new(Vec::new()),
-            resolution_error: None,
-            enforce_first_digest: false,
+            events: Some(events),
+            denied: Mutex::new(None),
+            claim_authority: Some(claim_authority),
+            authorized_claims: Mutex::new(Vec::new()),
+            resolutions: Mutex::new(Vec::new()),
         }
-    }
-
-    fn with_cancellation_claim(
-        claim: ToolExecutionCancellationClaim,
-        sequence: RecordingSequence,
-    ) -> Self {
-        let store = Self::with_claim(Err(unavailable()), sequence);
-        *store.cancellation_claim.lock().unwrap() = Ok(claim);
-        store
-    }
-
-    fn set_cancellation_claim(&self, claim: ToolExecutionCancellationClaim) {
-        *self.cancellation_claim.lock().unwrap() = Ok(claim);
-    }
-
-    fn digest_checking(receipt: DurableToolExecutionReceipt, sequence: RecordingSequence) -> Self {
-        Self {
-            enforce_first_digest: true,
-            ..Self::with_claim(Ok(ToolExecutionClaim::Completed(receipt)), sequence)
-        }
-    }
-
-    fn with_incomplete(
-        incomplete: Vec<IncompleteToolExecution>,
-        sequence: RecordingSequence,
-    ) -> Self {
-        Self {
-            incomplete,
-            ..Self::with_claim(
-                Ok(ToolExecutionClaim::Completed(durable_receipt(
-                    claim_authority(ToolExecutionId::new("unused").unwrap(), digest('1')),
-                    ToolExecutionTerminal::interrupted(),
-                ))),
-                sequence,
-            )
-        }
-    }
-
-    fn with_resolution_error(mut self, error: PortError) -> Self {
-        self.resolution_error = Some(error);
-        self
-    }
-
-    fn begin_requests(&self) -> Vec<NewToolExecution> {
-        self.begin_requests.lock().unwrap().clone()
-    }
-
-    fn terminal_writes(&self) -> Vec<ToolExecutionResolution> {
-        self.terminal_writes.lock().unwrap().clone()
     }
 }
 
-impl ToolExecutionStore for RecordingStore {
-    fn reserve(&self, request: NewToolIntent) -> Result<OperationIntentSnapshot, PortError> {
-        Ok(OperationIntentSnapshot {
-            execution_id: request.execution_id,
-            operation_digest: request.operation_digest,
-        })
+impl ToolExecutionStore for TestExecutionStore<'_> {
+    fn reserve(&self, _: NewToolIntent) -> Result<OperationIntentSnapshot, PortError> {
+        unreachable!("pre-effect orchestration does not reserve execution intents")
     }
 
-    fn begin(&self, request: NewToolExecution) -> Result<ToolExecutionClaim, PortError> {
-        self.sequence.lock().unwrap().push("begin");
-        let mut requests = self.begin_requests.lock().unwrap();
-        let digest_mismatch = self.enforce_first_digest
-            && requests
-                .first()
-                .is_some_and(|first| first.operation_digest != request.operation_digest);
-        requests.push(request);
-        if digest_mismatch {
-            return Err(conflict());
-        }
-        self.claim.clone()
+    fn begin(&self, _: NewToolExecution) -> Result<ToolExecutionClaim, PortError> {
+        unreachable!("pre-effect orchestration does not begin execution")
     }
 
     fn begin_authorized(
         &self,
         request: AuthorizedToolExecutionClaim,
     ) -> Result<ToolExecutionClaim, PortError> {
-        self.begin(NewToolExecution {
-            execution_id: request.execution_id,
-            operation_digest: request.request_content_digest,
-        })
+        let authority = self
+            .claim_authority
+            .clone()
+            .unwrap_or_else(|| unreachable!("pre-effect orchestration does not begin execution"));
+        self.events
+            .expect("execution tests must use a recording execution store")
+            .lock()
+            .unwrap()
+            .push("begin-authorized");
+        self.authorized_claims.lock().unwrap().push(request);
+        Ok(ToolExecutionClaim::Claimed(authority))
     }
 
     fn load_denied(
         &self,
-        _: &local_agent_terminal_application::ArtifactId,
-        _: &local_agent_terminal_application::ImmutableToolRequest,
+        _: &ArtifactId,
+        _: &ImmutableToolRequest,
     ) -> Result<Option<DeniedToolExecution>, PortError> {
-        Ok(None)
+        Ok(self.denied.lock().unwrap().clone())
     }
 
     fn resolve_denied(
         &self,
-        _: ToolExecutionDenialRequest,
+        request: ToolExecutionDenialRequest,
     ) -> Result<DeniedToolExecution, PortError> {
-        Err(unavailable())
+        self.events
+            .expect("denial tests must use a recording execution store")
+            .lock()
+            .unwrap()
+            .push("resolve-denied");
+        let denied = DeniedToolExecution::new(
+            request.request.request().execution_id().clone(),
+            request.request_artifact_id,
+            request.policy_decision_id,
+        );
+        *self.denied.lock().unwrap() = Some(denied.clone());
+        Ok(denied)
     }
 
     fn resolve_terminal(
         &self,
         resolution: ToolExecutionResolution,
     ) -> Result<DurableToolExecutionReceipt, PortError> {
-        self.sequence.lock().unwrap().push("resolve");
-        self.terminal_writes
+        if self.claim_authority.is_none() {
+            unreachable!("pre-effect orchestration does not resolve execution");
+        }
+        self.events
+            .expect("execution tests must use a recording execution store")
             .lock()
             .unwrap()
-            .push(resolution.clone());
-        if let Some(error) = &self.resolution_error {
-            return Err(error.clone());
-        }
-        Ok(resolution.receipt().clone())
+            .push("resolve-terminal");
+        let receipt = resolution.receipt().clone();
+        self.resolutions.lock().unwrap().push(resolution);
+        Ok(receipt)
     }
 
     fn request_cancellation(
         &self,
-        _: &ToolExecutionId,
-    ) -> Result<ToolExecutionCancellationClaim, PortError> {
-        self.sequence.lock().unwrap().push("cancel_claim");
-        self.cancellation_claim.lock().unwrap().clone()
+        _: &local_agent_terminal_application::ToolExecutionId,
+    ) -> Result<local_agent_terminal_application::ToolExecutionCancellationClaim, PortError> {
+        unreachable!("pre-effect orchestration does not cancel execution")
     }
 
     fn incomplete(&self) -> Result<Vec<IncompleteToolExecution>, PortError> {
-        self.sequence.lock().unwrap().push("incomplete");
-        Ok(self.incomplete.clone())
+        unreachable!("pre-effect orchestration does not inspect incomplete execution")
     }
 }
 
-struct RecordingExecutor {
-    result: Mutex<Option<Result<ToolExecutionResult, PortError>>>,
-    calls: AtomicUsize,
-    cancel_calls: AtomicUsize,
-    sequence: RecordingSequence,
+struct RecordingStructuredExecutor<'a> {
+    events: &'a Mutex<Vec<&'static str>>,
 }
 
-impl RecordingExecutor {
-    fn succeeding(receipt: ProcessReceipt, sequence: RecordingSequence) -> Self {
-        Self {
-            result: Mutex::new(Some(Ok(ToolExecutionResult { receipt }))),
-            calls: AtomicUsize::new(0),
-            cancel_calls: AtomicUsize::new(0),
-            sequence,
-        }
-    }
-
-    fn failing(error: PortError, sequence: RecordingSequence) -> Self {
-        Self {
-            result: Mutex::new(Some(Err(error))),
-            calls: AtomicUsize::new(0),
-            cancel_calls: AtomicUsize::new(0),
-            sequence,
-        }
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-
-    fn cancel_calls(&self) -> usize {
-        self.cancel_calls.load(Ordering::SeqCst)
-    }
-}
-
-impl StructuredToolExecutor for RecordingExecutor {
-    fn execute(&self, _: AuthorizedToolRequest) -> Result<ToolExecutionResult, PortError> {
-        self.sequence.lock().unwrap().push("effect");
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.result.lock().unwrap().take().unwrap()
-    }
-
-    fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
-        self.sequence.lock().unwrap().push("cancel_effect");
-        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(CancellationReceipt {
-            execution_id: execution_id.clone(),
-            status: ProcessStatus::Terminated,
-            job_receipt: None,
-            cancelled: true,
+impl StructuredToolExecutor for RecordingStructuredExecutor<'_> {
+    fn execute(&self, request: AuthorizedToolRequest) -> Result<ToolExecutionResult, PortError> {
+        self.events.lock().unwrap().push("effect");
+        Ok(ToolExecutionResult {
+            receipt: ProcessReceipt {
+                execution_id: request.execution_id,
+                status: ProcessStatus::Exited,
+                exit_code: Some(0),
+                stdout: BoundedOutput {
+                    bytes: Vec::new(),
+                    truncated: false,
+                },
+                stderr: BoundedOutput {
+                    bytes: Vec::new(),
+                    truncated: false,
+                },
+                duration_ms: 1,
+                job_receipt: JobReceipt {
+                    root_pid: 42,
+                    job_id: "execution-orchestration".to_owned(),
+                    kill_on_close: true,
+                    no_breakaway: true,
+                    job_memory_limit: true,
+                    job_cpu_time_limit: true,
+                    memory_limit_bytes: 1024,
+                    cpu_time_limit_ms: 1000,
+                    max_active_processes: 1,
+                    total_user_time_ms: 1,
+                    resource_limit_terminated: false,
+                    tree_terminated: false,
+                },
+                observed_writes: Vec::new(),
+                output_digest: digest('9'),
+            },
         })
+    }
+
+    fn cancel(
+        &self,
+        _: &ToolExecutionId,
+    ) -> Result<local_agent_terminal_application::CancellationReceipt, PortError> {
+        unreachable!("execution test does not cancel")
     }
 
     fn file_read(
@@ -1360,14 +1291,14 @@ impl StructuredToolExecutor for RecordingExecutor {
         >,
         PortError,
     > {
-        unreachable!()
+        unreachable!("execution test does not read files")
     }
 
     fn file_write(
         &self,
         _: local_agent_terminal_application::FileWriteRequest,
     ) -> Result<local_agent_terminal_application::VerifiedWrite, PortError> {
-        unreachable!()
+        unreachable!("execution test does not write files")
     }
 
     fn git_status(
@@ -1379,7 +1310,7 @@ impl StructuredToolExecutor for RecordingExecutor {
         >,
         PortError,
     > {
-        unreachable!()
+        unreachable!("execution test does not query Git status")
     }
 
     fn git_diff(
@@ -1391,57 +1322,548 @@ impl StructuredToolExecutor for RecordingExecutor {
         >,
         PortError,
     > {
-        unreachable!()
+        unreachable!("execution test does not query Git diff")
     }
 }
 
-struct AuthorizedFixture {
-    request: AuthorizedToolRequest,
-    operation_digest: Sha256Digest,
+struct RecordingPublisher<'a> {
+    events: &'a Mutex<Vec<&'static str>>,
+    artifact_id: ArtifactId,
 }
 
-fn authorized_fixture(execution_id: &str, argument: &str) -> AuthorizedFixture {
-    let request = approved_process_request(argument);
-    let approval = approved_tool_binding(&request);
-    let operation_digest =
-        canonical_approval_payload(&ApprovalDigestPayload::Tool(approval.payload().clone()))
-            .unwrap()
-            .operation_digest;
-    AuthorizedFixture {
-        request: AuthorizedToolRequest::new(
-            ToolExecutionId::new(execution_id).unwrap(),
-            approval,
-            request,
-        ),
-        operation_digest,
+struct RecordingAuthority<'a> {
+    events: &'a Mutex<Vec<&'static str>>,
+    current: ToolRequest,
+}
+
+impl ToolAuthorityResolver for RecordingAuthority<'_> {
+    fn resolve(&self, _: &ToolRequest) -> Result<ToolAuthoritySnapshot, PortError> {
+        self.events.lock().unwrap().push("authority");
+        authority_snapshot(self.current.clone())
     }
 }
 
-fn approved_process_request(argument: &str) -> ApprovedProcessRequest {
-    approved_process_request_with(argument, Phase::Implementation, WorkspaceVersion::new(4))
+struct ChangingAuthority<'a> {
+    events: &'a Mutex<Vec<&'static str>>,
+    current: Mutex<VecDeque<ToolRequest>>,
 }
 
-fn approved_process_request_with(
-    argument: &str,
-    phase: Phase,
-    workspace_version: WorkspaceVersion,
-) -> ApprovedProcessRequest {
+impl ToolAuthorityResolver for ChangingAuthority<'_> {
+    fn resolve(&self, _: &ToolRequest) -> Result<ToolAuthoritySnapshot, PortError> {
+        self.events.lock().unwrap().push("authority");
+        authority_snapshot(
+            self.current
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("test authority observation"),
+        )
+    }
+}
+
+struct UnusedResumeStore;
+
+impl ApprovalResumeStore for UnusedResumeStore {
+    fn load_for_resume(
+        &self,
+        _: &ApprovalId,
+        _: Timestamp,
+    ) -> Result<ApprovalResumeSnapshot, PortError> {
+        unreachable!("initial execution does not read approval resume state")
+    }
+
+    fn load_approval_request(&self, _: &ApprovalId) -> Result<ToolApprovalRequest, PortError> {
+        unreachable!("initial execution does not read approval artifacts")
+    }
+}
+
+impl ToolExecutionResumeStore for UnusedResumeStore {
+    fn load_intent(&self, _: &ToolExecutionId) -> Result<ToolExecutionResumeSnapshot, PortError> {
+        unreachable!("initial execution does not read execution resume state")
+    }
+
+    fn load_request_artifact(&self, _: &ArtifactId) -> Result<ImmutableToolRequest, PortError> {
+        unreachable!("initial execution does not read request artifacts")
+    }
+}
+
+struct RecordingResumeStore<'a> {
+    events: &'a Mutex<Vec<&'static str>>,
+    checked_at: Timestamp,
+    approval: ApprovalResumeSnapshot,
+    execution: ToolExecutionResumeSnapshot,
+    approval_request: ToolApprovalRequest,
+    immutable: ImmutableToolRequest,
+}
+
+impl ApprovalResumeStore for RecordingResumeStore<'_> {
+    fn load_for_resume(
+        &self,
+        approval_id: &ApprovalId,
+        checked_at: Timestamp,
+    ) -> Result<ApprovalResumeSnapshot, PortError> {
+        assert_eq!(approval_id, &self.approval.approval_id);
+        assert_eq!(checked_at, self.checked_at);
+        self.events.lock().unwrap().push("approval-resume");
+        Ok(self.approval.clone())
+    }
+
+    fn load_approval_request(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<ToolApprovalRequest, PortError> {
+        assert_eq!(approval_id, self.approval_request.approval_id());
+        self.events.lock().unwrap().push("approval-artifact");
+        Ok(self.approval_request.clone())
+    }
+}
+
+impl ToolExecutionResumeStore for RecordingResumeStore<'_> {
+    fn load_intent(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<ToolExecutionResumeSnapshot, PortError> {
+        assert_eq!(execution_id, &self.execution.execution_id);
+        self.events.lock().unwrap().push("execution-resume");
+        Ok(self.execution.clone())
+    }
+
+    fn load_request_artifact(
+        &self,
+        artifact_id: &ArtifactId,
+    ) -> Result<ImmutableToolRequest, PortError> {
+        assert_eq!(artifact_id, &self.execution.request_artifact_id);
+        self.events.lock().unwrap().push("request-artifact");
+        Ok(self.immutable.clone())
+    }
+}
+
+impl ToolRequestPublisher for RecordingPublisher<'_> {
+    fn publish(&self, request: &ImmutableToolRequest) -> Result<ArtifactId, PortError> {
+        assert_eq!(
+            request.request().execution_id().as_str(),
+            "execution-orchestration"
+        );
+        self.events.lock().unwrap().push("publish");
+        Ok(self.artifact_id.clone())
+    }
+}
+
+struct RecordingClock<'a> {
+    events: &'a Mutex<Vec<&'static str>>,
+    value: &'static str,
+}
+
+impl Clock for RecordingClock<'_> {
+    fn now_utc(&self) -> Result<String, PortError> {
+        self.events.lock().unwrap().push("clock");
+        Ok(self.value.to_owned())
+    }
+}
+
+struct RecordingEvaluator<'a> {
+    events: &'a Mutex<Vec<&'static str>>,
+    decision: PolicyDecision,
+}
+
+impl PolicyEvaluator for RecordingEvaluator<'_> {
+    fn evaluate(&self, _request: PolicyRequest) -> Result<PolicyDecision, PortError> {
+        self.events.lock().unwrap().push("evaluate");
+        Ok(self.decision.clone())
+    }
+}
+
+struct RecordingPolicyStore<'a> {
+    events: &'a Mutex<Vec<&'static str>>,
+    records: &'a Mutex<Vec<RecordedPolicyDecision>>,
+    decision_id: PolicyDecisionId,
+}
+
+impl PolicyDecisionStore for RecordingPolicyStore<'_> {
+    fn record(&self, decision: RecordedPolicyDecision) -> Result<PolicyDecisionId, PortError> {
+        self.events.lock().unwrap().push("record");
+        self.records.lock().unwrap().push(decision);
+        Ok(self.decision_id.clone())
+    }
+}
+
+struct SequenceIds<'a> {
+    events: &'a Mutex<Vec<&'static str>>,
+    values: Mutex<VecDeque<String>>,
+}
+
+impl<'a> SequenceIds<'a> {
+    fn new(events: &'a Mutex<Vec<&'static str>>) -> Self {
+        Self::with_values(
+            events,
+            [
+                "approval-1",
+                "approval-artifact-1",
+                "0123456789abcdef0123456789abcdef",
+                "approval-2",
+                "approval-artifact-2",
+                "fedcba9876543210fedcba9876543210",
+            ],
+        )
+    }
+
+    fn with_values(
+        events: &'a Mutex<Vec<&'static str>>,
+        values: impl IntoIterator<Item = &'static str>,
+    ) -> Self {
+        Self {
+            events,
+            values: Mutex::new(values.into_iter().map(str::to_owned).collect()),
+        }
+    }
+}
+
+impl IdGenerator for SequenceIds<'_> {
+    fn next_id(&self) -> Result<String, PortError> {
+        self.events.lock().unwrap().push("id");
+        self.values.lock().unwrap().pop_front().ok_or_else(|| {
+            PortError::failure(
+                SafeErrorClassification::Unavailable,
+                Retryability::NonRetryable,
+            )
+        })
+    }
+}
+
+struct RecordingApprovalPublisher {
+    stored: Mutex<Option<ToolApprovalRequest>>,
+    candidates: Mutex<Vec<ToolApprovalRequest>>,
+    inserts: Mutex<usize>,
+}
+
+impl RecordingApprovalPublisher {
+    fn new() -> Self {
+        Self {
+            stored: Mutex::new(None),
+            candidates: Mutex::new(Vec::new()),
+            inserts: Mutex::new(0),
+        }
+    }
+}
+
+impl ToolApprovalRequestPublisher for RecordingApprovalPublisher {
+    fn publish_or_replay(
+        &self,
+        request: ToolApprovalRequest,
+    ) -> Result<ToolApprovalPublication, PortError> {
+        self.candidates.lock().unwrap().push(request.clone());
+        let mut stored = self.stored.lock().unwrap();
+        if let Some(existing) = stored.as_ref() {
+            return Ok(ToolApprovalPublication::Replayed(existing.clone()));
+        }
+        *self.inserts.lock().unwrap() += 1;
+        *stored = Some(request.clone());
+        Ok(ToolApprovalPublication::Created(request))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ApprovalTermMutation {
+    ApprovalId,
+    Nonce,
+    Expiry,
+}
+
+struct TamperingApprovalPublisher {
+    mutation: ApprovalTermMutation,
+}
+
+impl ToolApprovalRequestPublisher for TamperingApprovalPublisher {
+    fn publish_or_replay(
+        &self,
+        request: ToolApprovalRequest,
+    ) -> Result<ToolApprovalPublication, PortError> {
+        let approval_id = if matches!(self.mutation, ApprovalTermMutation::ApprovalId) {
+            ApprovalId::new("approval-mutated").unwrap()
+        } else {
+            request.approval_id().clone()
+        };
+        let mut payload = request.payload().clone();
+        if matches!(self.mutation, ApprovalTermMutation::Nonce) {
+            payload.nonce = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+        }
+        if matches!(self.mutation, ApprovalTermMutation::Expiry) {
+            payload.expires_at = "2025-07-23T12:16:00Z".to_owned();
+        }
+        let mutated = ToolApprovalRequest::from_persisted(
+            approval_id,
+            request.approval_artifact_id().clone(),
+            request.execution_id().clone(),
+            request.policy_decision_id().clone(),
+            request.policy_request_binding_digest().clone(),
+            request.tool_request_artifact_id().clone(),
+            request.tool_request_binding_digest().clone(),
+            payload,
+        )?;
+        Ok(ToolApprovalPublication::Created(mutated))
+    }
+}
+
+struct FailingApprovalPublisher;
+
+impl ToolApprovalRequestPublisher for FailingApprovalPublisher {
+    fn publish_or_replay(
+        &self,
+        _: ToolApprovalRequest,
+    ) -> Result<ToolApprovalPublication, PortError> {
+        Err(PortError::failure(
+            SafeErrorClassification::Unavailable,
+            Retryability::Retryable,
+        ))
+    }
+}
+
+fn with_require_approval_orchestrator<R>(
+    request: &ToolRequest,
+    approval_requests: &dyn ToolApprovalRequestPublisher,
+    policy_expires_at: Option<Timestamp>,
+    run: impl FnOnce(
+        &ToolExecutionOrchestration<'_>,
+        &Mutex<Vec<&'static str>>,
+        &Mutex<Vec<RecordedPolicyDecision>>,
+        &PolicyDecisionId,
+    ) -> R,
+) -> R {
+    let events = Mutex::new(Vec::new());
+    let records = Mutex::new(Vec::new());
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let decision = policy_decision_with_expiry(
+        policy_request_for_tool(request, evaluated_at),
+        PolicyEffect::RequireApproval,
+        policy_expires_at,
+    );
+    let decision_id = PolicyDecisionId::from_decision(&decision);
+    let publisher = RecordingPublisher {
+        events: &events,
+        artifact_id: ArtifactId::new("artifact-tool-request-1").unwrap(),
+    };
+    let clock = RecordingClock {
+        events: &events,
+        value: "2025-07-23T12:00:00Z",
+    };
+    let evaluator = RecordingEvaluator {
+        events: &events,
+        decision,
+    };
+    let policy_store = RecordingPolicyStore {
+        events: &events,
+        records: &records,
+        decision_id: decision_id.clone(),
+    };
+    let authority = RecordingAuthority {
+        events: &events,
+        current: request.clone(),
+    };
+    let ids = SequenceIds::new(&events);
+    let resumes = UnusedResumeStore;
+    let orchestrator = ToolExecutionOrchestration::new(
+        &publisher,
+        &authority,
+        &clock,
+        &evaluator,
+        &policy_store,
+        &ids,
+        approval_requests,
+        &resumes,
+        &resumes,
+        &NO_DENIALS,
+    );
+    run(&orchestrator, &events, &records, &decision_id)
+}
+
+fn execute_with_decision(
+    decision: PolicyDecision,
+    decision_id: PolicyDecisionId,
+) -> (
+    Result<PreEffectOutcome, PortError>,
+    Vec<&'static str>,
+    Vec<RecordedPolicyDecision>,
+) {
+    execute_with_authority(tool_request(), decision, decision_id)
+}
+
+fn execute_with_authority(
+    current_request: ToolRequest,
+    decision: PolicyDecision,
+    decision_id: PolicyDecisionId,
+) -> (
+    Result<PreEffectOutcome, PortError>,
+    Vec<&'static str>,
+    Vec<RecordedPolicyDecision>,
+) {
+    let events = Mutex::new(Vec::new());
+    let records = Mutex::new(Vec::new());
+    let publisher = RecordingPublisher {
+        events: &events,
+        artifact_id: ArtifactId::new("artifact-tool-request-1").unwrap(),
+    };
+    let clock = RecordingClock {
+        events: &events,
+        value: "2025-07-23T12:00:00Z",
+    };
+    let evaluator = RecordingEvaluator {
+        events: &events,
+        decision,
+    };
+    let policy_store = RecordingPolicyStore {
+        events: &events,
+        records: &records,
+        decision_id,
+    };
+    let request = tool_request();
+    let authority = RecordingAuthority {
+        events: &events,
+        current: current_request,
+    };
+    let ids = SequenceIds::new(&events);
+    let approval_requests = RecordingApprovalPublisher::new();
+    let resumes = UnusedResumeStore;
+    let executions = TestExecutionStore::recording(&events);
+    let result = {
+        let orchestrator = ToolExecutionOrchestration::new(
+            &publisher,
+            &authority,
+            &clock,
+            &evaluator,
+            &policy_store,
+            &ids,
+            &approval_requests,
+            &resumes,
+            &resumes,
+            &executions,
+        );
+        orchestrator.execute(request)
+    };
+
+    (
+        result,
+        events.into_inner().unwrap(),
+        records.into_inner().unwrap(),
+    )
+}
+
+fn execute_allowed_tool(
+    request: ToolRequest,
+    authority: &dyn ToolAuthorityResolver,
+    events: &Mutex<Vec<&'static str>>,
+    executions: &dyn ToolExecutionStore,
+    executor: &dyn StructuredToolExecutor,
+) -> Result<ToolOutcome, PortError> {
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let decision = policy_decision(
+        policy_request_for_tool(&request, evaluated_at),
+        PolicyEffect::Allow,
+    );
+    let records = Mutex::new(Vec::new());
+    let publisher = RecordingPublisher {
+        events,
+        artifact_id: ArtifactId::new("artifact-tool-request-1").unwrap(),
+    };
+    let clock = RecordingClock {
+        events,
+        value: "2025-07-23T12:00:00Z",
+    };
+    let evaluator = RecordingEvaluator {
+        events,
+        decision: decision.clone(),
+    };
+    let policy_store = RecordingPolicyStore {
+        events,
+        records: &records,
+        decision_id: PolicyDecisionId::from_decision(&decision),
+    };
+    let ids = SequenceIds::new(events);
+    let approval_requests = RecordingApprovalPublisher::new();
+    let resumes = UnusedResumeStore;
+    let pre_effect = ToolExecutionOrchestration::new(
+        &publisher,
+        authority,
+        &clock,
+        &evaluator,
+        &policy_store,
+        &ids,
+        &approval_requests,
+        &resumes,
+        &resumes,
+        executions,
+    );
+    ExecuteTool::new(pre_effect, executor).execute(request)
+}
+
+fn policy_decision(request: PolicyRequest, effect: PolicyEffect) -> PolicyDecision {
+    policy_decision_with_digest(request, effect, 'c')
+}
+
+fn policy_decision_with_expiry(
+    request: PolicyRequest,
+    effect: PolicyEffect,
+    expires_at: Option<Timestamp>,
+) -> PolicyDecision {
+    let draft = combine_policy_rules(
+        request,
+        PolicyVersion::new(1).unwrap(),
+        vec![MatchedPolicyRule {
+            rule_id: PolicyRuleId::new("rule-process").unwrap(),
+            effect,
+            redactions: Vec::new(),
+        }],
+        expires_at,
+    )
+    .unwrap();
+    PolicyDecision {
+        draft,
+        operation_digest: digest('c'),
+    }
+}
+
+fn policy_decision_with_digest(
+    request: PolicyRequest,
+    effect: PolicyEffect,
+    digest_character: char,
+) -> PolicyDecision {
+    let draft = combine_policy_rules(
+        request,
+        PolicyVersion::new(1).unwrap(),
+        vec![MatchedPolicyRule {
+            rule_id: PolicyRuleId::new("rule-process").unwrap(),
+            effect,
+            redactions: Vec::new(),
+        }],
+        None,
+    )
+    .unwrap();
+    PolicyDecision {
+        draft,
+        operation_digest: digest(digest_character),
+    }
+}
+
+fn tool_request() -> ToolRequest {
+    tool_request_with_argv(vec!["test".to_owned()])
+}
+
+fn tool_request_with_argv(argv: Vec<String>) -> ToolRequest {
     let task_id = TaskId::new("task-1").unwrap();
     let process = ProcessToolRequest::new(
         ProcessBinding::new(
             task_id.clone(),
             RunId::new("run-1").unwrap(),
             PlanStepId::new("step-1").unwrap(),
-            phase,
-            workspace_version,
+            Phase::Implementation,
+            WorkspaceVersion::new(4),
             EnvironmentProfile::new("rust", digest('e')).unwrap(),
             1,
         )
         .unwrap(),
         ProcessInvocation::new(
             CapabilityRef::toolchain("cargo").unwrap(),
-            vec![argument.to_owned()],
-            CapabilityRef::worktree(task_id, ".").unwrap(),
+            argv,
+            CapabilityRef::worktree(task_id.clone(), ".").unwrap(),
             ProcessTrustTier::IsolatedWorker,
             NetworkProfile::Denied,
             Vec::new(),
@@ -1450,343 +1872,109 @@ fn approved_process_request_with(
         .unwrap(),
     )
     .unwrap();
-    ApprovedProcessRequest::new(
-        approved_executable_identity_at(resolver_canonical_executable_path()).unwrap(),
-        process,
-        Vec::new(),
-        None,
-        None,
-    )
-    .unwrap()
-}
-
-fn tool_request(argument: &str) -> ToolRequest {
-    tool_request_with(
-        "execution-orchestration",
-        approved_process_request(argument),
-        policy_context("agent-1", "run focused tests"),
-    )
-}
-
-fn rich_tool_request() -> ToolRequest {
-    let base = approved_process_request("test");
-    let task_id = base.process().binding().task_id().clone();
-    let process = ProcessToolRequest::new(
-        base.process().binding().clone(),
-        ProcessInvocation::new(
-            base.process().executable().clone(),
-            base.process().argv().to_vec(),
-            base.process().cwd().clone(),
-            base.process().trust_tier(),
-            base.process().network(),
-            vec![
-                ExpectedWrite::new(CapabilityRef::worktree(task_id, "target/out").unwrap())
-                    .unwrap(),
-            ],
-            base.process().executor_fencing_token(),
+    let approved = local_agent_terminal_application::ApprovedProcessRequest::new(
+        local_agent_terminal_application::ApprovedExecutableIdentity::new(
+            local_agent_terminal_application::ResolvedExecutable {
+                canonical_path: std::path::PathBuf::from(executable_path()),
+                sha256: digest('f'),
+                file_identity: local_agent_terminal_application::ExecutableFileIdentity::new(
+                    "file-1",
+                )
+                .unwrap(),
+                toolchain_id: "cargo".to_owned(),
+            },
+            "1.0".to_owned(),
         )
         .unwrap(),
+        process,
+        vec![CapabilityRef::worktree(task_id.clone(), "src").unwrap()],
+        None,
+        None,
     )
     .unwrap();
-    tool_request_with(
-        "execution-orchestration",
-        ApprovedProcessRequest::new(
-            base.approved_executable().clone(),
-            process,
-            vec![CapabilityRef::source("revision-1", "src/lib.rs").unwrap()],
-            Some(1024),
-            Some(500),
+    ToolRequest::new(
+        local_agent_terminal_application::ToolExecutionId::new("execution-orchestration").unwrap(),
+        approved,
+        local_agent_terminal_application::ToolPolicyContext::new(
+            PolicyActor {
+                connection_id: "connection-1".to_owned(),
+                agent_id: "agent-1".to_owned(),
+                trust_tier: TrustTier::IsolatedWorker,
+                locality: ActorLocality::Local,
+            },
+            PolicyAction::new("process.exec").unwrap(),
+            PolicyResource {
+                capability: CapabilityRef::worktree(task_id, ".").unwrap(),
+                content_digest: resource_digest(AUTHORITY_RESOURCE_BYTES),
+                resource_class: ResourceClass::InternalCode,
+            },
+            TaskRisk::High,
+            "run focused tests",
+            digest('b'),
         )
         .unwrap(),
-        policy_context("agent-1", "run focused tests"),
     )
+    .unwrap()
 }
 
-fn tool_request_with(
-    execution_id: &str,
-    process: ApprovedProcessRequest,
-    policy: ToolPolicyContext,
+fn tool_request_with_resource_class(
+    request: &ToolRequest,
+    resource_class: ResourceClass,
 ) -> ToolRequest {
-    ToolRequest::new(ToolExecutionId::new(execution_id).unwrap(), process, policy).unwrap()
-}
-
-fn policy_context(agent_id: &str, purpose: &str) -> ToolPolicyContext {
-    ToolPolicyContext::new(
-        PolicyActor {
-            connection_id: "connection-1".to_owned(),
-            agent_id: agent_id.to_owned(),
-            trust_tier: TrustTier::IsolatedWorker,
-            locality: ActorLocality::Local,
-        },
-        PolicyAction::new("process.exec").unwrap(),
-        PolicyResource {
-            capability: CapabilityRef::worktree(TaskId::new("task-1").unwrap(), ".").unwrap(),
-            content_digest: digest('a'),
-            resource_class: ResourceClass::InternalCode,
-        },
-        TaskRisk::High,
-        purpose,
-        digest('b'),
-    )
-    .unwrap()
-}
-
-fn mutate_wire_field(
-    base: &serde_json::Value,
-    path: &[&str],
-    value: serde_json::Value,
-) -> serde_json::Value {
-    let mut wire = base.clone();
-    let mut field = &mut wire["process"];
-    for component in path {
-        field = &mut field[*component];
-    }
-    *field = value;
-    wire
-}
-
-fn canonical_wire_binding_paths(wire: &serde_json::Value) -> BTreeSet<String> {
-    fn walk(value: &serde_json::Value, path: String, paths: &mut BTreeSet<String>) {
-        match value {
-            serde_json::Value::Object(fields) => {
-                for (name, value) in fields {
-                    walk(value, format!("{path}/{name}"), paths);
-                }
-            }
-            serde_json::Value::Array(values) => {
-                paths.insert(path.clone());
-                for (index, value) in values.iter().enumerate() {
-                    walk(value, format!("{path}/{index}"), paths);
-                }
-            }
-            _ => {
-                paths.insert(path);
-            }
-        }
-    }
-
-    let mut paths = BTreeSet::new();
-    walk(wire, String::new(), &mut paths);
-    paths
-}
-
-fn mutate_binding_path(wire: &mut serde_json::Value, path: &str) {
-    let value = wire.pointer_mut(path).unwrap();
-    match value {
-        serde_json::Value::Null => *value = serde_json::json!("changed"),
-        serde_json::Value::Bool(boolean) => *boolean = !*boolean,
-        serde_json::Value::Number(number) => {
-            *number = serde_json::Number::from(number.as_u64().unwrap() + 1);
-        }
-        serde_json::Value::String(text) => text.push_str("-changed"),
-        serde_json::Value::Array(values) => values.push(values[0].clone()),
-        serde_json::Value::Object(_) => unreachable!("only leaves and list containers are walked"),
-    }
-}
-
-fn canonical_wire_digest(wire: &serde_json::Value) -> Sha256Digest {
-    let bytes = serde_json_canonicalizer::to_vec(wire).unwrap();
-    Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
-}
-
-fn approved_executable_identity_at(
-    canonical_path: impl AsRef<Path>,
-) -> Result<ApprovedExecutableIdentity, PortError> {
-    ApprovedExecutableIdentity::new(
-        ResolvedExecutable {
-            canonical_path: canonical_path.as_ref().to_owned(),
-            sha256: digest('d'),
-            file_identity: local_agent_terminal_application::ExecutableFileIdentity::new(
-                "cargo-file",
-            )
-            .unwrap(),
-            toolchain_id: "cargo".to_owned(),
-        },
-        "1.97.1",
-    )
-}
-
-#[cfg(windows)]
-fn resolver_canonical_executable_path() -> &'static str {
-    r"\\?\C:\approved\cargo.exe"
-}
-
-#[cfg(not(windows))]
-fn resolver_canonical_executable_path() -> &'static str {
-    "/approved/cargo"
-}
-
-#[cfg(windows)]
-fn rejected_canonical_executable_paths() -> [(&'static str, &'static str); 6] {
-    [
-        ("dot", r"C:\approved\.\cargo.exe"),
-        ("dot-dot", r"C:\approved\..\cargo.exe"),
-        ("alternate data stream", r"C:\approved\cargo.exe:hostile"),
-        ("UNC", r"\\server\share\cargo.exe"),
-        ("verbatim UNC", r"\\?\UNC\server\share\cargo.exe"),
-        ("device namespace", r"\\.\C:\approved\cargo.exe"),
-    ]
-}
-
-#[cfg(not(windows))]
-fn rejected_canonical_executable_paths() -> [(&'static str, &'static str); 2] {
-    [
-        ("dot", "/approved/./cargo"),
-        ("dot-dot", "/approved/../cargo"),
-    ]
-}
-
-fn approved_tool_binding(request: &ApprovedProcessRequest) -> BoundToolApproval {
-    bind_tool_approval_payload(
-        ToolApprovalPayloadV1 {
-            schema: "approval-digest.v1".to_owned(),
-            approval_type: "tool".to_owned(),
-            task_id: "unbound".to_owned(),
-            operation: ToolApprovalOperationV1 {
-                run_id: "unbound".to_owned(),
-                plan_step_id: "unbound".to_owned(),
-                tool: "process.exec".to_owned(),
-                executable_digest: None,
-                arguments_digest: digest('0').as_str().to_owned(),
-                script_digest: None,
-                cwd_capability: "unbound".to_owned(),
-                environment_profile_digest: digest('0').as_str().to_owned(),
-                network_profile: "denied".to_owned(),
-                expected_writes: Vec::new(),
-                executor_fencing_token: None,
+    let policy = request.policy();
+    let resource = policy.resource();
+    ToolRequest::new(
+        request.execution_id().clone(),
+        request.process().clone(),
+        ToolPolicyContext::new(
+            policy.actor().clone(),
+            policy.action().clone(),
+            PolicyResource {
+                capability: resource.capability.clone(),
+                content_digest: resource.content_digest.clone(),
+                resource_class,
             },
-            policy_snapshot_digest: digest('b').as_str().to_owned(),
-            workspace_version: 0,
-            requested_at: "2026-07-23T12:00:00Z".to_owned(),
-            expires_at: "2026-07-23T12:15:00Z".to_owned(),
-            nonce: "0123456789abcdef0123456789abcdef".to_owned(),
-        },
-        request,
+            policy.task_risk(),
+            policy.purpose(),
+            policy.policy_snapshot_digest().clone(),
+        )
+        .unwrap(),
     )
     .unwrap()
 }
 
-fn process_receipt(
-    execution_id: ToolExecutionId,
-    status: ProcessStatus,
-    exit_code: Option<i32>,
-) -> ProcessReceipt {
-    ProcessReceipt {
-        execution_id,
-        status,
-        exit_code,
-        stdout: BoundedOutput {
-            bytes: b"secret stdout".to_vec(),
-            truncated: false,
-        },
-        stderr: BoundedOutput {
-            bytes: b"secret stderr".to_vec(),
-            truncated: false,
-        },
-        duration_ms: 25,
-        job_receipt: JobReceipt {
-            root_pid: 42,
-            job_id: r"C:\secret\runtime\job".to_owned(),
-            kill_on_close: true,
-            no_breakaway: true,
-            job_memory_limit: false,
-            job_cpu_time_limit: false,
-            memory_limit_bytes: 0,
-            cpu_time_limit_ms: 0,
-            max_active_processes: 1,
-            total_user_time_ms: 10,
-            resource_limit_terminated: false,
-            tree_terminated: false,
-        },
-        observed_writes: Vec::new(),
-        output_digest: digest('9'),
-    }
+fn authority_snapshot(request: ToolRequest) -> Result<ToolAuthoritySnapshot, PortError> {
+    let binding = request.process().process().binding();
+    let lease = request
+        .process()
+        .process()
+        .executor_fencing_token()
+        .map(|token| LeaseSnapshot {
+            task_id: binding.task_id().clone(),
+            holder_run_id: binding.run_id().clone(),
+            token,
+            state: LeaseState::Active,
+            acquired_at: "2025-07-23T11:00:00Z".to_owned(),
+            expires_at: "2025-07-23T13:00:00Z".to_owned(),
+            released_at: None,
+        });
+    ToolAuthoritySnapshot::new(request, AUTHORITY_RESOURCE_BYTES, lease)
 }
 
-fn claim_authority(
-    execution_id: ToolExecutionId,
-    operation_digest: Sha256Digest,
-) -> ToolExecutionClaimAuthority {
-    ToolExecutionClaimAuthority::from_persisted(
-        execution_id,
-        operation_digest,
-        RunId::new("run-1").unwrap(),
-        7,
-        Some(FencingToken::new(19).unwrap()),
-    )
-    .unwrap()
-}
-
-fn recovery_evidence(
-    execution_id: ToolExecutionId,
-    operation_digest: Sha256Digest,
-    state: ToolExecutionRecoveryState,
-) -> ToolExecutionRecoveryEvidence {
-    ToolExecutionRecoveryEvidence {
-        authority: claim_authority(execution_id, operation_digest),
-        task_id: TaskId::new("task-1").unwrap(),
-        canonical_request_artifact_id: ArtifactId::new("artifact-request-a").unwrap(),
-        idempotency_class: IdempotencyClass::NonRepeatable,
-        state,
-        process_binding: None,
-    }
-}
-
-fn durable_receipt(
-    authority: ToolExecutionClaimAuthority,
-    terminal: ToolExecutionTerminal,
-) -> DurableToolExecutionReceipt {
-    DurableToolExecutionReceipt::new(authority, terminal)
-}
-
-fn process_output(exit_code: Option<i32>) -> ToolExecutionOutput {
-    ToolExecutionOutput {
-        exit_code,
-        output_digest: digest('9'),
-        duration_ms: 25,
-        artifacts: unavailable_process_artifacts(),
-    }
-}
-
-fn unavailable_process_artifacts() -> DurableToolExecutionArtifacts {
-    DurableToolExecutionArtifacts::new(
-        DurableToolExecutionArtifact::Unavailable,
-        DurableToolExecutionArtifact::Unavailable,
-        Vec::new(),
-    )
-}
-
-fn available_process_artifacts() -> DurableToolExecutionArtifacts {
-    DurableToolExecutionArtifacts::new(
-        DurableToolExecutionArtifact::Available(ArtifactId::new("artifact-stdout").unwrap()),
-        DurableToolExecutionArtifact::Available(ArtifactId::new("artifact-stderr").unwrap()),
-        vec![DurableToolExecutionArtifact::Available(
-            ArtifactId::new("artifact-write-0").unwrap(),
-        )],
-    )
+fn resource_digest(bytes: &[u8]) -> Sha256Digest {
+    Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
 }
 
 fn digest(character: char) -> Sha256Digest {
     Sha256Digest::new(format!("sha256:{}", character.to_string().repeat(64))).unwrap()
 }
 
-fn internal_failure() -> PortError {
-    PortError::failure(
-        SafeErrorClassification::Internal,
-        Retryability::NonRetryable,
-    )
+#[cfg(windows)]
+fn executable_path() -> &'static str {
+    r"C:\approved\cargo.exe"
 }
 
-fn unavailable() -> PortError {
-    PortError::failure(
-        SafeErrorClassification::Unavailable,
-        Retryability::Retryable,
-    )
-}
-
-fn conflict() -> PortError {
-    PortError::failure(
-        SafeErrorClassification::Conflict,
-        Retryability::NonRetryable,
-    )
+#[cfg(not(windows))]
+fn executable_path() -> &'static str {
+    "/approved/cargo"
 }

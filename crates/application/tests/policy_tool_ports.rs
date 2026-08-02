@@ -1,23 +1,16 @@
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
-
 use local_agent_terminal_application::{
     bind_tool_approval_payload, canonical_approval_payload, canonical_file_write_recovery_request,
-    parse_file_write_recovery_request, ApprovalCheck, ApprovalClaim, ApprovalDigestPayload,
-    ApprovalId, ApprovalInvalidation, ApprovalResolution, ApprovalSnapshot, ApprovalState,
-    ApprovalStore, ApprovedExecutableIdentity, ApprovedProcessExecutor, ApprovedProcessRequest,
-    AuthorizedToolRequest, BoundToolApproval, CancellationReceipt, CanonicalEvidenceRef,
-    CapabilityFileWriteSession, CapabilityFileWriteSessionFactory, CapabilityFilesystem,
-    CapabilityResolver, CapabilityRootIdentity, CaptureFileWritePostEvidence,
-    CaptureFileWritePreEvidence, Clock, DisclosureChannel, DisclosurePolicyEvaluator,
-    DisclosureRequest, ExecutableFileIdentity, ExecuteApprovedTool, FileWriteEvidenceStore,
-    FileWritePolicyBinding, FileWritePostExpectation, FileWritePreImage, FileWriteRecoveryRequest,
-    NewApproval, ObservedFileImage, OpenFileWriteSession, PolicyDecisionStore, PolicyEvaluator,
-    PortError, ProcessLauncher, ProcessStatus, RelativePathComponents, ResolvedExecutable,
-    Retryability, SafeErrorClassification, StructuredGit, StructuredToolExecutor,
-    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionId, ToolExecutionResult,
-    ToolExecutionStore, VerifiedWrite,
+    parse_file_write_recovery_request, ApprovalDigestPayload, ApprovalStore,
+    ApprovedExecutableIdentity, ApprovedProcessExecutor, ApprovedProcessRequest, BoundToolApproval,
+    CanonicalEvidenceRef, CapabilityFileWriteSession, CapabilityFileWriteSessionFactory,
+    CapabilityFilesystem, CapabilityResolver, CapabilityRootIdentity, CaptureFileWritePostEvidence,
+    CaptureFileWritePreEvidence, DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest,
+    ExecutableFileIdentity, FileWriteEvidenceStore, FileWritePolicyBinding,
+    FileWritePostExpectation, FileWritePreImage, FileWriteRecoveryRequest, ObservedFileImage,
+    OpenFileWriteSession, PolicyDecisionStore, PolicyEvaluator, ProcessLauncher,
+    RelativePathComponents, ResolvedExecutable, StructuredGit, StructuredToolExecutor,
+    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolExecutionId, ToolExecutionStore,
+    VerifiedWrite,
 };
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, CapabilityRef, EnvironmentProfile, ExpectedWrite, FencingToken,
@@ -26,6 +19,7 @@ use local_agent_terminal_domain::{
     Sha256Digest, TaskId, WorkspaceFingerprint, WorkspaceVersion,
 };
 use sha2::Digest;
+use std::path::PathBuf;
 
 fn assert_object_safe<T: ?Sized>() {}
 
@@ -238,128 +232,6 @@ fn file_write_recovery_request_rejects_unbound_or_noncanonical_evidence() {
 }
 
 #[test]
-fn valid_approval_reaches_the_executor_once() {
-    let executor = CountingExecutor::default();
-    let approvals = FixedApprovals::new(approved_snapshot());
-    let use_case = ExecuteApprovedTool::new(&approvals, &executor, &FixedClock);
-
-    let _ = use_case.execute(check(), authorized_tool_request());
-
-    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn executor_failure_does_not_make_an_approval_replayable() {
-    let executor = CountingExecutor::default();
-    let approvals = FixedApprovals::new(approved_snapshot());
-    let use_case = ExecuteApprovedTool::new(&approvals, &executor, &FixedClock);
-
-    let _ = use_case.execute(check(), authorized_tool_request());
-    let _ = use_case.execute(check(), authorized_tool_request());
-
-    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn concurrent_claims_reach_the_executor_at_most_once() {
-    let executor = CountingExecutor::default();
-    let approvals = FixedApprovals::new(approved_snapshot());
-    let use_case = ExecuteApprovedTool::new(&approvals, &executor, &FixedClock);
-
-    std::thread::scope(|scope| {
-        let first = scope.spawn(|| use_case.execute(check(), authorized_tool_request()));
-        let second = scope.spawn(|| use_case.execute(check(), authorized_tool_request()));
-        let _ = first.join();
-        let _ = second.join();
-    });
-
-    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn invalid_or_consumed_approvals_do_not_call_the_executor() {
-    for case in [
-        ApprovalCase::Expired,
-        ApprovalCase::ExpiredOffset,
-        ApprovalCase::Consumed,
-        ApprovalCase::PolicyChanged,
-        ApprovalCase::WorkspaceChanged,
-        ApprovalCase::FencingChanged,
-        ApprovalCase::DigestChanged,
-        ApprovalCase::RequestBindingChanged,
-        ApprovalCase::MissingRequestBinding,
-    ] {
-        let executor = CountingExecutor::default();
-        let initial = snapshot(case);
-        let initial_state = initial.state;
-        let approvals = FixedApprovals::new(initial);
-        let use_case = ExecuteApprovedTool::new(&approvals, &executor, &FixedClock);
-
-        let error = use_case
-            .execute(check(), authorized_tool_request())
-            .expect_err("invalid approval must fail before execution");
-        assert_eq!(
-            error.retryability(),
-            local_agent_terminal_application::Retryability::NonRetryable
-        );
-        assert_eq!(executor.calls.load(Ordering::SeqCst), 0, "{case:?}");
-        assert_eq!(approvals.state(), initial_state, "{case:?}");
-    }
-}
-
-#[test]
-fn request_digest_and_scope_mismatches_do_not_call_the_executor() {
-    for request in [
-        authorized_tool_request_with_nonce("abcdef0123456789abcdef0123456789"),
-        authorized_tool_request_for(RequestMutation::Task),
-        authorized_tool_request_for(RequestMutation::Workspace),
-        authorized_tool_request_for(RequestMutation::Fencing),
-        authorized_tool_request_for(RequestMutation::CrossTaskRead),
-    ] {
-        let executor = CountingExecutor::default();
-        let approvals = FixedApprovals::new(approved_snapshot());
-        let use_case = ExecuteApprovedTool::new(&approvals, &executor, &FixedClock);
-
-        let error = use_case
-            .execute(check(), request)
-            .expect_err("request mismatch must fail before execution");
-        assert_eq!(
-            error.retryability(),
-            local_agent_terminal_application::Retryability::NonRetryable
-        );
-        assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
-    }
-}
-
-#[test]
-fn every_changed_execution_detail_is_rejected_before_the_executor() {
-    for mutation in [
-        RequestMutation::Task,
-        RequestMutation::Run,
-        RequestMutation::PlanStep,
-        RequestMutation::Phase,
-        RequestMutation::Executable,
-        RequestMutation::Arguments,
-        RequestMutation::Cwd,
-        RequestMutation::Environment,
-        RequestMutation::Network,
-        RequestMutation::ExpectedReads,
-        RequestMutation::ExpectedWrites,
-        RequestMutation::Timeout,
-        RequestMutation::MemoryLimit,
-        RequestMutation::CpuLimit,
-    ] {
-        let executor = CountingExecutor::default();
-        let approvals = FixedApprovals::new(approved_snapshot());
-        let use_case = ExecuteApprovedTool::new(&approvals, &executor, &FixedClock);
-
-        let _ = use_case.execute(check(), authorized_tool_request_for(mutation));
-
-        assert_eq!(executor.calls.load(Ordering::SeqCst), 0, "{mutation:?}");
-    }
-}
-
-#[test]
 fn arguments_digest_binds_only_argv() {
     let baseline_request = authorized_process_request_for(RequestMutation::None);
     let baseline_payload = approved_tool_payload(&baseline_request, APPROVAL_NONCE);
@@ -539,246 +411,6 @@ fn process_approval_freezes_digest_version_path_and_file_identity() {
     }
 }
 
-#[test]
-fn approval_identity_and_nonce_mismatches_do_not_call_the_executor() {
-    let mut wrong_id = approved_snapshot();
-    wrong_id.approval_id = ApprovalId::new("approval-2").unwrap();
-    let mut missing_nonce = approved_snapshot();
-    missing_nonce.nonce.clear();
-    let mut wrong_nonce = approved_snapshot();
-    wrong_nonce.nonce = "abcdef0123456789abcdef0123456789".to_owned();
-
-    for snapshot in [wrong_id, missing_nonce, wrong_nonce] {
-        let executor = CountingExecutor::default();
-        let approvals = FixedApprovals::new(snapshot);
-        let use_case = ExecuteApprovedTool::new(&approvals, &executor, &FixedClock);
-
-        let _ = use_case.execute(check(), authorized_tool_request());
-
-        assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ApprovalCase {
-    Expired,
-    ExpiredOffset,
-    Consumed,
-    PolicyChanged,
-    WorkspaceChanged,
-    FencingChanged,
-    DigestChanged,
-    RequestBindingChanged,
-    MissingRequestBinding,
-}
-
-struct FixedApprovals {
-    snapshot: Mutex<ApprovalSnapshot>,
-}
-
-impl FixedApprovals {
-    fn new(snapshot: ApprovalSnapshot) -> Self {
-        Self {
-            snapshot: Mutex::new(snapshot),
-        }
-    }
-
-    fn state(&self) -> ApprovalState {
-        self.snapshot.lock().unwrap().state
-    }
-}
-
-impl ApprovalStore for FixedApprovals {
-    fn request(&self, _: NewApproval) -> Result<ApprovalSnapshot, PortError> {
-        unreachable!()
-    }
-
-    fn resolve(&self, _: ApprovalResolution) -> Result<ApprovalSnapshot, PortError> {
-        unreachable!()
-    }
-
-    fn valid_for(&self, _: ApprovalCheck) -> Result<Option<ApprovalSnapshot>, PortError> {
-        Ok(Some(self.snapshot.lock().unwrap().clone()))
-    }
-
-    fn claim(&self, claim: ApprovalClaim) -> Result<Option<ApprovalSnapshot>, PortError> {
-        let mut snapshot = self.snapshot.lock().unwrap();
-        if !approval_matches_claim(&snapshot, &claim) {
-            return Ok(None);
-        }
-        snapshot.state = ApprovalState::Consumed;
-        Ok(Some(snapshot.clone()))
-    }
-
-    fn invalidate(&self, _: ApprovalInvalidation) -> Result<u64, PortError> {
-        unreachable!()
-    }
-}
-
-fn approval_matches_claim(snapshot: &ApprovalSnapshot, claim: &ApprovalClaim) -> bool {
-    snapshot.state == ApprovalState::Approved
-        && snapshot.approval_id == claim.approval_id
-        && snapshot.operation_digest == claim.expected_operation_digest
-        && snapshot.task_id == claim.task_id
-        && snapshot.workspace_version == claim.workspace_version
-        && snapshot.policy_snapshot_digest == claim.policy_snapshot_digest
-        && snapshot.fencing_token == claim.fencing_token
-        && snapshot.tool_request_binding_digest.as_ref() == Some(&claim.tool_request_binding_digest)
-        && snapshot.nonce == claim.nonce
-        && approval_is_live(&snapshot.expires_at, &claim.claimed_at)
-}
-
-fn approval_is_live(expires_at: &str, claimed_at: &str) -> bool {
-    use time::format_description::well_known::Rfc3339;
-    use time::OffsetDateTime;
-
-    match (
-        OffsetDateTime::parse(expires_at, &Rfc3339),
-        OffsetDateTime::parse(claimed_at, &Rfc3339),
-    ) {
-        (Ok(expires_at), Ok(claimed_at)) => expires_at > claimed_at,
-        _ => false,
-    }
-}
-
-struct FixedClock;
-
-impl Clock for FixedClock {
-    fn now_utc(&self) -> Result<String, PortError> {
-        Ok("2026-07-23T12:00:00Z".to_owned())
-    }
-}
-
-#[derive(Default)]
-struct CountingExecutor {
-    calls: AtomicUsize,
-}
-
-impl StructuredToolExecutor for CountingExecutor {
-    fn execute(&self, _: AuthorizedToolRequest) -> Result<ToolExecutionResult, PortError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(PortError::failure(
-            SafeErrorClassification::Internal,
-            Retryability::NonRetryable,
-        ))
-    }
-
-    fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
-        Ok(CancellationReceipt {
-            execution_id: execution_id.clone(),
-            status: ProcessStatus::Terminated,
-            job_receipt: None,
-            cancelled: true,
-        })
-    }
-
-    fn file_read(
-        &self,
-        _: local_agent_terminal_application::FileReadRequest,
-    ) -> Result<
-        local_agent_terminal_application::DisclosureOutcome<
-            local_agent_terminal_application::PolicyBoundBytes,
-        >,
-        PortError,
-    > {
-        unreachable!()
-    }
-
-    fn file_write(
-        &self,
-        _: local_agent_terminal_application::FileWriteRequest,
-    ) -> Result<local_agent_terminal_application::VerifiedWrite, PortError> {
-        unreachable!()
-    }
-
-    fn git_status(
-        &self,
-        _: local_agent_terminal_application::GitStatusRequest,
-    ) -> Result<
-        local_agent_terminal_application::DisclosureOutcome<
-            local_agent_terminal_application::GitStatusResult,
-        >,
-        PortError,
-    > {
-        unreachable!()
-    }
-
-    fn git_diff(
-        &self,
-        _: local_agent_terminal_application::GitDiffRequest,
-    ) -> Result<
-        local_agent_terminal_application::DisclosureOutcome<
-            local_agent_terminal_application::GitDiffResult,
-        >,
-        PortError,
-    > {
-        unreachable!()
-    }
-}
-
-fn snapshot(case: ApprovalCase) -> ApprovalSnapshot {
-    let mut snapshot = approved_snapshot();
-    match case {
-        ApprovalCase::Expired => snapshot.expires_at = "2026-07-23T11:59:59Z".to_owned(),
-        ApprovalCase::ExpiredOffset => snapshot.expires_at = "2026-07-23T19:00:00+07:30".to_owned(),
-        ApprovalCase::Consumed => snapshot.state = ApprovalState::Consumed,
-        ApprovalCase::PolicyChanged => snapshot.policy_snapshot_digest = digest('c'),
-        ApprovalCase::WorkspaceChanged => snapshot.workspace_version = WorkspaceVersion::new(5),
-        ApprovalCase::FencingChanged => snapshot.fencing_token = Some(20),
-        ApprovalCase::DigestChanged => snapshot.operation_digest = digest('d'),
-        ApprovalCase::RequestBindingChanged => {
-            snapshot.tool_request_binding_digest = Some(
-                approved_tool_binding(
-                    &authorized_process_request_for(RequestMutation::Phase),
-                    APPROVAL_NONCE,
-                )
-                .request_binding_digest()
-                .clone(),
-            );
-        }
-        ApprovalCase::MissingRequestBinding => snapshot.tool_request_binding_digest = None,
-    }
-    snapshot
-}
-
-fn approved_snapshot() -> ApprovalSnapshot {
-    ApprovalSnapshot {
-        approval_id: ApprovalId::new("approval-1").unwrap(),
-        state: ApprovalState::Approved,
-        operation_digest: approved_operation_digest(),
-        task_id: task_id(),
-        workspace_version: WorkspaceVersion::new(4),
-        policy_snapshot_digest: digest('b'),
-        fencing_token: Some(19),
-        tool_request_binding_digest: Some(
-            approved_tool_binding(
-                &authorized_process_request_for(RequestMutation::None),
-                APPROVAL_NONCE,
-            )
-            .request_binding_digest()
-            .clone(),
-        ),
-        expires_at: "2026-07-23T12:15:00Z".to_owned(),
-        nonce: "0123456789abcdef0123456789abcdef".to_owned(),
-    }
-}
-
-fn check() -> ApprovalCheck {
-    ApprovalCheck {
-        approval_id: ApprovalId::new("approval-1").unwrap(),
-        expected_operation_digest: approved_operation_digest(),
-        task_id: task_id(),
-        workspace_version: WorkspaceVersion::new(4),
-        policy_snapshot_digest: digest('b'),
-        fencing_token: Some(19),
-        checked_at: "2026-07-23T12:00:00Z".to_owned(),
-    }
-}
-
-fn authorized_tool_request() -> AuthorizedToolRequest {
-    authorized_tool_request_for(RequestMutation::None)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestMutation {
     None,
@@ -794,30 +426,10 @@ enum RequestMutation {
     Environment,
     Network,
     ExpectedReads,
-    CrossTaskRead,
     ExpectedWrites,
     Timeout,
     MemoryLimit,
     CpuLimit,
-}
-
-fn authorized_tool_request_for(mutation: RequestMutation) -> AuthorizedToolRequest {
-    let baseline_request = authorized_process_request_for(RequestMutation::None);
-    let approved_binding = approved_tool_binding(&baseline_request, APPROVAL_NONCE);
-    AuthorizedToolRequest::new(
-        ToolExecutionId::new("execution-1").unwrap(),
-        approved_binding,
-        authorized_process_request_for(mutation),
-    )
-}
-
-fn authorized_tool_request_with_nonce(nonce: &str) -> AuthorizedToolRequest {
-    let request = authorized_process_request_for(RequestMutation::None);
-    AuthorizedToolRequest::new(
-        ToolExecutionId::new("execution-1").unwrap(),
-        approved_tool_binding(&request, nonce),
-        request,
-    )
 }
 
 fn authorized_process_request_for(mutation: RequestMutation) -> ApprovedProcessRequest {
@@ -931,9 +543,6 @@ fn authorized_process_request_for(mutation: RequestMutation) -> ApprovedProcessR
             RequestMutation::ExpectedReads => {
                 vec![CapabilityRef::worktree(task_id, "src").unwrap()]
             }
-            RequestMutation::CrossTaskRead => {
-                vec![CapabilityRef::worktree(TaskId::new("task-2").unwrap(), "src").unwrap()]
-            }
             _ => Vec::new(),
         },
         (mutation == RequestMutation::MemoryLimit).then_some(1024),
@@ -1001,16 +610,6 @@ fn approved_tool_binding(request: &ApprovedProcessRequest, nonce: &str) -> Bound
         request,
     )
     .unwrap()
-}
-
-fn approved_operation_digest() -> Sha256Digest {
-    let request = authorized_process_request_for(RequestMutation::None);
-    canonical_approval_payload(&ApprovalDigestPayload::Tool(approved_tool_payload(
-        &request,
-        APPROVAL_NONCE,
-    )))
-    .unwrap()
-    .operation_digest
 }
 
 fn task_id() -> TaskId {

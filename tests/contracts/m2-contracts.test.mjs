@@ -22,6 +22,15 @@ test("architecture checker accepts the workspace while M2 packages are absent", 
   assert.match(run("scripts/check-architecture.mjs"), /architecture contracts: ok/);
 });
 
+test("application exposes one canonical tool execution entry point", () => {
+  const source = readFileSync("crates/application/src/lib.rs", "utf8");
+  const exports = source.match(/pub use execute_tool::\{([^}]+)\};/s)?.[1] ?? "";
+  assert.deepEqual(
+    exports.split(",").map((item) => item.trim()).filter((item) => item.startsWith("Execute")),
+    ["ExecuteTool"],
+  );
+});
+
 test("architecture checker rejects application dependencies outside its exact allowlist", () => {
   const directory = mkdtempSync(join(tmpdir(), "m2-contracts-"));
   try {
