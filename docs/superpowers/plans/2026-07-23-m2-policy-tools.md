@@ -601,7 +601,7 @@ git commit -m "feat: enforce windows tool process boundaries"
 **Interfaces:**
 - Implements the application `ExecuteTool` use case using only injected ports. `bootstrap` wires policy, approval, persistence, capability, Git, filesystem, executable/profile, process, clock, artifact, event, and lease adapters. It does not move authorization logic into the composition root.
 
-- [ ] **Step 1 - Write failing orchestration and crash tests**
+- [x] **Step 1 - Write failing orchestration and crash tests**
 
 Use recording fakes to assert this exact order for every read and write path:
 
@@ -631,7 +631,7 @@ cargo test -p local-agent-terminal-bootstrap --test tool_broker --test tool_reco
 
 Expected RED: `ExecuteTool` has contracts but no complete orchestration, and bootstrap has no M2 composition/recovery path.
 
-- [ ] **Step 2 - Implement the application use case**
+- [x] **Step 2 - Implement the application use case**
 
 Expose one typed entry point:
 
@@ -659,11 +659,11 @@ impl ExecuteTool<'_> {
 
 `ToolOutcome` is `Succeeded`, `Denied`, or `ApprovalRequired(ApprovalRequestDto)` plus typed failure classes; it never returns an OS path or secret-bearing raw diagnostic. Both initial execution and `resume_approved` rebuild the canonical payload from authoritative records. Keep one code path for pre-effect checks so approved execution cannot bypass normal policy/fencing validation.
 
-- [ ] **Step 3 - Compose adapters and deterministic startup recovery**
+- [x] **Step 3 - Compose adapters and deterministic startup recovery**
 
 Create a `ToolRuntime` holder in `bootstrap` and inject concrete stores/adapters once. Startup runs profile/control self-tests before marking tools available, fences stale leases, reconciles incomplete M2 intents/executions, terminates any retained local Job handle, expires approvals, and exposes typed `ready`, `degraded_read_only`, or `unavailable` state. An unenforceable requested boundary disables that tool/profile and never changes it to full-access execution.
 
-- [ ] **Step 4 - Run focused, recovery, and regression checks**
+- [x] **Step 4 - Run focused, recovery, and regression checks**
 
 ```powershell
 cargo fmt --all -- --check
@@ -675,7 +675,7 @@ cargo test -p local-agent-terminal-storage-sqlite --test tool_recovery
 
 Expected GREEN: call ordering and crash outcomes are deterministic, every canonical mutation blocks execution, cancellation is audited, restart never repeats ambiguous work, and M0/M1 startup/recovery stays green.
 
-- [ ] **Step 5 - Commit**
+- [x] **Step 5 - Commit**
 
 ```powershell
 git add crates/application crates/bootstrap
