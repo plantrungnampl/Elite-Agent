@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 mod logging;
+#[cfg(windows)]
+mod production_tools;
 mod startup;
 mod tool_runtime;
 mod workspace_monitor;

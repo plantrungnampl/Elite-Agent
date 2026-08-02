@@ -115,7 +115,7 @@ pub(crate) fn open_for_locator(
     if locator.repository_id.as_str() != expected_id {
         return Err(conflict());
     }
-    let config_path = repository.path().join("config");
+    let config_path = repository.commondir().join("config");
     let config_metadata = fs::symlink_metadata(&config_path).map_err(|_| not_found())?;
     if !config_metadata.is_file() || config_metadata.file_type().is_symlink() {
         return Err(conflict());

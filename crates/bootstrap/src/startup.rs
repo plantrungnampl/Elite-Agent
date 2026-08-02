@@ -16,6 +16,8 @@ use local_agent_terminal_storage_files::{
 use local_agent_terminal_storage_sqlite::{DatabaseHealth, DatabaseIssue, OpenError, SqliteStore};
 
 use crate::logging::LocalLog;
+#[cfg(windows)]
+use crate::production_tools::production_tool_broker;
 use crate::tool_runtime::{
     ToolBrokerConfig, ToolControlSelfTestStatus, ToolRuntime, ToolRuntimeAvailability,
 };
@@ -90,6 +92,14 @@ impl Bootstrap {
         Self::configured(config, None)
     }
 
+    pub fn production(config: StartupConfig) -> Self {
+        #[cfg(windows)]
+        let tool_broker = Some(production_tool_broker(&config));
+        #[cfg(not(windows))]
+        let tool_broker = None;
+        Self::configured(config, tool_broker)
+    }
+
     pub fn with_tool_broker(config: StartupConfig, tool_broker: ToolBrokerConfig) -> Self {
         Self::configured(config, Some(tool_broker))
     }
@@ -137,6 +147,18 @@ impl Bootstrap {
     pub fn reconfigure(&mut self, config: StartupConfig) -> &StartupStatusDto {
         self.config = Some(config);
         self.retry_startup_validation()
+    }
+
+    pub fn reconfigure_production(&mut self, config: StartupConfig) -> &StartupStatusDto {
+        #[cfg(windows)]
+        {
+            self.tool_broker = Some(production_tool_broker(&config));
+        }
+        #[cfg(not(windows))]
+        {
+            self.tool_broker = None;
+        }
+        self.reconfigure(config)
     }
 
     pub fn status(&self) -> &StartupStatusDto {

@@ -1875,6 +1875,7 @@ dependencies = [
  "local-agent-terminal-repository-git",
  "local-agent-terminal-storage-files",
  "local-agent-terminal-storage-sqlite",
+ "local-agent-terminal-tool-runtime",
  "rusqlite",
  "serde_json",
  "tempfile",

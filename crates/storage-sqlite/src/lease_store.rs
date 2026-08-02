@@ -3,7 +3,7 @@ use local_agent_terminal_application::{
     RevokeLease, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{ArtifactId, FencingToken, LeaseClaim, RunId, TaskId};
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
 
 use crate::event_store::{open_error_to_port, sqlite_error_to_port};
@@ -28,6 +28,11 @@ pub struct CoreSystemRunRequest {
 }
 
 impl SqliteStore {
+    pub fn current_lease(&self, task_id: &TaskId) -> Result<Option<LeaseSnapshot>, PortError> {
+        let connection = self.connection().map_err(open_error_to_port)?;
+        load_lease(&connection, task_id)
+    }
+
     pub fn ensure_core_system_run(&self, request: CoreSystemRunRequest) -> Result<(), PortError> {
         validate_core_run(&request)?;
         let mut connection = self.connection().map_err(open_error_to_port)?;
@@ -564,10 +569,10 @@ fn verify_run(
 }
 
 fn load_lease(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     task_id: &TaskId,
 ) -> Result<Option<LeaseSnapshot>, PortError> {
-    transaction
+    connection
         .query_row(
             "SELECT task_id, holder_run_id, fencing_token, status,
                     acquired_at, expires_at, released_at

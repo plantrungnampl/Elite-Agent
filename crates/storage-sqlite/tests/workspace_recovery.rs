@@ -652,6 +652,12 @@ fn core_system_run_satisfies_foreign_keys_and_one_lease_contender_wins() {
     let winner = outcomes.into_iter().find_map(Result::ok).unwrap();
     assert_eq!(winner.token.get(), 1);
     assert_eq!(winner.state, LeaseState::Active);
+    assert_eq!(
+        store
+            .current_lease(&TaskId::new("task-1").unwrap())
+            .unwrap(),
+        Some(winner.clone())
+    );
 
     let connection = Connection::open(&database.path).unwrap();
     assert_eq!(

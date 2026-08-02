@@ -18,7 +18,7 @@ impl ManagedBootstrap {
     fn resolve_with(resolve: impl FnOnce() -> Option<PathBuf>) -> Self {
         let bootstrap = resolve()
             .map(config)
-            .map(Bootstrap::new)
+            .map(Bootstrap::production)
             .unwrap_or_else(Bootstrap::configuration_unavailable);
         Self(Mutex::new(bootstrap))
     }
@@ -33,7 +33,9 @@ impl ManagedBootstrap {
     fn retry_with(&self, resolve: impl FnOnce() -> Option<PathBuf>) -> StartupStatusDto {
         match self.0.lock() {
             Ok(mut bootstrap) => match resolve() {
-                Some(app_data_dir) => bootstrap.reconfigure(config(app_data_dir)).clone(),
+                Some(app_data_dir) => bootstrap
+                    .reconfigure_production(config(app_data_dir))
+                    .clone(),
                 None => {
                     *bootstrap = Bootstrap::configuration_unavailable();
                     bootstrap.status().clone()
@@ -290,6 +292,10 @@ mod tests {
                 .state,
             StartupStateDto::Ready
         );
+        let activity = managed
+            .with_tool_runtime(|runtime| runtime.activity().map_err(Into::into))
+            .unwrap();
+        assert_eq!(activity.availability, ToolRuntimeAvailabilityDto::Ready);
     }
 
     #[test]
@@ -353,27 +359,14 @@ mod tests {
     }
 
     #[test]
-    fn unconfigured_tool_boundary_is_read_only_and_reported_unavailable() {
+    fn production_startup_composes_the_tool_broker() {
         let parent = TempDir::new().unwrap();
         let managed = ManagedBootstrap::resolve_with(|| Some(parent.path().join("app-data")));
 
         let activity = managed
             .with_tool_runtime(|runtime| runtime.activity().map_err(Into::into))
             .unwrap();
-        assert_eq!(
-            activity.availability,
-            ToolRuntimeAvailabilityDto::Unavailable
-        );
+        assert_eq!(activity.availability, ToolRuntimeAvailabilityDto::Ready);
         assert!(activity.entries.is_empty());
-        let error = managed
-            .with_tool_runtime(|runtime| {
-                runtime
-                    .cancel_for_ui(CancelToolExecutionRequestDto {
-                        execution_id: "execution-1".to_owned(),
-                    })
-                    .map_err(Into::into)
-            })
-            .unwrap_err();
-        assert_eq!(error.code, "unavailable");
     }
 }

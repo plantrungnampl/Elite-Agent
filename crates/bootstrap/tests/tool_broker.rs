@@ -45,6 +45,8 @@ const DENY_PROCESS_POLICY: &str =
 const ALLOW_PROCESS_POLICY: &str =
     r#"{"version":1,"rules":[{"id":"allow-process","effect":"allow","action":"process.exec"}]}"#;
 const APPROVE_PROCESS_POLICY: &str = r#"{"version":1,"rules":[{"id":"approve-process","effect":"require_approval","action":"process.exec"}]}"#;
+const DEFAULT_DENY_POLICY: &str =
+    r#"{"version":1,"rules":[{"id":"default-deny","effect":"deny"}]}"#;
 const EMPTY_BYTES_HASH: &str =
     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const SAFE_STDOUT_HASH: &str =
@@ -79,6 +81,31 @@ fn configured_runtime_routes_typed_requests_through_execute_tool() {
 
     assert!(matches!(outcome, ToolOutcome::Denied(_)));
     assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn production_runtime_resolves_the_authoritative_task_before_default_deny() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let policy = VersionedPolicyEngine::from_json(DEFAULT_DENY_POLICY).unwrap();
+    let request = tool_request_for_policy(
+        "execution-production-denied",
+        policy.snapshot_digest().clone(),
+    );
+    let bootstrap = Bootstrap::production(StartupConfig {
+        app_data_dir: fixture.app_data.clone(),
+        trusted_workspace_root: fixture.workspace_root.clone(),
+        secret_values: Vec::new(),
+    });
+
+    assert_eq!(
+        bootstrap.tool_runtime().unwrap().availability().unwrap(),
+        ToolRuntimeAvailability::Ready
+    );
+    let outcome = bootstrap.tool_runtime().unwrap().execute(request).unwrap();
+
+    assert!(matches!(outcome, ToolOutcome::Denied(_)));
 }
 
 #[test]

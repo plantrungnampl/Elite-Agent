@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
 pub use local_agent_terminal_domain::{
-    ActorId, ArtifactId, FencingToken, GitObjectId, LeaseClaim, Phase, ProjectId, RepositoryId,
-    RunId, Sequence, TaskBranch, TaskId, WorkspaceFingerprint, WorkspaceVersion, WorktreeId,
+    ActorId, ActorLocality, ArtifactId, FencingToken, GitObjectId, LeaseClaim, Phase, PolicyActor,
+    ProjectId, RepositoryId, ResourceClass, RunId, Sequence, Sha256Digest, TaskBranch, TaskId,
+    TaskRisk, TrustTier, WorkspaceFingerprint, WorkspaceVersion, WorktreeId,
 };
 
 mod append_events;
