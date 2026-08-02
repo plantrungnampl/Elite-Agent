@@ -15,10 +15,12 @@ use local_agent_terminal_application::{
     DisclosurePolicyEvaluator, DisclosureRequest, ExecutorLeaseStore, FileReadRequest,
     FileWriteEvidenceStore, FileWriteRecoverySnapshot, FileWriteRecoveryStore, FileWriteRequest,
     GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, PolicyBoundBytes,
-    PolicyDecisionId, PolicyDecisionStore, PortError, RawGitDiffResult, RawGitStatusResult,
-    RecordedPolicyDecision, Retryability, SafeErrorClassification, StructuredGit,
-    StructuredToolExecutor, ToolControlSelfTest, ToolExecutionArtifactEvidence, ToolExecutionId,
-    ToolExecutionResult, VerifiedBytes, VerifiedWrite, WorkspaceWriteCoordinator,
+    PolicyDecisionId, PolicyDecisionStore, PortError, QuarantinedToolExecutionArtifacts,
+    RawGitDiffResult, RawGitStatusResult, RecordedPolicyDecision, Retryability,
+    SafeErrorClassification, SafeToolExecutionError, StructuredGit, StructuredToolExecutor,
+    ToolControlSelfTest, ToolExecutionArtifactEvidence, ToolExecutionId,
+    ToolExecutionPostEffectReceipt, ToolExecutionResult, ToolExecutionStreamMetadata,
+    VerifiedBytes, VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, PolicyAction, PolicyEffect, PolicyRequest, PolicyResource, TaskId,
@@ -268,20 +270,29 @@ impl StructuredToolExecutor for ToolRuntime<'_> {
             .task_id()
             .clone();
         let capability = request.process_request().process().cwd().clone();
-        let mut receipt = self
-            .process_executor
-            .execute(execution_id, request.into_process_request())?;
-        let stdout = self.disclose_required_artifact(
+        let authority = request.authority().cloned();
+        let mut receipt = self.process_executor.execute(
+            execution_id,
+            request.into_process_request(),
+            authority.as_ref(),
+        )?;
+        let stdout = match self.disclose_required_artifact(
             task_id.clone(),
             capability.clone(),
             receipt.stdout.bytes.clone(),
-        )?;
-        let stderr = self.disclose_required_artifact(
+        ) {
+            Ok(stdout) => stdout,
+            Err(error) => return Ok(quarantine_result(receipt, error)),
+        };
+        let stderr = match self.disclose_required_artifact(
             task_id.clone(),
             capability.clone(),
             receipt.stderr.bytes.clone(),
-        )?;
-        let observed_writes = receipt
+        ) {
+            Ok(stderr) => stderr,
+            Err(error) => return Ok(quarantine_result(receipt, error)),
+        };
+        let observed_writes = match receipt
             .observed_writes
             .iter()
             .map(|write| {
@@ -294,7 +305,11 @@ impl StructuredToolExecutor for ToolRuntime<'_> {
                 )
                 .and_then(require_disclosed)
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(observed_writes) => observed_writes,
+            Err(error) => return Ok(quarantine_result(receipt, error)),
+        };
         receipt.stdout.bytes = stdout.bytes.clone();
         receipt.stderr.bytes = stderr.bytes.clone();
         receipt.output_digest = process_output_digest(&receipt.stdout.bytes, &receipt.stderr.bytes);
@@ -340,6 +355,48 @@ impl StructuredToolExecutor for ToolRuntime<'_> {
         request: GitDiffRequest,
     ) -> Result<DisclosureOutcome<GitDiffResult>, PortError> {
         self.diff(request)
+    }
+}
+
+fn quarantine_result(
+    mut receipt: local_agent_terminal_application::ProcessReceipt,
+    error: PortError,
+) -> ToolExecutionResult {
+    let post_effect = ToolExecutionPostEffectReceipt {
+        execution_id: receipt.execution_id.clone(),
+        status: receipt.status,
+        exit_code: receipt.exit_code,
+        stdout: ToolExecutionStreamMetadata {
+            digest: digest_bytes(&receipt.stdout.bytes),
+            size_bytes: receipt.stdout.bytes.len() as u64,
+            truncated: receipt.stdout.truncated,
+        },
+        stderr: ToolExecutionStreamMetadata {
+            digest: digest_bytes(&receipt.stderr.bytes),
+            size_bytes: receipt.stderr.bytes.len() as u64,
+            truncated: receipt.stderr.truncated,
+        },
+        duration_ms: receipt.duration_ms,
+        output_digest: receipt.output_digest.clone(),
+        observed_writes: receipt
+            .observed_writes
+            .iter()
+            .map(|write| write.write().clone())
+            .collect(),
+    };
+    receipt.stdout.bytes.clear();
+    receipt.stderr.bytes.clear();
+    ToolExecutionResult {
+        receipt,
+        artifacts: ToolExecutionArtifactEvidence::Quarantined(
+            QuarantinedToolExecutionArtifacts::new(
+                post_effect,
+                SafeToolExecutionError {
+                    classification: error.safe_classification(),
+                    retryability: error.retryability(),
+                },
+            ),
+        ),
     }
 }
 

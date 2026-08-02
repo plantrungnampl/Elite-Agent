@@ -162,6 +162,7 @@ impl<'a> ExecuteDurableTool<'a> {
                     &owner_run_id,
                     executor_fencing_token,
                 )?;
+                let request = request.with_authority(authority.clone());
                 let receipt =
                     receipt_from_executor_result(authority, self.executor.execute(request));
                 let resolution = ToolExecutionResolution::new(receipt);
@@ -321,17 +322,30 @@ fn receipt_from_executor_result(
 ) -> DurableToolExecutionReceipt {
     match result {
         Ok(result) if result.receipt.execution_id == *authority.execution_id() => {
-            let crate::ToolExecutionArtifactEvidence::Published(artifacts) = result.artifacts
-            else {
-                return indeterminate_receipt(authority, integrity_error());
-            };
-            match DurableToolExecutionReceipt::from_process_receipt(
-                authority.clone(),
-                result.receipt,
-                artifacts,
-            ) {
-                Ok(receipt) => receipt,
-                Err(_) => indeterminate_receipt(authority, integrity_error()),
+            match result.artifacts {
+                crate::ToolExecutionArtifactEvidence::Published(artifacts) => {
+                    match DurableToolExecutionReceipt::from_process_receipt(
+                        authority.clone(),
+                        result.receipt,
+                        artifacts,
+                    ) {
+                        Ok(receipt) => receipt,
+                        Err(_) => indeterminate_receipt(authority, integrity_error()),
+                    }
+                }
+                crate::ToolExecutionArtifactEvidence::Quarantined(quarantined) => {
+                    match DurableToolExecutionReceipt::from_post_effect_receipt(
+                        authority.clone(),
+                        quarantined.receipt().clone(),
+                        *quarantined.error(),
+                    ) {
+                        Ok(receipt) => receipt,
+                        Err(_) => indeterminate_receipt(authority, integrity_error()),
+                    }
+                }
+                crate::ToolExecutionArtifactEvidence::Disclosed(_) => {
+                    indeterminate_receipt(authority, integrity_error())
+                }
             }
         }
         Ok(_) => indeterminate_receipt(authority, integrity_error()),

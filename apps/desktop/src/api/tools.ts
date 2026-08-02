@@ -21,14 +21,17 @@ export interface ToolActivityEntryDto {
   approvalId: string | null;
   toolName: string;
   status: ToolActivityStatus;
-  summary: string;
+  executable: string;
+  arguments: string[];
+  cwdScope: string;
+  readScopes: string[];
+  writeScopes: string[];
   actorId: string;
   effectiveRole: string;
   reason: string;
   operationDigest: string;
   policyDecisionId: string | null;
   policySnapshotDigest: string;
-  scopes: string[];
   environmentProfileDigest: string;
   networkProfile: string;
   expiresAt: string | null;
@@ -47,10 +50,13 @@ export interface ToolActivityDto {
 export interface ToolApprovalRequestDto {
   approvalId: string;
   executionId: string;
-  summary: string;
+  executable: string;
+  arguments: string[];
+  cwdScope: string;
+  readScopes: string[];
+  writeScopes: string[];
   operationDigest: string;
   expiresAt: string;
-  scopes: string[];
   actorId: string;
   reason: string;
   environmentProfileDigest: string;

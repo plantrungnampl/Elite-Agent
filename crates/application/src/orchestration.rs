@@ -12,7 +12,7 @@ use crate::{
     canonical_json::sha256_digest,
     canonical_policy_binding_digest, canonical_tool_request, parse_policy_timestamp,
     tool::process_approval_operation,
-    tool_request_context, validate_approval_resume_relation, validate_authoritative_tool_request,
+    validate_approval_resume_relation, validate_authoritative_tool_request,
     validate_pending_approval_resume, ApprovalId, ApprovalRequestDto, ApprovalResumeSnapshot,
     ApprovalResumeStore, ArtifactId, AuthorizedToolExecutionClaim, Clock, DeniedToolExecution,
     IdGenerator, ImmutableToolRequest, PolicyDecision, PolicyDecisionId, PolicyDecisionStore,
@@ -249,6 +249,7 @@ impl<'a> ToolExecutionOrchestration<'a> {
                     .clone(),
                 fencing_token: process.executor_fencing_token(),
                 checked_at,
+                effect_checked_at: checked_at,
                 approval_checked_at,
             },
             immutable: immutable.clone(),
@@ -262,12 +263,13 @@ impl<'a> ToolExecutionOrchestration<'a> {
         if current.request() != &ready.authoritative_request {
             return Err(integrity_failure());
         }
+        let effect_checked_at = self.observed_at()?.1;
+        ready.claim.effect_checked_at = effect_checked_at;
         if let Some(approval) = &ready.claim.approval {
-            let checked_at = self.observed_at()?.1;
-            if parse_policy_timestamp(&approval.payload().expires_at)? <= checked_at {
+            if parse_policy_timestamp(&approval.payload().expires_at)? <= effect_checked_at {
                 return Err(integrity_failure());
             }
-            ready.claim.approval_checked_at = Some(checked_at);
+            ready.claim.approval_checked_at = Some(effect_checked_at);
         }
         Ok(())
     }
@@ -321,9 +323,7 @@ impl<'a> ToolExecutionOrchestration<'a> {
             &policy_request_binding_digest,
             &published,
         )?;
-        Ok(PreEffectOutcome::ApprovalRequired(approval_dto(
-            request, &published,
-        )?))
+        Ok(PreEffectOutcome::ApprovalRequired(approval_dto(&published)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -542,22 +542,16 @@ fn approval_window(
     Ok((requested_at, expires_at))
 }
 
-fn approval_dto(
-    request: &ToolRequest,
-    published: &ToolApprovalRequest,
-) -> Result<ApprovalRequestDto, PortError> {
-    let context = tool_request_context(request)?;
-    Ok(ApprovalRequestDto {
+fn approval_dto(published: &ToolApprovalRequest) -> ApprovalRequestDto {
+    ApprovalRequestDto {
         approval_id: published.approval_id().as_str().to_owned(),
-        summary: context.summary,
         operation_digest: published
             .canonical_payload()
             .operation_digest
             .as_str()
             .to_owned(),
         expires_at: published.payload().expires_at.clone(),
-        scopes: context.scopes,
-    })
+    }
 }
 
 fn invalid_input() -> PortError {

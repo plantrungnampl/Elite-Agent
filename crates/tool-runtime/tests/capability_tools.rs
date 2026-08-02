@@ -984,6 +984,47 @@ fn process_streams_are_scanned_and_redacted_before_the_executor_result_crosses_t
     assert_eq!(harness.policy_decisions.recorded.lock().unwrap().len(), 3);
 }
 
+#[test]
+fn process_effect_failure_returns_only_quarantined_receipt_metadata() {
+    let mut harness = Harness::new(None);
+    harness.disclosure_policy =
+        disclosure_engine("allow", "local").with_scan_failure_for_test(ScanFailurePoint::Initial);
+    harness.disclosure_context.snapshot_digest =
+        harness.disclosure_policy.snapshot_digest().clone();
+    let process = OutputProcess;
+    let runtime = ToolRuntime::new(
+        &harness.resolver,
+        &harness.reads,
+        &harness.sessions,
+        &harness.git,
+        &harness.leases,
+        &process,
+        &harness.evidence,
+        &harness.recovery,
+        &harness.writes,
+        &harness.disclosure_context,
+        &harness.disclosure_policy,
+        &harness.policy_decisions,
+        &harness.clock,
+    );
+
+    let result = StructuredToolExecutor::execute(&runtime, authorized_output_request())
+        .expect("post-effect scanner failure must retain a safe terminal result");
+    assert!(result.receipt.stdout.bytes.is_empty());
+    assert!(result.receipt.stderr.bytes.is_empty());
+    let ToolExecutionArtifactEvidence::Quarantined(quarantined) = result.artifacts else {
+        panic!("scanner failure must produce quarantined evidence");
+    };
+    assert_eq!(
+        quarantined.receipt().stdout.digest,
+        digest(b"x tok_test_7f89ac y")
+    );
+    assert_eq!(quarantined.receipt().stdout.size_bytes, 19);
+    assert_eq!(quarantined.receipt().observed_writes.len(), 1);
+    let rendered = format!("{quarantined:?}");
+    assert!(!rendered.contains("tok_test_7f89ac"));
+}
+
 struct OutputProcess;
 
 impl ToolControlSelfTest for OutputProcess {
@@ -997,6 +1038,7 @@ impl ApprovedProcessExecutor for OutputProcess {
         &self,
         execution_id: ToolExecutionId,
         _: ApprovedProcessRequest,
+        _authority: Option<&local_agent_terminal_application::ToolExecutionClaimAuthority>,
     ) -> Result<ProcessReceipt, PortError> {
         Ok(ProcessReceipt {
             execution_id,
@@ -1993,6 +2035,7 @@ impl ApprovedProcessExecutor for Process {
         &self,
         _: ToolExecutionId,
         _: ApprovedProcessRequest,
+        _authority: Option<&local_agent_terminal_application::ToolExecutionClaimAuthority>,
     ) -> Result<ProcessReceipt, PortError> {
         unreachable!()
     }

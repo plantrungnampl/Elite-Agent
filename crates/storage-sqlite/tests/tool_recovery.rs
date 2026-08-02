@@ -20,9 +20,10 @@ use local_agent_terminal_application::{
     ResolvedExecutable, SafeToolExecutionError, ToolApprovalOperationV1, ToolApprovalPayloadV1,
     ToolApprovalRequest, ToolExecutionCancellationClaim, ToolExecutionClaim,
     ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
-    ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResumeStore,
-    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolPolicyContext,
-    ToolRequest, ToolRequestBindingDigest, VerifiedFileWriteCompensation, VerifiedWrite,
+    ToolExecutionPostEffectReceipt, ToolExecutionRecoveryState, ToolExecutionResolution,
+    ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionStreamMetadata,
+    ToolExecutionTerminal, ToolExecutionTerminalKind, ToolPolicyContext, ToolRequest,
+    ToolRequestBindingDigest, VerifiedFileWriteCompensation, VerifiedWrite,
 };
 use local_agent_terminal_domain::{
     combine_policy_rules, ActorId, ActorLocality, ArtifactId, CapabilityRef, EnvironmentProfile,
@@ -159,6 +160,7 @@ fn authorized_begin_uses_the_exact_effective_policy_id() {
         policy_snapshot_digest: request.policy().policy_snapshot_digest().clone(),
         fencing_token: process.executor_fencing_token(),
         checked_at,
+        effect_checked_at: checked_at,
         approval_checked_at: None,
     };
 
@@ -176,6 +178,74 @@ fn authorized_begin_uses_the_exact_effective_policy_id() {
             )
             .unwrap(),
         effective_policy_id.as_str()
+    );
+}
+
+#[test]
+fn authorized_begin_rejects_an_allow_policy_that_expires_during_effect_revalidation() {
+    let database = TempDatabase::new();
+    let store = SqliteStore::open(&database.path).unwrap();
+    let request = exact_tool_request("execution-expired-allow");
+    let immutable = canonical_tool_request(&request).unwrap();
+    let request_artifact_id = ArtifactId::new("expired-allow-request").unwrap();
+    persist_artifact(
+        &database,
+        request_artifact_id.as_str(),
+        "tool-requests/execution-expired-allow.json",
+        "tool-request",
+        immutable.canonical_bytes(),
+    );
+    store
+        .reserve(NewToolIntent {
+            execution_id: request.execution_id().clone(),
+            operation_digest: immutable.binding_digest().as_sha256().clone(),
+        })
+        .unwrap();
+
+    let checked_at = Timestamp::from_unix_seconds(1_753_272_300);
+    let policy_id = record_exact_policy_with_expiry(
+        &store,
+        &request,
+        checked_at,
+        PolicyEffect::Allow,
+        '5',
+        Some(Timestamp::from_unix_seconds(checked_at.unix_seconds() + 30)),
+    );
+    let process = request.process().process();
+    let binding = process.binding();
+    let claim = AuthorizedToolExecutionClaim {
+        execution_id: request.execution_id().clone(),
+        request_artifact_id,
+        request_content_digest: immutable.binding_digest().as_sha256().clone(),
+        request_binding_digest: immutable.binding_digest().clone(),
+        task_id: binding.task_id().clone(),
+        run_id: binding.run_id().clone(),
+        tool_name: "process.exec".to_owned(),
+        policy_decision_id: policy_id,
+        policy_request_binding_digest: canonical_policy_binding_digest(&policy_request_for_tool(
+            &request, checked_at,
+        ))
+        .unwrap(),
+        approval: None,
+        workspace_version: binding.workspace_version(),
+        policy_snapshot_digest: request.policy().policy_snapshot_digest().clone(),
+        fencing_token: process.executor_fencing_token(),
+        checked_at,
+        effect_checked_at: Timestamp::from_unix_seconds(checked_at.unix_seconds() + 31),
+        approval_checked_at: None,
+    };
+
+    assert!(store.begin_authorized(claim).is_err());
+    assert_eq!(
+        configured_connection(&database.path)
+            .query_row(
+                "SELECT status || ':' || attempt_count FROM operation_intents
+                 WHERE id = 'execution-expired-allow'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "pending:0"
     );
 }
 
@@ -1494,6 +1564,61 @@ fn claimed_execution_can_resolve_no_effect_terminal_before_any_process_binding()
         );
         assert_eq!(terminal_event_count(&database), 1);
     }
+}
+
+#[test]
+fn quarantined_post_effect_receipt_round_trips_without_output_bytes() {
+    let database = TempDatabase::new();
+    let execution_id = "execution-quarantined-post-effect";
+    let (store, claim, _, _) = exact_approval_claim_fixture(&database, execution_id);
+    let ToolExecutionClaim::Claimed(authority) = store.begin_authorized(claim).unwrap() else {
+        panic!("fresh authorized execution must win the durable claim");
+    };
+    let post_effect = ToolExecutionPostEffectReceipt {
+        execution_id: authority.execution_id().clone(),
+        status: ProcessStatus::Exited,
+        exit_code: Some(0),
+        stdout: ToolExecutionStreamMetadata {
+            digest: digest_char('a'),
+            size_bytes: 19,
+            truncated: false,
+        },
+        stderr: ToolExecutionStreamMetadata {
+            digest: digest_char('b'),
+            size_bytes: 0,
+            truncated: false,
+        },
+        duration_ms: 42,
+        output_digest: digest_char('c'),
+        observed_writes: vec![VerifiedWrite {
+            digest: digest_char('d'),
+            size_bytes: 13,
+        }],
+    };
+    let receipt = DurableToolExecutionReceipt::from_post_effect_receipt(
+        authority,
+        post_effect,
+        SafeToolExecutionError {
+            classification:
+                local_agent_terminal_application::SafeErrorClassification::PermissionDenied,
+            retryability: local_agent_terminal_application::Retryability::NonRetryable,
+        },
+    )
+    .unwrap();
+    store
+        .resolve_terminal(ToolExecutionResolution::new(receipt.clone()))
+        .unwrap();
+
+    let reopened = SqliteStore::open(&database.path).unwrap();
+    let replayed = reopened
+        .resolve_terminal(ToolExecutionResolution::new(receipt.clone()))
+        .unwrap();
+    assert_eq!(replayed, receipt);
+    assert_eq!(replayed.terminal().output(), None);
+    assert_eq!(
+        replayed.terminal().post_effect().unwrap().stdout.size_bytes,
+        19
+    );
 }
 
 #[test]
@@ -3565,6 +3690,24 @@ fn record_exact_policy(
     effect: PolicyEffect,
     digest_marker: char,
 ) -> local_agent_terminal_application::PolicyDecisionId {
+    record_exact_policy_with_expiry(
+        store,
+        request,
+        evaluated_at,
+        effect,
+        digest_marker,
+        Some(Timestamp::from_unix_seconds(4_102_444_800)),
+    )
+}
+
+fn record_exact_policy_with_expiry(
+    store: &SqliteStore,
+    request: &ToolRequest,
+    evaluated_at: Timestamp,
+    effect: PolicyEffect,
+    digest_marker: char,
+    expires_at: Option<Timestamp>,
+) -> local_agent_terminal_application::PolicyDecisionId {
     let policy_request = policy_request_for_tool(request, evaluated_at);
     let draft = combine_policy_rules(
         policy_request,
@@ -3574,7 +3717,7 @@ fn record_exact_policy(
             effect,
             redactions: Vec::new(),
         }],
-        Some(Timestamp::from_unix_seconds(4_102_444_800)),
+        expires_at,
     )
     .unwrap();
     store
@@ -3808,6 +3951,7 @@ fn exact_approval_claim_fixture(
         policy_snapshot_digest: request.policy().policy_snapshot_digest().clone(),
         fencing_token: process.executor_fencing_token(),
         checked_at,
+        effect_checked_at: checked_at,
         approval_checked_at: Some(checked_at),
     };
     (store, claim, approval_id, effective_policy_id)

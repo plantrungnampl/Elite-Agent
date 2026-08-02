@@ -6,10 +6,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use local_agent_terminal_application::{
-    parse_policy_timestamp, ApprovalId, ApprovalResolution, ApprovalResumeStore, ApprovalStore,
-    ArtifactId, ArtifactWriteReservation, AuthoritativeProcessBinding,
-    AuthoritativeProcessTermination, CancelToolExecutionRequestDto, Clock,
-    DisclosedToolExecutionArtifacts, DisclosureOutcome, DurableToolCancellationOutcome,
+    parse_policy_timestamp, present_tool_activity_record, ApprovalId, ApprovalResolution,
+    ApprovalResumeStore, ApprovalStore, ArtifactId, ArtifactWriteReservation,
+    AuthoritativeProcessBinding, AuthoritativeProcessTermination, CancelToolExecutionRequestDto,
+    Clock, DisclosedToolExecutionArtifacts, DisclosureOutcome, DurableToolCancellationOutcome,
     DurableToolExecutionArtifact, DurableToolExecutionArtifacts, DurableToolExecutionOutcome,
     DurableToolExecutionReceipt, ExecuteTool, FileReadRequest, FileWriteRequest, GitDiffRequest,
     GitDiffResult, GitStatusRequest, GitStatusResult, IdGenerator, ImmutableToolRequest,
@@ -181,26 +181,41 @@ impl ToolBroker {
     fn activity_entries(
         &self,
     ) -> Result<Vec<local_agent_terminal_application::ToolActivityEntryDto>, PortError> {
-        self.database.tool_activity_entries()
+        let evaluated_at = parse_policy_timestamp(&self.database.now_utc()?)?;
+        self.database
+            .tool_activity_records()?
+            .into_iter()
+            .map(|record| {
+                present_tool_activity_record(record, &self.policies, &self.database, evaluated_at)
+            })
+            .collect()
     }
 
     fn approval_request(
         &self,
         approval_id: &ApprovalId,
     ) -> Result<ToolApprovalRequestDto, PortError> {
-        let entry = self
-            .database
-            .tool_activity_entry_for_approval(approval_id)?;
+        let evaluated_at = parse_policy_timestamp(&self.database.now_utc()?)?;
+        let entry = present_tool_activity_record(
+            self.database
+                .tool_activity_record_for_approval(approval_id)?,
+            &self.policies,
+            &self.database,
+            evaluated_at,
+        )?;
         if entry.status != ToolActivityStatusDto::ApprovalRequired {
             return Err(conflict());
         }
         Ok(ToolApprovalRequestDto {
             approval_id: approval_id.as_str().to_owned(),
             execution_id: entry.execution_id,
-            summary: entry.summary,
+            executable: entry.executable,
+            arguments: entry.arguments,
+            cwd_scope: entry.cwd_scope,
+            read_scopes: entry.read_scopes,
+            write_scopes: entry.write_scopes,
             operation_digest: entry.operation_digest,
             expires_at: entry.expires_at.ok_or_else(integrity_failure)?,
-            scopes: entry.scopes,
             actor_id: entry.actor_id,
             reason: entry.reason,
             environment_profile_digest: entry.environment_profile_digest,
@@ -276,15 +291,19 @@ impl StructuredToolExecutor for PublishingStructuredExecutor<'_, '_> {
             .task_id()
             .clone();
         let mut result = self.executor.execute(request)?;
-        let ToolExecutionArtifactEvidence::Disclosed(disclosed) = result.artifacts else {
-            return Err(integrity_failure());
+        result.artifacts = match result.artifacts {
+            ToolExecutionArtifactEvidence::Disclosed(disclosed) => {
+                ToolExecutionArtifactEvidence::Published(self.publisher.publish_tool_outputs(
+                    &task_id,
+                    &result.receipt.execution_id,
+                    &disclosed,
+                )?)
+            }
+            ToolExecutionArtifactEvidence::Quarantined(quarantined) => {
+                ToolExecutionArtifactEvidence::Quarantined(quarantined)
+            }
+            ToolExecutionArtifactEvidence::Published(_) => return Err(integrity_failure()),
         };
-        result.artifacts =
-            ToolExecutionArtifactEvidence::Published(self.publisher.publish_tool_outputs(
-                &task_id,
-                &result.receipt.execution_id,
-                &disclosed,
-            )?);
         Ok(result)
     }
 

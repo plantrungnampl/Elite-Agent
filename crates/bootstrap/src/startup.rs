@@ -606,6 +606,14 @@ fn database_open_failure(error: OpenError) -> StartupFailure {
             detail: "The database schema version is not supported by this application.".to_owned(),
             recovery: RecoveryMode::Retry,
         },
+        OpenError::ForeignKeyViolation { .. } => StartupFailure {
+            state: StartupStateDto::RecoverableFailure,
+            code: "startup.database_schema_invalid",
+            message: "The local database schema could not be validated.",
+            category: "integrity_failure",
+            detail: "The database contains rows that violate a required relationship.".to_owned(),
+            recovery: RecoveryMode::Retry,
+        },
         OpenError::Database(_) => StartupFailure {
             state: StartupStateDto::RecoverableFailure,
             code: "startup.database_unavailable",

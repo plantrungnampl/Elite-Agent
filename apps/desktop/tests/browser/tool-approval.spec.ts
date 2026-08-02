@@ -13,7 +13,8 @@ test("supports a digest-bound keyboard approval flow with focus restoration", as
 
   const dialog = page.getByRole("dialog", { name: "Approve tool request" });
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByText("toolchain:git [\"status\"]")).toBeVisible();
+  await expect(dialog.getByText("toolchain:git")).toBeVisible();
+  await expect(dialog.getByText('["status"]')).toBeVisible();
   await expect(dialog.getByText(`sha256:${"a".repeat(64)}`)).toBeVisible();
   const approve = dialog.getByRole("button", { name: "Approve exact request" });
   await expect(approve).toBeDisabled();
@@ -181,14 +182,17 @@ function activityFixture() {
         approvalId: "approval-1",
         toolName: "process.exec",
         status: "approval_required",
-        summary: "toolchain:git [\"status\"]",
+        executable: "toolchain:git",
+        arguments: ["status"],
+        cwdScope: "worktree:task-1",
+        readScopes: [],
+        writeScopes: [],
         actorId: "agent-local",
         effectiveRole: "implementer",
         reason: "Run the approved verification",
         operationDigest: `sha256:${"a".repeat(64)}`,
         policyDecisionId: "policy-1",
         policySnapshotDigest: `sha256:${"c".repeat(64)}`,
-        scopes: ["worktree:task-1"],
         environmentProfileDigest: "environment-safe",
         networkProfile: "denied",
         expiresAt: "2026-08-02T12:00:00Z",
@@ -203,14 +207,17 @@ function activityFixture() {
         approvalId: null,
         toolName: "process.exec",
         status: "running",
-        summary: "toolchain:git [\"status\"]",
+        executable: "toolchain:git",
+        arguments: ["status"],
+        cwdScope: "worktree:task-1",
+        readScopes: [],
+        writeScopes: [],
         actorId: "agent-local",
         effectiveRole: "implementer",
         reason: "Run the approved verification",
         operationDigest: `sha256:${"b".repeat(64)}`,
         policyDecisionId: "policy-2",
         policySnapshotDigest: `sha256:${"c".repeat(64)}`,
-        scopes: ["worktree:task-1"],
         environmentProfileDigest: "environment-safe",
         networkProfile: "denied",
         expiresAt: null,
@@ -228,10 +235,13 @@ function approvalFixture() {
   return {
     approvalId: "approval-1",
     executionId: "execution-approval",
-    summary: "toolchain:git [\"status\"]",
+    executable: "toolchain:git",
+    arguments: ["status"],
+    cwdScope: "worktree:task-1",
+    readScopes: [],
+    writeScopes: [],
     operationDigest: `sha256:${"a".repeat(64)}`,
     expiresAt: "2026-08-02T12:00:00Z",
-    scopes: ["worktree:task-1"],
     actorId: "agent-local",
     reason: "Run the approved verification",
     environmentProfileDigest: "environment-safe",

@@ -43,6 +43,8 @@ impl SqliteStore {
             path: path.as_ref().to_owned(),
         };
         let mut connection = Connection::open(&store.path)?;
+        migrations::reject_unknown_schema_without_mutation(&connection)?;
+        initialize_connection(&connection)?;
         migrations::validate_or_migrate(&mut connection)?;
         initialize_connection(&connection)?;
         Ok(store)

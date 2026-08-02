@@ -953,6 +953,25 @@ pub struct BoundedOutput {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionStreamMetadata {
+    pub digest: Sha256Digest,
+    pub size_bytes: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionPostEffectReceipt {
+    pub execution_id: ToolExecutionId,
+    pub status: ProcessStatus,
+    pub exit_code: Option<i32>,
+    pub stdout: ToolExecutionStreamMetadata,
+    pub stderr: ToolExecutionStreamMetadata,
+    pub duration_ms: u64,
+    pub output_digest: Sha256Digest,
+    pub observed_writes: Vec<VerifiedWrite>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessStatus {
     Exited,
@@ -1026,6 +1045,7 @@ pub struct AuthorizedToolExecutionClaim {
     pub policy_snapshot_digest: Sha256Digest,
     pub fencing_token: Option<FencingToken>,
     pub checked_at: Timestamp,
+    pub effect_checked_at: Timestamp,
     pub approval_checked_at: Option<Timestamp>,
 }
 
@@ -1092,6 +1112,26 @@ pub struct DisclosedToolExecutionArtifacts {
     observed_writes: Vec<PolicyBoundBytes>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedToolExecutionArtifacts {
+    receipt: ToolExecutionPostEffectReceipt,
+    error: SafeToolExecutionError,
+}
+
+impl QuarantinedToolExecutionArtifacts {
+    pub fn new(receipt: ToolExecutionPostEffectReceipt, error: SafeToolExecutionError) -> Self {
+        Self { receipt, error }
+    }
+
+    pub const fn receipt(&self) -> &ToolExecutionPostEffectReceipt {
+        &self.receipt
+    }
+
+    pub const fn error(&self) -> &SafeToolExecutionError {
+        &self.error
+    }
+}
+
 impl DisclosedToolExecutionArtifacts {
     pub fn new(
         stdout: PolicyBoundBytes,
@@ -1122,6 +1162,7 @@ impl DisclosedToolExecutionArtifacts {
 pub enum ToolExecutionArtifactEvidence {
     Disclosed(DisclosedToolExecutionArtifacts),
     Published(DurableToolExecutionArtifacts),
+    Quarantined(QuarantinedToolExecutionArtifacts),
 }
 
 impl DurableToolExecutionArtifacts {
@@ -1190,7 +1231,10 @@ enum ToolExecutionTerminalState {
     Cancelled,
     Terminated(ToolExecutionOutput),
     Interrupted,
-    Indeterminate(SafeToolExecutionError),
+    Indeterminate {
+        error: SafeToolExecutionError,
+        post_effect: Option<Box<ToolExecutionPostEffectReceipt>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1240,7 +1284,22 @@ impl ToolExecutionTerminal {
 
     pub const fn indeterminate(error: SafeToolExecutionError) -> Self {
         Self {
-            state: ToolExecutionTerminalState::Indeterminate(error),
+            state: ToolExecutionTerminalState::Indeterminate {
+                error,
+                post_effect: None,
+            },
+        }
+    }
+
+    pub fn indeterminate_with_post_effect(
+        error: SafeToolExecutionError,
+        post_effect: ToolExecutionPostEffectReceipt,
+    ) -> Self {
+        Self {
+            state: ToolExecutionTerminalState::Indeterminate {
+                error,
+                post_effect: Some(Box::new(post_effect)),
+            },
         }
     }
 
@@ -1251,7 +1310,7 @@ impl ToolExecutionTerminal {
             ToolExecutionTerminalState::Cancelled => ToolExecutionTerminalKind::Cancelled,
             ToolExecutionTerminalState::Terminated(_) => ToolExecutionTerminalKind::Terminated,
             ToolExecutionTerminalState::Interrupted => ToolExecutionTerminalKind::Interrupted,
-            ToolExecutionTerminalState::Indeterminate(_) => {
+            ToolExecutionTerminalState::Indeterminate { .. } => {
                 ToolExecutionTerminalKind::Indeterminate
             }
         }
@@ -1264,13 +1323,24 @@ impl ToolExecutionTerminal {
             | ToolExecutionTerminalState::Terminated(output) => Some(output),
             ToolExecutionTerminalState::Cancelled
             | ToolExecutionTerminalState::Interrupted
-            | ToolExecutionTerminalState::Indeterminate(_) => None,
+            | ToolExecutionTerminalState::Indeterminate { .. } => None,
         }
     }
 
     pub const fn error(&self) -> Option<&SafeToolExecutionError> {
         match &self.state {
-            ToolExecutionTerminalState::Indeterminate(error) => Some(error),
+            ToolExecutionTerminalState::Indeterminate { error, .. } => Some(error),
+            ToolExecutionTerminalState::Succeeded(_)
+            | ToolExecutionTerminalState::Failed(_)
+            | ToolExecutionTerminalState::Cancelled
+            | ToolExecutionTerminalState::Terminated(_)
+            | ToolExecutionTerminalState::Interrupted => None,
+        }
+    }
+
+    pub fn post_effect(&self) -> Option<&ToolExecutionPostEffectReceipt> {
+        match &self.state {
+            ToolExecutionTerminalState::Indeterminate { post_effect, .. } => post_effect.as_deref(),
             ToolExecutionTerminalState::Succeeded(_)
             | ToolExecutionTerminalState::Failed(_)
             | ToolExecutionTerminalState::Cancelled
@@ -1356,6 +1426,20 @@ impl DurableToolExecutionReceipt {
         };
         ToolExecutionTerminal::from_process(status, output)
             .map(|terminal| Self::new(authority, terminal))
+    }
+
+    pub fn from_post_effect_receipt(
+        authority: ToolExecutionClaimAuthority,
+        receipt: ToolExecutionPostEffectReceipt,
+        error: SafeToolExecutionError,
+    ) -> Result<Self, PortError> {
+        if authority.execution_id != receipt.execution_id {
+            return Err(invalid_input());
+        }
+        Ok(Self::new(
+            authority,
+            ToolExecutionTerminal::indeterminate_with_post_effect(error, receipt),
+        ))
     }
 
     pub const fn authority(&self) -> &ToolExecutionClaimAuthority {
@@ -1584,6 +1668,7 @@ pub struct AuthorizedToolRequest {
     request: ApprovedProcessRequest,
     request_binding_digest: ToolRequestBindingDigest,
     approval: Option<BoundToolApproval>,
+    authority: Option<ToolExecutionClaimAuthority>,
 }
 
 impl AuthorizedToolRequest {
@@ -1598,6 +1683,7 @@ impl AuthorizedToolRequest {
             request,
             request_binding_digest,
             approval: Some(approval),
+            authority: None,
         }
     }
 
@@ -1609,6 +1695,7 @@ impl AuthorizedToolRequest {
             request: process,
             request_binding_digest,
             approval: None,
+            authority: None,
         })
     }
 
@@ -1631,6 +1718,15 @@ impl AuthorizedToolRequest {
 
     pub fn into_process_request(self) -> ApprovedProcessRequest {
         self.request
+    }
+
+    pub(crate) fn with_authority(mut self, authority: ToolExecutionClaimAuthority) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+
+    pub const fn authority(&self) -> Option<&ToolExecutionClaimAuthority> {
+        self.authority.as_ref()
     }
 }
 
@@ -2009,6 +2105,7 @@ pub trait ApprovedProcessExecutor: ToolControlSelfTest + Send + Sync {
         &self,
         execution_id: ToolExecutionId,
         request: ApprovedProcessRequest,
+        authority: Option<&ToolExecutionClaimAuthority>,
     ) -> Result<ProcessReceipt, PortError>;
     fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError>;
     fn terminate_retained_process(

@@ -1,8 +1,13 @@
-use local_agent_terminal_domain::{NetworkProfile, ProjectId, TrustTier};
+use local_agent_terminal_domain::{
+    NetworkProfile, PolicyAction, PolicyEffect, PolicyRequest, PolicyResource, ProjectId,
+    Sha256Digest, Timestamp, TrustTier,
+};
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::{
-    tool::logical_capability, ExpectedPresence, PortError, ProjectSnapshot, RecoveryAction,
+    canonical_json::sha256_digest, tool::logical_capability, DisclosureChannel,
+    DisclosurePolicyEvaluator, DisclosureRequest, ExpectedPresence, PolicyDecisionId,
+    PolicyDecisionStore, PortError, ProjectSnapshot, RecordedPolicyDecision, RecoveryAction,
     RecoveryCandidate, RecoveryReason, RepositorySnapshot, Retryability, SafeErrorClassification,
     TaskLeaseState, TaskSnapshot, ToolRequest, WorktreeSnapshot, WorktreeState,
 };
@@ -200,14 +205,17 @@ pub struct ToolActivityEntryDto {
     pub approval_id: Option<String>,
     pub tool_name: String,
     pub status: ToolActivityStatusDto,
-    pub summary: String,
+    pub executable: String,
+    pub arguments: Vec<String>,
+    pub cwd_scope: String,
+    pub read_scopes: Vec<String>,
+    pub write_scopes: Vec<String>,
     pub actor_id: String,
     pub effective_role: String,
     pub reason: String,
     pub operation_digest: String,
     pub policy_decision_id: Option<String>,
     pub policy_snapshot_digest: String,
-    pub scopes: Vec<String>,
     pub environment_profile_digest: String,
     pub network_profile: String,
     pub expires_at: Option<String>,
@@ -230,10 +238,13 @@ pub struct ToolActivityDto {
 pub struct ToolApprovalRequestDto {
     pub approval_id: String,
     pub execution_id: String,
-    pub summary: String,
+    pub executable: String,
+    pub arguments: Vec<String>,
+    pub cwd_scope: String,
+    pub read_scopes: Vec<String>,
+    pub write_scopes: Vec<String>,
     pub operation_digest: String,
     pub expires_at: String,
-    pub scopes: Vec<String>,
     pub actor_id: String,
     pub reason: String,
     pub environment_profile_digest: String,
@@ -266,48 +277,38 @@ pub struct StopAllToolsReceiptDto {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolRequestContextDto {
-    pub summary: String,
+pub struct ToolRequestContext {
+    pub executable: String,
+    pub arguments: Vec<String>,
+    pub cwd_scope: String,
+    pub read_scopes: Vec<String>,
+    pub write_scopes: Vec<String>,
     pub actor_id: String,
     pub fallback_role: String,
     pub reason: String,
     pub policy_snapshot_digest: String,
-    pub scopes: Vec<String>,
     pub environment_profile_digest: String,
     pub network_profile: String,
     pub fencing_token: Option<u64>,
 }
 
-pub fn tool_request_context(request: &ToolRequest) -> Result<ToolRequestContextDto, PortError> {
+pub fn tool_request_context(request: &ToolRequest) -> Result<ToolRequestContext, PortError> {
     let process = request.process().process();
-    let mut scopes = Vec::with_capacity(
-        1 + request.process().expected_reads().len() + process.expected_writes().len(),
-    );
-    scopes.push(logical_capability(process.cwd()));
-    scopes.extend(
-        request
+    Ok(ToolRequestContext {
+        executable: logical_capability(process.executable()),
+        arguments: process.argv().to_vec(),
+        cwd_scope: logical_capability(process.cwd()),
+        read_scopes: request
             .process()
             .expected_reads()
             .iter()
-            .map(logical_capability),
-    );
-    scopes.extend(
-        process
+            .map(logical_capability)
+            .collect(),
+        write_scopes: process
             .expected_writes()
             .iter()
-            .map(|write| logical_capability(write.capability())),
-    );
-    let argument_count = process.argv().len();
-    let argument_label = if argument_count == 1 {
-        "argument"
-    } else {
-        "arguments"
-    };
-    Ok(ToolRequestContextDto {
-        summary: format!(
-            "process.exec {} ({argument_count} {argument_label})",
-            logical_capability(process.executable()),
-        ),
+            .map(|write| logical_capability(write.capability()))
+            .collect(),
         actor_id: request.policy().actor().agent_id.clone(),
         fallback_role: trust_tier_name(request.policy().actor().trust_tier).to_owned(),
         reason: request.policy().purpose().to_owned(),
@@ -316,7 +317,6 @@ pub fn tool_request_context(request: &ToolRequest) -> Result<ToolRequestContextD
             .policy_snapshot_digest()
             .as_str()
             .to_owned(),
-        scopes,
         environment_profile_digest: process
             .binding()
             .environment_profile()
@@ -328,14 +328,181 @@ pub fn tool_request_context(request: &ToolRequest) -> Result<ToolRequestContextD
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolActivityRecord {
+    pub request: ToolRequest,
+    pub approval_id: Option<String>,
+    pub status: ToolActivityStatusDto,
+    pub effective_role: String,
+    pub operation_digest: String,
+    pub policy_decision_id: Option<String>,
+    pub expires_at: Option<String>,
+    pub policy_rules: Vec<String>,
+    pub redaction_state: ToolRedactionStateDto,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+pub fn present_tool_activity_record(
+    record: ToolActivityRecord,
+    disclosures: &dyn DisclosurePolicyEvaluator,
+    policy_decisions: &dyn PolicyDecisionStore,
+    evaluated_at: Timestamp,
+) -> Result<ToolActivityEntryDto, PortError> {
+    let context = tool_request_context(&record.request)?;
+    let mut redacted = record.redaction_state == ToolRedactionStateDto::Redacted;
+    let mut disclose = |value| {
+        disclose_text(
+            &record.request,
+            value,
+            disclosures,
+            policy_decisions,
+            evaluated_at,
+            &mut redacted,
+        )
+    };
+    let executable = disclose(context.executable)?;
+    let arguments = context
+        .arguments
+        .into_iter()
+        .map(&mut disclose)
+        .collect::<Result<_, _>>()?;
+    let cwd_scope = disclose(context.cwd_scope)?;
+    let read_scopes = context
+        .read_scopes
+        .into_iter()
+        .map(&mut disclose)
+        .collect::<Result<_, _>>()?;
+    let write_scopes = context
+        .write_scopes
+        .into_iter()
+        .map(&mut disclose)
+        .collect::<Result<_, _>>()?;
+    let network_profile = disclose(context.network_profile)?;
+    let policy_rules = record
+        .policy_rules
+        .into_iter()
+        .map(&mut disclose)
+        .collect::<Result<_, _>>()?;
+    let actor_id = disclose(context.actor_id)?;
+    let effective_role = disclose(record.effective_role)?;
+    let reason = disclose(context.reason)?;
+    Ok(ToolActivityEntryDto {
+        execution_id: record.request.execution_id().as_str().to_owned(),
+        approval_id: record.approval_id,
+        tool_name: "process.exec".to_owned(),
+        status: record.status,
+        executable,
+        arguments,
+        cwd_scope,
+        read_scopes,
+        write_scopes,
+        actor_id,
+        effective_role,
+        reason,
+        operation_digest: record.operation_digest,
+        policy_decision_id: record.policy_decision_id,
+        policy_snapshot_digest: context.policy_snapshot_digest,
+        environment_profile_digest: context.environment_profile_digest,
+        network_profile,
+        expires_at: record.expires_at,
+        fencing_token: context.fencing_token,
+        policy_rules,
+        redaction_state: if redacted {
+            ToolRedactionStateDto::Redacted
+        } else {
+            ToolRedactionStateDto::None
+        },
+        started_at: record.started_at,
+        completed_at: record.completed_at,
+    })
+}
+
+fn disclose_text(
+    request: &ToolRequest,
+    value: String,
+    disclosures: &dyn DisclosurePolicyEvaluator,
+    policy_decisions: &dyn PolicyDecisionStore,
+    evaluated_at: Timestamp,
+    redacted: &mut bool,
+) -> Result<String, PortError> {
+    let bytes = value.into_bytes();
+    let original_digest =
+        Sha256Digest::new(sha256_digest(&bytes)).map_err(|_| integrity_failure())?;
+    let binding = request.process().process().binding();
+    let policy = request.policy();
+    let policy_request = PolicyRequest {
+        task_id: binding.task_id().clone(),
+        actor: policy.actor().clone(),
+        action: PolicyAction::new("tool.approval.display").map_err(|_| integrity_failure())?,
+        resource: PolicyResource {
+            capability: policy.resource().capability.clone(),
+            content_digest: original_digest.clone(),
+            resource_class: policy.resource().resource_class,
+        },
+        task_risk: policy.task_risk(),
+        workflow_phase: binding.workflow_phase().as_str().to_owned(),
+        purpose: "display tool approval context".to_owned(),
+        policy_snapshot_digest: policy.policy_snapshot_digest().clone(),
+        evaluated_at,
+    };
+    let disclosure = disclosures.disclose(DisclosureRequest {
+        policy_request: policy_request.clone(),
+        channel: DisclosureChannel::Summary,
+        bytes,
+    })?;
+    if disclosure.original_digest != original_digest
+        || disclosure.channel != DisclosureChannel::Summary
+        || disclosure.decision.draft.request() != &policy_request
+    {
+        return Err(integrity_failure());
+    }
+    let expected_decision_id = PolicyDecisionId::from_decision(&disclosure.decision);
+    let decision_id = policy_decisions.record(RecordedPolicyDecision {
+        decision: disclosure.decision.clone(),
+        recorded_at: evaluated_at,
+    })?;
+    if decision_id != expected_decision_id {
+        return Err(integrity_failure());
+    }
+    if !matches!(
+        disclosure.decision.draft.effect(),
+        PolicyEffect::Allow | PolicyEffect::AllowWithRedaction
+    ) || disclosure.approval_binding.is_some()
+    {
+        return Err(disclosure_denied());
+    }
+    let effective_bytes = disclosure.effective_bytes.ok_or_else(integrity_failure)?;
+    let effective_digest = disclosure.effective_digest.ok_or_else(integrity_failure)?;
+    let calculated_digest =
+        Sha256Digest::new(sha256_digest(&effective_bytes)).map_err(|_| integrity_failure())?;
+    if effective_digest != calculated_digest {
+        return Err(integrity_failure());
+    }
+    *redacted |= original_digest != effective_digest;
+    String::from_utf8(effective_bytes).map_err(|_| integrity_failure())
+}
+
+fn integrity_failure() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::IntegrityFailure,
+        Retryability::NonRetryable,
+    )
+}
+
+fn disclosure_denied() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::PermissionDenied,
+        Retryability::NonRetryable,
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalRequestDto {
     pub approval_id: String,
-    pub summary: String,
     pub operation_digest: String,
     pub expires_at: String,
-    pub scopes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

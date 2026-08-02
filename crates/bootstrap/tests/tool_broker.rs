@@ -44,9 +44,8 @@ const DENY_PROCESS_POLICY: &str =
     r#"{"version":1,"rules":[{"id":"deny-process","effect":"deny","action":"process.exec"}]}"#;
 const ALLOW_PROCESS_POLICY: &str =
     r#"{"version":1,"rules":[{"id":"allow-process","effect":"allow","action":"process.exec"}]}"#;
-const APPROVE_PROCESS_POLICY: &str = r#"{"version":1,"rules":[{"id":"approve-process","effect":"require_approval","action":"process.exec"}]}"#;
-const DEFAULT_DENY_POLICY: &str =
-    r#"{"version":1,"rules":[{"id":"default-deny","effect":"deny"}]}"#;
+const APPROVE_PROCESS_POLICY: &str = r#"{"version":1,"rules":[{"id":"approve-process","effect":"require_approval","action":"process.exec"},{"id":"redact-tool-display","effect":"allow_with_redaction","action":"tool.approval.display","redactions":["secret_scanner"]}]}"#;
+const DEFAULT_DENY_POLICY: &str = r#"{"version":1,"rules":[{"id":"default-deny-process","effect":"deny","action":"process.exec"},{"id":"tool-display","effect":"allow_with_redaction","action":"tool.approval.display","redactions":["secret_scanner"]}]}"#;
 const EMPTY_BYTES_HASH: &str =
     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const SAFE_STDOUT_HASH: &str =
@@ -367,8 +366,11 @@ fn configured_runtime_projects_exact_approval_context_and_rejects_a_stale_digest
     let entry = &activity.entries[0];
     assert_eq!(entry.execution_id, "execution-runtime-activity");
     assert_eq!(entry.status, ToolActivityStatusDto::ApprovalRequired);
-    assert_eq!(entry.summary, "process.exec toolchain:cargo (1 argument)");
-    assert!(!entry.summary.contains("test"));
+    assert_eq!(entry.executable, "toolchain:cargo");
+    assert_eq!(entry.arguments, ["test"]);
+    assert_eq!(entry.cwd_scope, "worktree:task-1");
+    assert!(entry.read_scopes.is_empty());
+    assert!(entry.write_scopes.is_empty());
     assert_eq!(entry.actor_id, "agent-1");
     assert_eq!(entry.reason, "run focused tests");
     assert_eq!(entry.network_profile, "denied");
@@ -378,7 +380,11 @@ fn configured_runtime_projects_exact_approval_context_and_rejects_a_stale_digest
     let detail = runtime.approval_request(approval_id.clone()).unwrap();
     assert_eq!(detail.execution_id, "execution-runtime-activity");
     assert_eq!(detail.operation_digest, published.operation_digest);
-    assert_eq!(detail.scopes, ["worktree:task-1"]);
+    assert_eq!(detail.executable, "toolchain:cargo");
+    assert_eq!(detail.arguments, ["test"]);
+    assert_eq!(detail.cwd_scope, "worktree:task-1");
+    assert!(detail.read_scopes.is_empty());
+    assert!(detail.write_scopes.is_empty());
 
     let error = runtime
         .resolve_approval(ResolveToolApprovalRequestDto {
@@ -403,6 +409,49 @@ fn configured_runtime_projects_exact_approval_context_and_rejects_a_stale_digest
     assert_eq!(resolved.execution_id, "execution-runtime-activity");
     assert_eq!(resolved.status, ToolActivityStatusDto::Indeterminate);
     assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn approval_display_redacts_secrets_without_losing_argument_boundaries() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let policy = VersionedPolicyEngine::from_json(APPROVE_PROCESS_POLICY).unwrap();
+    let request = tool_request_for_policy_and_display(
+        "execution-runtime-redacted-approval",
+        policy.snapshot_digest().clone(),
+        vec!["--token".to_owned(), "tok_test_7f89ac".to_owned()],
+        "use tok_test_7f89ac for the focused test",
+    );
+    let bootstrap = Bootstrap::with_tool_broker(
+        StartupConfig {
+            app_data_dir: fixture.app_data.clone(),
+            trusted_workspace_root: fixture.workspace_root.clone(),
+            secret_values: Vec::new(),
+        },
+        ToolBrokerConfig::new(
+            APPROVE_PROCESS_POLICY,
+            Arc::new(EchoAuthority),
+            Arc::new(RecordingExecutor::default()),
+        ),
+    );
+    let runtime = bootstrap.tool_runtime().unwrap();
+    let ToolOutcome::ApprovalRequired(published) = runtime.execute(request).unwrap() else {
+        panic!("approval policy must publish one immutable request");
+    };
+
+    let detail = runtime
+        .approval_request(ApprovalId::new(published.approval_id).unwrap())
+        .unwrap();
+
+    assert_eq!(detail.arguments.len(), 2);
+    assert_eq!(detail.arguments[0], "--token");
+    assert!(detail.arguments[1].starts_with("[REDACTED:api_token:"));
+    assert!(!detail.arguments[1].contains("tok_test_7f89ac"));
+    assert!(!detail.reason.contains("tok_test_7f89ac"));
+    assert_eq!(
+        detail.redaction_state,
+        local_agent_terminal_application::ToolRedactionStateDto::Redacted
+    );
 }
 
 #[test]
@@ -783,6 +832,20 @@ fn tool_request_for_policy(
     execution_id: &str,
     policy_snapshot_digest: Sha256Digest,
 ) -> ToolRequest {
+    tool_request_for_policy_and_display(
+        execution_id,
+        policy_snapshot_digest,
+        vec!["test".to_owned()],
+        "run focused tests",
+    )
+}
+
+fn tool_request_for_policy_and_display(
+    execution_id: &str,
+    policy_snapshot_digest: Sha256Digest,
+    arguments: Vec<String>,
+    purpose: &str,
+) -> ToolRequest {
     let task_id = TaskId::new("task-1").unwrap();
     let process = ProcessToolRequest::new(
         ProcessBinding::new(
@@ -797,7 +860,7 @@ fn tool_request_for_policy(
         .unwrap(),
         ProcessInvocation::new(
             CapabilityRef::toolchain("cargo").unwrap(),
-            vec!["test".to_owned()],
+            arguments,
             CapabilityRef::worktree(task_id.clone(), ".").unwrap(),
             ProcessTrustTier::IsolatedWorker,
             NetworkProfile::Denied,
@@ -842,7 +905,7 @@ fn tool_request_for_policy(
             resource_class: ResourceClass::InternalCode,
         },
         TaskRisk::High,
-        "run focused tests",
+        purpose,
         policy_snapshot_digest,
     )
     .unwrap();

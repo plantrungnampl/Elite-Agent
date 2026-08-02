@@ -286,8 +286,20 @@ END;
 #[derive(Debug)]
 pub enum OpenError {
     Database(rusqlite::Error),
-    ChecksumMismatch { recorded: String, expected: String },
-    UnsupportedSchema { found: i64, supported: i64 },
+    ChecksumMismatch {
+        recorded: String,
+        expected: String,
+    },
+    UnsupportedSchema {
+        found: i64,
+        supported: i64,
+    },
+    ForeignKeyViolation {
+        table: String,
+        rowid: i64,
+        parent: String,
+        foreign_key: i64,
+    },
 }
 
 impl fmt::Display for OpenError {
@@ -302,6 +314,15 @@ impl fmt::Display for OpenError {
                 formatter,
                 "unsupported schema version {found}; this binary supports {supported}"
             ),
+            Self::ForeignKeyViolation {
+                table,
+                rowid,
+                parent,
+                foreign_key,
+            } => write!(
+                formatter,
+                "SQLite foreign-key check failed for {table} row {rowid} -> {parent} (constraint {foreign_key})"
+            ),
         }
     }
 }
@@ -310,7 +331,9 @@ impl std::error::Error for OpenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Database(error) => Some(error),
-            Self::ChecksumMismatch { .. } | Self::UnsupportedSchema { .. } => None,
+            Self::ChecksumMismatch { .. }
+            | Self::UnsupportedSchema { .. }
+            | Self::ForeignKeyViolation { .. } => None,
         }
     }
 }
@@ -370,7 +393,7 @@ pub(crate) fn validate_or_migrate(connection: &mut Connection) -> Result<(), Ope
             });
         }
         apply_initial_migration(connection)?;
-        return Ok(());
+        return validate_foreign_keys(connection);
     }
 
     let version: Option<i64> = connection
@@ -388,31 +411,25 @@ pub(crate) fn validate_or_migrate(connection: &mut Connection) -> Result<(), Ope
     match version {
         1 => {
             validate_checksum(connection, 1, v1_migration_checksum())?;
-            apply_v2_migration(connection)?;
-            apply_v3_migration(connection)?;
-            apply_v4_migration(connection)?;
-            apply_v5_migration(connection)?;
+            apply_upgrade_migrations(connection, version)?;
         }
         2 => {
             validate_checksum(connection, 1, v1_migration_checksum())?;
             validate_checksum(connection, 2, v2_migration_checksum())?;
-            apply_v3_migration(connection)?;
-            apply_v4_migration(connection)?;
-            apply_v5_migration(connection)?;
+            apply_upgrade_migrations(connection, version)?;
         }
         3 => {
             validate_checksum(connection, 1, v1_migration_checksum())?;
             validate_checksum(connection, 2, v2_migration_checksum())?;
             validate_checksum(connection, 3, v3_migration_checksum())?;
-            apply_v4_migration(connection)?;
-            apply_v5_migration(connection)?;
+            apply_upgrade_migrations(connection, version)?;
         }
         4 => {
             validate_checksum(connection, 1, v1_migration_checksum())?;
             validate_checksum(connection, 2, v2_migration_checksum())?;
             validate_checksum(connection, 3, v3_migration_checksum())?;
             validate_checksum(connection, 4, v4_migration_checksum())?;
-            apply_v5_migration(connection)?;
+            apply_upgrade_migrations(connection, version)?;
         }
         SUPPORTED_SCHEMA_VERSION => {
             validate_checksum(connection, 1, v1_migration_checksum())?;
@@ -427,6 +444,57 @@ pub(crate) fn validate_or_migrate(connection: &mut Connection) -> Result<(), Ope
                 supported: SUPPORTED_SCHEMA_VERSION,
             });
         }
+    }
+    validate_foreign_keys(connection)
+}
+
+pub(crate) fn reject_unknown_schema_without_mutation(
+    connection: &Connection,
+) -> Result<(), OpenError> {
+    let has_migration_table: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'schema_migrations'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_migration_table {
+        return Ok(());
+    }
+    let has_user_objects: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_user_objects {
+        return Err(OpenError::UnsupportedSchema {
+            found: 0,
+            supported: SUPPORTED_SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
+
+fn validate_foreign_keys(connection: &Connection) -> Result<(), OpenError> {
+    let violation = connection
+        .query_row("PRAGMA foreign_key_check", [], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .optional()?;
+    if let Some((table, rowid, parent, foreign_key)) = violation {
+        return Err(OpenError::ForeignKeyViolation {
+            table,
+            rowid,
+            parent,
+            foreign_key,
+        });
     }
     Ok(())
 }
@@ -521,74 +589,86 @@ fn apply_initial_migration(connection: &mut Connection) -> Result<(), OpenError>
     Ok(())
 }
 
-fn apply_v2_migration(connection: &mut Connection) -> Result<(), OpenError> {
+fn apply_upgrade_migrations(connection: &mut Connection, version: i64) -> Result<(), OpenError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(V2_UPGRADE_SQL)?;
-    transaction.execute(
-        "INSERT INTO schema_migrations (
-            version, name, applied_at, application_version, checksum
-         ) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4)",
-        params![
-            2,
-            "adapter_hardening_v2",
-            env!("CARGO_PKG_VERSION"),
-            v2_migration_checksum()
+    for (next_version, name, sql, checksum) in match version {
+        1 => vec![
+            (
+                2,
+                "adapter_hardening_v2",
+                V2_UPGRADE_SQL,
+                v2_migration_checksum(),
+            ),
+            (
+                3,
+                "policy_tool_hardening_v3",
+                V3_POLICY_TOOL_HARDENING_SQL,
+                v3_migration_checksum(),
+            ),
+            (
+                4,
+                "tool_execution_lifecycle_v4",
+                V4_TOOL_EXECUTION_LIFECYCLE_SQL,
+                v4_migration_checksum(),
+            ),
+            (
+                5,
+                "pre_effect_terminal_v5",
+                V5_PRE_EFFECT_TERMINAL_SQL,
+                migration_checksum(),
+            ),
         ],
-    )?;
-    transaction.commit()?;
-    Ok(())
-}
-
-fn apply_v3_migration(connection: &mut Connection) -> Result<(), OpenError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(V3_POLICY_TOOL_HARDENING_SQL)?;
-    transaction.execute(
-        "INSERT INTO schema_migrations (
-            version, name, applied_at, application_version, checksum
-         ) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4)",
-        params![
-            3,
-            "policy_tool_hardening_v3",
-            env!("CARGO_PKG_VERSION"),
-            v3_migration_checksum()
+        2 => vec![
+            (
+                3,
+                "policy_tool_hardening_v3",
+                V3_POLICY_TOOL_HARDENING_SQL,
+                v3_migration_checksum(),
+            ),
+            (
+                4,
+                "tool_execution_lifecycle_v4",
+                V4_TOOL_EXECUTION_LIFECYCLE_SQL,
+                v4_migration_checksum(),
+            ),
+            (
+                5,
+                "pre_effect_terminal_v5",
+                V5_PRE_EFFECT_TERMINAL_SQL,
+                migration_checksum(),
+            ),
         ],
-    )?;
-    transaction.commit()?;
-    Ok(())
-}
-
-fn apply_v4_migration(connection: &mut Connection) -> Result<(), OpenError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(V4_TOOL_EXECUTION_LIFECYCLE_SQL)?;
-    transaction.execute(
-        "INSERT INTO schema_migrations (
-            version, name, applied_at, application_version, checksum
-         ) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4)",
-        params![
-            4,
-            "tool_execution_lifecycle_v4",
-            env!("CARGO_PKG_VERSION"),
-            v4_migration_checksum()
+        3 => vec![
+            (
+                4,
+                "tool_execution_lifecycle_v4",
+                V4_TOOL_EXECUTION_LIFECYCLE_SQL,
+                v4_migration_checksum(),
+            ),
+            (
+                5,
+                "pre_effect_terminal_v5",
+                V5_PRE_EFFECT_TERMINAL_SQL,
+                migration_checksum(),
+            ),
         ],
-    )?;
-    transaction.commit()?;
-    Ok(())
-}
-
-fn apply_v5_migration(connection: &mut Connection) -> Result<(), OpenError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(V5_PRE_EFFECT_TERMINAL_SQL)?;
-    transaction.execute(
-        "INSERT INTO schema_migrations (
-            version, name, applied_at, application_version, checksum
-         ) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4)",
-        params![
+        4 => vec![(
             5,
             "pre_effect_terminal_v5",
-            env!("CARGO_PKG_VERSION"),
-            migration_checksum()
-        ],
-    )?;
+            V5_PRE_EFFECT_TERMINAL_SQL,
+            migration_checksum(),
+        )],
+        _ => Vec::new(),
+    } {
+        transaction.execute_batch(sql)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (
+                version, name, applied_at, application_version, checksum
+             ) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4)",
+            params![next_version, name, env!("CARGO_PKG_VERSION"), checksum],
+        )?;
+    }
+    validate_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
 }

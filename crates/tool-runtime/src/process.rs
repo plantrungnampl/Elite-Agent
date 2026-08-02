@@ -198,6 +198,7 @@ impl ApprovedProcessExecutor for ProcessRuntime<'_> {
         &self,
         execution_id: ToolExecutionId,
         request: ApprovedProcessRequest,
+        _authority: Option<&local_agent_terminal_application::ToolExecutionClaimAuthority>,
     ) -> Result<ProcessReceipt, PortError> {
         Self::execute(self, execution_id, request)
     }

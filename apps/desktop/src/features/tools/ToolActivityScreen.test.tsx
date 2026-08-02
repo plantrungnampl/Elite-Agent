@@ -96,7 +96,8 @@ describe("ToolActivityScreen", () => {
     await user.click(trigger);
 
     const dialog = await screen.findByRole("dialog", { name: "Approve tool request" });
-    expect(within(dialog).getByText("toolchain:git [\"status\"]")).toBeVisible();
+    expect(within(dialog).getByText("toolchain:git")).toBeVisible();
+    expect(within(dialog).getByText('["status"]')).toBeVisible();
     expect(within(dialog).getByText("agent-local")).toBeVisible();
     expect(within(dialog).getByText("Run the approved verification")).toBeVisible();
     expect(within(dialog).getByText("environment-safe")).toBeVisible();
@@ -215,14 +216,17 @@ function activityFixture(): ToolActivityDto {
       approvalId: status === "approval_required" ? "approval-1" : null,
       toolName: "process.exec",
       status,
-      summary: "toolchain:git [\"status\"]",
+      executable: "toolchain:git",
+      arguments: ["status"],
+      cwdScope: "worktree:task-1",
+      readScopes: [],
+      writeScopes: [],
       actorId: "agent-local",
       effectiveRole: "implementer",
       reason: "Run the approved verification",
       operationDigest: `sha256:${"a".repeat(64)}`,
       policyDecisionId: `policy-${index}`,
       policySnapshotDigest: `sha256:${"c".repeat(64)}`,
-      scopes: ["worktree:task-1"],
       environmentProfileDigest: "environment-safe",
       networkProfile: "denied",
       expiresAt: status === "approval_required" ? "2026-08-02T12:00:00Z" : null,
@@ -241,10 +245,13 @@ function approvalFixture(): ToolApprovalRequestDto {
   return {
     approvalId: "approval-1",
     executionId: "execution-approval",
-    summary: "toolchain:git [\"status\"]",
+    executable: "toolchain:git",
+    arguments: ["status"],
+    cwdScope: "worktree:task-1",
+    readScopes: [],
+    writeScopes: [],
     operationDigest: `sha256:${"a".repeat(64)}`,
     expiresAt: "2026-08-02T12:00:00Z",
-    scopes: ["worktree:task-1"],
     actorId: "agent-local",
     reason: "Run the approved verification",
     environmentProfileDigest: "environment-safe",

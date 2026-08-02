@@ -23,8 +23,7 @@ use local_agent_terminal_tool_runtime::ToolRuntime as StructuredToolRuntime;
 use crate::startup::StartupConfig;
 use crate::tool_runtime::ToolBrokerConfig;
 
-const DEFAULT_POLICY_BUNDLE: &str =
-    r#"{"version":1,"rules":[{"id":"default-deny","effect":"deny"}]}"#;
+const DEFAULT_POLICY_BUNDLE: &str = r#"{"version":1,"rules":[{"id":"default-deny-process","effect":"deny","action":"process.exec"},{"id":"tool-display","effect":"allow_with_redaction","action":"tool.approval.display","redactions":["secret_scanner"]}]}"#;
 
 #[derive(Clone)]
 struct ProductionToolPaths {
@@ -187,6 +186,7 @@ impl ApprovedProcessExecutor for DisabledProcessExecutor {
         &self,
         _execution_id: ToolExecutionId,
         _request: ApprovedProcessRequest,
+        _authority: Option<&local_agent_terminal_application::ToolExecutionClaimAuthority>,
     ) -> Result<ProcessReceipt, PortError> {
         Err(unavailable())
     }

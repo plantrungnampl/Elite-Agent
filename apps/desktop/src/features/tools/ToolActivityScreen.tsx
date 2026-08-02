@@ -359,10 +359,13 @@ export function ToolActivityScreen({
               Approval is bound to the exact digest and expires automatically.
             </p>
             <dl className="approval-details">
-              <Detail label="Exact command or typed arguments" value={approval.summary} />
+              <Detail label="Executable" value={approval.executable} />
+              <Detail label="Arguments" value={formatArguments(approval.arguments)} />
               <Detail label="Actor" value={approval.actorId} />
               <Detail label="Reason" value={approval.reason} />
-              <Detail label="Scopes" value={approval.scopes.join(", ")} />
+              <Detail label="Working directory" value={approval.cwdScope} />
+              <Detail label="Read scopes" value={approval.readScopes.join(", ")} />
+              <Detail label="Write scopes" value={approval.writeScopes.join(", ")} />
               <Detail
                 label="Environment profile"
                 value={approval.environmentProfileDigest}
@@ -441,11 +444,14 @@ function ToolActivityRow({
         <details>
           <summary>Inspect exact context</summary>
           <dl className="activity-details">
-            <Detail label="Command or typed arguments" value={entry.summary} />
+            <Detail label="Executable" value={entry.executable} />
+            <Detail label="Arguments" value={formatArguments(entry.arguments)} />
             <Detail label="Actor" value={entry.actorId} />
             <Detail label="Role" value={entry.effectiveRole} />
             <Detail label="Reason" value={entry.reason} />
-            <Detail label="Scope" value={entry.scopes.join(", ")} />
+            <Detail label="Working directory" value={entry.cwdScope} />
+            <Detail label="Read scopes" value={entry.readScopes.join(", ")} />
+            <Detail label="Write scopes" value={entry.writeScopes.join(", ")} />
             <Detail
               label="Environment"
               value={`environment: ${entry.environmentProfileDigest}`}
@@ -506,6 +512,10 @@ function Detail({ label, value }: { label: string; value: string }) {
       <dd>{value === "" ? "None" : value}</dd>
     </div>
   );
+}
+
+function formatArguments(arguments_: string[]) {
+  return JSON.stringify(arguments_);
 }
 
 function statusSymbol(status: ToolActivityEntryDto["status"]) {

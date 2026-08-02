@@ -1087,6 +1087,59 @@ fn startup_rejects_unknown_nonempty_database_without_mutating_it() {
     assert_eq!(directory_entries(&directory.0), original_files);
 }
 
+#[test]
+fn upgrade_rejects_orphaned_rows_before_committing_the_new_schema() {
+    let directory = TempDirectory::new();
+    let path = directory.0.join("state.sqlite3");
+    let mut connection = Connection::open(&path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .unwrap();
+    install_prior_v4(&mut connection);
+    connection
+        .execute(
+            "INSERT INTO tasks (
+                id, project_id, title, objective, phase, condition, operation_state,
+                risk_level, base_branch, base_commit, created_at, updated_at
+             ) VALUES ('orphan-task', 'missing-project', 'orphan', 'orphan',
+                'Implementation', 'Active', 'None', 'high', 'main', ?1,
+                '2026-07-30T00:00:00Z', '2026-07-30T00:00:00Z')",
+            ["a".repeat(40)],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        SqliteStore::open(&path),
+        Err(OpenError::ForeignKeyViolation {
+            table,
+            rowid: _,
+            parent,
+            foreign_key: _
+        }) if table == "tasks" && parent == "projects"
+    ));
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = 'orphan-task'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
 fn directory_entries(directory: &std::path::Path) -> Vec<std::ffi::OsString> {
     let mut entries: Vec<_> = fs::read_dir(directory)
         .unwrap()

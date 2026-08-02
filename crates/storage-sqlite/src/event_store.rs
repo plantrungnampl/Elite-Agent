@@ -162,12 +162,12 @@ impl EventStore for SqliteStore {
 pub(crate) fn open_error_to_port(error: OpenError) -> PortError {
     match error {
         OpenError::Database(error) => sqlite_error_to_port(error),
-        OpenError::ChecksumMismatch { .. } | OpenError::UnsupportedSchema { .. } => {
-            PortError::failure(
-                SafeErrorClassification::IntegrityFailure,
-                Retryability::NonRetryable,
-            )
-        }
+        OpenError::ChecksumMismatch { .. }
+        | OpenError::UnsupportedSchema { .. }
+        | OpenError::ForeignKeyViolation { .. } => PortError::failure(
+            SafeErrorClassification::IntegrityFailure,
+            Retryability::NonRetryable,
+        ),
     }
 }
 

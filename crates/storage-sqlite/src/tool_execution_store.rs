@@ -15,8 +15,9 @@ use local_agent_terminal_application::{
     PolicyRequestBindingDigest, PortError, ProcessExecutionBindingStore, ProcessStatus,
     Retryability, SafeErrorClassification, SafeToolExecutionError, ToolExecutionCancellationClaim,
     ToolExecutionClaim, ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId,
-    ToolExecutionOutput, ToolExecutionRecoveryEvidence, ToolExecutionRecoveryState,
-    ToolExecutionResolution, ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
+    ToolExecutionOutput, ToolExecutionPostEffectReceipt, ToolExecutionRecoveryEvidence,
+    ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionStore,
+    ToolExecutionStreamMetadata, ToolExecutionTerminal, ToolExecutionTerminalKind,
     VerifiedFileWriteCompensation, WorkspaceMutationRequest,
 };
 use local_agent_terminal_domain::{
@@ -1504,12 +1505,13 @@ fn validate_exact_policy(
     request: &AuthorizedToolExecutionClaim,
     tool_request: &local_agent_terminal_application::ToolRequest,
 ) -> Result<(), PortError> {
-    validate_policy_identity(
+    validate_policy_identity_at(
         transaction,
         &request.policy_decision_id,
         &request.policy_request_binding_digest,
         tool_request,
         request.checked_at,
+        request.effect_checked_at,
         if request.approval.is_some() {
             "require_approval"
         } else {
@@ -1528,6 +1530,29 @@ fn validate_policy_identity(
     expected_effect: &str,
     mode: PolicyValidationMode,
 ) -> Result<(), PortError> {
+    validate_policy_identity_at(
+        transaction,
+        decision_id,
+        binding_digest,
+        tool_request,
+        checked_at,
+        checked_at,
+        expected_effect,
+        mode,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_policy_identity_at(
+    transaction: &Transaction<'_>,
+    decision_id: &PolicyDecisionId,
+    binding_digest: &PolicyRequestBindingDigest,
+    tool_request: &local_agent_terminal_application::ToolRequest,
+    checked_at: local_agent_terminal_domain::Timestamp,
+    observed_at: local_agent_terminal_domain::Timestamp,
+    expected_effect: &str,
+    mode: PolicyValidationMode,
+) -> Result<(), PortError> {
     let policy_request = policy_request_for_tool(tool_request, checked_at);
     if canonical_policy_binding_digest(&policy_request).map_err(|_| integrity_failure())?
         != *binding_digest
@@ -1542,7 +1567,7 @@ fn validate_policy_identity(
                     unixepoch(created_at),
                     expires_at IS NULL OR unixepoch(expires_at) > ?2
             FROM policy_decisions WHERE id = ?1",
-            params![decision_id.as_str(), checked_at.unix_seconds(),],
+            params![decision_id.as_str(), observed_at.unix_seconds(),],
             |row| {
                 Ok(ExactPolicyRow {
                     task_id: row.get(0)?,
@@ -3539,13 +3564,17 @@ fn terminal_value(terminal: &ToolExecutionTerminal) -> serde_json::Value {
             let error = terminal
                 .error()
                 .expect("indeterminate terminal kind has an error");
-            json!({
+            let mut value = json!({
                 "error": {
                     "classification": error_classification_name(error.classification),
                     "retryability": retryability_name(error.retryability),
                 },
                 "kind": terminal_kind_name(terminal.kind()),
-            })
+            });
+            if let Some(post_effect) = terminal.post_effect() {
+                value["postEffect"] = post_effect_value(post_effect);
+            }
+            value
         }
         ToolExecutionTerminalKind::Cancelled | ToolExecutionTerminalKind::Interrupted => {
             json!({ "kind": terminal_kind_name(terminal.kind()) })
@@ -3563,6 +3592,37 @@ fn artifact_value(artifact: &DurableToolExecutionArtifact) -> serde_json::Value 
             "availability": "unavailable",
         }),
     }
+}
+
+fn post_effect_value(receipt: &ToolExecutionPostEffectReceipt) -> serde_json::Value {
+    json!({
+        "executionId": receipt.execution_id.as_str(),
+        "status": match receipt.status {
+            ProcessStatus::Exited => "exited",
+            ProcessStatus::Terminated => "terminated",
+        },
+        "exitCode": receipt.exit_code,
+        "stdout": stream_metadata_value(&receipt.stdout),
+        "stderr": stream_metadata_value(&receipt.stderr),
+        "durationMs": receipt.duration_ms,
+        "outputDigest": receipt.output_digest.as_str(),
+        "observedWrites": receipt
+            .observed_writes
+            .iter()
+            .map(|write| json!({
+                "digest": write.digest.as_str(),
+                "sizeBytes": write.size_bytes,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn stream_metadata_value(metadata: &ToolExecutionStreamMetadata) -> serde_json::Value {
+    json!({
+        "digest": metadata.digest.as_str(),
+        "sizeBytes": metadata.size_bytes,
+        "truncated": metadata.truncated,
+    })
 }
 
 const fn terminal_kind_name(kind: ToolExecutionTerminalKind) -> &'static str {
@@ -3598,11 +3658,14 @@ const fn retryability_name(retryability: Retryability) -> &'static str {
 
 fn terminal_error_json(terminal: &ToolExecutionTerminal) -> Option<String> {
     terminal.error().map(|error| {
-        json!({
+        let mut value = json!({
             "classification": error_classification_name(error.classification),
             "retryability": retryability_name(error.retryability),
-        })
-        .to_string()
+        });
+        if let Some(post_effect) = terminal.post_effect() {
+            value["postEffect"] = post_effect_value(post_effect);
+        }
+        value.to_string()
     })
 }
 
@@ -3672,15 +3735,20 @@ fn parse_terminal_receipt(value: &str) -> Result<DurableToolExecutionReceipt, Po
         "interrupted" => Ok(ToolExecutionTerminal::interrupted()),
         "indeterminate" => {
             let error = required_object(terminal, "error")?;
-            Ok(ToolExecutionTerminal::indeterminate(
-                SafeToolExecutionError {
-                    classification: parse_error_classification(required_string(
-                        error,
-                        "classification",
-                    )?)?,
-                    retryability: parse_retryability(required_string(error, "retryability")?)?,
-                },
-            ))
+            let error = SafeToolExecutionError {
+                classification: parse_error_classification(required_string(
+                    error,
+                    "classification",
+                )?)?,
+                retryability: parse_retryability(required_string(error, "retryability")?)?,
+            };
+            match terminal.get("postEffect") {
+                Some(post_effect) => Ok(ToolExecutionTerminal::indeterminate_with_post_effect(
+                    error,
+                    parse_post_effect_receipt(post_effect)?,
+                )),
+                None => Ok(ToolExecutionTerminal::indeterminate(error)),
+            }
         }
         _ => Err(integrity_failure()),
     }
@@ -3706,6 +3774,61 @@ fn parse_terminal_receipt(value: &str) -> Result<DurableToolExecutionReceipt, Po
         }
         _ => Err(integrity_failure()),
     }
+}
+
+fn parse_post_effect_receipt(
+    value: &serde_json::Value,
+) -> Result<ToolExecutionPostEffectReceipt, PortError> {
+    let execution_id = ToolExecutionId::new(required_string(value, "executionId")?)
+        .map_err(|_| integrity_failure())?;
+    let status = match required_string(value, "status")? {
+        "exited" => ProcessStatus::Exited,
+        "terminated" => ProcessStatus::Terminated,
+        _ => return Err(integrity_failure()),
+    };
+    let stdout = parse_stream_metadata(required_object(value, "stdout")?)?;
+    let stderr = parse_stream_metadata(required_object(value, "stderr")?)?;
+    let observed_writes = value
+        .get("observedWrites")
+        .and_then(Value::as_array)
+        .ok_or_else(integrity_failure)?
+        .iter()
+        .map(|write| {
+            Ok(local_agent_terminal_application::VerifiedWrite {
+                digest: Sha256Digest::new(required_string(write, "digest")?)
+                    .map_err(|_| integrity_failure())?,
+                size_bytes: required_u64(write, "sizeBytes")?,
+            })
+        })
+        .collect::<Result<Vec<_>, PortError>>()?;
+    Ok(ToolExecutionPostEffectReceipt {
+        execution_id,
+        status,
+        exit_code: match value.get("exitCode") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_i64()
+                    .ok_or_else(integrity_failure)
+                    .and_then(|value| i32::try_from(value).map_err(|_| integrity_failure()))?,
+            ),
+        },
+        stdout,
+        stderr,
+        duration_ms: required_u64(value, "durationMs")?,
+        output_digest: Sha256Digest::new(required_string(value, "outputDigest")?)
+            .map_err(|_| integrity_failure())?,
+        observed_writes,
+    })
+}
+
+fn parse_stream_metadata(value: &Value) -> Result<ToolExecutionStreamMetadata, PortError> {
+    Ok(ToolExecutionStreamMetadata {
+        digest: Sha256Digest::new(required_string(value, "digest")?)
+            .map_err(|_| integrity_failure())?,
+        size_bytes: required_u64(value, "sizeBytes")?,
+        truncated: required_bool(value, "truncated")?,
+    })
 }
 
 fn parse_process_termination(

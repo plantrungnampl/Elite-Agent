@@ -18,7 +18,19 @@ use tempfile::TempDir;
 // ponytail: serialize fixture writes until libgit2 SHA-256 is safe beside SHA-1 writes.
 static GIT_FIXTURE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+fn fixture_write_guard() -> std::sync::MutexGuard<'static, ()> {
+    GIT_FIXTURE_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("git fixture write lock")
+}
+
 fn commit_all(repository: &Repository, message: &str) -> String {
+    let _write_guard = fixture_write_guard();
+    commit_all_unlocked(repository, message)
+}
+
+fn commit_all_unlocked(repository: &Repository, message: &str) -> String {
     let mut index = repository.index().expect("index");
     index
         .add_all(["*"], IndexAddOption::DEFAULT, None)
@@ -47,6 +59,7 @@ fn commit_all(repository: &Repository, message: &str) -> String {
 
 #[cfg(feature = "test-seams")]
 fn dangling_commit(repository: &Repository, message: &str) -> git2::Oid {
+    let _write_guard = fixture_write_guard();
     let tree = repository
         .head()
         .expect("head")
@@ -71,10 +84,7 @@ fn commit_repository_with_format(
     root: &Path,
     object_format: GitObjectFormat,
 ) -> (Repository, String) {
-    let _write_guard = GIT_FIXTURE_WRITE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("git fixture write lock");
+    let _write_guard = fixture_write_guard();
     let mut options = RepositoryInitOptions::new();
     options.object_format(object_format);
     let repository = Repository::init_opts(root, &options).expect("init");
@@ -499,6 +509,7 @@ fn checkout_disables_crlf_filters_and_preserves_blob_bytes() {
     let source = fixture.path().join("source");
     fs::create_dir(&source).expect("source");
     let (repository, _commit) = commit_repository(&source);
+    let _write_guard = fixture_write_guard();
     fs::write(source.join(".gitattributes"), b"*.txt text eol=crlf\n").expect("attributes");
     fs::write(source.join("line.txt"), b"one\ntwo\n").expect("line");
     let mut index = repository.index().expect("index");

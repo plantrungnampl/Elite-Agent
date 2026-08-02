@@ -1,6 +1,6 @@
 use local_agent_terminal_application::{
     tool_request_context, ApprovalId, ApprovalResumeStore, ArtifactId, PortError,
-    ToolActivityEntryDto, ToolActivityStatusDto, ToolExecutionId, ToolExecutionResumeStore,
+    ToolActivityRecord, ToolActivityStatusDto, ToolExecutionId, ToolExecutionResumeStore,
     ToolRedactionStateDto,
 };
 use local_agent_terminal_domain::{PolicyRuleId, RedactionDirective, Sha256Digest};
@@ -11,14 +11,14 @@ use crate::event_store::{open_error_to_port, sqlite_error_to_port};
 use crate::SqliteStore;
 
 impl SqliteStore {
-    pub fn tool_activity_entries(&self) -> Result<Vec<ToolActivityEntryDto>, PortError> {
+    pub fn tool_activity_records(&self) -> Result<Vec<ToolActivityRecord>, PortError> {
         self.load_tool_activity_entries(None)
     }
 
-    pub fn tool_activity_entry_for_approval(
+    pub fn tool_activity_record_for_approval(
         &self,
         approval_id: &ApprovalId,
-    ) -> Result<ToolActivityEntryDto, PortError> {
+    ) -> Result<ToolActivityRecord, PortError> {
         self.load_tool_activity_entries(Some(approval_id))?
             .pop()
             .ok_or_else(not_found)
@@ -27,7 +27,7 @@ impl SqliteStore {
     fn load_tool_activity_entries(
         &self,
         approval_id: Option<&ApprovalId>,
-    ) -> Result<Vec<ToolActivityEntryDto>, PortError> {
+    ) -> Result<Vec<ToolActivityRecord>, PortError> {
         let connection = self.connection().map_err(open_error_to_port)?;
         let mut statement = connection
             .prepare(
@@ -104,7 +104,7 @@ impl SqliteStore {
             .collect()
     }
 
-    fn activity_entry(&self, row: RawToolActivityRow) -> Result<ToolActivityEntryDto, PortError> {
+    fn activity_entry(&self, row: RawToolActivityRow) -> Result<ToolActivityRecord, PortError> {
         let execution_id =
             ToolExecutionId::new(row.execution_id.clone()).map_err(|_| integrity_failure())?;
         let artifact_id =
@@ -169,23 +169,14 @@ impl SqliteStore {
             return Err(integrity_failure());
         }
 
-        Ok(ToolActivityEntryDto {
-            execution_id: execution_id.as_str().to_owned(),
+        Ok(ToolActivityRecord {
+            request: immutable.request().clone(),
             approval_id: approval_id.map(|value| value.as_str().to_owned()),
-            tool_name: "process.exec".to_owned(),
             status,
-            summary: context.summary,
-            actor_id: context.actor_id,
             effective_role,
-            reason: context.reason,
             operation_digest,
             policy_decision_id: Some(policy_decision_id),
-            policy_snapshot_digest: context.policy_snapshot_digest,
-            scopes: context.scopes,
-            environment_profile_digest: context.environment_profile_digest,
-            network_profile: context.network_profile,
             expires_at: row.approval_expires_at,
-            fencing_token: request_fencing_token,
             policy_rules: matched.rule_ids,
             redaction_state: if redacted {
                 ToolRedactionStateDto::Redacted
