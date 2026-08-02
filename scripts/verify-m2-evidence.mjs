@@ -16,6 +16,7 @@ const manifestPath =
     : resolve(root, process.argv[manifestArgument + 1]);
 const artifactRoot = dirname(manifestPath);
 const requiredCommands = new Map(requiredCommandEntries);
+const requireApproved = process.argv.includes("--require-approved");
 
 try {
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
@@ -82,7 +83,12 @@ try {
     );
   }
   const review = readFileSync(join(artifactRoot, "review.md"), "utf8");
-  assert(/Independent approval: (?:PENDING|PASS)/u.test(review), "invalid review verdict");
+  const reviewVerdict = review.match(/^## Independent approval: (PENDING|PASS)$/mu)?.[1];
+  assert(reviewVerdict !== undefined, "invalid review verdict");
+  assert(
+    !requireApproved || reviewVerdict === "PASS",
+    "independent approval is pending",
+  );
   assert(
     readFileSync(join(artifactRoot, "known-limitations.md"), "utf8").trim().length > 0,
     "known limitations are absent",

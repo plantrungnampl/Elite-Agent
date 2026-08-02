@@ -170,7 +170,6 @@ fn read_status(path: &Path) -> &'static str {
     match fs::read(path) {
         Ok(_) => "allowed",
         Err(error) if is_permission_denied(&error) => "denied",
-        Err(_) if path.as_os_str().to_string_lossy().starts_with(r"\\") => "denied",
         Err(_) => "other",
     }
 }
@@ -552,7 +551,7 @@ fn is_permission_denied(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::PermissionDenied
         || matches!(
             error.raw_os_error(),
-            Some(5 | 53 | 67 | 1_231 | 1_260 | 10_013)
+            Some(5 | 53 | 65 | 67 | 1_231 | 1_260 | 10_013)
         )
 }
 

@@ -26,7 +26,9 @@ test("Windows CI runs containment before fresh M2 evidence verification", () => 
     "cargo test -p local-agent-terminal-platform-windows --features test-seams --test filesystem_matrix --test process_matrix",
   );
   const generate = workflow.indexOf("node scripts/run-m2-evidence.mjs");
-  const verify = workflow.indexOf("node scripts/verify-m2-evidence.mjs");
+  const verify = workflow.indexOf(
+    "node scripts/verify-m2-evidence.mjs --require-approved",
+  );
   const postFinal = workflow.indexOf("node scripts/run-m2-post-final-contracts.mjs");
   const verifyPostFinal = workflow.indexOf("node scripts/verify-m2-post-final-log.mjs");
   const upload = workflow.indexOf("actions/upload-artifact@v4");
@@ -112,6 +114,22 @@ test("M2 verifier rejects tampered review and limitations artifacts", () => {
   }
 });
 
+test("final M2 verification rejects a pending independent review", () => {
+  withEvidenceCopy((directory, manifest) => {
+    const reviewPath = join(directory, "review.md");
+    const review = readFileSync(reviewPath, "utf8").replace(
+      "Independent approval: PASS",
+      "Independent approval: PENDING",
+    );
+    writeFileSync(reviewPath, review);
+    manifest.artifactSha256["review.md"] = hash(readFileSync(reviewPath));
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /independent approval is pending/u, [
+      "--require-approved",
+    ]);
+  });
+});
+
 test("M2 verifier rejects dirty source and immutable design changes", () => {
   for (const path of [
     "tests/contracts/fixtures/m2/raw-shell-request.json",
@@ -166,10 +184,15 @@ function writeManifest(directory, manifest) {
   writeFileSync(join(directory, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
-function assertVerifierFails(directory, pattern) {
+function assertVerifierFails(directory, pattern, extraArguments = []) {
   const result = spawnSync(
     process.execPath,
-    ["scripts/verify-m2-evidence.mjs", "--manifest", join(directory, "manifest.json")],
+    [
+      "scripts/verify-m2-evidence.mjs",
+      ...extraArguments,
+      "--manifest",
+      join(directory, "manifest.json"),
+    ],
     { cwd: process.cwd(), encoding: "utf8" },
   );
   assert.notEqual(result.status, 0);

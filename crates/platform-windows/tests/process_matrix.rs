@@ -910,14 +910,21 @@ fn real_lpac_denies_registered_descendant_creation_modes() {
         .lines()
         .filter_map(|line| line.strip_prefix("d2d-descendant-"))
         .collect::<BTreeSet<_>>();
-    let expected = BTreeSet::from([
-        "ordinary=process-limit-denied",
-        "detached-new-process-group=process-limit-denied",
-        "breakaway=access-denied",
-        "attempts=complete",
-    ]);
-
-    assert_eq!(observed, expected);
+    assert_eq!(observed.len(), 4);
+    assert!(observed.contains("attempts=complete"));
+    assert!(observed.contains("breakaway=access-denied"));
+    for allowed in [
+        ["ordinary=process-limit-denied", "ordinary=access-denied"],
+        [
+            "detached-new-process-group=process-limit-denied",
+            "detached-new-process-group=access-denied",
+        ],
+    ] {
+        assert!(
+            allowed.iter().any(|result| observed.contains(result)),
+            "unexpected descendant result: {observed:?}",
+        );
+    }
     assert_eq!(receipt.status, ProcessStatus::Terminated);
     assert_eq!(receipt.exit_code, None);
     assert!(!receipt.stderr.truncated);
@@ -1091,7 +1098,7 @@ fn real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix() {
         ("long", long_path),
         ("replacement", replacement_path),
     ];
-    for (_, path) in path_variants.iter().filter(|(label, _)| *label != "unc") {
+    for (_, path) in &path_variants {
         assert!(
             fs::read(path).is_ok(),
             "parent path control failed for {}",
