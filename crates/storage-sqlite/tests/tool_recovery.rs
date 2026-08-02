@@ -372,6 +372,83 @@ fn authoritative_process_binding_starts_only_the_exact_claim() {
 }
 
 #[test]
+fn tool_audit_events_retain_authority_scope_and_causal_lineage() {
+    let database = TempDatabase::new();
+    let execution_id = "execution-audit-envelope";
+    let (store, claim, approval_id, policy_id) =
+        exact_approval_claim_fixture(&database, execution_id);
+    let request_digest = claim.request_content_digest.to_string();
+    let ToolExecutionClaim::Claimed(authority) = store.begin_authorized(claim).unwrap() else {
+        panic!("fresh authorized execution must win the durable claim");
+    };
+    let binding = AuthoritativeProcessBinding::new(authority, 4_242, "job-audit-envelope").unwrap();
+    store.record_process_binding(binding.clone()).unwrap();
+    store
+        .resolve_terminal(ToolExecutionResolution::new(recovered_process_receipt(
+            &binding,
+        )))
+        .unwrap();
+
+    let connection = configured_connection(&database.path);
+    let events = connection
+        .prepare(
+            "SELECT event_id, event_type, actor_id, observation_class, payload_json,
+                    causation_id, correlation_id
+             FROM events
+             WHERE stream_id = 'task-1'
+               AND json_extract(payload_json, '$.executionId') = ?1
+               AND event_type IN ('tool.execution.started', 'tool.execution.completed')
+             ORDER BY sequence",
+        )
+        .unwrap()
+        .query_map([execution_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let [started, completed] = events.as_slice() else {
+        panic!("expected one started and one completed audit event");
+    };
+    let started_payload: serde_json::Value = serde_json::from_str(&started.4).unwrap();
+    let completed_payload: serde_json::Value = serde_json::from_str(&completed.4).unwrap();
+
+    for (event, payload) in [(started, &started_payload), (completed, &completed_payload)] {
+        assert_eq!(event.2, "agent-1");
+        assert_eq!(event.3, "tool_verified");
+        assert_eq!(payload["actorBinding"]["actor"]["agentId"], "agent-1");
+        assert!(payload["actorBinding"]["digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert_eq!(payload["effectiveRole"], "executor");
+        assert_eq!(payload["requestDigest"], request_digest);
+        assert_eq!(payload["operationDigest"], request_digest);
+        assert_eq!(payload["policyDecisionId"], policy_id.as_str());
+        assert_eq!(payload["approvalId"], approval_id.as_str());
+        assert_eq!(payload["policySnapshotDigest"], digest_char('b').as_str());
+        assert_eq!(payload["scope"]["capability"]["kind"], "worktree");
+        assert_eq!(payload["scope"]["capability"]["taskId"], "task-1");
+        assert_eq!(payload["executorFencingToken"], 19);
+        assert_eq!(event.6, format!("tool-execution:{execution_id}"));
+        assert_ne!(event.5, event.6);
+    }
+    assert_eq!(
+        started.5,
+        format!("approval.consumed:{}:3", approval_id.as_str())
+    );
+    assert_eq!(completed.5, started.0);
+}
+
+#[test]
 fn recovered_process_termination_round_trips_exact_receipt_and_audit() {
     let database = TempDatabase::new();
     let execution_id = "execution-recovered-process";

@@ -828,7 +828,8 @@ impl ToolExecutionStore for SqliteStore {
                 .prepare(
                     "SELECT payload_json FROM events
                      WHERE stream_id = ?1 AND event_type = 'operation.cancel.requested'
-                       AND actor_type = 'tool' AND actor_id = ?2",
+                       AND actor_type = 'tool'
+                       AND json_extract(payload_json, '$.executionId') = ?2",
                 )
                 .map_err(sqlite_error_to_port)?;
             let payloads = statement
@@ -841,6 +842,13 @@ impl ToolExecutionStore for SqliteStore {
             payloads
         };
         let expected_payload = cancellation_event_payload(&authority);
+        let expected_audit_payload = audited_tool_event_payload(
+            &transaction,
+            &intent.task_id,
+            execution_id.as_str(),
+            expected_payload.clone(),
+        )?
+        .payload;
         match cancellation_payloads.as_slice() {
             [] => {
                 append_tool_event(
@@ -856,7 +864,7 @@ impl ToolExecutionStore for SqliteStore {
             }
             [payload]
                 if serde_json::from_str::<Value>(payload).map_err(|_| integrity_failure())?
-                    == expected_payload =>
+                    == expected_audit_payload =>
             {
                 let (state, current_sequence, latest_sequence): (String, i64, i64) = transaction
                     .query_row(
@@ -1344,17 +1352,23 @@ fn load_denied_projection(
     if actual_error != expected_error {
         return Err(integrity_failure());
     }
-    let expected_event = denial_event_payload(
-        &ToolExecutionDenialRequest {
-            request_artifact_id: request_artifact_id.clone(),
-            request: request.clone(),
-            policy_decision_id: policy_decision_id.clone(),
-            policy_request_binding_digest: policy_binding,
-            effect,
-            checked_at: evaluated_at,
-        },
-        request.binding_digest().as_sha256().as_str(),
-    );
+    let expected_event = audited_tool_event_payload(
+        transaction,
+        &intent.task_id,
+        execution_id.as_str(),
+        denial_event_payload(
+            &ToolExecutionDenialRequest {
+                request_artifact_id: request_artifact_id.clone(),
+                request: request.clone(),
+                policy_decision_id: policy_decision_id.clone(),
+                policy_request_binding_digest: policy_binding,
+                effect,
+                checked_at: evaluated_at,
+            },
+            request.binding_digest().as_sha256().as_str(),
+        ),
+    )?
+    .payload;
     let mut statement = transaction
         .prepare(
             "SELECT payload_json FROM events
@@ -2677,9 +2691,15 @@ fn file_write_completion_matches(
         snapshot.request.task_id.as_str()
     );
     let receipt = file_write_receipt(snapshot, completion, &mutation_event_id);
-    let event_payload =
-        file_write_completed_event(snapshot, completion, &mutation_event_id).to_string();
     let connection = store.connection().map_err(open_error_to_port)?;
+    let event_payload = audited_tool_event_payload(
+        &connection,
+        snapshot.request.task_id.as_str(),
+        completion.execution_id.as_str(),
+        file_write_completed_event(snapshot, completion, &mutation_event_id),
+    )?
+    .payload
+    .to_string();
     let matches: bool = connection
         .query_row(
             "SELECT
@@ -4066,10 +4086,21 @@ fn load_terminal_receipt(
         .map_err(sqlite_error_to_port)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(sqlite_error_to_port)?;
+    let expected_audit_payload = if parsed.current_schema {
+        audited_tool_event_payload(
+            connection,
+            &intent.task_id,
+            execution_id.as_str(),
+            parsed.audit_payload.clone(),
+        )?
+        .payload
+    } else {
+        parsed.audit_payload.clone()
+    };
     if audit_payloads.len() != 1
         || serde_json::from_str::<serde_json::Value>(&audit_payloads[0].1)
             .map_err(|_| integrity_failure())?
-            != parsed.audit_payload
+            != expected_audit_payload
     {
         return Err(integrity_failure());
     }
@@ -4095,6 +4126,102 @@ fn load_terminal_receipt(
     Ok(receipt)
 }
 
+struct AuditedToolEvent {
+    payload: Value,
+    actor_id: String,
+    policy_decision_id: String,
+}
+
+struct ToolAuditContext {
+    actor_id: String,
+    actor_json: String,
+    actor_binding_digest: String,
+    effective_role: String,
+    request_digest: String,
+    operation_digest: String,
+    policy_decision_id: String,
+    policy_snapshot_digest: String,
+    approval_id: Option<String>,
+    resource_json: String,
+    fencing_token: Option<i64>,
+}
+
+fn audited_tool_event_payload(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    execution_id: &str,
+    mut payload: Value,
+) -> Result<AuditedToolEvent, PortError> {
+    let context = connection
+        .query_row(
+            "SELECT ar.agent_id, pd.actor_json, pd.actor_binding_digest, ar.role,
+                    a.content_hash, oi.operation_digest, te.policy_decision_id,
+                    pd.policy_snapshot_digest, te.approval_id, pd.resource_json,
+                    te.executor_fencing_token
+             FROM tool_executions te
+             JOIN operation_intents oi ON oi.id = te.operation_intent_id
+             JOIN policy_decisions pd ON pd.id = te.policy_decision_id
+             JOIN artifacts a ON a.id = te.arguments_artifact_id
+             JOIN agent_runs ar ON ar.id = te.run_id AND ar.task_id = te.task_id
+             WHERE te.id = ?1 AND te.task_id = ?2",
+            params![execution_id, task_id],
+            |row| {
+                Ok(ToolAuditContext {
+                    actor_id: row.get(0)?,
+                    actor_json: row.get(1)?,
+                    actor_binding_digest: row.get(2)?,
+                    effective_role: row.get(3)?,
+                    request_digest: row.get(4)?,
+                    operation_digest: row.get(5)?,
+                    policy_decision_id: row.get(6)?,
+                    policy_snapshot_digest: row.get(7)?,
+                    approval_id: row.get(8)?,
+                    resource_json: row.get(9)?,
+                    fencing_token: row.get(10)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(sqlite_error_to_port)?
+        .ok_or_else(integrity_failure)?;
+    let actor: Value =
+        serde_json::from_str(&context.actor_json).map_err(|_| integrity_failure())?;
+    let scope: Value =
+        serde_json::from_str(&context.resource_json).map_err(|_| integrity_failure())?;
+    let fields = [
+        ("auditSchema", json!("tool-audit.v1")),
+        ("actorId", json!(context.actor_id)),
+        (
+            "actorBinding",
+            json!({"actor": actor, "digest": context.actor_binding_digest}),
+        ),
+        ("effectiveRole", json!(context.effective_role)),
+        ("requestDigest", json!(context.request_digest)),
+        ("operationDigest", json!(context.operation_digest)),
+        ("policyDecisionId", json!(context.policy_decision_id)),
+        (
+            "policySnapshotDigest",
+            json!(context.policy_snapshot_digest),
+        ),
+        ("approvalId", json!(context.approval_id)),
+        ("scope", scope),
+        ("executorFencingToken", json!(context.fencing_token)),
+        ("observationClass", json!("tool_verified")),
+    ];
+    let object = payload.as_object_mut().ok_or_else(integrity_failure)?;
+    for (field, value) in fields {
+        if object.get(field).is_some_and(|existing| existing != &value) {
+            return Err(integrity_failure());
+        }
+        object.insert(field.to_owned(), value);
+    }
+    Ok(AuditedToolEvent {
+        payload,
+        actor_id: context.actor_id,
+        policy_decision_id: context.policy_decision_id,
+    })
+}
+
 fn append_tool_event(
     transaction: &Transaction<'_>,
     task_id: &str,
@@ -4103,6 +4230,21 @@ fn append_tool_event(
     operation_state: &str,
     payload: serde_json::Value,
 ) -> Result<(), PortError> {
+    let audited = audited_tool_event_payload(transaction, task_id, execution_id, payload)?;
+    let payload = audited.payload;
+    let causation_id = transaction
+        .query_row(
+            "SELECT event_id FROM events
+             WHERE stream_id = ?1
+               AND json_extract(payload_json, '$.executionId') = ?2
+             ORDER BY sequence DESC LIMIT 1",
+            params![task_id, execution_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sqlite_error_to_port)?
+        .unwrap_or_else(|| format!("policy-decision:{}", audited.policy_decision_id));
+    let correlation_id = format!("tool-execution:{execution_id}");
     let (sequence, updated_at): (i64, String) = transaction
         .query_row(
             "SELECT current_sequence + 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -4120,15 +4262,16 @@ fn append_tool_event(
                 actor_id, observation_class, payload_json, metadata_json, causation_id,
                 correlation_id, created_at
              ) VALUES (?1, ?2, ?3, ?4, 1, 'tool', ?5, 'tool_verified',
-                ?6, '{}', ?7, ?7, ?8)",
+                ?6, '{}', ?7, ?8, ?9)",
             params![
                 format!("{event_type}:{execution_id}:{sequence}"),
                 task_id,
                 sequence,
                 event_type,
-                execution_id,
+                audited.actor_id,
                 payload.to_string(),
-                format!("tool-execution:{execution_id}"),
+                causation_id,
+                correlation_id,
                 updated_at,
             ],
         )
