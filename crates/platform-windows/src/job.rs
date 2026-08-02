@@ -15,15 +15,21 @@ use local_agent_terminal_application::ToolExecutionId;
 use local_agent_terminal_application::{
     AuthorizedProcessRequest, JobReceipt, PortError, Retryability, SafeErrorClassification,
 };
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
+    INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
-    JobObjectEndOfJobTimeInformation, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-    SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JOBOBJECT_END_OF_JOB_TIME_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_TERMINATE_AT_END_OF_JOB,
+    JobObjectEndOfJobTimeInformation, JobObjectExtendedLimitInformation, OpenJobObjectW,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_END_OF_JOB_TIME_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    JOB_OBJECT_TERMINATE_AT_END_OF_JOB,
 };
+use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, TerminateProcess, WaitForSingleObject, INFINITE,
 };
@@ -31,6 +37,12 @@ use windows_sys::Win32::System::Threading::{
 pub(super) const TERMINATED_EXIT_CODE: u32 = 0xC000_013A;
 const TREE_EXIT_DEADLINE: Duration = Duration::from_secs(5);
 const NATURAL_TREE_EXIT_GRACE: Duration = Duration::from_millis(50);
+const REQUIRED_LIMIT_FLAGS: u32 = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+    | JOB_OBJECT_LIMIT_JOB_MEMORY
+    | JOB_OBJECT_LIMIT_JOB_TIME;
+const BREAKAWAY_LIMIT_FLAGS: u32 =
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
 
 #[cfg(feature = "test-seams")]
 static JOB_CLEANUP_FAILURE: Mutex<Option<ConfiguredJobCleanupFailure>> = Mutex::new(None);
@@ -126,6 +138,8 @@ pub(super) struct ActiveJob {
     process: OwnedHandle,
     root_pid: u32,
     job_id: String,
+    #[cfg(feature = "test-seams")]
+    execution_id: String,
     termination: Mutex<()>,
     terminated: AtomicBool,
     assigned: AtomicBool,
@@ -138,18 +152,30 @@ struct ConfiguredJobLimits {
     max_active_processes: u32,
 }
 
+pub(super) struct RetainedJob {
+    job: OwnedHandle,
+    root_pid: u32,
+    job_id: String,
+    configured_limits: ConfiguredJobLimits,
+}
+
 impl ActiveJob {
     pub(super) fn new(
         job: OwnedHandle,
         process: OwnedHandle,
         root_pid: u32,
         job_id: String,
+        execution_id: String,
     ) -> Self {
+        #[cfg(not(feature = "test-seams"))]
+        let _ = execution_id;
         Self {
             job,
             process,
             root_pid,
             job_id,
+            #[cfg(feature = "test-seams")]
+            execution_id,
             termination: Mutex::new(()),
             terminated: AtomicBool::new(false),
             assigned: AtomicBool::new(false),
@@ -163,10 +189,7 @@ impl ActiveJob {
     ) -> Result<(), PortError> {
         self.configure_end_of_job_time_action()?;
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-            | JOB_OBJECT_LIMIT_JOB_MEMORY
-            | JOB_OBJECT_LIMIT_JOB_TIME;
+        limits.BasicLimitInformation.LimitFlags = REQUIRED_LIMIT_FLAGS;
         limits.BasicLimitInformation.ActiveProcessLimit = request.limits.max_active_processes;
         limits.BasicLimitInformation.PerJobUserTimeLimit =
             millis_to_windows_ticks(request.limits.cpu_time_limit_ms)?;
@@ -209,19 +232,17 @@ impl ActiveJob {
             return Ok(());
         }
         #[cfg(feature = "test-seams")]
-        record_termination_entry(&self.job_id);
+        record_termination_entry(&self.execution_id);
         let _termination = self.termination.lock().map_err(|_| platform_error())?;
         if self.terminated.load(Ordering::Acquire) {
             return Ok(());
         }
         #[cfg(feature = "test-seams")]
-        if controlled_cleanup_failure(&self.job_id, JobCleanupFailurePointForTest::Terminate) {
+        if controlled_cleanup_failure(&self.execution_id, JobCleanupFailurePointForTest::Terminate)
+        {
             return Err(platform_error());
         }
-        // SAFETY: the Job Object handle remains owned by self for this call.
-        if unsafe { TerminateJobObject(self.job.as_raw(), TERMINATED_EXIT_CODE) } == 0 {
-            return Err(platform_error());
-        }
+        terminate_job(&self.job)?;
         self.terminated.store(true, Ordering::Release);
         Ok(())
     }
@@ -257,19 +278,10 @@ impl ActiveJob {
 
     pub(super) fn wait_tree_exit(&self) -> Result<(), PortError> {
         #[cfg(feature = "test-seams")]
-        if controlled_cleanup_failure(&self.job_id, JobCleanupFailurePointForTest::TreeWait) {
+        if controlled_cleanup_failure(&self.execution_id, JobCleanupFailurePointForTest::TreeWait) {
             return Err(platform_error());
         }
-        let deadline = Instant::now() + TREE_EXIT_DEADLINE;
-        loop {
-            if self.active_process_count()? == 0 {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(platform_error());
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
+        wait_for_tree_exit(&self.job)
     }
 
     pub(super) fn exit_code(&self) -> Result<i32, PortError> {
@@ -291,23 +303,13 @@ impl ActiveJob {
 
     pub(super) fn receipt(&self, tree_terminated: bool) -> Result<JobReceipt, PortError> {
         let configured = self.configured_limits.get().ok_or_else(platform_error)?;
-        let accounting = self.accounting()?;
-        let total_user_time_ms =
-            u64::try_from(accounting.TotalUserTime).map_err(|_| platform_error())? / 10_000;
-        Ok(JobReceipt {
-            root_pid: self.root_pid,
-            job_id: self.job_id.clone(),
-            kill_on_close: true,
-            no_breakaway: true,
-            job_memory_limit: true,
-            job_cpu_time_limit: true,
-            memory_limit_bytes: configured.memory_limit_bytes,
-            cpu_time_limit_ms: configured.cpu_time_limit_ms,
-            max_active_processes: configured.max_active_processes,
-            total_user_time_ms,
-            resource_limit_terminated: accounting.TotalTerminatedProcesses != 0,
+        job_receipt(
+            &self.job,
+            self.root_pid,
+            &self.job_id,
+            configured,
             tree_terminated,
-        })
+        )
     }
 
     fn active_process_count(&self) -> Result<u32, PortError> {
@@ -315,50 +317,21 @@ impl ActiveJob {
     }
 
     fn accounting(&self) -> Result<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, PortError> {
-        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-        // SAFETY: accounting is writable for the declared structure size and job is valid.
-        if unsafe {
-            QueryInformationJobObject(
-                self.job.as_raw(),
-                JobObjectBasicAccountingInformation,
-                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast::<c_void>(),
-                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                ptr::null_mut(),
-            )
-        } == 0
-        {
-            return Err(platform_error());
-        }
-        Ok(accounting)
+        query_job_accounting(&self.job)
     }
 
     fn verify_configured_limits(
         &self,
         request: &AuthorizedProcessRequest,
     ) -> Result<ConfiguredJobLimits, PortError> {
-        let mut observed = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        // SAFETY: observed is writable for the declared structure size and job is valid.
-        if unsafe {
-            QueryInformationJobObject(
-                self.job.as_raw(),
-                JobObjectExtendedLimitInformation,
-                (&mut observed as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast::<c_void>(),
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                ptr::null_mut(),
-            )
-        } == 0
-        {
+        let observed = query_extended_limits(&self.job).inspect_err(|_| {
             self.terminate_unassigned();
-            return Err(platform_error());
-        }
-        let required_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-            | JOB_OBJECT_LIMIT_JOB_MEMORY
-            | JOB_OBJECT_LIMIT_JOB_TIME;
+        })?;
         let expected_ticks = millis_to_windows_ticks(request.limits.cpu_time_limit_ms)?;
         let expected_memory =
             usize::try_from(request.limits.memory_limit_bytes).map_err(|_| invalid_input())?;
-        if observed.BasicLimitInformation.LimitFlags & required_flags != required_flags
+        if observed.BasicLimitInformation.LimitFlags & REQUIRED_LIMIT_FLAGS != REQUIRED_LIMIT_FLAGS
+            || observed.BasicLimitInformation.LimitFlags & BREAKAWAY_LIMIT_FLAGS != 0
             || observed.BasicLimitInformation.ActiveProcessLimit
                 != request.limits.max_active_processes
             || observed.BasicLimitInformation.PerJobUserTimeLimit != expected_ticks
@@ -417,6 +390,168 @@ impl ActiveJob {
         terminate_process(&self.process);
         self.terminated.store(true, Ordering::Release);
     }
+}
+
+impl RetainedJob {
+    pub(super) fn open(job_id: &str, root_pid: u32) -> Result<Self, PortError> {
+        let name = wide_job_name(job_id)?;
+        // SAFETY: name is a live NUL-terminated string; the returned handle is owned.
+        let job = OwnedHandle::new(unsafe {
+            OpenJobObjectW(JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE, 0, name.as_ptr())
+        })?;
+        let configured_limits = verify_retained_controls(&job)?;
+        Ok(Self {
+            job,
+            root_pid,
+            job_id: job_id.to_owned(),
+            configured_limits,
+        })
+    }
+
+    pub(super) fn terminate(&self) -> Result<(), PortError> {
+        terminate_job(&self.job)
+    }
+
+    pub(super) fn wait_tree_exit(&self) -> Result<(), PortError> {
+        wait_for_tree_exit(&self.job)
+    }
+
+    pub(super) fn receipt(&self) -> Result<JobReceipt, PortError> {
+        job_receipt(
+            &self.job,
+            self.root_pid,
+            &self.job_id,
+            &self.configured_limits,
+            true,
+        )
+    }
+}
+
+fn verify_retained_controls(job: &OwnedHandle) -> Result<ConfiguredJobLimits, PortError> {
+    let observed = query_extended_limits(job)?;
+    let flags = observed.BasicLimitInformation.LimitFlags;
+    if flags & REQUIRED_LIMIT_FLAGS != REQUIRED_LIMIT_FLAGS
+        || flags & BREAKAWAY_LIMIT_FLAGS != 0
+        || observed.BasicLimitInformation.ActiveProcessLimit == 0
+        || observed.BasicLimitInformation.PerJobUserTimeLimit <= 0
+        || observed.BasicLimitInformation.PerJobUserTimeLimit % 10_000 != 0
+        || observed.JobMemoryLimit == 0
+        || query_end_of_job_time_action(job)? != JOB_OBJECT_TERMINATE_AT_END_OF_JOB
+    {
+        return Err(platform_error());
+    }
+    Ok(ConfiguredJobLimits {
+        memory_limit_bytes: u64::try_from(observed.JobMemoryLimit).map_err(|_| platform_error())?,
+        cpu_time_limit_ms: u64::try_from(observed.BasicLimitInformation.PerJobUserTimeLimit)
+            .map_err(|_| platform_error())?
+            / 10_000,
+        max_active_processes: observed.BasicLimitInformation.ActiveProcessLimit,
+    })
+}
+
+fn terminate_job(job: &OwnedHandle) -> Result<(), PortError> {
+    // SAFETY: the Job Object handle remains valid for this call.
+    if unsafe { TerminateJobObject(job.as_raw(), TERMINATED_EXIT_CODE) } == 0 {
+        return Err(platform_error());
+    }
+    Ok(())
+}
+
+fn wait_for_tree_exit(job: &OwnedHandle) -> Result<(), PortError> {
+    let deadline = Instant::now() + TREE_EXIT_DEADLINE;
+    loop {
+        if query_job_accounting(job)?.ActiveProcesses == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(platform_error());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn query_job_accounting(
+    job: &OwnedHandle,
+) -> Result<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, PortError> {
+    let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    // SAFETY: accounting is writable for the declared structure size and job is valid.
+    if unsafe {
+        QueryInformationJobObject(
+            job.as_raw(),
+            JobObjectBasicAccountingInformation,
+            (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast::<c_void>(),
+            size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(platform_error());
+    }
+    Ok(accounting)
+}
+
+fn query_extended_limits(
+    job: &OwnedHandle,
+) -> Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION, PortError> {
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // SAFETY: limits is writable for the declared structure size and job is valid.
+    if unsafe {
+        QueryInformationJobObject(
+            job.as_raw(),
+            JobObjectExtendedLimitInformation,
+            (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast::<c_void>(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(platform_error());
+    }
+    Ok(limits)
+}
+
+fn query_end_of_job_time_action(job: &OwnedHandle) -> Result<u32, PortError> {
+    let mut action = JOBOBJECT_END_OF_JOB_TIME_INFORMATION::default();
+    // SAFETY: action is writable for the declared structure size and job is valid.
+    if unsafe {
+        QueryInformationJobObject(
+            job.as_raw(),
+            JobObjectEndOfJobTimeInformation,
+            (&mut action as *mut JOBOBJECT_END_OF_JOB_TIME_INFORMATION).cast::<c_void>(),
+            size_of::<JOBOBJECT_END_OF_JOB_TIME_INFORMATION>() as u32,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(platform_error());
+    }
+    Ok(action.EndOfJobTimeAction)
+}
+
+fn job_receipt(
+    job: &OwnedHandle,
+    root_pid: u32,
+    job_id: &str,
+    configured: &ConfiguredJobLimits,
+    tree_terminated: bool,
+) -> Result<JobReceipt, PortError> {
+    let accounting = query_job_accounting(job)?;
+    let total_user_time_ms =
+        u64::try_from(accounting.TotalUserTime).map_err(|_| platform_error())? / 10_000;
+    Ok(JobReceipt {
+        root_pid,
+        job_id: job_id.to_owned(),
+        kill_on_close: true,
+        no_breakaway: true,
+        job_memory_limit: true,
+        job_cpu_time_limit: true,
+        memory_limit_bytes: configured.memory_limit_bytes,
+        cpu_time_limit_ms: configured.cpu_time_limit_ms,
+        max_active_processes: configured.max_active_processes,
+        total_user_time_ms,
+        resource_limit_terminated: accounting.TotalTerminatedProcesses != 0,
+        tree_terminated,
+    })
 }
 
 #[cfg(feature = "test-seams")]
@@ -519,9 +654,19 @@ impl Drop for OwnedHandle {
     }
 }
 
-pub(super) fn create_job() -> Result<OwnedHandle, PortError> {
-    // SAFETY: null security attributes and name request a private unnamed Job Object.
-    OwnedHandle::new(unsafe { CreateJobObjectW(ptr::null(), ptr::null()) })
+pub(super) fn create_job(job_id: &str) -> Result<OwnedHandle, PortError> {
+    let name = wide_job_name(job_id)?;
+    // SAFETY: name is a live NUL-terminated string and null security attributes use
+    // the caller's default DACL.
+    let job = unsafe {
+        SetLastError(ERROR_SUCCESS);
+        OwnedHandle::new(CreateJobObjectW(ptr::null(), name.as_ptr()))?
+    };
+    // SAFETY: CreateJobObjectW documents last-error as ERROR_ALREADY_EXISTS on reuse.
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        return Err(integrity_failure());
+    }
+    Ok(job)
 }
 
 pub(super) fn terminate_process(process: &OwnedHandle) {
@@ -539,6 +684,13 @@ fn millis_to_windows_ticks(milliseconds: u64) -> Result<i64, PortError> {
         .ok_or_else(invalid_input)
 }
 
+fn wide_job_name(job_id: &str) -> Result<Vec<u16>, PortError> {
+    if job_id.is_empty() || job_id.contains('\0') {
+        return Err(invalid_input());
+    }
+    Ok(job_id.encode_utf16().chain(std::iter::once(0)).collect())
+}
+
 pub(super) fn validate_job_limits(request: &AuthorizedProcessRequest) -> Result<(), PortError> {
     millis_to_windows_ticks(request.limits.cpu_time_limit_ms)?;
     usize::try_from(request.limits.memory_limit_bytes).map_err(|_| invalid_input())?;
@@ -548,6 +700,13 @@ pub(super) fn validate_job_limits(request: &AuthorizedProcessRequest) -> Result<
 fn invalid_input() -> PortError {
     PortError::failure(
         SafeErrorClassification::InvalidInput,
+        Retryability::NonRetryable,
+    )
+}
+
+fn integrity_failure() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::IntegrityFailure,
         Retryability::NonRetryable,
     )
 }

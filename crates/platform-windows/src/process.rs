@@ -51,13 +51,17 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
-use crate::job::{create_job, terminate_process, validate_job_limits, ActiveJob, OwnedHandle};
+use crate::job::{
+    create_job, terminate_process, validate_job_limits, ActiveJob, OwnedHandle, RetainedJob,
+    TERMINATED_EXIT_CODE,
+};
 use crate::lpac::{
     record_current_windows_error, record_resume_succeeded, record_suspended_child_created,
     LpacBoundary, PreparedLpacBoundary, TrustedLpacWorktreeRegistration,
 };
 
 const FAILED_THREAD_RESUME: u32 = u32::MAX;
+const JOB_NAME_PREFIX: &str = "LocalAgentTerminal.Job.v1.";
 
 #[cfg(feature = "test-seams")]
 static FAIL_OUTPUT_READER_START: Mutex<Option<ToolExecutionId>> = Mutex::new(None);
@@ -654,7 +658,7 @@ impl ProcessLauncher for WindowsProcessLauncher {
         let mut prepared = configured.prepare(&request)?;
 
         let started_at = Instant::now();
-        let Some(child) = registration.activate(&request, &prepared)? else {
+        let Some(child) = registration.activate(&request, authority, &prepared)? else {
             prepared.cleanup()?;
             registration.finish()?;
             return Err(permission_denied());
@@ -735,11 +739,14 @@ impl ProcessLauncher for WindowsProcessLauncher {
 
         let stdout = join_output(stdout_reader)?;
         let stderr = join_output(stderr_reader)?;
-        let terminated = child.active.was_terminated() || resource_limit_terminated;
+        let observed_exit_code = child.active.exit_code()?;
+        let terminated = child.active.was_terminated()
+            || resource_limit_terminated
+            || observed_exit_code as u32 == TERMINATED_EXIT_CODE;
         let exit_code = if terminated {
             None
         } else {
-            Some(child.active.exit_code()?)
+            Some(observed_exit_code)
         };
         let observed_writes = configured.observed_writes(&request, cleanup.prepared());
         let observed_writes =
@@ -810,32 +817,45 @@ impl ProcessLauncher for WindowsProcessLauncher {
     ) -> Result<CancellationReceipt, PortError> {
         let active = {
             let mut registrations = self.registrations.lock().map_err(|_| internal_error())?;
-            let Some(ExecutionRegistration::Active {
-                job,
-                authority: Some(authority),
-                cancel_requested,
-            }) = registrations.get_mut(binding.authority().execution_id())
-            else {
-                return Err(permission_denied());
-            };
-            if authority != binding.authority()
-                || job.root_pid() != binding.root_pid()
-                || job.job_id() != binding.job_id()
-            {
+            match registrations.get_mut(binding.authority().execution_id()) {
+                Some(ExecutionRegistration::Active {
+                    job,
+                    authority: Some(authority),
+                    cancel_requested,
+                }) => {
+                    if authority != binding.authority()
+                        || job.root_pid() != binding.root_pid()
+                        || job.job_id() != binding.job_id()
+                    {
+                        return Err(integrity_failure());
+                    }
+                    *cancel_requested = true;
+                    Some(job.clone())
+                }
+                Some(_) => return Err(permission_denied()),
+                None => None,
+            }
+        };
+        let job_receipt = if let Some(active) = active {
+            active.terminate()?;
+            if active.wait_process(INFINITE) != WAIT_OBJECT_0 {
+                return Err(platform_error());
+            }
+            active.wait_tree_exit()?;
+            active.receipt(true)?
+        } else {
+            if binding.job_id() != job_name(binding.authority()) {
                 return Err(integrity_failure());
             }
-            *cancel_requested = true;
-            job.clone()
+            let retained = RetainedJob::open(binding.job_id(), binding.root_pid())?;
+            retained.terminate()?;
+            retained.wait_tree_exit()?;
+            retained.receipt()?
         };
-        active.terminate()?;
-        if active.wait_process(INFINITE) != WAIT_OBJECT_0 {
-            return Err(platform_error());
-        }
-        active.wait_tree_exit()?;
         Ok(CancellationReceipt {
             execution_id: binding.authority().execution_id().clone(),
             status: ProcessStatus::Terminated,
-            job_receipt: Some(active.receipt(true)?),
+            job_receipt: Some(job_receipt),
             cancelled: true,
         })
     }
@@ -899,6 +919,7 @@ impl<'launcher> ExecutionRegistrationGuard<'launcher> {
     fn activate(
         &mut self,
         request: &AuthorizedProcessRequest,
+        authority: &ToolExecutionClaimAuthority,
         prepared: &PreparedProcessBoundary,
     ) -> Result<Option<SuspendedChild>, PortError> {
         let mut registrations = self
@@ -911,7 +932,7 @@ impl<'launcher> ExecutionRegistrationGuard<'launcher> {
             Some(ExecutionRegistration::CancelRequested) => return Ok(None),
             _ => return Err(integrity_failure()),
         }
-        let child = create_suspended_process(request, prepared)?;
+        let child = create_suspended_process(request, authority, prepared)?;
         child.active.configure_and_assign(request)?;
         registrations.insert(
             self.execution_id.clone(),
@@ -1148,9 +1169,11 @@ struct SuspendedChild {
 
 fn create_suspended_process(
     request: &AuthorizedProcessRequest,
+    authority: &ToolExecutionClaimAuthority,
     boundary: &PreparedProcessBoundary,
 ) -> Result<SuspendedChild, PortError> {
-    let job = create_job()?;
+    let job_id = job_name(authority);
+    let job = create_job(&job_id)?;
     let (stdin_read, stdin_write) = create_pipe_pair(PipeInheritance::Read)?;
     drop(stdin_write);
     let (stdout_read, stdout_write) = create_pipe_pair(PipeInheritance::Write)?;
@@ -1213,6 +1236,7 @@ fn create_suspended_process(
             job,
             process,
             process_information.dwProcessId,
+            job_id,
             request.execution_id.as_str().to_owned(),
         )),
         primary_thread,
@@ -1719,6 +1743,29 @@ fn wait_timeout(timeout_ms: u64) -> u32 {
 
 fn elapsed_millis(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn job_name(authority: &ToolExecutionClaimAuthority) -> String {
+    let mut hasher = Sha256::new();
+    hash_job_name_field(&mut hasher, authority.execution_id().as_str().as_bytes());
+    hash_job_name_field(
+        &mut hasher,
+        authority.operation_digest().as_str().as_bytes(),
+    );
+    hash_job_name_field(&mut hasher, authority.owner_run_id().as_str().as_bytes());
+    hash_job_name_field(&mut hasher, &authority.attempt().to_le_bytes());
+    let mut fencing_token = [0; 9];
+    if let Some(token) = authority.executor_fencing_token() {
+        fencing_token[0] = 1;
+        fencing_token[1..].copy_from_slice(&token.get().to_le_bytes());
+    }
+    hash_job_name_field(&mut hasher, &fencing_token);
+    format!("{JOB_NAME_PREFIX}{:x}", hasher.finalize())
+}
+
+fn hash_job_name_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 fn output_digest(stdout: &[u8], stderr: &[u8]) -> Sha256Digest {

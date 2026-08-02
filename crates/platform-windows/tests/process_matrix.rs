@@ -117,6 +117,7 @@ use windows_sys::Win32::System::Threading::{
 
 #[cfg(feature = "test-seams")]
 static JOB_CLEANUP_FAILURE_TEST_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_PROCESS_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 
 trait TestProcessLauncher {
     fn execute(&self, request: AuthorizedProcessRequest) -> Result<ProcessReceipt, PortError>;
@@ -180,6 +181,7 @@ impl TestProcessBindings {
         }
     }
 
+    #[cfg(feature = "test-seams")]
     fn rejecting(authority: ToolExecutionClaimAuthority) -> Self {
         Self {
             authority,
@@ -219,6 +221,54 @@ fn claimed_authority(request: &AuthorizedProcessRequest) -> ToolExecutionClaimAu
         Some(request.executor_claim.token()),
     )
     .unwrap()
+}
+
+#[cfg(feature = "test-seams")]
+fn substituted_authorities(
+    authority: &ToolExecutionClaimAuthority,
+) -> [ToolExecutionClaimAuthority; 5] {
+    [
+        ToolExecutionClaimAuthority::from_persisted(
+            ToolExecutionId::new("execution-retained-recovery-substitute").unwrap(),
+            authority.operation_digest().clone(),
+            authority.owner_run_id().clone(),
+            authority.attempt(),
+            authority.executor_fencing_token(),
+        )
+        .unwrap(),
+        ToolExecutionClaimAuthority::from_persisted(
+            authority.execution_id().clone(),
+            digest(b"substituted process operation"),
+            authority.owner_run_id().clone(),
+            authority.attempt(),
+            authority.executor_fencing_token(),
+        )
+        .unwrap(),
+        ToolExecutionClaimAuthority::from_persisted(
+            authority.execution_id().clone(),
+            authority.operation_digest().clone(),
+            RunId::new("run-2").unwrap(),
+            authority.attempt(),
+            authority.executor_fencing_token(),
+        )
+        .unwrap(),
+        ToolExecutionClaimAuthority::from_persisted(
+            authority.execution_id().clone(),
+            authority.operation_digest().clone(),
+            authority.owner_run_id().clone(),
+            authority.attempt() + 1,
+            authority.executor_fencing_token(),
+        )
+        .unwrap(),
+        ToolExecutionClaimAuthority::from_persisted(
+            authority.execution_id().clone(),
+            authority.operation_digest().clone(),
+            authority.owner_run_id().clone(),
+            authority.attempt(),
+            None,
+        )
+        .unwrap(),
+    ]
 }
 
 fn test_binding_error() -> PortError {
@@ -759,6 +809,29 @@ fn verified_boundary_runs_in_a_real_kill_on_close_job_and_captures_output() {
     assert!(String::from_utf8_lossy(&receipt.stdout.bytes).contains("literal ;&|$()"));
     assert!(receipt.job_receipt.kill_on_close);
     assert!(receipt.job_receipt.no_breakaway);
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn nonzero_process_exit_is_not_reported_as_job_termination() {
+    let root = TempDir::new().unwrap();
+    let boundary = Arc::new(TestOnlyBoundary::valid(root.path().to_owned()));
+    let launcher =
+        WindowsProcessLauncher::with_isolated_worker_boundary(boundary, boundary_binding());
+    let mut request = request(
+        vec![
+            "--exact".to_owned(),
+            "process_child_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        BTreeMap::from([("LAT_PROCESS_HELPER".to_owned(), "exit-23".to_owned())]),
+    );
+    request.execution_id = ToolExecutionId::new("execution-nonzero-exit").unwrap();
+
+    let receipt = launcher.execute(request).unwrap();
+
+    assert_eq!(receipt.status, ProcessStatus::Exited);
+    assert_eq!(receipt.exit_code, Some(23));
 }
 
 #[test]
@@ -2002,6 +2075,7 @@ fn retained_process_recovery_validates_exact_authority_and_job_before_terminatio
     );
     request.execution_id = ToolExecutionId::new("execution-retained-recovery").unwrap();
     request.timeout_ms = 30_000;
+    let duplicate_request = request.clone();
     let execution_id = request.execution_id.clone();
     let authority = claimed_authority(&request);
     let captured = Arc::new(Mutex::new(None));
@@ -2035,22 +2109,19 @@ fn retained_process_recovery_validates_exact_authority_and_job_before_terminatio
         assert!(Instant::now() < deadline, "retained process did not resume");
         thread::yield_now();
     }
+    let recovery_launcher = WindowsProcessLauncher::default();
 
-    let wrong_authority = ToolExecutionClaimAuthority::from_persisted(
-        authority.execution_id().clone(),
-        authority.operation_digest().clone(),
-        authority.owner_run_id().clone(),
-        authority.attempt() + 1,
-        authority.executor_fencing_token(),
-    )
-    .unwrap();
-    let wrong_authority_binding =
-        AuthoritativeProcessBinding::new(wrong_authority, binding.root_pid(), binding.job_id())
-            .unwrap();
+    let duplicate_launcher = WindowsProcessLauncher::with_isolated_worker_boundary(
+        Arc::new(TestOnlyBoundary::valid(root.path().to_owned())),
+        boundary_binding(),
+    );
+    let duplicate_bindings = TestProcessBindings::rejecting(authority.clone());
     assert_eq!(
-        local_agent_terminal_application::ProcessLauncher::terminate_retained_process(
-            launcher.as_ref(),
-            &wrong_authority_binding,
+        local_agent_terminal_application::ProcessLauncher::execute(
+            &duplicate_launcher,
+            duplicate_request,
+            &authority,
+            &duplicate_bindings,
         )
         .unwrap_err()
         .safe_classification(),
@@ -2058,12 +2129,28 @@ fn retained_process_recovery_validates_exact_authority_and_job_before_terminatio
     );
     assert!(process_is_active(binding.root_pid()));
 
+    for wrong_authority in substituted_authorities(&authority) {
+        let wrong_authority_binding =
+            AuthoritativeProcessBinding::new(wrong_authority, binding.root_pid(), binding.job_id())
+                .unwrap();
+        assert_eq!(
+            local_agent_terminal_application::ProcessLauncher::terminate_retained_process(
+                &recovery_launcher,
+                &wrong_authority_binding,
+            )
+            .unwrap_err()
+            .safe_classification(),
+            SafeErrorClassification::IntegrityFailure
+        );
+        assert!(process_is_active(binding.root_pid()));
+    }
+
     let wrong_job_binding =
         AuthoritativeProcessBinding::new(authority, binding.root_pid(), "job-not-retained")
             .unwrap();
     assert_eq!(
         local_agent_terminal_application::ProcessLauncher::terminate_retained_process(
-            launcher.as_ref(),
+            &recovery_launcher,
             &wrong_job_binding,
         )
         .unwrap_err()
@@ -2074,7 +2161,7 @@ fn retained_process_recovery_validates_exact_authority_and_job_before_terminatio
 
     let termination =
         local_agent_terminal_application::ProcessLauncher::terminate_retained_process(
-            launcher.as_ref(),
+            &recovery_launcher,
             &binding,
         )
         .unwrap();
@@ -2810,6 +2897,7 @@ fn process_child_helper() {
         .map(|pair| pair[1].as_str());
     match std::env::var("LAT_PROCESS_HELPER").ok().as_deref() {
         Some("emit") => println!("literal ;&|$()"),
+        Some("exit-23") => std::process::exit(23),
         Some("argv") => println!("argv={}", skip_value.unwrap()),
         Some("lpac-identity") => {
             let is_app_container = current_process_token_flag(TokenIsAppContainer);
@@ -4822,7 +4910,12 @@ fn request(argv: Vec<String>, environment: BTreeMap<String, String>) -> Authoriz
     let executable = executables.resolve("test-helper", "test-version").unwrap();
     let network_digest = digest(b"network-profile");
     AuthorizedProcessRequest {
-        execution_id: ToolExecutionId::new("execution-1").unwrap(),
+        execution_id: ToolExecutionId::new(format!(
+            "execution-test-{}-{}",
+            std::process::id(),
+            NEXT_PROCESS_EXECUTION_ID.fetch_add(1, Ordering::Relaxed),
+        ))
+        .unwrap(),
         trust_tier: ProcessTrustTier::IsolatedWorker,
         executable,
         argv,
