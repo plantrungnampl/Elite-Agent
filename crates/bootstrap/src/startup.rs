@@ -429,6 +429,18 @@ fn start(
         ),
     ));
 
+    let file_writes = tools.recover_file_writes().map_err(tool_recovery_failure)?;
+    log.push(record(
+        "startup.file_writes.reconciled",
+        "bootstrap",
+        DiagnosticSeverityDto::Info,
+        None,
+        &format!(
+            "Durable file-write reconciliation completed: terminalized={}.",
+            file_writes.len()
+        ),
+    ));
+
     let tool_report = tools.reconcile_intents().map_err(tool_recovery_failure)?;
     let tool_availability = tools.availability().map_err(tool_recovery_failure)?;
     log.push(record(

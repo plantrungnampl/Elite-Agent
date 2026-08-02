@@ -825,7 +825,9 @@ impl SqliteStore {
                 "SELECT id, task_id, operation_kind, idempotency_class, idempotency_key,
                         canonical_request_artifact_id, operation_digest, status,
                         executor_fencing_token, attempt_count, created_at, updated_at
-                 FROM operation_intents WHERE status = 'started' ORDER BY created_at, id",
+                 FROM operation_intents
+                 WHERE status = 'started' AND operation_kind <> 'file.write'
+                 ORDER BY created_at, id",
             )
             .map_err(sqlite_error_to_port)?;
         let rows = statement
@@ -1213,6 +1215,35 @@ pub(crate) fn record_workspace_mutation_in_transaction(
     transaction: &Transaction<'_>,
     request: WorkspaceMutationRequest,
 ) -> Result<WorkspaceMutationResult, PortError> {
+    record_workspace_mutation_with_authority(
+        transaction,
+        request,
+        WorkspaceMutationAuthority::ActiveLease,
+    )
+}
+
+pub(crate) fn record_recovered_workspace_mutation_in_transaction(
+    transaction: &Transaction<'_>,
+    request: WorkspaceMutationRequest,
+) -> Result<WorkspaceMutationResult, PortError> {
+    record_workspace_mutation_with_authority(
+        transaction,
+        request,
+        WorkspaceMutationAuthority::StartupRecovery,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum WorkspaceMutationAuthority {
+    ActiveLease,
+    StartupRecovery,
+}
+
+fn record_workspace_mutation_with_authority(
+    transaction: &Transaction<'_>,
+    request: WorkspaceMutationRequest,
+    authority: WorkspaceMutationAuthority,
+) -> Result<WorkspaceMutationResult, PortError> {
     validate_mutation_request(&request)?;
     verify_mutation_evidence(transaction, &request)?;
     let task: Option<(String, String, String, i64, i64, i64)> = transaction
@@ -1266,13 +1297,46 @@ pub(crate) fn record_workspace_mutation_in_transaction(
     let Some((holder_run_id, lease_token, lease_status)) = lease else {
         return Err(PortError::stale_lease(current_token, request.claim.token()));
     };
-    if lease_status != "active"
-        || holder_run_id != request.claim.holder_run_id().as_str()
-        || lease_token != i64::try_from(request.claim.token().get()).unwrap_or_default()
-        || request.claim.task_id() != &request.task_id
-        || request.claim.token() != current_token
-    {
-        return Err(PortError::stale_lease(current_token, request.claim.token()));
+    let claimed_token = i64::try_from(request.claim.token().get()).map_err(|_| invalid_input())?;
+    match authority {
+        WorkspaceMutationAuthority::ActiveLease => {
+            if lease_status != "active"
+                || holder_run_id != request.claim.holder_run_id().as_str()
+                || lease_token != claimed_token
+                || request.claim.task_id() != &request.task_id
+                || request.claim.token() != current_token
+            {
+                return Err(PortError::stale_lease(current_token, request.claim.token()));
+            }
+        }
+        WorkspaceMutationAuthority::StartupRecovery => {
+            let expected_token = claimed_token.checked_add(1).ok_or_else(invalid_input)?;
+            let fence_event_id = format!(
+                "executor.lease.fenced:{}:{}",
+                request.task_id.as_str(),
+                request.claim.token().get()
+            );
+            let exact_fence: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM events
+                        WHERE stream_id = ?1 AND sequence = ?2
+                          AND event_id = ?3 AND event_type = 'executor.lease.fenced'
+                    )",
+                    params![request.task_id.as_str(), current_sequence, fence_event_id],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_error_to_port)?;
+            if lease_status != "revoked"
+                || holder_run_id != request.claim.holder_run_id().as_str()
+                || lease_token != claimed_token
+                || request.claim.task_id() != &request.task_id
+                || fencing_epoch != expected_token
+                || !exact_fence
+            {
+                return Err(PortError::stale_lease(current_token, request.claim.token()));
+            }
+        }
     }
 
     let state = WorkflowState::new(
@@ -1372,21 +1436,23 @@ pub(crate) fn record_workspace_mutation_in_transaction(
             )
             .map_err(sqlite_error_to_port)?;
     }
-    let revoked = transaction
-        .execute(
-            "UPDATE executor_leases SET status = 'revoked', released_at = ?1
-             WHERE task_id = ?2 AND holder_run_id = ?3
-               AND fencing_token = ?4 AND status = 'active'",
-            params![
-                now,
-                request.task_id.as_str(),
-                request.claim.holder_run_id().as_str(),
-                i64::try_from(request.claim.token().get()).map_err(|_| invalid_input())?,
-            ],
-        )
-        .map_err(sqlite_error_to_port)?;
-    if revoked != 1 {
-        return Err(conflict());
+    if matches!(authority, WorkspaceMutationAuthority::ActiveLease) {
+        let revoked = transaction
+            .execute(
+                "UPDATE executor_leases SET status = 'revoked', released_at = ?1
+                 WHERE task_id = ?2 AND holder_run_id = ?3
+                   AND fencing_token = ?4 AND status = 'active'",
+                params![
+                    now,
+                    request.task_id.as_str(),
+                    request.claim.holder_run_id().as_str(),
+                    claimed_token,
+                ],
+            )
+            .map_err(sqlite_error_to_port)?;
+        if revoked != 1 {
+            return Err(conflict());
+        }
     }
 
     Ok(WorkspaceMutationResult {

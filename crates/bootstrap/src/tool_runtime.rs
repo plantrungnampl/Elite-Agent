@@ -12,20 +12,20 @@ use local_agent_terminal_application::{
     CanonicalEvidenceRef, Clock, DisclosedToolExecutionArtifacts, DisclosureOutcome,
     DurableToolCancellationOutcome, DurableToolExecutionArtifact, DurableToolExecutionArtifacts,
     DurableToolExecutionOutcome, DurableToolExecutionReceipt, ExecuteTool, FileReadRequest,
-    FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult,
-    IdGenerator, ImmutableToolRequest, IncompleteToolExecution, NewToolIntent,
-    OperationIntentSnapshot, PolicyBoundBytes, PortError, ProcessStatus, ProjectId,
-    ReservedArtifact, ResolveToolApprovalRequestDto, RetainedProcessController, Retryability,
-    SafeErrorClassification, SafeToolExecutionError, Sha256Digest, StopAllToolsReceiptDto,
-    StructuredToolExecutor, TaskId, TaskQuery, ToolActivityDto, ToolActivityStatusDto,
-    ToolApprovalDecisionDto, ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestDto,
-    ToolApprovalRequestPublisher, ToolApprovalResolutionDto, ToolAuthorityResolver,
-    ToolCancellationReceiptDto, ToolControlSelfTest, ToolExecutionArtifactEvidence,
-    ToolExecutionCancellationClaim, ToolExecutionId, ToolExecutionOrchestration,
-    ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResumeStore,
-    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolOutcome, ToolRequest,
-    ToolRequestPublisher, ToolRuntimeAvailabilityDto, VerifiedWrite, WorkspaceEvidenceStore,
-    WorkspaceWriteCoordinator,
+    FileWriteRecoverySnapshot, FileWriteRecoveryState, FileWriteRequest, GitDiffRequest,
+    GitDiffResult, GitStatusRequest, GitStatusResult, IdGenerator, ImmutableToolRequest,
+    IncompleteToolExecution, NewToolIntent, OperationIntentSnapshot, PolicyBoundBytes, PortError,
+    ProcessStatus, ProjectId, ReservedArtifact, ResolveToolApprovalRequestDto,
+    RetainedProcessController, Retryability, SafeErrorClassification, SafeToolExecutionError,
+    Sha256Digest, StopAllToolsReceiptDto, StructuredToolExecutor, TaskId, TaskQuery,
+    ToolActivityDto, ToolActivityStatusDto, ToolApprovalDecisionDto, ToolApprovalPublication,
+    ToolApprovalRequest, ToolApprovalRequestDto, ToolApprovalRequestPublisher,
+    ToolApprovalResolutionDto, ToolAuthorityResolver, ToolCancellationReceiptDto,
+    ToolControlSelfTest, ToolExecutionArtifactEvidence, ToolExecutionCancellationClaim,
+    ToolExecutionId, ToolExecutionOrchestration, ToolExecutionRecoveryState,
+    ToolExecutionResolution, ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal,
+    ToolExecutionTerminalKind, ToolOutcome, ToolRequest, ToolRequestPublisher,
+    ToolRuntimeAvailabilityDto, VerifiedWrite, WorkspaceEvidenceStore, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_policy_engine::VersionedPolicyEngine;
 use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
@@ -35,6 +35,8 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(0);
 
 type ToolWorkerResult = Result<ToolOutcome, PortError>;
+type StartupFileWriteRecovery =
+    dyn Fn() -> Result<Vec<FileWriteRecoverySnapshot>, PortError> + Send + Sync;
 
 pub trait SelfTestingToolExecutor: StructuredToolExecutor + ToolControlSelfTest {}
 
@@ -48,6 +50,7 @@ pub struct ToolBrokerConfig {
     process_enabled: bool,
     write_enabled: bool,
     workspace_writes: Arc<WorkspaceWriteCoordinator>,
+    file_write_recovery: Option<Arc<StartupFileWriteRecovery>>,
 }
 
 impl ToolBrokerConfig {
@@ -63,6 +66,7 @@ impl ToolBrokerConfig {
             process_enabled: true,
             write_enabled: true,
             workspace_writes: Arc::new(WorkspaceWriteCoordinator::new()),
+            file_write_recovery: None,
         }
     }
 
@@ -82,6 +86,14 @@ impl ToolBrokerConfig {
         workspace_writes: Arc<WorkspaceWriteCoordinator>,
     ) -> Self {
         self.workspace_writes = workspace_writes;
+        self
+    }
+
+    pub(crate) fn with_file_write_recovery(
+        mut self,
+        recovery: Arc<StartupFileWriteRecovery>,
+    ) -> Self {
+        self.file_write_recovery = Some(recovery);
         self
     }
 
@@ -135,6 +147,7 @@ pub struct ToolRuntime {
     executor: Option<Arc<dyn SelfTestingToolExecutor>>,
     broker: Option<Arc<ToolBroker>>,
     retained_processes: Arc<dyn RetainedProcessController>,
+    file_write_recovery: Option<Arc<StartupFileWriteRecovery>>,
     state: Arc<Mutex<ToolRuntimeState>>,
     shutdown: Mutex<()>,
     degraded_read_only: bool,
@@ -440,7 +453,14 @@ impl ToolRuntime {
         let retained_processes = Arc::new(StructuredExecutorProcessController {
             executor: Arc::clone(&executor),
         });
-        Self::configured(executions, Some(executor), None, retained_processes, false)
+        Self::configured(
+            executions,
+            Some(executor),
+            None,
+            retained_processes,
+            None,
+            false,
+        )
     }
 
     pub(crate) fn with_broker(
@@ -449,6 +469,7 @@ impl ToolRuntime {
         config: ToolBrokerConfig,
     ) -> Result<Self, PortError> {
         let degraded_read_only = !config.process_enabled && !config.write_enabled;
+        let file_write_recovery = config.file_write_recovery.clone();
         let broker = Arc::new(ToolBroker::new(database, artifacts, config)?);
         let executions: Arc<dyn ToolExecutionStore> = Arc::new(broker.database.clone());
         let executor = Arc::clone(&broker.executor);
@@ -460,6 +481,7 @@ impl ToolRuntime {
             Some(executor),
             Some(broker),
             retained_processes,
+            file_write_recovery,
             degraded_read_only,
         ))
     }
@@ -468,7 +490,7 @@ impl ToolRuntime {
         executions: Arc<dyn ToolExecutionStore>,
         retained_processes: Arc<dyn RetainedProcessController>,
     ) -> Self {
-        Self::configured(executions, None, None, retained_processes, false)
+        Self::configured(executions, None, None, retained_processes, None, false)
     }
 
     fn configured(
@@ -476,6 +498,7 @@ impl ToolRuntime {
         executor: Option<Arc<dyn SelfTestingToolExecutor>>,
         broker: Option<Arc<ToolBroker>>,
         retained_processes: Arc<dyn RetainedProcessController>,
+        file_write_recovery: Option<Arc<StartupFileWriteRecovery>>,
         degraded_read_only: bool,
     ) -> Self {
         Self {
@@ -483,6 +506,7 @@ impl ToolRuntime {
             executor,
             broker,
             retained_processes,
+            file_write_recovery,
             state: Arc::new(Mutex::new(ToolRuntimeState {
                 dispatch_open: false,
                 availability: ToolRuntimeAvailability::Unavailable,
@@ -505,6 +529,35 @@ impl ToolRuntime {
     pub fn recover_startup(&self) -> Result<ToolStartupRecoveryReport, PortError> {
         self.inspect_survivors()?;
         self.reconcile_intents()
+    }
+
+    pub(crate) fn recover_file_writes(&self) -> Result<Vec<FileWriteRecoverySnapshot>, PortError> {
+        let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
+        {
+            let state = self.state.lock().map_err(|_| internal_failure())?;
+            if state.dispatch_open
+                || !state.workers.is_empty()
+                || state.startup_inspection.is_none()
+                || state.recovery_report.is_some()
+            {
+                return Err(conflict());
+            }
+        }
+        let Some(recovery) = self.file_write_recovery.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let snapshots = recovery()?;
+        if snapshots.iter().any(|snapshot| {
+            matches!(
+                snapshot.state,
+                FileWriteRecoveryState::Prepared
+                    | FileWriteRecoveryState::Started
+                    | FileWriteRecoveryState::Indeterminate
+            )
+        }) {
+            return Err(integrity_failure());
+        }
+        Ok(snapshots)
     }
 
     pub fn inspect_survivors(&self) -> Result<ToolStartupRecoveryReport, PortError> {

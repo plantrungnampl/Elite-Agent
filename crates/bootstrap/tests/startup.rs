@@ -57,6 +57,7 @@ fn first_startup_creates_and_validates_required_local_state() {
             "startup.leases.fenced",
             "startup.tools.survivors_inspected",
             "startup.repositories.reconciled",
+            "startup.file_writes.reconciled",
             "startup.tools.reconciled",
             "startup.intents.reconciled",
             "startup.approvals.expired",

@@ -1871,6 +1871,12 @@ pub trait FileWriteRecoveryStore: Send + Sync {
         &self,
         completion: FileWriteRecoveryCompletion,
     ) -> Result<FileWriteRecoverySnapshot, PortError>;
+    fn complete_recovery(
+        &self,
+        completion: FileWriteRecoveryCompletion,
+    ) -> Result<FileWriteRecoverySnapshot, PortError> {
+        self.complete(completion)
+    }
     fn fail(
         &self,
         execution_id: &ToolExecutionId,

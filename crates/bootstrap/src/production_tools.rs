@@ -9,14 +9,15 @@ use local_agent_terminal_application::{
     DisclosureContextProvider, DisclosureContextRequest, DisclosureOutcome, ExpectedPresence,
     FileReadRequest, FileWriteEvidenceStore, FileWritePolicyBinding, FileWritePreImage,
     FileWriteRecoveryCompletion, FileWriteRecoveryIntent, FileWriteRecoveryRequest,
-    FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult,
-    InspectWorktree, ManagedWorktreePath, PolicyAction, PolicyActor, PolicyBoundBytes,
-    PolicyResource, PortError, ProcessReceipt, RepositoryGateway, ResolvedCapabilityTarget,
-    ResourceClass, Retryability, SafeErrorClassification, Sha256Digest, StructuredToolExecutor,
-    TaskId, TaskQuery, TaskRisk, ToolAuthorityResolver, ToolAuthoritySnapshot, ToolControlSelfTest,
-    ToolExecutionId, ToolExecutionResult, ToolPolicyContext, ToolRequest, TrustTier,
-    TrustedDisclosureContext, VerifiedWrite, WorkspaceFingerprint, WorkspaceRecoveryStore,
-    WorkspaceWriteCoordinator, WorktreeObservation,
+    FileWriteRecoverySnapshot, FileWriteRecoveryStore, FileWriteRequest, GitDiffRequest,
+    GitDiffResult, GitStatusRequest, GitStatusResult, InspectWorktree, ManagedWorktreePath,
+    PolicyAction, PolicyActor, PolicyBoundBytes, PolicyResource, PortError, ProcessReceipt,
+    RepositoryGateway, ResolvedCapabilityTarget, ResourceClass, Retryability,
+    SafeErrorClassification, Sha256Digest, StructuredToolExecutor, TaskId, TaskQuery, TaskRisk,
+    ToolAuthorityResolver, ToolAuthoritySnapshot, ToolControlSelfTest, ToolExecutionId,
+    ToolExecutionResult, ToolPolicyContext, ToolRequest, TrustTier, TrustedDisclosureContext,
+    VerifiedWrite, WorkspaceFingerprint, WorkspaceRecoveryStore, WorkspaceWriteCoordinator,
+    WorktreeObservation,
 };
 use local_agent_terminal_platform_windows::{CapabilityRegistration, WindowsCapabilityAdapter};
 use local_agent_terminal_policy_engine::VersionedPolicyEngine;
@@ -44,18 +45,21 @@ pub(crate) fn production_tool_broker(config: &StartupConfig) -> ToolBrokerConfig
         trusted_workspace_root: config.trusted_workspace_root.clone(),
     };
     let writes = Arc::new(WorkspaceWriteCoordinator::new());
+    let executor = Arc::new(ProductionToolExecutor {
+        paths: paths.clone(),
+        writes: Arc::clone(&writes),
+    });
+    let recovery_executor = Arc::clone(&executor);
     ToolBrokerConfig::new(
         DEFAULT_POLICY_BUNDLE,
         Arc::new(ProductionToolAuthority {
             paths: paths.clone(),
         }),
-        Arc::new(ProductionToolExecutor {
-            paths,
-            writes: Arc::clone(&writes),
-        }),
+        executor,
     )
     .without_process()
     .with_workspace_writes(writes)
+    .with_file_write_recovery(Arc::new(move || recovery_executor.recover_file_writes()))
 }
 
 struct ProductionToolAuthority {
@@ -131,6 +135,76 @@ struct ProductionToolExecutor {
 }
 
 impl ProductionToolExecutor {
+    fn recover_file_writes(&self) -> Result<Vec<FileWriteRecoverySnapshot>, PortError> {
+        let database = open_database(&self.paths)?;
+        let recoverable = database.recover()?;
+        if recoverable.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut task_ids = Vec::new();
+        for snapshot in recoverable {
+            if !task_ids.contains(&snapshot.request.task_id) {
+                task_ids.push(snapshot.request.task_id);
+            }
+        }
+        let tasks = task_ids
+            .iter()
+            .map(|task_id| database.task(task_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let artifacts =
+            ContentAddressedArtifactStore::open(self.paths.app_data_dir.join("artifacts"))?;
+        let gateway = GitRepositoryGateway::open(
+            &self.paths.trusted_workspace_root,
+            &[self.paths.app_data_dir.join("artifacts")],
+        )?;
+        let git = GitStructuredTools::from_owned_tasks(&gateway, &database, &task_ids)?;
+        let registrations = tasks
+            .iter()
+            .map(|task| {
+                let worktree = task.worktree.as_ref().ok_or_else(unavailable)?;
+                CapabilityRegistration::worktree(
+                    git.root_identity(&task.task_id)
+                        .ok_or_else(unavailable)?
+                        .clone(),
+                    task.task_id.clone(),
+                    self.paths
+                        .trusted_workspace_root
+                        .join(worktree.worktree_id.as_str()),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let capabilities = WindowsCapabilityAdapter::new(registrations)?;
+        let policy = VersionedPolicyEngine::from_json(DEFAULT_POLICY_BUNDLE)?;
+        let context = ProductionDisclosureContext {
+            task: tasks.into_iter().next().ok_or_else(unavailable)?,
+            policy_snapshot_digest: policy.snapshot_digest().clone(),
+        };
+        let disabled_process = DisabledProcessExecutor;
+        let evidence = ProductionFileWriteEvidence {
+            database: &database,
+            artifacts: &artifacts,
+            repositories: &gateway,
+            task: &context.task,
+            policy: None,
+        };
+        StructuredToolRuntime::new(
+            &capabilities,
+            &capabilities,
+            &capabilities,
+            &git,
+            &database,
+            &disabled_process,
+            &evidence,
+            &database,
+            self.writes.as_ref(),
+            &context,
+            &policy,
+            &database,
+            &database,
+        )
+        .recover_file_writes()
+    }
+
     fn with_runtime<T>(
         &self,
         task_id: &TaskId,

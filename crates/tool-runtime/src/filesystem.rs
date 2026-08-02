@@ -181,7 +181,7 @@ fn recover_started_write(
     };
     let completion = CaptureFileWritePostEvidence::new(snapshot.request.clone(), verified)
         .and_then(|capture| evidence.capture_post_write(capture));
-    let completed = completion.and_then(|completion| recovery.complete(completion));
+    let completed = completion.and_then(|completion| recovery.complete_recovery(completion));
     match completed {
         Ok(completed) => {
             validate_recovery_transition(snapshot, &completed, FileWriteRecoveryState::Completed)?;

@@ -32,7 +32,8 @@ use crate::approval_store::{append_approval_event, parse_canonical_approval_payl
 use crate::event_store::{open_error_to_port, sqlite_error_to_port};
 use crate::policy_store::{actor_json, digest_json, effect_name, resource_json};
 use crate::workspace_store::{
-    record_workspace_mutation_in_transaction, verify_evidence_ref_in_transaction,
+    record_recovered_workspace_mutation_in_transaction, record_workspace_mutation_in_transaction,
+    verify_evidence_ref_in_transaction,
 };
 use crate::SqliteStore;
 
@@ -251,98 +252,18 @@ impl FileWriteRecoveryStore for SqliteStore {
         &self,
         completion: FileWriteRecoveryCompletion,
     ) -> Result<FileWriteRecoverySnapshot, PortError> {
-        let snapshot = load_file_write_snapshot(self, &completion.execution_id)?;
-        validate_file_write_completion(&snapshot, &completion)?;
-        if snapshot.state == FileWriteRecoveryState::Completed {
-            if file_write_completion_matches(self, &snapshot, &completion)? {
-                return Ok(snapshot);
-            }
-            return Err(conflict());
-        }
-        if snapshot.state != FileWriteRecoveryState::Started {
-            return Err(conflict());
-        }
-        let post_digest = Sha256Digest::new(completion.post_evidence.content_hash.clone())
-            .map_err(|_| {
-                PortError::failure(
-                    SafeErrorClassification::InvalidInput,
-                    Retryability::NonRetryable,
-                )
-            })?;
-        self.artifact_by_id(
-            completion.post_evidence.artifact_id.as_str(),
-            &post_digest,
-            None,
-            Some(snapshot.request.task_id.as_str()),
-        )?;
-        let expected_sequence = snapshot
-            .request
-            .expected_sequence
-            .get()
-            .checked_add(1)
-            .ok_or_else(invalid_input)?;
-        let mutation = WorkspaceMutationRequest {
-            task_id: snapshot.request.task_id.clone(),
-            expected_sequence: Sequence::new(expected_sequence),
-            claim: snapshot.request.lease_claim.clone(),
-            pre_fingerprint: snapshot.request.pre_fingerprint.clone(),
-            post_fingerprint: completion.post_fingerprint.clone(),
-            pre_evidence: snapshot.request.pre_evidence.clone(),
-            post_evidence: completion.post_evidence.clone(),
-            actor_id: snapshot.request.actor_id.clone(),
-            correlation_id: snapshot.request.correlation_id.clone(),
-        };
-        let mut connection = self.connection().map_err(open_error_to_port)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sqlite_error_to_port)?;
-        verify_evidence_ref_in_transaction(
-            &transaction,
-            &completion.post_evidence,
-            &snapshot.request.task_id,
-        )?;
-        let mutation_result = record_workspace_mutation_in_transaction(&transaction, mutation)?;
-        let receipt = file_write_receipt(&snapshot, &completion, mutation_result.event_id.as_str());
-        let intent_changed = transaction
-            .execute(
-                "UPDATE operation_intents
-                 SET status = 'succeeded', result_artifact_id = ?1,
-                     external_receipt_json = ?2,
-                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE id = ?3 AND operation_kind = 'file.write' AND status = 'started'",
-                params![
-                    completion.post_evidence.artifact_id.as_str(),
-                    receipt,
-                    completion.execution_id.as_str(),
-                ],
-            )
-            .map_err(sqlite_error_to_port)?;
-        let execution_changed = transaction
-            .execute(
-                "UPDATE tool_executions
-                 SET status = 'succeeded',
-                     completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                     stdout_artifact_id = ?1
-                 WHERE id = ?2 AND tool_name = 'file.write' AND status = 'running'",
-                params![
-                    completion.post_evidence.artifact_id.as_str(),
-                    completion.execution_id.as_str(),
-                ],
-            )
-            .map_err(sqlite_error_to_port)?;
-        if intent_changed != 1 || execution_changed != 1 {
-            return Err(conflict());
-        }
-        append_tool_event(
-            &transaction,
-            snapshot.request.task_id.as_str(),
-            completion.execution_id.as_str(),
-            "tool.execution.completed",
-            "None",
-            file_write_completed_event(&snapshot, &completion, mutation_result.event_id.as_str()),
-        )?;
-        transaction.commit().map_err(sqlite_error_to_port)?;
-        load_file_write_snapshot(self, &completion.execution_id)
+        complete_file_write(self, completion, FileWriteCompletionAuthority::ActiveLease)
+    }
+
+    fn complete_recovery(
+        &self,
+        completion: FileWriteRecoveryCompletion,
+    ) -> Result<FileWriteRecoverySnapshot, PortError> {
+        complete_file_write(
+            self,
+            completion,
+            FileWriteCompletionAuthority::StartupRecovery,
+        )
     }
 
     fn fail(
@@ -504,6 +425,122 @@ impl FileWriteRecoveryStore for SqliteStore {
             })
             .collect()
     }
+}
+
+#[derive(Clone, Copy)]
+enum FileWriteCompletionAuthority {
+    ActiveLease,
+    StartupRecovery,
+}
+
+fn complete_file_write(
+    store: &SqliteStore,
+    completion: FileWriteRecoveryCompletion,
+    authority: FileWriteCompletionAuthority,
+) -> Result<FileWriteRecoverySnapshot, PortError> {
+    let snapshot = load_file_write_snapshot(store, &completion.execution_id)?;
+    validate_file_write_completion(&snapshot, &completion)?;
+    let sequence_offset = match authority {
+        FileWriteCompletionAuthority::ActiveLease => 1,
+        FileWriteCompletionAuthority::StartupRecovery => 2,
+    };
+    if snapshot.state == FileWriteRecoveryState::Completed {
+        if file_write_completion_matches(store, &snapshot, &completion, sequence_offset + 1)? {
+            return Ok(snapshot);
+        }
+        return Err(conflict());
+    }
+    if snapshot.state != FileWriteRecoveryState::Started {
+        return Err(conflict());
+    }
+    let post_digest =
+        Sha256Digest::new(completion.post_evidence.content_hash.clone()).map_err(|_| {
+            PortError::failure(
+                SafeErrorClassification::InvalidInput,
+                Retryability::NonRetryable,
+            )
+        })?;
+    store.artifact_by_id(
+        completion.post_evidence.artifact_id.as_str(),
+        &post_digest,
+        None,
+        Some(snapshot.request.task_id.as_str()),
+    )?;
+    let expected_sequence = snapshot
+        .request
+        .expected_sequence
+        .get()
+        .checked_add(sequence_offset)
+        .ok_or_else(invalid_input)?;
+    let mutation = WorkspaceMutationRequest {
+        task_id: snapshot.request.task_id.clone(),
+        expected_sequence: Sequence::new(expected_sequence),
+        claim: snapshot.request.lease_claim.clone(),
+        pre_fingerprint: snapshot.request.pre_fingerprint.clone(),
+        post_fingerprint: completion.post_fingerprint.clone(),
+        pre_evidence: snapshot.request.pre_evidence.clone(),
+        post_evidence: completion.post_evidence.clone(),
+        actor_id: snapshot.request.actor_id.clone(),
+        correlation_id: snapshot.request.correlation_id.clone(),
+    };
+    let mut connection = store.connection().map_err(open_error_to_port)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error_to_port)?;
+    verify_evidence_ref_in_transaction(
+        &transaction,
+        &completion.post_evidence,
+        &snapshot.request.task_id,
+    )?;
+    let mutation_result = match authority {
+        FileWriteCompletionAuthority::ActiveLease => {
+            record_workspace_mutation_in_transaction(&transaction, mutation)?
+        }
+        FileWriteCompletionAuthority::StartupRecovery => {
+            record_recovered_workspace_mutation_in_transaction(&transaction, mutation)?
+        }
+    };
+    let receipt = file_write_receipt(&snapshot, &completion, mutation_result.event_id.as_str());
+    let intent_changed = transaction
+        .execute(
+            "UPDATE operation_intents
+             SET status = 'succeeded', result_artifact_id = ?1,
+                 external_receipt_json = ?2,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?3 AND operation_kind = 'file.write' AND status = 'started'",
+            params![
+                completion.post_evidence.artifact_id.as_str(),
+                receipt,
+                completion.execution_id.as_str(),
+            ],
+        )
+        .map_err(sqlite_error_to_port)?;
+    let execution_changed = transaction
+        .execute(
+            "UPDATE tool_executions
+             SET status = 'succeeded',
+                 completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 stdout_artifact_id = ?1
+             WHERE id = ?2 AND tool_name = 'file.write' AND status = 'running'",
+            params![
+                completion.post_evidence.artifact_id.as_str(),
+                completion.execution_id.as_str(),
+            ],
+        )
+        .map_err(sqlite_error_to_port)?;
+    if intent_changed != 1 || execution_changed != 1 {
+        return Err(conflict());
+    }
+    append_tool_event(
+        &transaction,
+        snapshot.request.task_id.as_str(),
+        completion.execution_id.as_str(),
+        "tool.execution.completed",
+        "None",
+        file_write_completed_event(&snapshot, &completion, mutation_result.event_id.as_str()),
+    )?;
+    transaction.commit().map_err(sqlite_error_to_port)?;
+    load_file_write_snapshot(store, &completion.execution_id)
 }
 
 impl ToolExecutionStore for SqliteStore {
@@ -2708,12 +2745,13 @@ fn file_write_completion_matches(
     store: &SqliteStore,
     snapshot: &FileWriteRecoverySnapshot,
     completion: &FileWriteRecoveryCompletion,
+    mutation_sequence_offset: u64,
 ) -> Result<bool, PortError> {
     let mutation_sequence = snapshot
         .request
         .expected_sequence
         .get()
-        .checked_add(2)
+        .checked_add(mutation_sequence_offset)
         .ok_or_else(invalid_input)?;
     let mutation_event_id = format!(
         "workspace.mutated:{}:{mutation_sequence}",

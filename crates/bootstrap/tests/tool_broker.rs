@@ -8,38 +8,42 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use local_agent_terminal_application::{
-    bind_tool_approval_payload, canonical_policy_binding_digest, canonical_tool_request,
-    policy_request_for_tool, AcquireLease, ApprovalId, ApprovalResolution, ApprovalResumeStore,
-    ApprovalStore, ApprovedExecutableIdentity, ApprovedProcessRequest, AuthoritativeProcessBinding,
-    AuthorizedToolRequest, BoundedOutput, CancellationReceipt, DisclosedToolExecutionArtifacts,
-    DisclosureOutcome, DurableToolExecutionArtifact, FileReadRequest, FileWritePolicyBinding,
-    FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, JobReceipt,
-    PolicyBoundBytes, PolicyDecision, PolicyDecisionStore, PortError, ProcessExecutionBindingStore,
-    ProcessReceipt, ProcessStatus, RecordedPolicyDecision, ResolveToolApprovalRequestDto,
-    ResolvedExecutable, Retryability, SafeErrorClassification, StructuredToolExecutor, TaskQuery,
-    ToolActivityStatusDto, ToolApprovalDecisionDto, ToolApprovalOperationV1, ToolApprovalPayloadV1,
-    ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestPublisher,
-    ToolAuthorityResolver, ToolAuthoritySnapshot, ToolControlSelfTest,
-    ToolExecutionArtifactEvidence, ToolExecutionResult, ToolExecutionResumeStore,
-    ToolExecutionTerminalKind, ToolOutcome, ToolPolicyContext, ToolRequest, ToolRequestPublisher,
-    VerifiedWrite, WorkspaceEvidenceStore,
+    bind_tool_approval_payload, canonical_file_write_recovery_request,
+    canonical_policy_binding_digest, canonical_tool_request, policy_request_for_tool, AcquireLease,
+    ApprovalId, ApprovalResolution, ApprovalResumeStore, ApprovalStore, ApprovedExecutableIdentity,
+    ApprovedProcessRequest, ArtifactWriteReservation, AuthoritativeProcessBinding,
+    AuthorizedToolRequest, BoundedOutput, CancellationReceipt, CanonicalEvidenceRef,
+    DisclosedToolExecutionArtifacts, DisclosureOutcome, DurableToolExecutionArtifact,
+    FileReadRequest, FileWritePolicyBinding, FileWritePreImage, FileWriteRecoveryIntent,
+    FileWriteRecoveryRequest, FileWriteRecoveryState, FileWriteRecoveryStore, FileWriteRequest,
+    GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, JobReceipt, PolicyBoundBytes,
+    PolicyDecision, PolicyDecisionStore, PortError, ProcessExecutionBindingStore, ProcessReceipt,
+    ProcessStatus, RecordedPolicyDecision, RelativePathComponents, ReservedArtifact,
+    ResolveToolApprovalRequestDto, ResolvedExecutable, Retryability, SafeErrorClassification,
+    StructuredToolExecutor, TaskQuery, ToolActivityStatusDto, ToolApprovalDecisionDto,
+    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolApprovalPublication, ToolApprovalRequest,
+    ToolApprovalRequestPublisher, ToolAuthorityResolver, ToolAuthoritySnapshot,
+    ToolControlSelfTest, ToolExecutionArtifactEvidence, ToolExecutionResult,
+    ToolExecutionResumeStore, ToolExecutionTerminalKind, ToolOutcome, ToolPolicyContext,
+    ToolRequest, ToolRequestPublisher, VerifiedWrite, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_bootstrap::{
     Bootstrap, StartupConfig, ToolArtifactPublisher, ToolBrokerConfig, ToolRuntimeAvailability,
 };
 use local_agent_terminal_domain::{
-    combine_policy_rules, ActorLocality, ArtifactId, CapabilityRef, EnvironmentProfile, LeaseClaim,
-    MatchedPolicyRule, NetworkProfile, Phase, PlanStepId, PolicyAction, PolicyActor, PolicyEffect,
-    PolicyResource, PolicyRuleId, PolicyVersion, ProcessBinding, ProcessInvocation,
-    ProcessToolRequest, ProcessTrustTier, ResourceClass, RunId, Sha256Digest, TaskId, TaskRisk,
-    Timestamp, TrustTier, WorkspaceVersion,
+    combine_policy_rules, ActorId, ActorLocality, ArtifactId, CapabilityRef, EnvironmentProfile,
+    LeaseClaim, MatchedPolicyRule, NetworkProfile, Phase, PlanStepId, PolicyAction, PolicyActor,
+    PolicyEffect, PolicyResource, PolicyRuleId, PolicyVersion, ProcessBinding, ProcessInvocation,
+    ProcessToolRequest, ProcessTrustTier, ProjectId, ResourceClass, RunId, Sha256Digest, TaskId,
+    TaskRisk, Timestamp, TrustTier, WorkspaceVersion,
 };
 use local_agent_terminal_policy_engine::VersionedPolicyEngine;
-use local_agent_terminal_storage_files::ContentAddressedArtifactStore;
+use local_agent_terminal_repository_git::{GitRepositoryGateway, GitStructuredTools};
+use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
 use local_agent_terminal_storage_sqlite::SqliteStore;
 use rusqlite::Connection;
 
-use support::WorkspaceFixture;
+use support::{WorkspaceFixture, EMPTY_JSON_HASH};
 
 const DENY_PROCESS_POLICY: &str =
     r#"{"version":1,"rules":[{"id":"deny-process","effect":"deny","action":"process.exec"}]}"#;
@@ -345,6 +349,292 @@ fn production_runtime_writes_with_durable_recovery_evidence() {
         )
         .unwrap();
     assert_eq!(evidence_count, 3);
+}
+
+#[cfg(windows)]
+#[test]
+fn production_startup_terminalizes_a_prepared_file_write() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    seed_production_file_write_crash(&fixture, "prepared-file-write", FileWriteCrash::Prepared);
+
+    let bootstrap = production_bootstrap(&fixture);
+
+    assert_eq!(
+        bootstrap.tool_runtime().unwrap().availability().unwrap(),
+        ToolRuntimeAvailability::Ready
+    );
+    assert_eq!(
+        file_write_lifecycle(&fixture, "prepared-file-write"),
+        "denied:cancelled"
+    );
+    assert!(!fixture.managed_worktree().join("recovered.txt").exists());
+    assert!(SqliteStore::open(&fixture.database_path)
+        .unwrap()
+        .recover()
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn production_startup_recovers_a_started_file_write_with_no_effect() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    seed_production_file_write_crash(&fixture, "started-file-write", FileWriteCrash::Started);
+
+    let bootstrap = production_bootstrap(&fixture);
+
+    assert_eq!(
+        bootstrap.tool_runtime().unwrap().availability().unwrap(),
+        ToolRuntimeAvailability::Ready
+    );
+    assert_eq!(
+        file_write_lifecycle(&fixture, "started-file-write"),
+        "failed:failed"
+    );
+    assert!(!fixture.managed_worktree().join("recovered.txt").exists());
+    assert!(SqliteStore::open(&fixture.database_path)
+        .unwrap()
+        .recover()
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn production_startup_completes_a_started_file_write_with_the_exact_post_image() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let before_workspace_version = seed_production_file_write_crash(
+        &fixture,
+        "applied-file-write",
+        FileWriteCrash::ExactPostImage,
+    );
+
+    let bootstrap = production_bootstrap(&fixture);
+    let database = SqliteStore::open(&fixture.database_path).unwrap();
+
+    assert_eq!(
+        bootstrap.tool_runtime().unwrap().availability().unwrap(),
+        ToolRuntimeAvailability::Ready
+    );
+    assert_eq!(
+        file_write_lifecycle(&fixture, "applied-file-write"),
+        "succeeded:succeeded"
+    );
+    assert_eq!(
+        std::fs::read(fixture.managed_worktree().join("recovered.txt")).unwrap(),
+        b"recovered write\n"
+    );
+    assert_eq!(
+        database
+            .task(&TaskId::new("task-1").unwrap())
+            .unwrap()
+            .workspace_version
+            .get(),
+        before_workspace_version + 1
+    );
+    assert!(database.recover().unwrap().is_empty());
+    let codes = bootstrap
+        .local_diagnostics()
+        .iter()
+        .map(|record| record.code.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        codes
+            .iter()
+            .position(|code| *code == "startup.repositories.reconciled")
+            < codes
+                .iter()
+                .position(|code| *code == "startup.file_writes.reconciled")
+    );
+    assert!(
+        codes
+            .iter()
+            .position(|code| *code == "startup.file_writes.reconciled")
+            < codes
+                .iter()
+                .position(|code| *code == "startup.tools.reconciled")
+    );
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum FileWriteCrash {
+    Prepared,
+    Started,
+    ExactPostImage,
+}
+
+#[cfg(windows)]
+fn production_bootstrap(fixture: &WorkspaceFixture) -> Bootstrap {
+    Bootstrap::production(StartupConfig {
+        app_data_dir: fixture.app_data.clone(),
+        trusted_workspace_root: fixture.workspace_root.clone(),
+        secret_values: Vec::new(),
+    })
+}
+
+#[cfg(windows)]
+fn seed_production_file_write_crash(
+    fixture: &WorkspaceFixture,
+    execution_id: &str,
+    crash: FileWriteCrash,
+) -> u64 {
+    let bootstrap = production_bootstrap(fixture);
+    let task_id = TaskId::new("task-1").unwrap();
+    let lease = bootstrap
+        .workspace_runtime()
+        .unwrap()
+        .acquire_lease(AcquireLease {
+            task_id: task_id.clone(),
+            holder_run_id: RunId::new("run-lease-1").unwrap(),
+            expected_fencing_epoch: 0,
+            acquired_at: "2026-07-26T00:00:10Z".to_owned(),
+            expires_at: "2099-07-26T01:00:10Z".to_owned(),
+        })
+        .unwrap();
+    let database = SqliteStore::open(&fixture.database_path).unwrap();
+    let artifacts =
+        ContentAddressedArtifactStore::open(fixture.app_data.join("artifacts")).unwrap();
+    let task = database.task(&task_id).unwrap();
+    let policy = VersionedPolicyEngine::from_json(DEFAULT_DENY_POLICY).unwrap();
+    let policy = record_file_write_policy(&database, policy.snapshot_digest().clone());
+    let repositories = GitRepositoryGateway::open(
+        &fixture.workspace_root,
+        &[fixture.app_data.join("artifacts")],
+    )
+    .unwrap();
+    let git = GitStructuredTools::from_owned_tasks(
+        &repositories,
+        &database,
+        std::slice::from_ref(&task_id),
+    )
+    .unwrap();
+    let pre_evidence = publish_file_write_test_artifact(
+        &database,
+        &artifacts,
+        &task.project_id,
+        &task_id,
+        &format!("{execution_id}-pre-fingerprint"),
+        "workspace_fingerprint",
+        EMPTY_JSON_HASH,
+        b"{}",
+    );
+    let expected_post_digest = Sha256Digest::new(
+        "sha256:e20bbadfebaa2068b819899960c401c01e8268392b483b4326c18b8d921ae63d",
+    )
+    .unwrap();
+    let request = FileWriteRecoveryRequest {
+        execution_id: local_agent_terminal_application::ToolExecutionId::new(execution_id).unwrap(),
+        task_id: task_id.clone(),
+        root_identity: git.root_identity(&task_id).unwrap().clone(),
+        relative_components: RelativePathComponents::new(vec!["recovered.txt".to_owned()]).unwrap(),
+        lease_claim: LeaseClaim::new(task_id.clone(), lease.holder_run_id, lease.token),
+        expected_sequence: task.current_sequence,
+        pre_image: FileWritePreImage::Absent,
+        expected_post_digest,
+        expected_post_size: b"recovered write\n".len() as u64,
+        pre_fingerprint: task.worktree.as_ref().unwrap().fingerprint.clone(),
+        pre_evidence,
+        actor_id: ActorId::new("tool-runtime").unwrap(),
+        correlation_id: format!("file-write:{execution_id}"),
+        policy,
+    };
+    let canonical = canonical_file_write_recovery_request(&request).unwrap();
+    let request_artifact = publish_file_write_test_artifact(
+        &database,
+        &artifacts,
+        &task.project_id,
+        &task_id,
+        &format!("{execution_id}-request"),
+        "file_write_request",
+        canonical.operation_digest.as_str(),
+        &canonical.canonical_bytes,
+    );
+    let prepared = database
+        .prepare(FileWriteRecoveryIntent {
+            request,
+            request_artifact,
+        })
+        .unwrap();
+    if !matches!(crash, FileWriteCrash::Prepared) {
+        let started = database.start(&prepared.request.execution_id).unwrap();
+        assert_eq!(started.state, FileWriteRecoveryState::Started);
+    }
+    if matches!(crash, FileWriteCrash::ExactPostImage) {
+        std::fs::write(
+            fixture.managed_worktree().join("recovered.txt"),
+            b"recovered write\n",
+        )
+        .unwrap();
+    }
+    drop(bootstrap);
+    task.workspace_version.get()
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn publish_file_write_test_artifact(
+    database: &SqliteStore,
+    artifacts: &ContentAddressedArtifactStore,
+    project_id: &ProjectId,
+    task_id: &TaskId,
+    artifact_id: &str,
+    artifact_type: &str,
+    content_hash: &str,
+    bytes: &[u8],
+) -> CanonicalEvidenceRef {
+    let storage_key = ContentAddressedArtifactStore::storage_key(content_hash).unwrap();
+    let reference = JournaledArtifactWriter::new(artifacts, database, database)
+        .write(
+            ArtifactWriteReservation {
+                operation_id: format!("publish-{artifact_id}"),
+                artifact: ReservedArtifact {
+                    artifact_id: artifact_id.to_owned(),
+                    task_id: Some(task_id.clone()),
+                    project_id: project_id.as_str().to_owned(),
+                    artifact_type: artifact_type.to_owned(),
+                    logical_path: format!("file-writes/{artifact_id}"),
+                    content_hash: content_hash.to_owned(),
+                    storage_key,
+                    size_bytes: bytes.len() as u64,
+                    mime_type: Some("application/json".to_owned()),
+                    created_by_type: "tool".to_owned(),
+                    created_by_id: "tool-runtime".to_owned(),
+                    created_at: "2026-07-26T00:00:10Z".to_owned(),
+                    supersedes: None,
+                },
+                temp_name: format!("{artifact_id}.tmp"),
+                created_at: "2026-07-26T00:00:10Z".to_owned(),
+            },
+            bytes,
+        )
+        .unwrap();
+    CanonicalEvidenceRef {
+        artifact_id: ArtifactId::new(artifact_id).unwrap(),
+        content_hash: reference.content_hash,
+        storage_key: reference.storage_key,
+        size_bytes: reference.size_bytes,
+        project_id: project_id.clone(),
+        task_id: Some(task_id.clone()),
+    }
+}
+
+#[cfg(windows)]
+fn file_write_lifecycle(fixture: &WorkspaceFixture, execution_id: &str) -> String {
+    fixture
+        .database()
+        .query_row(
+            "SELECT te.status || ':' || oi.status
+             FROM tool_executions te
+             JOIN operation_intents oi ON oi.id = te.operation_intent_id
+             WHERE te.id = ?1",
+            [execution_id],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 #[test]

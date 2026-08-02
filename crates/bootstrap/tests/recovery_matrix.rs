@@ -77,6 +77,7 @@ fn startup_exposes_workspace_runtime_only_after_ordered_recovery() {
             "startup.leases.fenced",
             "startup.tools.survivors_inspected",
             "startup.repositories.reconciled",
+            "startup.file_writes.reconciled",
             "startup.tools.reconciled",
             "startup.intents.reconciled",
             "startup.approvals.expired",
