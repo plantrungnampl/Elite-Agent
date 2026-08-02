@@ -7,12 +7,12 @@ use local_agent_terminal_application::{
     CapabilityResolver, CaptureFileWritePostEvidence, CaptureFileWritePreEvidence,
     DisclosureContextProvider, DisclosureContextRequest, DisclosureOutcome, FileReadRequest,
     FileWriteEvidenceStore, FileWriteRecoveryCompletion, FileWriteRecoveryIntent, FileWriteRequest,
-    GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, PolicyActor,
-    PolicyBoundBytes, PortError, ProcessReceipt, ResolvedCapabilityTarget, ResourceClass,
-    Retryability, SafeErrorClassification, Sha256Digest, StructuredToolExecutor, TaskId, TaskQuery,
-    TaskRisk, ToolAuthorityResolver, ToolAuthoritySnapshot, ToolControlSelfTest, ToolExecutionId,
-    ToolExecutionResult, TrustTier, TrustedDisclosureContext, VerifiedWrite,
-    WorkspaceWriteCoordinator,
+    GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, PolicyAction, PolicyActor,
+    PolicyBoundBytes, PolicyResource, PortError, ProcessReceipt, ResolvedCapabilityTarget,
+    ResourceClass, Retryability, SafeErrorClassification, Sha256Digest, StructuredToolExecutor,
+    TaskId, TaskQuery, TaskRisk, ToolAuthorityResolver, ToolAuthoritySnapshot, ToolControlSelfTest,
+    ToolExecutionId, ToolExecutionResult, ToolPolicyContext, ToolRequest, TrustTier,
+    TrustedDisclosureContext, VerifiedWrite, WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_platform_windows::{CapabilityRegistration, WindowsCapabilityAdapter};
 use local_agent_terminal_policy_engine::VersionedPolicyEngine;
@@ -23,7 +23,8 @@ use local_agent_terminal_tool_runtime::ToolRuntime as StructuredToolRuntime;
 use crate::startup::StartupConfig;
 use crate::tool_runtime::ToolBrokerConfig;
 
-const DEFAULT_POLICY_BUNDLE: &str = r#"{"version":1,"rules":[{"id":"default-deny-process","effect":"deny","action":"process.exec"},{"id":"tool-display","effect":"allow_with_redaction","action":"tool.approval.display","redactions":["secret_scanner"]}]}"#;
+const DEFAULT_POLICY_BUNDLE: &str = r#"{"version":1,"rules":[{"id":"default-deny-process","effect":"deny","action":"process.exec"},{"id":"structured-read","effect":"allow_with_redaction","action":"context.disclose","redactions":["secret_scanner"]},{"id":"tool-display","effect":"allow_with_redaction","action":"tool.approval.display","redactions":["secret_scanner"]}]}"#;
+const PRODUCTION_TOOL_PURPOSE: &str = "execute a structured local tool";
 
 #[derive(Clone)]
 struct ProductionToolPaths {
@@ -59,12 +60,13 @@ impl ToolAuthorityResolver for ProductionToolAuthority {
         request: &local_agent_terminal_application::ToolRequest,
     ) -> Result<ToolAuthoritySnapshot, PortError> {
         let task_id = request.process().process().binding().task_id();
-        let (database, capabilities, _, _) = task_adapters(&self.paths, task_id)?;
+        let (database, capabilities, _, task) = task_adapters(&self.paths, task_id)?;
         let resource = request.policy().resource();
         let resolved = capabilities.resolve(CapabilityRequest {
             task_id: task_id.clone(),
             capability: resource.capability.clone(),
         })?;
+        let authoritative_capability = resolved.capability.clone();
         let resource_bytes = match resolved.target {
             ResolvedCapabilityTarget::Root => Vec::new(),
             ResolvedCapabilityTarget::Relative(relative_components) => {
@@ -88,7 +90,30 @@ impl ToolAuthorityResolver for ProductionToolAuthority {
         } else {
             None
         };
-        ToolAuthoritySnapshot::new(request.clone(), &resource_bytes, lease)
+        let binding = request.process().process().binding();
+        if binding.workflow_phase() != task.phase
+            || binding.workspace_version() != task.workspace_version
+        {
+            return Err(integrity_failure());
+        }
+        let policy = VersionedPolicyEngine::from_json(DEFAULT_POLICY_BUNDLE)?;
+        let authoritative_request = ToolRequest::new(
+            request.execution_id().clone(),
+            request.process().clone(),
+            ToolPolicyContext::new(
+                production_actor(),
+                PolicyAction::new("process.exec").map_err(|_| integrity_failure())?,
+                PolicyResource {
+                    capability: authoritative_capability,
+                    content_digest: resource.content_digest.clone(),
+                    resource_class: ResourceClass::InternalCode,
+                },
+                production_task_risk(&task),
+                PRODUCTION_TOOL_PURPOSE,
+                policy.snapshot_digest().clone(),
+            )?,
+        )?;
+        ToolAuthoritySnapshot::new(authoritative_request, &resource_bytes, lease)
     }
 }
 
@@ -237,21 +262,11 @@ impl DisclosureContextProvider for ProductionDisclosureContext {
             return Err(unavailable());
         }
         Ok(TrustedDisclosureContext {
-            actor: PolicyActor {
-                connection_id: "core.local".to_owned(),
-                agent_id: "core.structured-tool".to_owned(),
-                trust_tier: TrustTier::CoreAdapter,
-                locality: ActorLocality::Local,
-            },
+            actor: production_actor(),
             resource_class: ResourceClass::InternalCode,
-            task_risk: match self.task.risk_level {
-                local_agent_terminal_application::RiskLevel::Low => TaskRisk::Low,
-                local_agent_terminal_application::RiskLevel::Medium => TaskRisk::Medium,
-                local_agent_terminal_application::RiskLevel::High => TaskRisk::High,
-                local_agent_terminal_application::RiskLevel::Critical => TaskRisk::Critical,
-            },
+            task_risk: production_task_risk(&self.task),
             workflow_phase: self.task.phase.as_str().to_owned(),
-            purpose: "execute a structured local tool".to_owned(),
+            purpose: PRODUCTION_TOOL_PURPOSE.to_owned(),
             policy_snapshot_digest: self.policy_snapshot_digest.clone(),
         })
     }
@@ -298,4 +313,29 @@ fn unavailable() -> PortError {
         SafeErrorClassification::Unavailable,
         Retryability::NonRetryable,
     )
+}
+
+fn integrity_failure() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::IntegrityFailure,
+        Retryability::NonRetryable,
+    )
+}
+
+fn production_actor() -> PolicyActor {
+    PolicyActor {
+        connection_id: "core.local".to_owned(),
+        agent_id: "core.structured-tool".to_owned(),
+        trust_tier: TrustTier::CoreAdapter,
+        locality: ActorLocality::Local,
+    }
+}
+
+fn production_task_risk(task: &local_agent_terminal_application::TaskSnapshot) -> TaskRisk {
+    match task.risk_level {
+        local_agent_terminal_application::RiskLevel::Low => TaskRisk::Low,
+        local_agent_terminal_application::RiskLevel::Medium => TaskRisk::Medium,
+        local_agent_terminal_application::RiskLevel::High => TaskRisk::High,
+        local_agent_terminal_application::RiskLevel::Critical => TaskRisk::Critical,
+    }
 }

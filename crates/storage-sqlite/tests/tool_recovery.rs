@@ -1622,6 +1622,107 @@ fn quarantined_post_effect_receipt_round_trips_without_output_bytes() {
 }
 
 #[test]
+fn quarantined_post_effect_receipt_rejects_an_inner_execution_id_mismatch() {
+    let database = TempDatabase::new();
+    let execution_id = "execution-quarantined-mismatched-inner-id";
+    let (store, claim, _, _) = exact_approval_claim_fixture(&database, execution_id);
+    let operation_digest = claim.request_content_digest.clone();
+    let ToolExecutionClaim::Claimed(authority) = store.begin_authorized(claim).unwrap() else {
+        panic!("fresh authorized execution must win the durable claim");
+    };
+    let receipt = DurableToolExecutionReceipt::from_post_effect_receipt(
+        authority.clone(),
+        ToolExecutionPostEffectReceipt {
+            execution_id: authority.execution_id().clone(),
+            status: ProcessStatus::Exited,
+            exit_code: Some(0),
+            stdout: ToolExecutionStreamMetadata {
+                digest: digest_char('a'),
+                size_bytes: 19,
+                truncated: false,
+            },
+            stderr: ToolExecutionStreamMetadata {
+                digest: digest_char('b'),
+                size_bytes: 0,
+                truncated: false,
+            },
+            duration_ms: 42,
+            output_digest: digest_char('c'),
+            observed_writes: Vec::new(),
+        },
+        SafeToolExecutionError {
+            classification:
+                local_agent_terminal_application::SafeErrorClassification::PermissionDenied,
+            retryability: local_agent_terminal_application::Retryability::NonRetryable,
+        },
+    )
+    .unwrap();
+    store
+        .resolve_terminal(ToolExecutionResolution::new(receipt))
+        .unwrap();
+
+    let connection = configured_connection(&database.path);
+    let receipt_json: String = connection
+        .query_row(
+            "SELECT external_receipt_json FROM operation_intents WHERE id = ?1",
+            [execution_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut receipt_value: serde_json::Value = serde_json::from_str(&receipt_json).unwrap();
+    receipt_value["terminal"]["postEffect"]["executionId"] =
+        serde_json::json!("execution-substituted");
+    let event_json: String = connection
+        .query_row(
+            "SELECT payload_json FROM events
+             WHERE event_type = 'tool.execution.completed'
+               AND json_extract(payload_json, '$.executionId') = ?1",
+            [execution_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut event_value: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+    event_value["receipt"] = receipt_value.clone();
+    let error_json: String = connection
+        .query_row(
+            "SELECT error_json FROM operation_intents WHERE id = ?1",
+            [execution_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut error_value: serde_json::Value = serde_json::from_str(&error_json).unwrap();
+    error_value["postEffect"]["executionId"] = serde_json::json!("execution-substituted");
+    connection
+        .execute_batch("DROP TRIGGER events_update_forbidden;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE operation_intents
+             SET external_receipt_json = ?1, error_json = ?2
+             WHERE id = ?3",
+            params![
+                receipt_value.to_string(),
+                error_value.to_string(),
+                execution_id
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE events SET payload_json = ?1
+             WHERE event_type = 'tool.execution.completed'
+               AND json_extract(payload_json, '$.executionId') = ?2",
+            params![event_value.to_string(), execution_id],
+        )
+        .unwrap();
+
+    assert_integrity_failure(store.begin(NewToolExecution {
+        execution_id: ToolExecutionId::new(execution_id).unwrap(),
+        operation_digest,
+    }));
+}
+
+#[test]
 fn claimed_execution_cannot_resolve_success_before_a_process_binding() {
     let database = TempDatabase::new();
     let execution_id = "execution-success-before-binding";

@@ -3745,7 +3745,7 @@ fn parse_terminal_receipt(value: &str) -> Result<DurableToolExecutionReceipt, Po
             match terminal.get("postEffect") {
                 Some(post_effect) => Ok(ToolExecutionTerminal::indeterminate_with_post_effect(
                     error,
-                    parse_post_effect_receipt(post_effect)?,
+                    parse_post_effect_receipt(post_effect, authority.execution_id())?,
                 )),
                 None => Ok(ToolExecutionTerminal::indeterminate(error)),
             }
@@ -3778,9 +3778,13 @@ fn parse_terminal_receipt(value: &str) -> Result<DurableToolExecutionReceipt, Po
 
 fn parse_post_effect_receipt(
     value: &serde_json::Value,
+    expected_execution_id: &ToolExecutionId,
 ) -> Result<ToolExecutionPostEffectReceipt, PortError> {
     let execution_id = ToolExecutionId::new(required_string(value, "executionId")?)
         .map_err(|_| integrity_failure())?;
+    if &execution_id != expected_execution_id {
+        return Err(integrity_failure());
+    }
     let status = match required_string(value, "status")? {
         "exited" => ProcessStatus::Exited,
         "terminated" => ProcessStatus::Terminated,

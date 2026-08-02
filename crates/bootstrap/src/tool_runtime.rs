@@ -13,17 +13,18 @@ use local_agent_terminal_application::{
     DurableToolExecutionArtifact, DurableToolExecutionArtifacts, DurableToolExecutionOutcome,
     DurableToolExecutionReceipt, ExecuteTool, FileReadRequest, FileWriteRequest, GitDiffRequest,
     GitDiffResult, GitStatusRequest, GitStatusResult, IdGenerator, ImmutableToolRequest,
-    IncompleteToolExecution, NewToolIntent, OperationIntentSnapshot, PortError, ProcessStatus,
-    ProjectId, ReservedArtifact, ResolveToolApprovalRequestDto, RetainedProcessController,
-    Retryability, SafeErrorClassification, SafeToolExecutionError, StopAllToolsReceiptDto,
-    StructuredToolExecutor, TaskId, TaskQuery, ToolActivityDto, ToolActivityStatusDto,
-    ToolApprovalDecisionDto, ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestDto,
-    ToolApprovalRequestPublisher, ToolApprovalResolutionDto, ToolAuthorityResolver,
-    ToolCancellationReceiptDto, ToolControlSelfTest, ToolExecutionArtifactEvidence,
-    ToolExecutionCancellationClaim, ToolExecutionId, ToolExecutionOrchestration,
-    ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResumeStore,
-    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolOutcome, ToolRequest,
-    ToolRequestPublisher, ToolRuntimeAvailabilityDto, VerifiedWrite, WorkspaceEvidenceStore,
+    IncompleteToolExecution, NewToolIntent, OperationIntentSnapshot, PolicyBoundBytes, PortError,
+    ProcessStatus, ProjectId, ReservedArtifact, ResolveToolApprovalRequestDto,
+    RetainedProcessController, Retryability, SafeErrorClassification, SafeToolExecutionError,
+    StopAllToolsReceiptDto, StructuredToolExecutor, TaskId, TaskQuery, ToolActivityDto,
+    ToolActivityStatusDto, ToolApprovalDecisionDto, ToolApprovalPublication, ToolApprovalRequest,
+    ToolApprovalRequestDto, ToolApprovalRequestPublisher, ToolApprovalResolutionDto,
+    ToolAuthorityResolver, ToolCancellationReceiptDto, ToolControlSelfTest,
+    ToolExecutionArtifactEvidence, ToolExecutionCancellationClaim, ToolExecutionId,
+    ToolExecutionOrchestration, ToolExecutionRecoveryState, ToolExecutionResolution,
+    ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
+    ToolOutcome, ToolRequest, ToolRequestPublisher, ToolRuntimeAvailabilityDto, VerifiedWrite,
+    WorkspaceEvidenceStore,
 };
 use local_agent_terminal_policy_engine::VersionedPolicyEngine;
 use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
@@ -122,11 +123,13 @@ struct ToolBroker {
     policies: VersionedPolicyEngine,
     authority: Arc<dyn ToolAuthorityResolver>,
     executor: Arc<dyn SelfTestingToolExecutor>,
+    process_enabled: bool,
 }
 
 struct PublishingStructuredExecutor<'a, 'storage> {
     executor: &'a dyn SelfTestingToolExecutor,
     publisher: &'a ToolArtifactPublisher<'storage>,
+    process_enabled: bool,
 }
 
 struct ToolWorker {
@@ -168,6 +171,7 @@ impl ToolBroker {
             policies,
             authority: config.authority,
             executor: config.executor,
+            process_enabled: config.process_enabled,
         })
     }
 
@@ -184,6 +188,31 @@ impl ToolBroker {
         execution_id: &ToolExecutionId,
     ) -> Result<DurableToolCancellationOutcome, PortError> {
         self.with_execute_tool(|execute| execute.cancel(execution_id))
+    }
+
+    fn file_read(
+        &self,
+        request: FileReadRequest,
+    ) -> Result<DisclosureOutcome<PolicyBoundBytes>, PortError> {
+        self.executor.file_read(request)
+    }
+
+    fn file_write(&self, request: FileWriteRequest) -> Result<VerifiedWrite, PortError> {
+        self.executor.file_write(request)
+    }
+
+    fn git_status(
+        &self,
+        request: GitStatusRequest,
+    ) -> Result<DisclosureOutcome<GitStatusResult>, PortError> {
+        self.executor.git_status(request)
+    }
+
+    fn git_diff(
+        &self,
+        request: GitDiffRequest,
+    ) -> Result<DisclosureOutcome<GitDiffResult>, PortError> {
+        self.executor.git_diff(request)
     }
 
     fn activity_entries(
@@ -282,6 +311,7 @@ impl ToolBroker {
         let executor = PublishingStructuredExecutor {
             executor: self.executor.as_ref(),
             publisher: &publisher,
+            process_enabled: self.process_enabled,
         };
         operation(ExecuteTool::new(orchestration, &executor))
     }
@@ -292,6 +322,9 @@ impl StructuredToolExecutor for PublishingStructuredExecutor<'_, '_> {
         &self,
         request: local_agent_terminal_application::AuthorizedToolRequest,
     ) -> Result<local_agent_terminal_application::ToolExecutionResult, PortError> {
+        if !self.process_enabled {
+            return Err(unavailable());
+        }
         let task_id = request
             .process_request()
             .process()
@@ -618,6 +651,51 @@ impl ToolRuntime {
         self.dispatch_and_wait(execution_id, move || broker.resume_approved(approval_id))
     }
 
+    pub fn file_read(
+        &self,
+        request: FileReadRequest,
+    ) -> Result<DisclosureOutcome<PolicyBoundBytes>, PortError> {
+        let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
+        self.ensure_structured_dispatch(true)?;
+        self.broker
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .file_read(request)
+    }
+
+    pub fn file_write(&self, request: FileWriteRequest) -> Result<VerifiedWrite, PortError> {
+        let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
+        self.ensure_structured_dispatch(false)?;
+        self.broker
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .file_write(request)
+    }
+
+    pub fn git_status(
+        &self,
+        request: GitStatusRequest,
+    ) -> Result<DisclosureOutcome<GitStatusResult>, PortError> {
+        let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
+        self.ensure_structured_dispatch(true)?;
+        self.broker
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .git_status(request)
+    }
+
+    pub fn git_diff(
+        &self,
+        request: GitDiffRequest,
+    ) -> Result<DisclosureOutcome<GitDiffResult>, PortError> {
+        let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
+        self.ensure_structured_dispatch(true)?;
+        self.broker
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .git_diff(request)
+    }
+
     pub fn activity(&self) -> Result<ToolActivityDto, PortError> {
         let (availability, entries) = match &self.broker {
             Some(broker) => (
@@ -733,6 +811,20 @@ impl ToolRuntime {
             worker.handle.join().map_err(|_| internal_failure())?;
         }
         result
+    }
+
+    fn ensure_structured_dispatch(&self, allow_degraded: bool) -> Result<(), PortError> {
+        let state = self.state.lock().map_err(|_| internal_failure())?;
+        if !state.dispatch_open {
+            return Err(conflict());
+        }
+        if state.availability == ToolRuntimeAvailability::Ready
+            || (allow_degraded && state.availability == ToolRuntimeAvailability::DegradedReadOnly)
+        {
+            Ok(())
+        } else {
+            Err(unavailable())
+        }
     }
 
     fn start_worker(

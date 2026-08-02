@@ -159,7 +159,7 @@ fn policy_resource_class_may_upgrade_but_not_downgrade() {
 #[test]
 fn representative_request_mutations_fail_closed() {
     type Mutation = fn(&mut Fixture);
-    let mutations: [Mutation; 32] = [
+    let mutations: [Mutation; 31] = [
         |fixture| fixture.execution_id = "execution-2",
         |fixture| fixture.actor_connection = "connection-2",
         |fixture| fixture.actor_agent = "agent-2",
@@ -171,7 +171,6 @@ fn representative_request_mutations_fail_closed() {
         |fixture| fixture.phase = Phase::Verification,
         |fixture| fixture.workspace_version = 5,
         |fixture| fixture.timeout_ms = 2,
-        |fixture| fixture.policy_action = "process.inspect",
         |fixture| fixture.task_risk = TaskRisk::Critical,
         |fixture| fixture.purpose = "mutated purpose",
         |fixture| fixture.policy_digest = 'c',
@@ -269,7 +268,6 @@ struct Fixture {
     actor_agent: &'static str,
     actor_trust: TrustTier,
     actor_locality: ActorLocality,
-    policy_action: &'static str,
     task_risk: TaskRisk,
     purpose: &'static str,
     policy_digest: char,
@@ -317,7 +315,6 @@ impl Default for Fixture {
             actor_agent: "agent-1",
             actor_trust: TrustTier::IsolatedWorker,
             actor_locality: ActorLocality::Local,
-            policy_action: "process.exec",
             task_risk: TaskRisk::High,
             purpose: "run focused tests",
             policy_digest: 'b',
@@ -402,7 +399,7 @@ fn tool_request(fixture: &Fixture) -> ToolRequest {
                 trust_tier: fixture.actor_trust,
                 locality: fixture.actor_locality,
             },
-            PolicyAction::new(fixture.policy_action).unwrap(),
+            PolicyAction::new("process.exec").unwrap(),
             PolicyResource {
                 capability: CapabilityRef::worktree(task_id, fixture.resource_path).unwrap(),
                 content_digest: resource_digest(&fixture.resource_bytes),

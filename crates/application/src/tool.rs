@@ -629,7 +629,9 @@ impl ToolRequest {
         policy: ToolPolicyContext,
     ) -> Result<Self, PortError> {
         let task_id = process.process().binding().task_id();
-        if policy.resource().capability.worktree_task_id() != Some(task_id) {
+        if policy.action().as_str() != "process.exec"
+            || policy.resource().capability.worktree_task_id() != Some(task_id)
+        {
             return Err(invalid_input());
         }
         Ok(Self {

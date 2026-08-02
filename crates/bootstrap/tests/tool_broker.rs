@@ -45,7 +45,7 @@ const DENY_PROCESS_POLICY: &str =
 const ALLOW_PROCESS_POLICY: &str =
     r#"{"version":1,"rules":[{"id":"allow-process","effect":"allow","action":"process.exec"}]}"#;
 const APPROVE_PROCESS_POLICY: &str = r#"{"version":1,"rules":[{"id":"approve-process","effect":"require_approval","action":"process.exec"},{"id":"redact-tool-display","effect":"allow_with_redaction","action":"tool.approval.display","redactions":["secret_scanner"]}]}"#;
-const DEFAULT_DENY_POLICY: &str = r#"{"version":1,"rules":[{"id":"default-deny-process","effect":"deny","action":"process.exec"},{"id":"tool-display","effect":"allow_with_redaction","action":"tool.approval.display","redactions":["secret_scanner"]}]}"#;
+const DEFAULT_DENY_POLICY: &str = r#"{"version":1,"rules":[{"id":"default-deny-process","effect":"deny","action":"process.exec"},{"id":"structured-read","effect":"allow_with_redaction","action":"context.disclose","redactions":["secret_scanner"]},{"id":"tool-display","effect":"allow_with_redaction","action":"tool.approval.display","redactions":["secret_scanner"]}]}"#;
 const EMPTY_BYTES_HASH: &str =
     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const SAFE_STDOUT_HASH: &str =
@@ -88,7 +88,7 @@ fn production_runtime_resolves_the_authoritative_task_before_default_deny() {
     let fixture = WorkspaceFixture::new();
     fixture.seed_present_workspace();
     let policy = VersionedPolicyEngine::from_json(DEFAULT_DENY_POLICY).unwrap();
-    let request = tool_request_for_policy(
+    let request = production_tool_request(
         "execution-production-denied",
         policy.snapshot_digest().clone(),
     );
@@ -105,6 +105,156 @@ fn production_runtime_resolves_the_authoritative_task_before_default_deny() {
     let outcome = bootstrap.tool_runtime().unwrap().execute(request).unwrap();
 
     assert!(matches!(outcome, ToolOutcome::Denied(_)));
+}
+
+#[cfg(windows)]
+#[test]
+fn production_runtime_rejects_forged_policy_and_task_context_before_evaluation() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let policy = VersionedPolicyEngine::from_json(DEFAULT_DENY_POLICY).unwrap();
+    let trusted = production_tool_request(
+        "execution-production-trusted-template",
+        policy.snapshot_digest().clone(),
+    );
+    let forged_policy = ToolPolicyContext::new(
+        PolicyActor {
+            connection_id: "hostile-connection".to_owned(),
+            agent_id: "hostile-agent".to_owned(),
+            trust_tier: TrustTier::IsolatedWorker,
+            locality: ActorLocality::Cloud,
+        },
+        trusted.policy().action().clone(),
+        trusted.policy().resource().clone(),
+        TaskRisk::Low,
+        "claim a weaker policy identity",
+        trusted.policy().policy_snapshot_digest().clone(),
+    )
+    .unwrap();
+    let forged_policy_request = ToolRequest::new(
+        local_agent_terminal_application::ToolExecutionId::new(
+            "execution-production-forged-policy",
+        )
+        .unwrap(),
+        trusted.process().clone(),
+        forged_policy,
+    )
+    .unwrap();
+    let forged_binding_request = rebind_tool_request(
+        &trusted,
+        "execution-production-forged-binding",
+        Phase::Verification,
+        WorkspaceVersion::new(99),
+    );
+    let bootstrap = Bootstrap::production(StartupConfig {
+        app_data_dir: fixture.app_data.clone(),
+        trusted_workspace_root: fixture.workspace_root.clone(),
+        secret_values: Vec::new(),
+    });
+    let runtime = bootstrap.tool_runtime().unwrap();
+
+    for request in [forged_policy_request, forged_binding_request] {
+        let error = runtime.execute(request).unwrap_err();
+        assert_eq!(
+            error.safe_classification(),
+            SafeErrorClassification::IntegrityFailure
+        );
+    }
+    let decision_count: i64 = fixture
+        .database()
+        .query_row("SELECT COUNT(*) FROM policy_decisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(decision_count, 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn production_degraded_runtime_exposes_read_tools_and_fails_closed_for_hostile_git() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    std::fs::write(
+        fixture
+            .workspace_root
+            .join("worktree-task-1")
+            .join(".gitattributes"),
+        "*.txt filter=untrusted\n",
+    )
+    .unwrap();
+    let bootstrap = Bootstrap::production(StartupConfig {
+        app_data_dir: fixture.app_data.clone(),
+        trusted_workspace_root: fixture.workspace_root.clone(),
+        secret_values: Vec::new(),
+    });
+    let runtime = bootstrap.tool_runtime().unwrap();
+    let task_id = TaskId::new("task-1").unwrap();
+    let file = CapabilityRef::worktree(task_id.clone(), "README.md").unwrap();
+    let worktree = CapabilityRef::worktree(task_id.clone(), ".").unwrap();
+
+    let DisclosureOutcome::Disclosed(read) = runtime
+        .file_read(FileReadRequest {
+            task_id: task_id.clone(),
+            capability: file,
+            expected_digest: None,
+        })
+        .unwrap()
+    else {
+        panic!("safe structured read must be disclosed");
+    };
+    assert_eq!(read.bytes, b"original\n");
+
+    let status_error = runtime
+        .git_status(GitStatusRequest {
+            task_id: task_id.clone(),
+            worktree: worktree.clone(),
+        })
+        .unwrap_err();
+    assert_eq!(
+        status_error.safe_classification(),
+        SafeErrorClassification::PermissionDenied
+    );
+
+    let diff_error = runtime
+        .git_diff(GitDiffRequest { task_id, worktree })
+        .unwrap_err();
+    assert_eq!(
+        diff_error.safe_classification(),
+        SafeErrorClassification::PermissionDenied
+    );
+}
+
+#[test]
+fn degraded_read_only_never_reaches_the_process_executor() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let policy = VersionedPolicyEngine::from_json(ALLOW_PROCESS_POLICY).unwrap();
+    let request = tool_request_for_policy(
+        "execution-degraded-read-only",
+        policy.snapshot_digest().clone(),
+    );
+    let executor = Arc::new(RecordingExecutor::default());
+    let bootstrap = Bootstrap::with_tool_broker(
+        StartupConfig {
+            app_data_dir: fixture.app_data.clone(),
+            trusted_workspace_root: fixture.workspace_root.clone(),
+            secret_values: Vec::new(),
+        },
+        ToolBrokerConfig::new(
+            ALLOW_PROCESS_POLICY,
+            Arc::new(EchoAuthority),
+            executor.clone(),
+        )
+        .degraded_read_only(),
+    );
+    let runtime = bootstrap.tool_runtime().unwrap();
+
+    assert_eq!(
+        runtime.availability().unwrap(),
+        ToolRuntimeAvailability::DegradedReadOnly
+    );
+    let _ = runtime.execute(request);
+    assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -838,6 +988,88 @@ fn tool_request_for_policy(
         vec!["test".to_owned()],
         "run focused tests",
     )
+}
+
+fn production_tool_request(
+    execution_id: &str,
+    policy_snapshot_digest: Sha256Digest,
+) -> ToolRequest {
+    let request = tool_request_for_policy(execution_id, policy_snapshot_digest.clone());
+    let request = rebind_tool_request(
+        &request,
+        execution_id,
+        Phase::Implementation,
+        WorkspaceVersion::new(0),
+    );
+    let policy = ToolPolicyContext::new(
+        PolicyActor {
+            connection_id: "core.local".to_owned(),
+            agent_id: "core.structured-tool".to_owned(),
+            trust_tier: TrustTier::CoreAdapter,
+            locality: ActorLocality::Local,
+        },
+        PolicyAction::new("process.exec").unwrap(),
+        request.policy().resource().clone(),
+        TaskRisk::High,
+        "execute a structured local tool",
+        policy_snapshot_digest,
+    )
+    .unwrap();
+    ToolRequest::new(
+        request.execution_id().clone(),
+        request.process().clone(),
+        policy,
+    )
+    .unwrap()
+}
+
+fn rebind_tool_request(
+    request: &ToolRequest,
+    execution_id: &str,
+    phase: Phase,
+    workspace_version: WorkspaceVersion,
+) -> ToolRequest {
+    let approved = request.process();
+    let process = approved.process();
+    let binding = process.binding();
+    let rebound = ProcessToolRequest::new(
+        ProcessBinding::new(
+            binding.task_id().clone(),
+            binding.run_id().clone(),
+            binding.plan_step_id().clone(),
+            phase,
+            workspace_version,
+            binding.environment_profile().clone(),
+            binding.timeout_ms(),
+        )
+        .unwrap(),
+        ProcessInvocation::new(
+            process.executable().clone(),
+            process.argv().to_vec(),
+            process.cwd().clone(),
+            process.trust_tier(),
+            process.network(),
+            process.expected_writes().to_vec(),
+            process.executor_fencing_token(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let approved = ApprovedProcessRequest::new(
+        approved.approved_executable().clone(),
+        rebound,
+        approved.expected_reads().to_vec(),
+        approved.memory_limit_bytes(),
+        approved.cpu_time_limit_ms(),
+        approved.disk_write_limit_bytes(),
+    )
+    .unwrap();
+    ToolRequest::new(
+        local_agent_terminal_application::ToolExecutionId::new(execution_id).unwrap(),
+        approved,
+        request.policy().clone(),
+    )
+    .unwrap()
 }
 
 fn tool_request_for_policy_and_display(

@@ -113,6 +113,33 @@ fn mismatched_policy_task_is_invalid_before_policy_request_mapping() {
 }
 
 #[test]
+fn process_request_rejects_a_mismatched_policy_action() {
+    let request = tool_request();
+    let policy = request.policy();
+    let mismatched_policy = ToolPolicyContext::new(
+        policy.actor().clone(),
+        PolicyAction::new("file.read").unwrap(),
+        policy.resource().clone(),
+        policy.task_risk(),
+        policy.purpose(),
+        policy.policy_snapshot_digest().clone(),
+    )
+    .unwrap();
+
+    let error = ToolRequest::new(
+        ToolExecutionId::new("execution-mismatched-policy-action").unwrap(),
+        request.process().clone(),
+        mismatched_policy,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::InvalidInput
+    );
+}
+
+#[test]
 fn approval_publication_port_is_object_safe() {
     fn accepts(_: &dyn ToolApprovalRequestPublisher) {}
 
