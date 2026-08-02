@@ -92,6 +92,8 @@ use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY,
     TOKEN_USER,
 };
+#[cfg(feature = "test-seams")]
+use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
@@ -2057,6 +2059,153 @@ fn bounded_inert_helper_outlives_a_short_real_lpac_timeout() {
     assert_eq!(receipt.job_receipt.max_active_processes, 8);
     assert!(!receipt.job_receipt.resource_limit_terminated);
     assert!(receipt.job_receipt.tree_terminated);
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn app_exit_and_crash_kill_a_live_real_lpac_root() {
+    for (mode, clean_exit) in [("exit", true), ("crash", false)] {
+        let root = TempDir::new().unwrap();
+        let worktree = root.path().join("worktree");
+        let pid_path = root.path().join("lpac.pid");
+        let acknowledged_path = root.path().join("acknowledged");
+        fs::create_dir(&worktree).unwrap();
+        let mut host = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lpac_host_exit_helper", "--nocapture"])
+            .env("LAT_LPAC_HOST_MODE", mode)
+            .env("LAT_LPAC_HOST_WORKTREE", &worktree)
+            .env("LAT_LPAC_HOST_PID", &pid_path)
+            .env("LAT_LPAC_HOST_ACK", &acknowledged_path)
+            .spawn()
+            .unwrap();
+
+        let child_pid = wait_for_file(&pid_path).trim().parse::<u32>().unwrap();
+        // SAFETY: OpenProcess receives the observed LPAC PID with query/synchronize access only.
+        let child_process = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                0,
+                child_pid,
+            )
+        };
+        assert!(!child_process.is_null());
+        let mut child_exit_code = 0;
+        // SAFETY: child_process is a live query handle and child_exit_code is writable.
+        assert_ne!(
+            unsafe { GetExitCodeProcess(child_process, &mut child_exit_code) },
+            0
+        );
+        assert_eq!(child_exit_code, STILL_ACTIVE as u32);
+        fs::write(&acknowledged_path, b"acknowledged").unwrap();
+
+        let status = host.wait().unwrap();
+        if clean_exit {
+            assert_eq!(status.code(), Some(0));
+        } else {
+            assert_eq!(status.code(), Some(86));
+        }
+        // SAFETY: child_process remains owned by this test until CloseHandle below.
+        assert_eq!(
+            unsafe { WaitForSingleObject(child_process, 5_000) },
+            WAIT_OBJECT_0,
+            "LPAC root survived host {mode}",
+        );
+        // SAFETY: child_process remains a valid query handle and child_exit_code is writable.
+        assert_ne!(
+            unsafe { GetExitCodeProcess(child_process, &mut child_exit_code) },
+            0
+        );
+        assert_ne!(child_exit_code, STILL_ACTIVE as u32);
+        // SAFETY: child_process is owned by this iteration.
+        unsafe {
+            CloseHandle(child_process);
+        }
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn lpac_host_exit_helper() {
+    let Ok(mode) = std::env::var("LAT_LPAC_HOST_MODE") else {
+        return;
+    };
+    let worktree = PathBuf::from(std::env::var_os("LAT_LPAC_HOST_WORKTREE").unwrap());
+    let pid_path = PathBuf::from(std::env::var_os("LAT_LPAC_HOST_PID").unwrap());
+    let acknowledged_path = PathBuf::from(std::env::var_os("LAT_LPAC_HOST_ACK").unwrap());
+    let launcher = Arc::new(registered_lpac_launcher(&worktree));
+    let mut request = request(
+        vec![
+            "--exact".to_owned(),
+            "process_child_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        BTreeMap::from([(
+            "LAT_PROCESS_HELPER".to_owned(),
+            "bounded-inert-wait".to_owned(),
+        )]),
+    );
+    request.execution_id = ToolExecutionId::new(format!("execution-lpac-host-{mode}")).unwrap();
+    request.timeout_ms = 30_000;
+    let execution_id = request.execution_id.clone();
+    let authority = claimed_authority(&request);
+    let captured = Arc::new(Mutex::new(None));
+    let bindings = CapturingProcessBindings {
+        authority: authority.clone(),
+        captured: Arc::clone(&captured),
+    };
+    let stderr_observation =
+        observe_stderr_marker_for_test(execution_id.clone(), b"bounded-inert-started").unwrap();
+    let executing = Arc::clone(&launcher);
+    let _execution = thread::spawn(move || {
+        local_agent_terminal_application::ProcessLauncher::execute(
+            executing.as_ref(),
+            request,
+            &authority,
+            &bindings,
+        )
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let binding = loop {
+        if let Some(binding) = captured.lock().unwrap().clone() {
+            break binding;
+        }
+        assert!(Instant::now() < deadline, "LPAC root was not bound");
+        thread::yield_now();
+    };
+    while lpac_lifecycle_counts_for_test(&execution_id).resumes_succeeded != 1 {
+        assert!(Instant::now() < deadline, "LPAC root did not resume");
+        thread::yield_now();
+    }
+    while !stderr_observation.observed() {
+        assert!(
+            Instant::now() < deadline,
+            "LPAC root did not publish readiness"
+        );
+        thread::yield_now();
+    }
+    assert!(process_is_active(binding.root_pid()));
+    let staged_pid_path = pid_path.with_extension("tmp");
+    fs::write(&staged_pid_path, binding.root_pid().to_string()).unwrap();
+    fs::rename(staged_pid_path, &pid_path).unwrap();
+    while !acknowledged_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "parent did not acknowledge LPAC root"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(process_is_active(binding.root_pid()));
+
+    match mode.as_str() {
+        "exit" => std::process::exit(0),
+        "crash" => {
+            // SAFETY: the pseudo-handle targets this helper process only.
+            assert_ne!(unsafe { TerminateProcess(GetCurrentProcess(), 86) }, 0);
+            std::process::abort();
+        }
+        _ => panic!("unsupported host termination mode"),
+    }
 }
 
 #[cfg(feature = "test-seams")]
