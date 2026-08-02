@@ -1,32 +1,57 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-
-#[cfg(test)]
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use local_agent_terminal_application::{
-    ArtifactId, ArtifactWriteReservation, AuthoritativeProcessBinding,
-    AuthoritativeProcessTermination, Clock, DurableToolExecutionReceipt, ImmutableToolRequest,
-    IncompleteToolExecution, NewToolIntent, OperationIntentSnapshot, PortError, ProcessStatus,
-    ProjectId, ReservedArtifact, RetainedProcessController, Retryability, SafeErrorClassification,
-    SafeToolExecutionError, StructuredToolExecutor, TaskId, TaskQuery, ToolApprovalPublication,
-    ToolApprovalRequest, ToolApprovalRequestPublisher, ToolControlSelfTest,
-    ToolExecutionCancellationClaim, ToolExecutionId, ToolExecutionRecoveryState,
-    ToolExecutionResolution, ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal,
-    ToolRequestPublisher, WorkspaceEvidenceStore,
+    parse_policy_timestamp, ApprovalId, ApprovalResumeStore, ArtifactId, ArtifactWriteReservation,
+    AuthoritativeProcessBinding, AuthoritativeProcessTermination, Clock,
+    DurableToolCancellationOutcome, DurableToolExecutionOutcome, DurableToolExecutionReceipt,
+    ExecuteTool, IdGenerator, ImmutableToolRequest, IncompleteToolExecution, NewToolIntent,
+    OperationIntentSnapshot, PortError, ProcessStatus, ProjectId, ReservedArtifact,
+    RetainedProcessController, Retryability, SafeErrorClassification, SafeToolExecutionError,
+    StructuredToolExecutor, TaskId, TaskQuery, ToolApprovalPublication, ToolApprovalRequest,
+    ToolApprovalRequestPublisher, ToolAuthorityResolver, ToolControlSelfTest,
+    ToolExecutionCancellationClaim, ToolExecutionId, ToolExecutionOrchestration,
+    ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResumeStore,
+    ToolExecutionStore, ToolExecutionTerminal, ToolOutcome, ToolRequest, ToolRequestPublisher,
+    WorkspaceEvidenceStore,
 };
+use local_agent_terminal_policy_engine::VersionedPolicyEngine;
 use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
 use local_agent_terminal_storage_sqlite::SqliteStore;
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(0);
 
-type ToolWorkerResult = Result<DurableToolExecutionReceipt, PortError>;
+type ToolWorkerResult = Result<ToolOutcome, PortError>;
 
 pub trait SelfTestingToolExecutor: StructuredToolExecutor + ToolControlSelfTest {}
 
 impl<T> SelfTestingToolExecutor for T where T: StructuredToolExecutor + ToolControlSelfTest {}
+
+#[derive(Clone)]
+pub struct ToolBrokerConfig {
+    policy_bundle_json: String,
+    authority: Arc<dyn ToolAuthorityResolver>,
+    executor: Arc<dyn SelfTestingToolExecutor>,
+}
+
+impl ToolBrokerConfig {
+    pub fn new(
+        policy_bundle_json: impl Into<String>,
+        authority: Arc<dyn ToolAuthorityResolver>,
+        executor: Arc<dyn SelfTestingToolExecutor>,
+    ) -> Self {
+        Self {
+            policy_bundle_json: policy_bundle_json.into(),
+            authority,
+            executor,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolRuntimeAvailability {
@@ -58,7 +83,7 @@ struct ToolRuntimeState {
     availability: ToolRuntimeAvailability,
     startup_inspection: Option<ToolStartupInspection>,
     recovery_report: Option<ToolStartupRecoveryReport>,
-    workers: BTreeMap<ToolExecutionId, JoinHandle<ToolWorkerResult>>,
+    workers: BTreeMap<ToolExecutionId, ToolWorker>,
 }
 
 #[derive(Clone)]
@@ -71,10 +96,32 @@ struct ToolStartupInspection {
 pub struct ToolRuntime {
     executions: Arc<dyn ToolExecutionStore>,
     executor: Option<Arc<dyn SelfTestingToolExecutor>>,
+    broker: Option<Arc<ToolBroker>>,
     retained_processes: Arc<dyn RetainedProcessController>,
-    state: Mutex<ToolRuntimeState>,
+    state: Arc<Mutex<ToolRuntimeState>>,
     shutdown: Mutex<()>,
 }
+
+struct ToolBroker {
+    database: SqliteStore,
+    artifacts: ContentAddressedArtifactStore,
+    policies: VersionedPolicyEngine,
+    authority: Arc<dyn ToolAuthorityResolver>,
+    executor: Arc<dyn SelfTestingToolExecutor>,
+}
+
+struct ToolWorker {
+    handle: JoinHandle<()>,
+    completion: Arc<ToolWorkerCompletion>,
+}
+
+#[derive(Default)]
+struct ToolWorkerCompletion {
+    result: Mutex<Option<ToolWorkerResult>>,
+    ready: Condvar,
+}
+
+struct RuntimeIdGenerator;
 
 struct StructuredExecutorProcessController {
     executor: Arc<dyn SelfTestingToolExecutor>,
@@ -89,40 +136,143 @@ impl RetainedProcessController for StructuredExecutorProcessController {
     }
 }
 
+impl ToolBroker {
+    fn new(
+        database: SqliteStore,
+        artifacts: ContentAddressedArtifactStore,
+        config: ToolBrokerConfig,
+    ) -> Result<Self, PortError> {
+        let policies = VersionedPolicyEngine::from_json(&config.policy_bundle_json)?;
+        Ok(Self {
+            database,
+            artifacts,
+            policies,
+            authority: config.authority,
+            executor: config.executor,
+        })
+    }
+
+    fn execute(&self, request: ToolRequest) -> Result<ToolOutcome, PortError> {
+        self.with_execute_tool(|execute| execute.execute(request))
+    }
+
+    fn resume_approved(&self, approval_id: ApprovalId) -> Result<ToolOutcome, PortError> {
+        self.with_execute_tool(|execute| execute.resume_approved(approval_id))
+    }
+
+    fn cancel(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<DurableToolCancellationOutcome, PortError> {
+        self.with_execute_tool(|execute| execute.cancel(execution_id))
+    }
+
+    fn approval_execution_id(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<ToolExecutionId, PortError> {
+        let observed_at = parse_policy_timestamp(&self.database.now_utc()?)?;
+        let approval =
+            ApprovalResumeStore::load_for_resume(&self.database, approval_id, observed_at)?;
+        if approval.approval_id != *approval_id {
+            return Err(integrity_failure());
+        }
+        Ok(approval.execution_id)
+    }
+
+    fn resolve_terminal(
+        &self,
+        resolution: ToolExecutionResolution,
+    ) -> Result<DurableToolExecutionReceipt, PortError> {
+        self.database.resolve_terminal(resolution)
+    }
+
+    fn with_execute_tool<T>(&self, operation: impl FnOnce(ExecuteTool<'_>) -> T) -> T {
+        let publisher = ToolArtifactPublisher::new(&self.database, &self.artifacts);
+        let orchestration = ToolExecutionOrchestration::new(
+            &publisher,
+            self.authority.as_ref(),
+            &self.database,
+            &self.policies,
+            &self.database,
+            &RuntimeIdGenerator,
+            &publisher,
+            &self.database,
+            &self.database,
+            &self.database,
+        );
+        operation(ExecuteTool::new(orchestration, self.executor.as_ref()))
+    }
+}
+
+impl IdGenerator for RuntimeIdGenerator {
+    fn next_id(&self) -> Result<String, PortError> {
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| internal_failure())?;
+        let sequence = NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed);
+        let process = u64::from(std::process::id());
+        let timestamp = elapsed.as_nanos() as u64 ^ process.rotate_left(32);
+        Ok(format!("{timestamp:016x}{sequence:016x}"))
+    }
+}
+
 impl ToolRuntime {
-    pub fn new(
+    #[cfg(test)]
+    fn new(
         executions: Arc<dyn ToolExecutionStore>,
         executor: Arc<dyn SelfTestingToolExecutor>,
     ) -> Self {
         let retained_processes = Arc::new(StructuredExecutorProcessController {
             executor: Arc::clone(&executor),
         });
-        Self::configured(executions, Some(executor), retained_processes)
+        Self::configured(executions, Some(executor), None, retained_processes)
+    }
+
+    pub(crate) fn with_broker(
+        database: SqliteStore,
+        artifacts: ContentAddressedArtifactStore,
+        config: ToolBrokerConfig,
+    ) -> Result<Self, PortError> {
+        let broker = Arc::new(ToolBroker::new(database, artifacts, config)?);
+        let executions: Arc<dyn ToolExecutionStore> = Arc::new(broker.database.clone());
+        let executor = Arc::clone(&broker.executor);
+        let retained_processes = Arc::new(StructuredExecutorProcessController {
+            executor: Arc::clone(&executor),
+        });
+        Ok(Self::configured(
+            executions,
+            Some(executor),
+            Some(broker),
+            retained_processes,
+        ))
     }
 
     pub fn recovery_only(
         executions: Arc<dyn ToolExecutionStore>,
         retained_processes: Arc<dyn RetainedProcessController>,
     ) -> Self {
-        Self::configured(executions, None, retained_processes)
+        Self::configured(executions, None, None, retained_processes)
     }
 
     fn configured(
         executions: Arc<dyn ToolExecutionStore>,
         executor: Option<Arc<dyn SelfTestingToolExecutor>>,
+        broker: Option<Arc<ToolBroker>>,
         retained_processes: Arc<dyn RetainedProcessController>,
     ) -> Self {
         Self {
             executions,
             executor,
+            broker,
             retained_processes,
-            state: Mutex::new(ToolRuntimeState {
+            state: Arc::new(Mutex::new(ToolRuntimeState {
                 dispatch_open: false,
                 availability: ToolRuntimeAvailability::Unavailable,
                 startup_inspection: None,
                 recovery_report: None,
                 workers: BTreeMap::new(),
-            }),
+            })),
             shutdown: Mutex::new(()),
         }
     }
@@ -292,12 +442,52 @@ impl ToolRuntime {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn dispatch_test_worker(
+    pub fn execute(&self, request: ToolRequest) -> Result<ToolOutcome, PortError> {
+        let execution_id = request.execution_id().clone();
+        let broker = Arc::clone(self.broker.as_ref().ok_or_else(unavailable)?);
+        self.dispatch_and_wait(execution_id, move || broker.execute(request))
+    }
+
+    pub fn resume_approved(&self, approval_id: ApprovalId) -> Result<ToolOutcome, PortError> {
+        let broker = Arc::clone(self.broker.as_ref().ok_or_else(unavailable)?);
+        let execution_id = broker.approval_execution_id(&approval_id)?;
+        self.dispatch_and_wait(execution_id, move || broker.resume_approved(approval_id))
+    }
+
+    pub fn cancel(
+        &self,
+        execution_id: &ToolExecutionId,
+    ) -> Result<DurableToolCancellationOutcome, PortError> {
+        self.broker
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .cancel(execution_id)
+    }
+
+    fn dispatch_and_wait(
         &self,
         execution_id: ToolExecutionId,
-        worker: impl FnOnce() -> Result<DurableToolExecutionReceipt, PortError> + Send + 'static,
-    ) -> Result<(), PortError> {
+        worker: impl FnOnce() -> ToolWorkerResult + Send + 'static,
+    ) -> ToolWorkerResult {
+        let completion = self.start_worker(execution_id.clone(), worker)?;
+        let result = completion.wait();
+        let owned_worker = self
+            .state
+            .lock()
+            .map_err(|_| internal_failure())?
+            .workers
+            .remove(&execution_id);
+        if let Some(worker) = owned_worker {
+            worker.handle.join().map_err(|_| internal_failure())?;
+        }
+        result
+    }
+
+    fn start_worker(
+        &self,
+        execution_id: ToolExecutionId,
+        worker: impl FnOnce() -> ToolWorkerResult + Send + 'static,
+    ) -> Result<Arc<ToolWorkerCompletion>, PortError> {
         let mut state = self.state.lock().map_err(|_| internal_failure())?;
         if !state.dispatch_open
             || state.availability != ToolRuntimeAvailability::Ready
@@ -305,10 +495,46 @@ impl ToolRuntime {
         {
             return Err(conflict());
         }
+        let completion = Arc::new(ToolWorkerCompletion::default());
+        let worker_completion = Arc::clone(&completion);
+        let runtime_state = Arc::clone(&self.state);
         let handle = thread::Builder::new()
-            .spawn(worker)
+            .spawn(move || {
+                let result = match catch_unwind(AssertUnwindSafe(worker)) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let mut state = runtime_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.dispatch_open = false;
+                        state.availability = ToolRuntimeAvailability::Unavailable;
+                        Err(internal_failure())
+                    }
+                };
+                worker_completion.complete(result);
+            })
             .map_err(|_| unavailable())?;
-        state.workers.insert(execution_id, handle);
+        state.workers.insert(
+            execution_id,
+            ToolWorker {
+                handle,
+                completion: Arc::clone(&completion),
+            },
+        );
+        Ok(completion)
+    }
+
+    #[cfg(test)]
+    fn dispatch_test_worker(
+        &self,
+        execution_id: ToolExecutionId,
+        worker: impl FnOnce() -> Result<DurableToolExecutionReceipt, PortError> + Send + 'static,
+    ) -> Result<(), PortError> {
+        self.start_worker(execution_id, move || {
+            worker().map(|receipt| {
+                ToolOutcome::Execution(DurableToolExecutionOutcome::Completed(receipt))
+            })
+        })?;
         Ok(())
     }
 
@@ -323,6 +549,118 @@ impl ToolRuntime {
         if workers.is_empty() {
             return Ok(Vec::new());
         }
+        match self.broker.as_ref() {
+            Some(broker) => self.stop_all_broker(workers, broker),
+            None => self.stop_all_legacy(workers),
+        }
+    }
+
+    fn stop_all_broker(
+        &self,
+        workers: BTreeMap<ToolExecutionId, ToolWorker>,
+        broker: &ToolBroker,
+    ) -> Result<Vec<DurableToolExecutionReceipt>, PortError> {
+        let mut authorities = BTreeMap::new();
+        let mut completed = BTreeMap::new();
+        let mut cancellation_errors = BTreeMap::new();
+        let mut pending = workers.iter().collect::<VecDeque<_>>();
+        while let Some((execution_id, worker)) = pending.pop_front() {
+            match broker.cancel(execution_id) {
+                Ok(DurableToolCancellationOutcome::Requested { authority, .. })
+                | Ok(DurableToolCancellationOutcome::InFlight(authority)) => {
+                    authorities.insert(execution_id.clone(), authority);
+                }
+                Ok(DurableToolCancellationOutcome::Completed(receipt)) => {
+                    completed.insert(execution_id.clone(), receipt);
+                }
+                Err(error)
+                    if matches!(
+                        error.safe_classification(),
+                        SafeErrorClassification::NotFound | SafeErrorClassification::Conflict
+                    ) =>
+                {
+                    if !worker
+                        .completion
+                        .wait_for_completion(Duration::from_millis(10))?
+                    {
+                        pending.push_back((execution_id, worker));
+                    }
+                }
+                Err(error) => {
+                    cancellation_errors.insert(execution_id.clone(), error);
+                }
+            }
+        }
+
+        let mut receipts = Vec::with_capacity(workers.len());
+        let mut first_error = None;
+        for (execution_id, worker) in workers {
+            if worker.handle.join().is_err() {
+                record_first_error(&mut first_error, internal_failure());
+            }
+            let worker_receipt = match worker.completion.wait() {
+                Ok(ToolOutcome::Execution(DurableToolExecutionOutcome::Completed(receipt))) => {
+                    Some(receipt)
+                }
+                Ok(ToolOutcome::Execution(
+                    DurableToolExecutionOutcome::TerminalPersistenceUnresolved {
+                        resolution, ..
+                    },
+                )) => match broker.resolve_terminal(resolution) {
+                    Ok(receipt) => Some(receipt),
+                    Err(error) => {
+                        record_first_error(&mut first_error, error);
+                        None
+                    }
+                },
+                Ok(ToolOutcome::Execution(
+                    DurableToolExecutionOutcome::InFlight(_)
+                    | DurableToolExecutionOutcome::Indeterminate(_),
+                ))
+                | Err(_) => authorities.remove(&execution_id).map(|authority| {
+                    let error = cancellation_errors
+                        .remove(&execution_id)
+                        .unwrap_or_else(internal_failure);
+                    indeterminate_receipt(authority, &error)
+                }),
+                Ok(ToolOutcome::Denied(_) | ToolOutcome::ApprovalRequired(_)) => None,
+            };
+            if let Some(persisted) = completed.remove(&execution_id) {
+                cancellation_errors.remove(&execution_id);
+                if worker_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt != &persisted)
+                {
+                    record_first_error(&mut first_error, integrity_failure());
+                }
+                receipts.push(persisted);
+                continue;
+            }
+            let Some(receipt) = worker_receipt else {
+                if let Some(error) = cancellation_errors.remove(&execution_id) {
+                    record_first_error(&mut first_error, error);
+                }
+                continue;
+            };
+            match broker.resolve_terminal(ToolExecutionResolution::new(receipt)) {
+                Ok(receipt) => {
+                    cancellation_errors.remove(&execution_id);
+                    receipts.push(receipt);
+                }
+                Err(error) => record_first_error(&mut first_error, error),
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(receipts)
+        }
+    }
+
+    fn stop_all_legacy(
+        &self,
+        workers: BTreeMap<ToolExecutionId, ToolWorker>,
+    ) -> Result<Vec<DurableToolExecutionReceipt>, PortError> {
         let executor = self.executor.as_ref().ok_or_else(unavailable)?;
         let mut authorities = BTreeMap::new();
         let mut completed = BTreeMap::new();
@@ -359,9 +697,25 @@ impl ToolRuntime {
 
         let mut receipts = Vec::with_capacity(workers.len());
         for (execution_id, worker) in workers {
-            let worker_receipt = match worker.join() {
-                Ok(Ok(receipt)) => Some(receipt),
-                Ok(Err(worker_error)) => match authorities.remove(&execution_id) {
+            let joined = worker.handle.join();
+            let worker_receipt = match worker.completion.wait() {
+                Ok(ToolOutcome::Execution(DurableToolExecutionOutcome::Completed(receipt))) => {
+                    Some(receipt)
+                }
+                Ok(ToolOutcome::Execution(
+                    DurableToolExecutionOutcome::TerminalPersistenceUnresolved {
+                        resolution, ..
+                    },
+                )) => Some(resolution.into_receipt()),
+                Ok(ToolOutcome::Execution(
+                    DurableToolExecutionOutcome::InFlight(_)
+                    | DurableToolExecutionOutcome::Indeterminate(_),
+                ))
+                | Ok(ToolOutcome::Denied(_) | ToolOutcome::ApprovalRequired(_)) => {
+                    record_first_error(&mut first_error, integrity_failure());
+                    None
+                }
+                Err(worker_error) => match authorities.remove(&execution_id) {
                     Some(authority) => {
                         let error = cancellation_errors
                             .remove(&execution_id)
@@ -372,26 +726,14 @@ impl ToolRuntime {
                         let error = cancellation_errors
                             .remove(&execution_id)
                             .unwrap_or(worker_error);
-                        record_first_error(&mut first_error, error);
-                        None
-                    }
-                },
-                Err(_) => match authorities.remove(&execution_id) {
-                    Some(authority) => {
-                        let error = cancellation_errors
-                            .remove(&execution_id)
-                            .unwrap_or_else(internal_failure);
-                        Some(indeterminate_receipt(authority, &error))
-                    }
-                    None => {
-                        let error = cancellation_errors
-                            .remove(&execution_id)
-                            .unwrap_or_else(internal_failure);
                         record_first_error(&mut first_error, error);
                         None
                     }
                 },
             };
+            if joined.is_err() {
+                record_first_error(&mut first_error, internal_failure());
+            }
             if let Some(persisted) = completed.remove(&execution_id) {
                 cancellation_errors.remove(&execution_id);
                 if worker_receipt
@@ -422,6 +764,39 @@ impl ToolRuntime {
         } else {
             Ok(receipts)
         }
+    }
+}
+
+impl ToolWorkerCompletion {
+    fn complete(&self, worker_result: ToolWorkerResult) {
+        let mut result = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *result = Some(worker_result);
+        self.ready.notify_all();
+    }
+
+    fn wait(&self) -> ToolWorkerResult {
+        let mut result = self.result.lock().map_err(|_| internal_failure())?;
+        loop {
+            if let Some(worker_result) = result.as_ref() {
+                return worker_result.clone();
+            }
+            result = self.ready.wait(result).map_err(|_| internal_failure())?;
+        }
+    }
+
+    fn wait_for_completion(&self, timeout: Duration) -> Result<bool, PortError> {
+        let result = self.result.lock().map_err(|_| internal_failure())?;
+        if result.is_some() {
+            return Ok(true);
+        }
+        let (result, _) = self
+            .ready
+            .wait_timeout(result, timeout)
+            .map_err(|_| internal_failure())?;
+        Ok(result.is_some())
     }
 }
 

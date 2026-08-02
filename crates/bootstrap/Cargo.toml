@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 local-agent-terminal-application = { path = "../application" }
+local-agent-terminal-policy-engine = { path = "../policy-engine" }
 local-agent-terminal-repository-git = { path = "../repository-git" }
 local-agent-terminal-storage-files = { path = "../storage-files" }
 local-agent-terminal-storage-sqlite = { path = "../storage-sqlite" }

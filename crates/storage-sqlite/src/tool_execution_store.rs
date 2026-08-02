@@ -1610,10 +1610,11 @@ pub(crate) fn validate_tool_approval_policy(
         .query_row(
             "SELECT unixepoch(expires_at) FROM policy_decisions WHERE id = ?1",
             [decision_id.as_str()],
-            |row| row.get(0),
+            |row| row.get::<_, Option<i64>>(0),
         )
         .optional()
-        .map_err(sqlite_error_to_port)?;
+        .map_err(sqlite_error_to_port)?
+        .flatten();
     if policy_expires_at.is_some_and(|expires_at| approval_expires_at.unix_seconds() > expires_at) {
         return Err(integrity_failure());
     }

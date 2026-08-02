@@ -8,15 +8,15 @@ use local_agent_terminal_application::{
     DisclosureOutcome, DurableToolExecutionReceipt, FileReadRequest, FileWriteRequest,
     GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, IdempotencyClass,
     ImmutableToolRequest, IncompleteToolExecution, JobReceipt, NewToolExecution, NewToolIntent,
-    OperationIntentSnapshot, PolicyBoundBytes, PortError, ProcessStatus, Retryability,
-    SafeErrorClassification, StructuredToolExecutor, ToolControlSelfTest,
+    OperationIntentSnapshot, PolicyBoundBytes, PortError, ProcessStatus, RetainedProcessController,
+    Retryability, SafeErrorClassification, StructuredToolExecutor, ToolControlSelfTest,
     ToolExecutionCancellationClaim, ToolExecutionClaim, ToolExecutionClaimAuthority,
     ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionRecoveryEvidence,
     ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResult, ToolExecutionStore,
     ToolExecutionTerminalKind, VerifiedWrite,
 };
 use local_agent_terminal_bootstrap::{
-    SelfTestingToolExecutor, ToolControlSelfTestStatus, ToolRuntime, ToolRuntimeAvailability,
+    ToolControlSelfTestStatus, ToolRuntime, ToolRuntimeAvailability,
 };
 use local_agent_terminal_domain::{RunId, Sha256Digest, TaskId};
 
@@ -37,7 +37,10 @@ fn startup_recovery_interrupts_unstarted_claim_before_dispatch_release() {
 
     let report = runtime.recover_startup().unwrap();
 
-    assert_eq!(report.control_self_test, ToolControlSelfTestStatus::Passed);
+    assert_eq!(
+        report.control_self_test,
+        ToolControlSelfTestStatus::NotConfigured
+    );
     assert_eq!(report.recovered, 1);
     assert_eq!(report.interrupted, 1);
     assert_eq!(report.indeterminate, 0);
@@ -45,9 +48,9 @@ fn startup_recovery_interrupts_unstarted_claim_before_dispatch_release() {
     assert_eq!(report.survivor_inspection_failures, 0);
     assert_eq!(
         runtime.availability().unwrap(),
-        ToolRuntimeAvailability::Ready
+        ToolRuntimeAvailability::Unavailable
     );
-    runtime.release_dispatch().unwrap();
+    assert!(runtime.release_dispatch().is_err());
     assert_eq!(executor.execute_calls(), 0);
     assert!(executor.terminated_bindings().is_empty());
     assert_eq!(
@@ -80,7 +83,10 @@ fn startup_recovery_terminates_exact_retained_job_and_never_relaunches() {
     let second = runtime.recover_startup().unwrap();
 
     assert_eq!(first, second);
-    assert_eq!(first.control_self_test, ToolControlSelfTestStatus::Passed);
+    assert_eq!(
+        first.control_self_test,
+        ToolControlSelfTestStatus::NotConfigured
+    );
     assert_eq!(first.recovered, 1);
     assert_eq!(first.interrupted, 0);
     assert_eq!(first.indeterminate, 1);
@@ -88,7 +94,7 @@ fn startup_recovery_terminates_exact_retained_job_and_never_relaunches() {
     assert_eq!(first.survivor_inspection_failures, 0);
     assert_eq!(
         runtime.availability().unwrap(),
-        ToolRuntimeAvailability::DegradedReadOnly
+        ToolRuntimeAvailability::Unavailable
     );
     assert!(runtime.release_dispatch().is_err());
     assert_eq!(executor.execute_calls(), 0);
@@ -206,7 +212,7 @@ fn startup_recovery_retains_started_execution_without_process_binding() {
 }
 
 #[test]
-fn failed_control_self_test_keeps_dispatch_closed_after_recovery() {
+fn recovery_only_runtime_never_opens_dispatch_without_a_configured_broker() {
     let evidence = recovery_evidence(
         "execution-control-self-test",
         ToolExecutionRecoveryState::Claimed,
@@ -221,9 +227,12 @@ fn failed_control_self_test_keeps_dispatch_closed_after_recovery() {
     let second = runtime.recover_startup().unwrap();
 
     assert_eq!(first, second);
-    assert_eq!(first.control_self_test, ToolControlSelfTestStatus::Failed);
+    assert_eq!(
+        first.control_self_test,
+        ToolControlSelfTestStatus::NotConfigured
+    );
     assert_eq!(first.recovered, 1);
-    assert_eq!(executor.control_self_test_calls(), 1);
+    assert_eq!(executor.control_self_test_calls(), 0);
     assert_eq!(store.incomplete_calls(), 1);
     assert_eq!(
         store
@@ -243,8 +252,8 @@ fn failed_control_self_test_keeps_dispatch_closed_after_recovery() {
 
 fn runtime(store: Arc<RecoveryExecutionStore>, executor: Arc<RecoveryExecutor>) -> ToolRuntime {
     let execution_port: Arc<dyn ToolExecutionStore> = store;
-    let executor_port: Arc<dyn SelfTestingToolExecutor> = executor;
-    ToolRuntime::new(execution_port, executor_port)
+    let retained_processes: Arc<dyn RetainedProcessController> = executor;
+    ToolRuntime::recovery_only(execution_port, retained_processes)
 }
 
 struct RecoveryExecutionStore {
@@ -373,6 +382,21 @@ impl RecoveryExecutor {
     fn control_self_test_calls(&self) -> usize {
         self.control_self_test_calls.load(Ordering::SeqCst)
     }
+
+    fn terminate_binding(
+        &self,
+        binding: &AuthoritativeProcessBinding,
+    ) -> Result<CancellationReceipt, PortError> {
+        self.terminated_bindings
+            .lock()
+            .unwrap()
+            .push(binding.clone());
+        self.cancellations
+            .lock()
+            .unwrap()
+            .remove(binding.authority().execution_id())
+            .ok_or_else(unavailable)
+    }
 }
 
 impl ToolControlSelfTest for RecoveryExecutor {
@@ -398,15 +422,7 @@ impl StructuredToolExecutor for RecoveryExecutor {
         &self,
         binding: &AuthoritativeProcessBinding,
     ) -> Result<CancellationReceipt, PortError> {
-        self.terminated_bindings
-            .lock()
-            .unwrap()
-            .push(binding.clone());
-        self.cancellations
-            .lock()
-            .unwrap()
-            .remove(binding.authority().execution_id())
-            .ok_or_else(unavailable)
+        self.terminate_binding(binding)
     }
 
     fn file_read(
@@ -429,6 +445,15 @@ impl StructuredToolExecutor for RecoveryExecutor {
 
     fn git_diff(&self, _: GitDiffRequest) -> Result<DisclosureOutcome<GitDiffResult>, PortError> {
         unreachable!()
+    }
+}
+
+impl RetainedProcessController for RecoveryExecutor {
+    fn terminate_retained_process(
+        &self,
+        binding: &AuthoritativeProcessBinding,
+    ) -> Result<CancellationReceipt, PortError> {
+        self.terminate_binding(binding)
     }
 }
 

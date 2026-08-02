@@ -9,17 +9,21 @@ use local_agent_terminal_application::{
     GitStatusRequest, GitStatusResult, ImmutableToolRequest, IncompleteToolExecution,
     NewToolExecution, NewToolIntent, OperationIntentSnapshot, PolicyBoundBytes, PortError,
     ProcessStatus, Retryability, SafeErrorClassification, StartupStateDto, StructuredToolExecutor,
-    ToolControlSelfTest, ToolExecutionCancellationClaim, ToolExecutionClaim,
-    ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
-    ToolExecutionResolution, ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal,
-    ToolExecutionTerminalKind, VerifiedWrite,
+    ToolAuthorityResolver, ToolAuthoritySnapshot, ToolControlSelfTest,
+    ToolExecutionCancellationClaim, ToolExecutionClaim, ToolExecutionClaimAuthority,
+    ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput, ToolExecutionResolution,
+    ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
+    ToolRequest, VerifiedWrite,
 };
 use local_agent_terminal_domain::{ArtifactId, RunId, Sha256Digest};
 use tempfile::TempDir;
 
 use crate::startup::{Bootstrap, StartupConfig};
 
-use super::{SelfTestingToolExecutor, ToolRuntime};
+use super::{SelfTestingToolExecutor, ToolBrokerConfig, ToolRuntime};
+
+const ALLOW_PROCESS_POLICY: &str =
+    r#"{"version":1,"rules":[{"id":"allow-process","effect":"allow","action":"process.exec"}]}"#;
 
 #[test]
 fn configured_startup_exposes_ready_before_releasing_dispatch() {
@@ -27,7 +31,10 @@ fn configured_startup_exposes_ready_before_releasing_dispatch() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let executor: Arc<dyn SelfTestingToolExecutor> =
         Arc::new(BlockingCancellationExecutor::new(events));
-    let bootstrap = Bootstrap::with_tool_executor(startup_config(&root), executor);
+    let bootstrap = Bootstrap::with_tool_broker(
+        startup_config(&root),
+        ToolBrokerConfig::new(ALLOW_PROCESS_POLICY, Arc::new(UnusedAuthority), executor),
+    );
 
     assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
     assert!(bootstrap.workspace_runtime().is_some());
@@ -65,7 +72,10 @@ fn configured_startup_keeps_unavailable_dispatch_closed_without_failing_startup(
     let executor: Arc<dyn SelfTestingToolExecutor> = Arc::new(
         BlockingCancellationExecutor::with_unavailable_controls(events),
     );
-    let bootstrap = Bootstrap::with_tool_executor(startup_config(&root), executor);
+    let bootstrap = Bootstrap::with_tool_broker(
+        startup_config(&root),
+        ToolBrokerConfig::new(ALLOW_PROCESS_POLICY, Arc::new(UnusedAuthority), executor),
+    );
 
     assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
     let runtime = bootstrap.tool_runtime().unwrap();
@@ -232,6 +242,14 @@ fn concurrent_stop_all_callers_wait_for_the_same_worker_join() {
         .is_empty());
     second.join().unwrap();
     assert_eq!(executor.cancel_count(authority.execution_id()), 1);
+}
+
+struct UnusedAuthority;
+
+impl ToolAuthorityResolver for UnusedAuthority {
+    fn resolve(&self, _: &ToolRequest) -> Result<ToolAuthoritySnapshot, PortError> {
+        unreachable!("startup self-tests do not resolve tool authority")
+    }
 }
 
 #[derive(Clone)]

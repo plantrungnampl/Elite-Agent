@@ -2,16 +2,27 @@
 mod support;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use local_agent_terminal_application::{
     bind_tool_approval_payload, canonical_policy_binding_digest, canonical_tool_request,
-    policy_request_for_tool, ApprovalId, ApprovalResumeStore, ApprovedExecutableIdentity,
-    ApprovedProcessRequest, PolicyDecision, PolicyDecisionStore, RecordedPolicyDecision,
-    ResolvedExecutable, ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolApprovalPublication,
-    ToolApprovalRequest, ToolApprovalRequestPublisher, ToolExecutionResumeStore, ToolPolicyContext,
-    ToolRequest, ToolRequestPublisher,
+    policy_request_for_tool, ApprovalId, ApprovalResolution, ApprovalResumeStore, ApprovalStore,
+    ApprovedExecutableIdentity, ApprovedProcessRequest, AuthoritativeProcessBinding,
+    AuthorizedToolRequest, CancellationReceipt, DisclosureOutcome, FileReadRequest,
+    FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult,
+    PolicyBoundBytes, PolicyDecision, PolicyDecisionStore, PortError, ProcessExecutionBindingStore,
+    ProcessStatus, RecordedPolicyDecision, ResolvedExecutable, Retryability,
+    SafeErrorClassification, StructuredToolExecutor, ToolApprovalOperationV1,
+    ToolApprovalPayloadV1, ToolApprovalPublication, ToolApprovalRequest,
+    ToolApprovalRequestPublisher, ToolAuthorityResolver, ToolAuthoritySnapshot,
+    ToolControlSelfTest, ToolExecutionResult, ToolExecutionResumeStore, ToolOutcome,
+    ToolPolicyContext, ToolRequest, ToolRequestPublisher, VerifiedWrite,
 };
-use local_agent_terminal_bootstrap::ToolArtifactPublisher;
+use local_agent_terminal_bootstrap::{
+    Bootstrap, StartupConfig, ToolArtifactPublisher, ToolBrokerConfig, ToolRuntimeAvailability,
+};
 use local_agent_terminal_domain::{
     combine_policy_rules, ActorLocality, ArtifactId, CapabilityRef, EnvironmentProfile,
     MatchedPolicyRule, NetworkProfile, Phase, PlanStepId, PolicyAction, PolicyActor, PolicyEffect,
@@ -19,11 +30,228 @@ use local_agent_terminal_domain::{
     ProcessToolRequest, ProcessTrustTier, ResourceClass, RunId, Sha256Digest, TaskId, TaskRisk,
     Timestamp, TrustTier, WorkspaceVersion,
 };
+use local_agent_terminal_policy_engine::VersionedPolicyEngine;
 use local_agent_terminal_storage_files::ContentAddressedArtifactStore;
 use local_agent_terminal_storage_sqlite::SqliteStore;
 use rusqlite::Connection;
 
 use support::WorkspaceFixture;
+
+const DENY_PROCESS_POLICY: &str =
+    r#"{"version":1,"rules":[{"id":"deny-process","effect":"deny","action":"process.exec"}]}"#;
+const ALLOW_PROCESS_POLICY: &str =
+    r#"{"version":1,"rules":[{"id":"allow-process","effect":"allow","action":"process.exec"}]}"#;
+const APPROVE_PROCESS_POLICY: &str = r#"{"version":1,"rules":[{"id":"approve-process","effect":"require_approval","action":"process.exec"}]}"#;
+const EMPTY_BYTES_HASH: &str =
+    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+#[test]
+fn configured_runtime_routes_typed_requests_through_execute_tool() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let policy = VersionedPolicyEngine::from_json(DENY_PROCESS_POLICY).unwrap();
+    let request =
+        tool_request_for_policy("execution-runtime-denied", policy.snapshot_digest().clone());
+    let executor = Arc::new(RecordingExecutor::default());
+    let bootstrap = Bootstrap::with_tool_broker(
+        StartupConfig {
+            app_data_dir: fixture.app_data.clone(),
+            trusted_workspace_root: fixture.workspace_root.clone(),
+            secret_values: Vec::new(),
+        },
+        ToolBrokerConfig::new(
+            DENY_PROCESS_POLICY,
+            Arc::new(EchoAuthority),
+            executor.clone(),
+        ),
+    );
+
+    assert_eq!(
+        bootstrap.tool_runtime().unwrap().availability().unwrap(),
+        ToolRuntimeAvailability::Ready
+    );
+    let outcome = bootstrap.tool_runtime().unwrap().execute(request).unwrap();
+
+    assert!(matches!(outcome, ToolOutcome::Denied(_)));
+    assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn stop_all_cancels_and_joins_a_runtime_owned_execution() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let policy = VersionedPolicyEngine::from_json(ALLOW_PROCESS_POLICY).unwrap();
+    let request =
+        tool_request_for_policy("execution-runtime-stop", policy.snapshot_digest().clone());
+    let executor = Arc::new(RecordingExecutor::blocking(
+        SqliteStore::open(&fixture.database_path).unwrap(),
+    ));
+    let bootstrap = Bootstrap::with_tool_broker(
+        StartupConfig {
+            app_data_dir: fixture.app_data.clone(),
+            trusted_workspace_root: fixture.workspace_root.clone(),
+            secret_values: Vec::new(),
+        },
+        ToolBrokerConfig::new(
+            ALLOW_PROCESS_POLICY,
+            Arc::new(EchoAuthority),
+            executor.clone(),
+        ),
+    );
+    let runtime = bootstrap.tool_runtime().unwrap();
+
+    std::thread::scope(|scope| {
+        let execution = scope.spawn(|| runtime.execute(request));
+        executor.wait_until_started();
+        let stopped = runtime.stop_all();
+        executor.release();
+        let outcome = execution.join().unwrap().unwrap();
+        let receipts = stopped.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ToolOutcome::Execution(
+                local_agent_terminal_application::DurableToolExecutionOutcome::Completed(_)
+            )
+        ));
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(executor.cancel_calls.load(Ordering::SeqCst), 1);
+    });
+    assert!(runtime.stop_all().unwrap().is_empty());
+}
+
+#[test]
+fn stop_all_cancels_started_workers_while_an_earlier_worker_is_still_registering() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let policy = VersionedPolicyEngine::from_json(ALLOW_PROCESS_POLICY).unwrap();
+    let pending = tool_request_for_policy("execution-a-pending", policy.snapshot_digest().clone());
+    let started = tool_request_for_policy("execution-b-started", policy.snapshot_digest().clone());
+    let authority = Arc::new(BlockingAuthority::new("execution-a-pending"));
+    let executor = Arc::new(RecordingExecutor::blocking(
+        SqliteStore::open(&fixture.database_path).unwrap(),
+    ));
+    let bootstrap = Bootstrap::with_tool_broker(
+        StartupConfig {
+            app_data_dir: fixture.app_data.clone(),
+            trusted_workspace_root: fixture.workspace_root.clone(),
+            secret_values: Vec::new(),
+        },
+        ToolBrokerConfig::new(ALLOW_PROCESS_POLICY, authority.clone(), executor.clone()),
+    );
+    let runtime = bootstrap.tool_runtime().unwrap();
+
+    std::thread::scope(|scope| {
+        let pending_execution = scope.spawn(|| runtime.execute(pending));
+        authority.wait_until_blocked();
+        let started_execution = scope.spawn(|| runtime.execute(started));
+        executor.wait_until_started();
+        let shutdown = scope.spawn(|| runtime.stop_all());
+
+        let cancelled_before_release = executor.wait_until_cancelled(Duration::from_millis(250));
+        authority.release();
+
+        shutdown.join().unwrap().unwrap();
+        pending_execution.join().unwrap().unwrap();
+        started_execution.join().unwrap().unwrap();
+        assert!(
+            cancelled_before_release,
+            "a registering worker must not delay cancellation of a started worker"
+        );
+    });
+}
+
+#[test]
+fn configured_runtime_resumes_an_approved_request_through_execute_tool() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let policy = VersionedPolicyEngine::from_json(APPROVE_PROCESS_POLICY).unwrap();
+    let request = tool_request_for_policy(
+        "execution-runtime-approved",
+        policy.snapshot_digest().clone(),
+    );
+    let executor = Arc::new(RecordingExecutor::failing(
+        SqliteStore::open(&fixture.database_path).unwrap(),
+    ));
+    let bootstrap = Bootstrap::with_tool_broker(
+        StartupConfig {
+            app_data_dir: fixture.app_data.clone(),
+            trusted_workspace_root: fixture.workspace_root.clone(),
+            secret_values: Vec::new(),
+        },
+        ToolBrokerConfig::new(
+            APPROVE_PROCESS_POLICY,
+            Arc::new(EchoAuthority),
+            executor.clone(),
+        ),
+    );
+    let runtime = bootstrap.tool_runtime().unwrap();
+    let initial = runtime.execute(request);
+    let ToolOutcome::ApprovalRequired(approval) = initial.unwrap() else {
+        panic!("approval policy must return the immutable approval request");
+    };
+    let approval_id = ApprovalId::new(approval.approval_id).unwrap();
+    SqliteStore::open(&fixture.database_path)
+        .unwrap()
+        .resolve(ApprovalResolution {
+            approval_id: approval_id.clone(),
+            approved: true,
+        })
+        .unwrap();
+
+    let outcome = runtime.resume_approved(approval_id).unwrap();
+
+    assert!(matches!(
+        outcome,
+        ToolOutcome::Execution(
+            local_agent_terminal_application::DurableToolExecutionOutcome::Completed(_)
+        )
+    ));
+    assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn worker_panic_after_process_binding_closes_production_dispatch() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let policy = VersionedPolicyEngine::from_json(ALLOW_PROCESS_POLICY).unwrap();
+    let executor = Arc::new(RecordingExecutor::panicking(
+        SqliteStore::open(&fixture.database_path).unwrap(),
+    ));
+    let bootstrap = Bootstrap::with_tool_broker(
+        StartupConfig {
+            app_data_dir: fixture.app_data.clone(),
+            trusted_workspace_root: fixture.workspace_root.clone(),
+            secret_values: Vec::new(),
+        },
+        ToolBrokerConfig::new(
+            ALLOW_PROCESS_POLICY,
+            Arc::new(EchoAuthority),
+            executor.clone(),
+        ),
+    );
+    let runtime = bootstrap.tool_runtime().unwrap();
+    let panicking_request =
+        tool_request_for_policy("execution-runtime-panics", policy.snapshot_digest().clone());
+    let later_request =
+        tool_request_for_policy("execution-after-panic", policy.snapshot_digest().clone());
+
+    std::thread::scope(|scope| {
+        let panicking = scope.spawn(|| runtime.execute(panicking_request));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while runtime.availability().unwrap() != ToolRuntimeAvailability::Unavailable {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+
+        assert!(runtime.execute(later_request).is_err());
+        assert_eq!(
+            panicking.join().unwrap().unwrap_err().safe_classification(),
+            SafeErrorClassification::Internal
+        );
+    });
+    assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 1);
+}
 
 #[test]
 fn journaled_tool_publishers_persist_distinct_verified_artifacts_and_exact_relation() {
@@ -310,6 +538,13 @@ fn approval_request(
 }
 
 fn tool_request(execution_id: &str) -> ToolRequest {
+    tool_request_for_policy(execution_id, digest('b'))
+}
+
+fn tool_request_for_policy(
+    execution_id: &str,
+    policy_snapshot_digest: Sha256Digest,
+) -> ToolRequest {
     let task_id = TaskId::new("task-1").unwrap();
     let process = ProcessToolRequest::new(
         ProcessBinding::new(
@@ -364,12 +599,12 @@ fn tool_request(execution_id: &str) -> ToolRequest {
         PolicyAction::new("process.exec").unwrap(),
         PolicyResource {
             capability: CapabilityRef::worktree(task_id, ".").unwrap(),
-            content_digest: digest('a'),
+            content_digest: Sha256Digest::new(EMPTY_BYTES_HASH).unwrap(),
             resource_class: ResourceClass::InternalCode,
         },
         TaskRisk::High,
         "run focused tests",
-        digest('b'),
+        policy_snapshot_digest,
     )
     .unwrap();
     ToolRequest::new(
@@ -378,6 +613,198 @@ fn tool_request(execution_id: &str) -> ToolRequest {
         policy,
     )
     .unwrap()
+}
+
+struct EchoAuthority;
+
+impl ToolAuthorityResolver for EchoAuthority {
+    fn resolve(&self, request: &ToolRequest) -> Result<ToolAuthoritySnapshot, PortError> {
+        ToolAuthoritySnapshot::new(request.clone(), b"", None)
+    }
+}
+
+struct BlockingAuthority {
+    execution_id: &'static str,
+    state: Mutex<ExecutorState>,
+    changed: Condvar,
+}
+
+impl BlockingAuthority {
+    fn new(execution_id: &'static str) -> Self {
+        Self {
+            execution_id,
+            state: Mutex::new(ExecutorState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait_until_blocked(&self) {
+        let state = self.state.lock().unwrap();
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.started)
+            .unwrap();
+        assert!(state.started && !timeout.timed_out());
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().released = true;
+        self.changed.notify_all();
+    }
+}
+
+impl ToolAuthorityResolver for BlockingAuthority {
+    fn resolve(&self, request: &ToolRequest) -> Result<ToolAuthoritySnapshot, PortError> {
+        if request.execution_id().as_str() == self.execution_id {
+            let mut state = self.state.lock().unwrap();
+            state.started = true;
+            self.changed.notify_all();
+            while !state.released {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+        ToolAuthoritySnapshot::new(request.clone(), b"", None)
+    }
+}
+
+#[derive(Default)]
+struct ExecutorState {
+    started: bool,
+    released: bool,
+}
+
+#[derive(Default)]
+struct RecordingExecutor {
+    execute_calls: AtomicUsize,
+    cancel_calls: AtomicUsize,
+    blocking: bool,
+    panics: bool,
+    bindings: Option<SqliteStore>,
+    state: Mutex<ExecutorState>,
+    changed: Condvar,
+}
+
+impl RecordingExecutor {
+    fn blocking(bindings: SqliteStore) -> Self {
+        Self {
+            blocking: true,
+            bindings: Some(bindings),
+            ..Self::default()
+        }
+    }
+
+    fn failing(bindings: SqliteStore) -> Self {
+        Self {
+            blocking: true,
+            bindings: Some(bindings),
+            state: Mutex::new(ExecutorState {
+                released: true,
+                ..ExecutorState::default()
+            }),
+            ..Self::default()
+        }
+    }
+
+    fn panicking(bindings: SqliteStore) -> Self {
+        Self {
+            blocking: true,
+            panics: true,
+            bindings: Some(bindings),
+            ..Self::default()
+        }
+    }
+
+    fn wait_until_started(&self) {
+        let state = self.state.lock().unwrap();
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.started)
+            .unwrap();
+        assert!(state.started && !timeout.timed_out());
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().released = true;
+        self.changed.notify_all();
+    }
+
+    fn wait_until_cancelled(&self, timeout: Duration) -> bool {
+        let state = self.state.lock().unwrap();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.released)
+            .unwrap();
+        state.released
+    }
+}
+
+impl ToolControlSelfTest for RecordingExecutor {
+    fn verify_controls(&self) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
+impl StructuredToolExecutor for RecordingExecutor {
+    fn execute(&self, request: AuthorizedToolRequest) -> Result<ToolExecutionResult, PortError> {
+        self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        assert!(self.blocking, "denied policy must not reach the executor");
+        let bindings = self.bindings.as_ref().unwrap();
+        let authority = bindings.load_claimed_authority(&request.execution_id)?;
+        bindings.record_process_binding(AuthoritativeProcessBinding::new(
+            authority,
+            4_242,
+            "runtime-owned-test-job",
+        )?)?;
+        let mut state = self.state.lock().unwrap();
+        state.started = true;
+        self.changed.notify_all();
+        if self.panics {
+            panic!("injected panic after authoritative process binding");
+        }
+        while !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+        Err(PortError::failure(
+            SafeErrorClassification::Unavailable,
+            Retryability::NonRetryable,
+        ))
+    }
+
+    fn cancel(
+        &self,
+        execution_id: &local_agent_terminal_application::ToolExecutionId,
+    ) -> Result<CancellationReceipt, PortError> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        self.release();
+        Ok(CancellationReceipt {
+            execution_id: execution_id.clone(),
+            status: ProcessStatus::Terminated,
+            job_receipt: None,
+            cancelled: true,
+        })
+    }
+
+    fn file_read(
+        &self,
+        _: FileReadRequest,
+    ) -> Result<DisclosureOutcome<PolicyBoundBytes>, PortError> {
+        unreachable!("test exercises process execution only")
+    }
+
+    fn file_write(&self, _: FileWriteRequest) -> Result<VerifiedWrite, PortError> {
+        unreachable!("test exercises process execution only")
+    }
+
+    fn git_status(
+        &self,
+        _: GitStatusRequest,
+    ) -> Result<DisclosureOutcome<GitStatusResult>, PortError> {
+        unreachable!("test exercises process execution only")
+    }
+
+    fn git_diff(&self, _: GitDiffRequest) -> Result<DisclosureOutcome<GitDiffResult>, PortError> {
+        unreachable!("test exercises process execution only")
+    }
 }
 
 fn digest(marker: char) -> Sha256Digest {
