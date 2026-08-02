@@ -702,7 +702,7 @@ git commit -m "feat: orchestrate audited structured tools"
 **Interfaces:**
 - Tauri commands call the Task 8 use cases and queries. React consumes immutable camelCase DTOs and submits only opaque IDs plus the digest/version it displayed. The UI cannot select a tool, executable, argv, capability, environment, network profile, expected write, fencing token, or policy exception payload.
 
-- [ ] **Step 1 - Write failing API, component, and browser tests**
+- [x] **Step 1 - Write failing API, component, and browser tests**
 
 Test an exact invoke allowlist:
 
@@ -725,15 +725,15 @@ pnpm --dir apps/desktop test:browser -- tool-approval.spec.ts
 
 Expected RED: the API module, screen, and commands do not exist.
 
-- [ ] **Step 2 - Add immutable Rust DTO commands**
+- [x] **Step 2 - Add immutable Rust DTO commands**
 
 Add `#[serde(deny_unknown_fields)]` request DTOs and serialize only application DTOs. `get_approval_request` loads the existing core-built request; `resolve_tool_approval` compare-checks the displayed full digest and delegates the decision; grant resumes through `ExecuteTool::resume_approved`. `cancel_tool_execution` and `stop_all_tools` return authoritative receipts. Rust enforces all privilege; command names never encode generic execution.
 
-- [ ] **Step 3 - Build the minimal accessible React view**
+- [x] **Step 3 - Build the minimal accessible React view**
 
 Keep API calls in `src/api/tools.ts`, derive view state during render, and keep interaction state in event handlers/refs rather than effects. Render a semantic activity table for exact auditable fields and a dialog for one approval. Use an `aria-live` status for policy/cancel results, visible focus, non-color labels, existing design tokens, and reduced-motion styles. On every refresh/mutation, use a monotonic request generation so a delayed poll cannot overwrite an approval invalidation or cancellation response.
 
-- [ ] **Step 4 - Run frontend, browser, Tauri, and architecture checks**
+- [x] **Step 4 - Run frontend, browser, Tauri, and architecture checks**
 
 ```powershell
 pnpm --dir apps/desktop test --run
@@ -746,7 +746,7 @@ node scripts/check-architecture.mjs
 
 Expected GREEN: typed IPC and all UI states are covered, stale dialogs cannot grant, keyboard/axe/contrast/reflow checks pass, the frontend build succeeds, and no generic capability reaches React.
 
-- [ ] **Step 5 - Commit**
+- [x] **Step 5 - Commit**
 
 ```powershell
 git add apps/desktop
