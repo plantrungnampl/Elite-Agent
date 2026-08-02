@@ -269,7 +269,7 @@ fn capture_repository(repository: &git2::Repository) -> Result<CapturedRepositor
         .to_owned();
     let (_index_lock, index_bytes) = open_and_read_bounded(&index_path, MAX_INDEX_BYTES)?;
     let (_config_lock, config_bytes) =
-        open_and_read_bounded(&repository.path().join("config"), MAX_CONFIG_BYTES)?;
+        open_and_read_bounded(&repository.commondir().join("config"), MAX_CONFIG_BYTES)?;
     let head_entries = capture_head(repository)?;
     let index_entries = capture_index(repository)?;
     let worktree_entries = capture_worktree(repository)?;

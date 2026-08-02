@@ -160,7 +160,7 @@ pub(crate) fn scan(
             }
         }
     }
-    if repository.is_shallow() || repository.is_bare() || repository.is_worktree() {
+    if repository.is_shallow() || repository.is_bare() {
         hazards.push(hazard(
             RepositoryHazardReason::UnsafeConfiguration,
             "unsupported repository layout",

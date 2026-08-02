@@ -297,6 +297,12 @@ fn start(
     tool_broker: Option<ToolBrokerConfig>,
     retained_processes: Arc<dyn RetainedProcessController>,
 ) -> Result<StartupRuntimes, StartupFailure> {
+    let workspace_writes = tool_broker
+        .as_ref()
+        .map(ToolBrokerConfig::workspace_writes)
+        .unwrap_or_else(|| {
+            Arc::new(local_agent_terminal_application::WorkspaceWriteCoordinator::new())
+        });
     let _recovery_lock =
         RecoveryLock::acquire(&config.app_data_dir).map_err(recovery_lock_failure)?;
     log.push(record(
@@ -483,6 +489,7 @@ fn start(
             artifacts,
             repositories,
             workspace_report.recovery_candidates,
+            workspace_writes,
         ),
         tools,
     })

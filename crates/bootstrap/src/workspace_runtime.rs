@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use local_agent_terminal_application::{
     AcquireLease, ActorId, ArtifactId, ArtifactRootMode, CanonicalJsonRequest, Clock,
@@ -30,7 +30,7 @@ pub struct WorkspaceRuntime {
     database: SqliteStore,
     artifacts: ContentAddressedArtifactStore,
     repositories: GitRepositoryGateway,
-    writes: WorkspaceWriteCoordinator,
+    writes: Arc<WorkspaceWriteCoordinator>,
     monitor: WorkspaceMonitor,
     recovery_candidates: Vec<RecoveryCandidate>,
     active_claims: Mutex<HashMap<TaskId, LeaseClaim>>,
@@ -47,12 +47,13 @@ impl WorkspaceRuntime {
         artifacts: ContentAddressedArtifactStore,
         repositories: GitRepositoryGateway,
         recovery_candidates: Vec<RecoveryCandidate>,
+        writes: Arc<WorkspaceWriteCoordinator>,
     ) -> Self {
         Self {
             database,
             artifacts,
             repositories,
-            writes: WorkspaceWriteCoordinator::new(),
+            writes,
             monitor: WorkspaceMonitor,
             recovery_candidates,
             active_claims: Mutex::new(HashMap::new()),

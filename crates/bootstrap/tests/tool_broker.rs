@@ -9,25 +9,26 @@ use std::time::Duration;
 
 use local_agent_terminal_application::{
     bind_tool_approval_payload, canonical_policy_binding_digest, canonical_tool_request,
-    policy_request_for_tool, ApprovalId, ApprovalResolution, ApprovalResumeStore, ApprovalStore,
-    ApprovedExecutableIdentity, ApprovedProcessRequest, AuthoritativeProcessBinding,
+    policy_request_for_tool, AcquireLease, ApprovalId, ApprovalResolution, ApprovalResumeStore,
+    ApprovalStore, ApprovedExecutableIdentity, ApprovedProcessRequest, AuthoritativeProcessBinding,
     AuthorizedToolRequest, BoundedOutput, CancellationReceipt, DisclosedToolExecutionArtifacts,
-    DisclosureOutcome, DurableToolExecutionArtifact, FileReadRequest, FileWriteRequest,
-    GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, JobReceipt, PolicyBoundBytes,
-    PolicyDecision, PolicyDecisionStore, PortError, ProcessExecutionBindingStore, ProcessReceipt,
-    ProcessStatus, RecordedPolicyDecision, ResolveToolApprovalRequestDto, ResolvedExecutable,
-    Retryability, SafeErrorClassification, StructuredToolExecutor, ToolActivityStatusDto,
-    ToolApprovalDecisionDto, ToolApprovalOperationV1, ToolApprovalPayloadV1,
+    DisclosureOutcome, DurableToolExecutionArtifact, FileReadRequest, FileWritePolicyBinding,
+    FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult, JobReceipt,
+    PolicyBoundBytes, PolicyDecision, PolicyDecisionStore, PortError, ProcessExecutionBindingStore,
+    ProcessReceipt, ProcessStatus, RecordedPolicyDecision, ResolveToolApprovalRequestDto,
+    ResolvedExecutable, Retryability, SafeErrorClassification, StructuredToolExecutor, TaskQuery,
+    ToolActivityStatusDto, ToolApprovalDecisionDto, ToolApprovalOperationV1, ToolApprovalPayloadV1,
     ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestPublisher,
     ToolAuthorityResolver, ToolAuthoritySnapshot, ToolControlSelfTest,
-    ToolExecutionArtifactEvidence, ToolExecutionResult, ToolExecutionResumeStore, ToolOutcome,
-    ToolPolicyContext, ToolRequest, ToolRequestPublisher, VerifiedWrite, WorkspaceEvidenceStore,
+    ToolExecutionArtifactEvidence, ToolExecutionResult, ToolExecutionResumeStore,
+    ToolExecutionTerminalKind, ToolOutcome, ToolPolicyContext, ToolRequest, ToolRequestPublisher,
+    VerifiedWrite, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_bootstrap::{
     Bootstrap, StartupConfig, ToolArtifactPublisher, ToolBrokerConfig, ToolRuntimeAvailability,
 };
 use local_agent_terminal_domain::{
-    combine_policy_rules, ActorLocality, ArtifactId, CapabilityRef, EnvironmentProfile,
+    combine_policy_rules, ActorLocality, ArtifactId, CapabilityRef, EnvironmentProfile, LeaseClaim,
     MatchedPolicyRule, NetworkProfile, Phase, PlanStepId, PolicyAction, PolicyActor, PolicyEffect,
     PolicyResource, PolicyRuleId, PolicyVersion, ProcessBinding, ProcessInvocation,
     ProcessToolRequest, ProcessTrustTier, ResourceClass, RunId, Sha256Digest, TaskId, TaskRisk,
@@ -100,7 +101,7 @@ fn production_runtime_resolves_the_authoritative_task_before_default_deny() {
 
     assert_eq!(
         bootstrap.tool_runtime().unwrap().availability().unwrap(),
-        ToolRuntimeAvailability::DegradedReadOnly
+        ToolRuntimeAvailability::Ready
     );
     let outcome = bootstrap.tool_runtime().unwrap().execute(request).unwrap();
 
@@ -171,7 +172,7 @@ fn production_runtime_rejects_forged_policy_and_task_context_before_evaluation()
 
 #[cfg(windows)]
 #[test]
-fn production_degraded_runtime_exposes_read_tools_and_fails_closed_for_hostile_git() {
+fn production_runtime_exposes_read_tools_and_fails_closed_for_hostile_git() {
     let fixture = WorkspaceFixture::new();
     fixture.seed_present_workspace();
     std::fs::write(
@@ -224,6 +225,128 @@ fn production_degraded_runtime_exposes_read_tools_and_fails_closed_for_hostile_g
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn production_runtime_reports_clean_git_status_and_diff() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let bootstrap = Bootstrap::production(StartupConfig {
+        app_data_dir: fixture.app_data.clone(),
+        trusted_workspace_root: fixture.workspace_root.clone(),
+        secret_values: Vec::new(),
+    });
+    let runtime = bootstrap.tool_runtime().unwrap();
+    let task_id = TaskId::new("task-1").unwrap();
+    let worktree = CapabilityRef::worktree(task_id.clone(), ".").unwrap();
+
+    let DisclosureOutcome::Disclosed(status) = runtime
+        .git_status(GitStatusRequest {
+            task_id: task_id.clone(),
+            worktree: worktree.clone(),
+        })
+        .unwrap()
+    else {
+        panic!("clean production status must be disclosed");
+    };
+    let DisclosureOutcome::Disclosed(diff) = runtime
+        .git_diff(GitDiffRequest {
+            task_id,
+            worktree: worktree.clone(),
+        })
+        .unwrap()
+    else {
+        panic!("clean production diff must be disclosed");
+    };
+
+    assert_eq!(status.path_scope, worktree);
+    assert!(!status.truncated);
+    assert!(!diff.truncated);
+}
+
+#[cfg(windows)]
+#[test]
+fn production_runtime_writes_with_durable_recovery_evidence() {
+    let fixture = WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let bootstrap = Bootstrap::production(StartupConfig {
+        app_data_dir: fixture.app_data.clone(),
+        trusted_workspace_root: fixture.workspace_root.clone(),
+        secret_values: Vec::new(),
+    });
+    let task_id = TaskId::new("task-1").unwrap();
+    let lease = bootstrap
+        .workspace_runtime()
+        .unwrap()
+        .acquire_lease(AcquireLease {
+            task_id: task_id.clone(),
+            holder_run_id: RunId::new("run-lease-1").unwrap(),
+            expected_fencing_epoch: 0,
+            acquired_at: "2026-07-26T00:00:10Z".to_owned(),
+            expires_at: "2099-07-26T01:00:10Z".to_owned(),
+        })
+        .unwrap();
+    let policy = VersionedPolicyEngine::from_json(DEFAULT_DENY_POLICY).unwrap();
+    let database = SqliteStore::open(&fixture.database_path).unwrap();
+    let policy = record_file_write_policy(&database, policy.snapshot_digest().clone());
+    let before_write = database.task(&task_id).unwrap();
+
+    let verified = bootstrap
+        .tool_runtime()
+        .unwrap()
+        .file_write(FileWriteRequest {
+            execution_id: local_agent_terminal_application::ToolExecutionId::new(
+                "production-file-write",
+            )
+            .unwrap(),
+            task_id: task_id.clone(),
+            capability: CapabilityRef::worktree(task_id.clone(), "generated.txt").unwrap(),
+            expected_digest: None,
+            bytes: b"production write\n".to_vec(),
+            lease_claim: LeaseClaim::new(task_id.clone(), lease.holder_run_id, lease.token),
+            policy,
+        })
+        .unwrap();
+
+    assert_eq!(verified.size_bytes, b"production write\n".len() as u64);
+    assert_eq!(
+        std::fs::read(
+            fixture
+                .workspace_root
+                .join("worktree-task-1")
+                .join("generated.txt")
+        )
+        .unwrap(),
+        b"production write\n"
+    );
+    let after_write = database.task(&task_id).unwrap();
+    assert_eq!(
+        after_write.current_sequence.get(),
+        before_write.current_sequence.get() + 3
+    );
+    assert_eq!(
+        after_write.workspace_version.get(),
+        before_write.workspace_version.get() + 1
+    );
+    let status: String = fixture
+        .database()
+        .query_row(
+            "SELECT status FROM operation_intents WHERE id = 'production-file-write'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "succeeded");
+    let evidence_count: i64 = fixture
+        .database()
+        .query_row(
+            "SELECT COUNT(*) FROM artifacts WHERE id LIKE 'file-write-%-production-file-write'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(evidence_count, 3);
+}
+
 #[test]
 fn degraded_read_only_never_reaches_the_process_executor() {
     let fixture = WorkspaceFixture::new();
@@ -253,7 +376,21 @@ fn degraded_read_only_never_reaches_the_process_executor() {
         runtime.availability().unwrap(),
         ToolRuntimeAvailability::DegradedReadOnly
     );
-    let _ = runtime.execute(request);
+    let ToolOutcome::Execution(
+        local_agent_terminal_application::DurableToolExecutionOutcome::Completed(receipt),
+    ) = runtime.execute(request).unwrap()
+    else {
+        panic!("disabled process must resolve to a durable terminal receipt");
+    };
+    assert_eq!(
+        receipt.terminal().kind(),
+        ToolExecutionTerminalKind::Indeterminate
+    );
+    assert_eq!(
+        receipt.terminal().error().unwrap().classification,
+        SafeErrorClassification::Unavailable
+    );
+    assert!(receipt.terminal().post_effect().is_none());
     assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 0);
 }
 
@@ -1021,6 +1158,46 @@ fn production_tool_request(
         policy,
     )
     .unwrap()
+}
+
+#[cfg(windows)]
+fn record_file_write_policy(
+    database: &SqliteStore,
+    policy_snapshot_digest: Sha256Digest,
+) -> FileWritePolicyBinding {
+    let evaluated_at = Timestamp::from_unix_seconds(1_753_272_000);
+    let request = production_tool_request(
+        "production-file-write-policy",
+        policy_snapshot_digest.clone(),
+    );
+    let draft = combine_policy_rules(
+        policy_request_for_tool(&request, evaluated_at),
+        PolicyVersion::new(1).unwrap(),
+        vec![MatchedPolicyRule {
+            rule_id: PolicyRuleId::new("allow-file-write").unwrap(),
+            effect: PolicyEffect::Allow,
+            redactions: Vec::new(),
+        }],
+        None,
+    )
+    .unwrap();
+    let operation_digest = digest('e');
+    let decision_id = database
+        .record(RecordedPolicyDecision {
+            decision: PolicyDecision {
+                draft,
+                operation_digest: operation_digest.clone(),
+            },
+            recorded_at: evaluated_at,
+        })
+        .unwrap();
+    FileWritePolicyBinding {
+        decision_id: decision_id.as_str().to_owned(),
+        operation_digest,
+        policy_snapshot_digest,
+        effect: PolicyEffect::Allow,
+        approval_id: None,
+    }
 }
 
 fn rebind_tool_request(

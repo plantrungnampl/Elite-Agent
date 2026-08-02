@@ -9,22 +9,23 @@ use local_agent_terminal_application::{
     parse_policy_timestamp, present_tool_activity_record, ApprovalId, ApprovalResolution,
     ApprovalResumeStore, ApprovalStore, ArtifactId, ArtifactWriteReservation,
     AuthoritativeProcessBinding, AuthoritativeProcessTermination, CancelToolExecutionRequestDto,
-    Clock, DisclosedToolExecutionArtifacts, DisclosureOutcome, DurableToolCancellationOutcome,
-    DurableToolExecutionArtifact, DurableToolExecutionArtifacts, DurableToolExecutionOutcome,
-    DurableToolExecutionReceipt, ExecuteTool, FileReadRequest, FileWriteRequest, GitDiffRequest,
-    GitDiffResult, GitStatusRequest, GitStatusResult, IdGenerator, ImmutableToolRequest,
-    IncompleteToolExecution, NewToolIntent, OperationIntentSnapshot, PolicyBoundBytes, PortError,
-    ProcessStatus, ProjectId, ReservedArtifact, ResolveToolApprovalRequestDto,
-    RetainedProcessController, Retryability, SafeErrorClassification, SafeToolExecutionError,
-    StopAllToolsReceiptDto, StructuredToolExecutor, TaskId, TaskQuery, ToolActivityDto,
-    ToolActivityStatusDto, ToolApprovalDecisionDto, ToolApprovalPublication, ToolApprovalRequest,
-    ToolApprovalRequestDto, ToolApprovalRequestPublisher, ToolApprovalResolutionDto,
-    ToolAuthorityResolver, ToolCancellationReceiptDto, ToolControlSelfTest,
-    ToolExecutionArtifactEvidence, ToolExecutionCancellationClaim, ToolExecutionId,
-    ToolExecutionOrchestration, ToolExecutionRecoveryState, ToolExecutionResolution,
-    ToolExecutionResumeStore, ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
-    ToolOutcome, ToolRequest, ToolRequestPublisher, ToolRuntimeAvailabilityDto, VerifiedWrite,
-    WorkspaceEvidenceStore,
+    CanonicalEvidenceRef, Clock, DisclosedToolExecutionArtifacts, DisclosureOutcome,
+    DurableToolCancellationOutcome, DurableToolExecutionArtifact, DurableToolExecutionArtifacts,
+    DurableToolExecutionOutcome, DurableToolExecutionReceipt, ExecuteTool, FileReadRequest,
+    FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest, GitStatusResult,
+    IdGenerator, ImmutableToolRequest, IncompleteToolExecution, NewToolIntent,
+    OperationIntentSnapshot, PolicyBoundBytes, PortError, ProcessStatus, ProjectId,
+    ReservedArtifact, ResolveToolApprovalRequestDto, RetainedProcessController, Retryability,
+    SafeErrorClassification, SafeToolExecutionError, Sha256Digest, StopAllToolsReceiptDto,
+    StructuredToolExecutor, TaskId, TaskQuery, ToolActivityDto, ToolActivityStatusDto,
+    ToolApprovalDecisionDto, ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestDto,
+    ToolApprovalRequestPublisher, ToolApprovalResolutionDto, ToolAuthorityResolver,
+    ToolCancellationReceiptDto, ToolControlSelfTest, ToolExecutionArtifactEvidence,
+    ToolExecutionCancellationClaim, ToolExecutionId, ToolExecutionOrchestration,
+    ToolExecutionRecoveryState, ToolExecutionResolution, ToolExecutionResumeStore,
+    ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind, ToolOutcome, ToolRequest,
+    ToolRequestPublisher, ToolRuntimeAvailabilityDto, VerifiedWrite, WorkspaceEvidenceStore,
+    WorkspaceWriteCoordinator,
 };
 use local_agent_terminal_policy_engine::VersionedPolicyEngine;
 use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
@@ -45,6 +46,8 @@ pub struct ToolBrokerConfig {
     authority: Arc<dyn ToolAuthorityResolver>,
     executor: Arc<dyn SelfTestingToolExecutor>,
     process_enabled: bool,
+    write_enabled: bool,
+    workspace_writes: Arc<WorkspaceWriteCoordinator>,
 }
 
 impl ToolBrokerConfig {
@@ -58,12 +61,32 @@ impl ToolBrokerConfig {
             authority,
             executor,
             process_enabled: true,
+            write_enabled: true,
+            workspace_writes: Arc::new(WorkspaceWriteCoordinator::new()),
         }
     }
 
     pub fn degraded_read_only(mut self) -> Self {
         self.process_enabled = false;
+        self.write_enabled = false;
         self
+    }
+
+    pub(crate) fn without_process(mut self) -> Self {
+        self.process_enabled = false;
+        self
+    }
+
+    pub(crate) fn with_workspace_writes(
+        mut self,
+        workspace_writes: Arc<WorkspaceWriteCoordinator>,
+    ) -> Self {
+        self.workspace_writes = workspace_writes;
+        self
+    }
+
+    pub(crate) fn workspace_writes(&self) -> Arc<WorkspaceWriteCoordinator> {
+        Arc::clone(&self.workspace_writes)
     }
 }
 
@@ -124,12 +147,14 @@ struct ToolBroker {
     authority: Arc<dyn ToolAuthorityResolver>,
     executor: Arc<dyn SelfTestingToolExecutor>,
     process_enabled: bool,
+    write_enabled: bool,
 }
 
 struct PublishingStructuredExecutor<'a, 'storage> {
     executor: &'a dyn SelfTestingToolExecutor,
     publisher: &'a ToolArtifactPublisher<'storage>,
     process_enabled: bool,
+    write_enabled: bool,
 }
 
 struct ToolWorker {
@@ -172,6 +197,7 @@ impl ToolBroker {
             authority: config.authority,
             executor: config.executor,
             process_enabled: config.process_enabled,
+            write_enabled: config.write_enabled,
         })
     }
 
@@ -312,6 +338,7 @@ impl ToolBroker {
             executor: self.executor.as_ref(),
             publisher: &publisher,
             process_enabled: self.process_enabled,
+            write_enabled: self.write_enabled,
         };
         operation(ExecuteTool::new(orchestration, &executor))
     }
@@ -371,6 +398,9 @@ impl StructuredToolExecutor for PublishingStructuredExecutor<'_, '_> {
     }
 
     fn file_write(&self, request: FileWriteRequest) -> Result<VerifiedWrite, PortError> {
+        if !self.write_enabled {
+            return Err(unavailable());
+        }
         self.executor.file_write(request)
     }
 
@@ -418,7 +448,7 @@ impl ToolRuntime {
         artifacts: ContentAddressedArtifactStore,
         config: ToolBrokerConfig,
     ) -> Result<Self, PortError> {
-        let degraded_read_only = !config.process_enabled;
+        let degraded_read_only = !config.process_enabled && !config.write_enabled;
         let broker = Arc::new(ToolBroker::new(database, artifacts, config)?);
         let executions: Arc<dyn ToolExecutionStore> = Arc::new(broker.database.clone());
         let executor = Arc::clone(&broker.executor);
@@ -1222,6 +1252,35 @@ impl<'a> ToolArtifactPublisher<'a> {
             return Err(integrity_failure());
         }
         Ok(task.project_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_evidence(
+        &self,
+        artifact_id: ArtifactId,
+        task_id: &TaskId,
+        artifact_type: &'static str,
+        logical_path: String,
+        created_by_id: &str,
+        digest: &Sha256Digest,
+        bytes: &[u8],
+        mime_type: &'static str,
+    ) -> Result<CanonicalEvidenceRef, PortError> {
+        let project_id = self.project_id(task_id)?;
+        self.publish_artifact(JournaledToolArtifact {
+            artifact_id: &artifact_id,
+            task_id,
+            project_id: &project_id,
+            artifact_type,
+            logical_path,
+            created_by_id,
+            digest: digest.as_str(),
+            bytes,
+            mime_type,
+        })?;
+        self.database
+            .available_evidence(&artifact_id)?
+            .ok_or_else(integrity_failure)
     }
 
     fn publish_tool_outputs(
