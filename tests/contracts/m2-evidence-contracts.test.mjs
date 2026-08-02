@@ -130,6 +130,46 @@ test("final M2 verification rejects a pending independent review", () => {
   });
 });
 
+test("final M2 verification binds every verdict to the reviewed source", () => {
+  withEvidenceCopy((directory, manifest) => {
+    writeReview(
+      directory,
+      manifest,
+      reviewFixture(manifest.sourceCommit, "PASS", "PENDING", "PASS"),
+    );
+    assertVerifierFails(directory, /spec compliance is pending/u, [
+      "--require-approved",
+    ]);
+  });
+  withEvidenceCopy((directory, manifest) => {
+    writeReview(
+      directory,
+      manifest,
+      reviewFixture("0".repeat(40), "PASS", "PASS", "PASS"),
+    );
+    assertVerifierFails(directory, /reviewed source commit mismatch/u, [
+      "--require-approved",
+    ]);
+  });
+});
+
+test("M2 verifier rejects native skipped-test summaries", () => {
+  for (const summary of [
+    "test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured\n",
+    "  1 skipped\n",
+    "      Tests  1 skipped (1)\n",
+  ]) {
+    withEvidenceCopy((directory, manifest) => {
+      const entry = manifest.commands[0];
+      const outputPath = join(directory, entry.outputFile);
+      appendFileSync(outputPath, summary);
+      entry.outputSha256 = hash(readFileSync(outputPath));
+      writeManifest(directory, manifest);
+      assertVerifierFails(directory, /command skipped a case/u);
+    });
+  }
+});
+
 test("M2 verifier rejects dirty source and immutable design changes", () => {
   for (const path of [
     "tests/contracts/fixtures/m2/raw-shell-request.json",
@@ -169,6 +209,37 @@ test("M2 post-final verifier rejects an absent log", () => {
   assert.match(`${result.stdout}${result.stderr}`, /M2 post-final contracts/u);
 });
 
+test("M2 post-final verifier requires every approval-critical contract", () => {
+  const original = readFileSync(
+    "artifacts/verification/m2/post-final-contracts.log",
+    "utf8",
+  );
+  for (const name of [
+    "Windows CI runs containment before fresh M2 evidence verification",
+    "final M2 verification rejects a pending independent review",
+  ]) {
+    const path = join(tmpdir(), `m2-post-final-${process.pid}.log`);
+    try {
+      writeFileSync(
+        path,
+        original
+          .split(/\r?\n/u)
+          .filter((line) => !line.includes(name))
+          .join("\n"),
+      );
+      const result = spawnSync(
+        process.execPath,
+        ["scripts/verify-m2-post-final-log.mjs", "--log", path],
+        { cwd: process.cwd(), encoding: "utf8" },
+      );
+      assert.notEqual(result.status, 0);
+      assert.match(`${result.stdout}${result.stderr}`, /missing passing contract/u);
+    } finally {
+      rmSync(path, { force: true });
+    }
+  }
+});
+
 function withEvidenceCopy(callback) {
   const directory = mkdtempSync(join(tmpdir(), "m2-evidence-"));
   try {
@@ -182,6 +253,26 @@ function withEvidenceCopy(callback) {
 
 function writeManifest(directory, manifest) {
   writeFileSync(join(directory, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+function writeReview(directory, manifest, review) {
+  const path = join(directory, "review.md");
+  writeFileSync(path, review);
+  manifest.artifactSha256["review.md"] = hash(readFileSync(path));
+  writeManifest(directory, manifest);
+}
+
+function reviewFixture(sourceCommit, independent, spec, code) {
+  return `# M2 independent review
+
+## Reviewed source commit: ${sourceCommit}
+
+## Independent approval: ${independent}
+
+## Spec compliance: ${spec}
+
+## Code quality: ${code}
+`;
 }
 
 function assertVerifierFails(directory, pattern, extraArguments = []) {
