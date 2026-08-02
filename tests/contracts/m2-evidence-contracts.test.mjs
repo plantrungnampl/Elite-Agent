@@ -210,10 +210,20 @@ test("M2 post-final verifier rejects an absent log", () => {
 });
 
 test("M2 post-final verifier requires every approval-critical contract", () => {
-  const original = readFileSync(
-    "artifacts/verification/m2/post-final-contracts.log",
-    "utf8",
-  );
+  const names = [
+    "M2 evidence is complete and internally consistent",
+    "Windows CI runs containment before fresh M2 evidence verification",
+    "M2 verifier rejects modified captured output",
+    "M2 verifier rejects stale and non-ancestor source commits",
+    "M2 verifier rejects missing, failed, and skipped commands",
+    "M2 verifier rejects omitted containment cases",
+    "M2 verifier rejects platform and toolchain drift",
+    "M2 verifier rejects tampered review and limitations artifacts",
+    "final M2 verification rejects a pending independent review",
+    "M2 verifier rejects dirty source and immutable design changes",
+    "M2 evidence generation preflight rejects dirty source",
+    "M2 post-final verifier rejects an absent log",
+  ];
   for (const name of [
     "Windows CI runs containment before fresh M2 evidence verification",
     "final M2 verification rejects a pending independent review",
@@ -222,9 +232,9 @@ test("M2 post-final verifier requires every approval-critical contract", () => {
     try {
       writeFileSync(
         path,
-        original
-          .split(/\r?\n/u)
-          .filter((line) => !line.includes(name))
+        names
+          .filter((candidate) => candidate !== name)
+          .map((candidate) => `✔ ${candidate}`)
           .join("\n"),
       );
       const result = spawnSync(

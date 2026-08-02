@@ -10,12 +10,14 @@ const outputPath =
     : resolve(root, process.argv[logArgument + 1]);
 const required = [
   "M2 evidence is complete and internally consistent",
+  "Windows CI runs containment before fresh M2 evidence verification",
   "M2 verifier rejects modified captured output",
   "M2 verifier rejects stale and non-ancestor source commits",
   "M2 verifier rejects missing, failed, and skipped commands",
   "M2 verifier rejects omitted containment cases",
   "M2 verifier rejects platform and toolchain drift",
   "M2 verifier rejects tampered review and limitations artifacts",
+  "final M2 verification rejects a pending independent review",
   "M2 verifier rejects dirty source and immutable design changes",
   "M2 evidence generation preflight rejects dirty source",
   "M2 post-final verifier rejects an absent log",

@@ -57,7 +57,7 @@ try {
     );
     const output = readFileSync(join(artifactRoot, entry.outputFile));
     assert(entry.outputSha256 === hash(output), `output hash mismatch: ${command}`);
-    assert(!output.toString("utf8").includes("# SKIP"), `command skipped a case: ${command}`);
+    assert(!hasSkippedTests(output.toString("utf8")), `command skipped a case: ${command}`);
   }
 
   assertDeepEqual(
@@ -83,12 +83,18 @@ try {
     );
   }
   const review = readFileSync(join(artifactRoot, "review.md"), "utf8");
-  const reviewVerdict = review.match(/^## Independent approval: (PENDING|PASS)$/mu)?.[1];
-  assert(reviewVerdict !== undefined, "invalid review verdict");
-  assert(
-    !requireApproved || reviewVerdict === "PASS",
-    "independent approval is pending",
-  );
+  const independentVerdict = reviewVerdict(review, "Independent approval");
+  const specVerdict = reviewVerdict(review, "Spec compliance");
+  const codeVerdict = reviewVerdict(review, "Code quality");
+  if (requireApproved) {
+    assert(independentVerdict === "PASS", "independent approval is pending");
+    assert(specVerdict === "PASS", "spec compliance is pending");
+    assert(codeVerdict === "PASS", "code quality is pending");
+    const reviewedSource = review.match(
+      /^## Reviewed source commit: ([0-9a-f]{40}|[0-9a-f]{64})$/mu,
+    )?.[1];
+    assert(reviewedSource === manifest.sourceCommit, "reviewed source commit mismatch");
+  }
   assert(
     readFileSync(join(artifactRoot, "known-limitations.md"), "utf8").trim().length > 0,
     "known limitations are absent",
@@ -144,6 +150,22 @@ function commandOutput(command) {
 
 function hash(value) {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function hasSkippedTests(output) {
+  return (
+    output.includes("# SKIP") ||
+    /\b[1-9]\d*\s+(?:ignored|skipped)\b/u.test(output) ||
+    /\bskipped\s+[1-9]\d*\b/u.test(output)
+  );
+}
+
+function reviewVerdict(review, heading) {
+  const verdict = review.match(
+    new RegExp(`^## ${heading}: (PENDING|PASS)$`, "mu"),
+  )?.[1];
+  assert(verdict !== undefined, `invalid ${heading.toLowerCase()} verdict`);
+  return verdict;
 }
 
 function assertDeepEqual(actual, expected, message) {
