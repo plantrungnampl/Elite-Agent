@@ -5,7 +5,7 @@ test("first Tab reaches the skip link and activation moves focus to main", async
 }) => {
   await openShell(page);
 
-  await page.keyboard.press("Tab");
+  await page.locator("body").press("Tab");
   await expect(
     page.getByRole("link", { name: "Skip to startup status" }),
   ).toBeFocused();
