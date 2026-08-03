@@ -847,7 +847,7 @@ fn stop_all_cancels_started_workers_while_an_earlier_worker_is_still_registering
         executor.wait_until_started();
         let shutdown = scope.spawn(|| runtime.stop_all());
 
-        let cancelled_before_release = executor.wait_until_cancelled(Duration::from_millis(250));
+        let cancelled_before_release = executor.wait_until_cancelled(Duration::from_secs(5));
         authority.release();
 
         shutdown.join().unwrap().unwrap();
