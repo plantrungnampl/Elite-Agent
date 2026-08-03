@@ -1,0 +1,478 @@
+{
+  "schemaVersion": 1,
+  "finalized": true,
+  "generatedAtUtc": "2026-08-03T13:10:08.912Z",
+  "sourceCommit": "7c7a6c0139e919c1dcb6efd88214e71078e488f8",
+  "platform": "win32-x64",
+  "outputCapture": "combined stdout/stderr bytes normalized to LF",
+  "toolVersions": {
+    "os": "Windows_NT 10.0.26200 x64",
+    "node": "v24.16.0",
+    "pnpm": "11.7.0",
+    "git": "git version 2.54.0.windows.1",
+    "rustup": "rustup 1.29.0 (28d1352db 2026-03-05)",
+    "rustToolchain": "1.97.1-x86_64-pc-windows-msvc (overridden by 'D:\\multiagent\\rust-toolchain.toml')",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)"
+  },
+  "commands": [
+    {
+      "name": "frozen-install",
+      "command": "pnpm install --frozen-lockfile",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:06:53.843Z",
+      "durationMs": 877,
+      "outputFile": "outputs/frozen-install.log",
+      "outputSha256": "sha256:0d4873a14cbd4752c04ec9d271233e15e95724eb6108b0b11d93b9826b8d5883"
+    },
+    {
+      "name": "design-contracts",
+      "command": "node scripts/verify-design-contracts.mjs",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:06:54.722Z",
+      "durationMs": 79,
+      "outputFile": "outputs/design-contracts.log",
+      "outputSha256": "sha256:b5cd721cbd79d0db596529962f463442bca6fe3f46067cf82a20b2a85d150852"
+    },
+    {
+      "name": "architecture",
+      "command": "node scripts/check-architecture.mjs",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:06:54.802Z",
+      "durationMs": 180,
+      "outputFile": "outputs/architecture.log",
+      "outputSha256": "sha256:dc03b01395fd9c81198a04278ff2d04986443b2d7f71d20a6b77e1ef7f53c30f"
+    },
+    {
+      "name": "source-contracts",
+      "command": "node --test tests/contracts/architecture.test.mjs tests/contracts/design-contracts.test.mjs tests/contracts/m1-contracts.test.mjs tests/contracts/m2-contracts.test.mjs",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:06:54.984Z",
+      "durationMs": 5834,
+      "outputFile": "outputs/source-contracts.log",
+      "outputSha256": "sha256:d6894260afa50dda76b04a8f1a2ba55eca66abb078d3f85de29b989f9339f45f"
+    },
+    {
+      "name": "rust-format",
+      "command": "cargo fmt --all -- --check",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:07:00.819Z",
+      "durationMs": 786,
+      "outputFile": "outputs/rust-format.log",
+      "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "rust-clippy",
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:07:01.605Z",
+      "durationMs": 493,
+      "outputFile": "outputs/rust-clippy.log",
+      "outputSha256": "sha256:a178c7902ac24dda0e2c0cd4cf0e47a2a6976ef30481cb4015f2f71620380d8b"
+    },
+    {
+      "name": "rust-tests",
+      "command": "cargo test --workspace --all-targets",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:07:02.099Z",
+      "durationMs": 63278,
+      "outputFile": "outputs/rust-tests.log",
+      "outputSha256": "sha256:a593cce863560cfde60ce38291a5d62df7fc281698b66df0e256718bb6965ec4"
+    },
+    {
+      "name": "rust-all-features",
+      "command": "cargo test --workspace --all-features",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:08:05.379Z",
+      "durationMs": 70439,
+      "outputFile": "outputs/rust-all-features.log",
+      "outputSha256": "sha256:c58f98a5da8f5c5e2c03cb9b2f2ed2fc5f9200651e75bc94095f97f5d701a67f"
+    },
+    {
+      "name": "rust-doc",
+      "command": "cargo test --workspace --doc",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:09:15.819Z",
+      "durationMs": 4569,
+      "outputFile": "outputs/rust-doc.log",
+      "outputSha256": "sha256:3a06fce41aea01434f3a3d15ec414f13a96208692f67a290f1e653e97598a21e"
+    },
+    {
+      "name": "probe-format",
+      "command": "cargo fmt --manifest-path tests/fixtures/m2-containment-probe/Cargo.toml -- --check",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:09:20.389Z",
+      "durationMs": 114,
+      "outputFile": "outputs/probe-format.log",
+      "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "probe-clippy",
+      "command": "cargo clippy --manifest-path tests/fixtures/m2-containment-probe/Cargo.toml --all-targets -- -D warnings",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:09:20.504Z",
+      "durationMs": 102,
+      "outputFile": "outputs/probe-clippy.log",
+      "outputSha256": "sha256:6d77f64dfc8c5325b90fdbe05d8be367bdd578bcccec24f275c5ffee7d03dd6e"
+    },
+    {
+      "name": "tool-security-matrix",
+      "command": "cargo test -p local-agent-terminal-tool-runtime --test security_matrix",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:09:20.606Z",
+      "durationMs": 2446,
+      "outputFile": "outputs/tool-security-matrix.log",
+      "outputSha256": "sha256:d1a2551d1677b071d8bc020df572a1b5dae4475427fe70cdad419a4753a9ec7f"
+    },
+    {
+      "name": "platform-windows",
+      "command": "cargo test -p local-agent-terminal-platform-windows --test filesystem_matrix --test process_matrix",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:09:23.053Z",
+      "durationMs": 3162,
+      "outputFile": "outputs/platform-windows.log",
+      "outputSha256": "sha256:c67299c9d425eb28886516664c9ca19b3219450c82923740f48b290364a551b0"
+    },
+    {
+      "name": "platform-windows-seams",
+      "command": "cargo test -p local-agent-terminal-platform-windows --features test-seams --test filesystem_matrix --test process_matrix",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:09:26.216Z",
+      "durationMs": 6584,
+      "outputFile": "outputs/platform-windows-seams.log",
+      "outputSha256": "sha256:cf05b355539faac62755dd6a50543f8a92ef4503a4ebdc239a7986218d3e03bc"
+    },
+    {
+      "name": "tool-broker-e2e",
+      "command": "cargo test -p local-agent-terminal-bootstrap --test tool_broker_e2e --test tool_recovery",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:09:32.801Z",
+      "durationMs": 11660,
+      "outputFile": "outputs/tool-broker-e2e.log",
+      "outputSha256": "sha256:b0644a8593fbb28388c39aa37f32fc41273a2e283720e65f3291682621950a7c"
+    },
+    {
+      "name": "frontend-tests",
+      "command": "pnpm --dir apps/desktop test --run",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:09:44.462Z",
+      "durationMs": 4516,
+      "outputFile": "outputs/frontend-tests.log",
+      "outputSha256": "sha256:77577a4c29aafdd8e489823b25202b0e5641b6ab629d705b29cd1b939840f384"
+    },
+    {
+      "name": "playwright-install",
+      "command": "pnpm --dir apps/desktop exec playwright install chromium",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:09:48.979Z",
+      "durationMs": 1242,
+      "outputFile": "outputs/playwright-install.log",
+      "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "browser-tests",
+      "command": "pnpm --dir apps/desktop test:browser",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:09:50.222Z",
+      "durationMs": 9163,
+      "outputFile": "outputs/browser-tests.log",
+      "outputSha256": "sha256:b308c9591e4d66c64f4b2b8f84f2022b68c108bdd90142c0d9a719d9ab10e1e2"
+    },
+    {
+      "name": "frontend-build",
+      "command": "pnpm --dir apps/desktop build",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:09:59.386Z",
+      "durationMs": 3058,
+      "outputFile": "outputs/frontend-build.log",
+      "outputSha256": "sha256:7d6f1ab7f95ac179e7b1263b2f03b8b3417381aa88e97225526060f2c2d90d82"
+    },
+    {
+      "name": "desktop-debug-build",
+      "command": "cargo build -p local-agent-terminal-desktop",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:10:02.444Z",
+      "durationMs": 6291,
+      "outputFile": "outputs/desktop-debug-build.log",
+      "outputSha256": "sha256:7b9a0805dccfb8a8f8016b075a87cc13a48060a3011f92f36c8b55e3cefb4816"
+    },
+    {
+      "name": "diff-check",
+      "command": "git diff --check",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:10:08.736Z",
+      "durationMs": 49,
+      "outputFile": "outputs/diff-check.log",
+      "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "committed-diff-check",
+      "command": "git diff --check 321734f..HEAD",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:10:08.786Z",
+      "durationMs": 77,
+      "outputFile": "outputs/committed-diff-check.log",
+      "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "design-docs-unchanged",
+      "command": "git diff --exit-code 321734f -- docs/multi-agent-terminal-design",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-03T13:10:08.864Z",
+      "durationMs": 47,
+      "outputFile": "outputs/design-docs-unchanged.log",
+      "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "containmentCases": [
+    {
+      "case": "direct OS repository/original/sibling/profile/appdata/capability canaries",
+      "classification": "fail-closed",
+      "evidence": [
+        {
+          "command": "platform-windows",
+          "needle": "real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix"
+        }
+      ]
+    },
+    {
+      "case": "loopback/LAN/internet denial",
+      "classification": "fail-closed",
+      "evidence": [
+        {
+          "command": "platform-windows",
+          "needle": "real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix"
+        },
+        {
+          "command": "platform-windows-seams",
+          "needle": "lpac_network_denial_is_stronger_than_the_paired_ordinary_appcontainer_control"
+        }
+      ]
+    },
+    {
+      "case": "empty-by-default environment and provider credentials",
+      "classification": "preserved",
+      "evidence": [
+        {
+          "command": "platform-windows",
+          "needle": "real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix"
+        },
+        {
+          "command": "platform-windows-seams",
+          "needle": "child_environment_starts_empty_and_does_not_inherit_parent_canary"
+        }
+      ]
+    },
+    {
+      "case": "registry, credential, and named-pipe isolation",
+      "classification": "fail-closed",
+      "evidence": [
+        {
+          "command": "platform-windows",
+          "needle": "real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix"
+        }
+      ]
+    },
+    {
+      "case": "junction/symlink/UNC/device/ADS/case/Unicode/long/replacement paths",
+      "classification": "fail-closed",
+      "evidence": [
+        {
+          "command": "platform-windows",
+          "needle": "real_lpac_denies_filesystem_path_environment_and_network_hostile_matrix"
+        },
+        {
+          "command": "platform-windows",
+          "needle": "unicode_normalization_is_exact_and_non_disclosing"
+        },
+        {
+          "command": "platform-windows-seams",
+          "needle": "replacement_races_are_contained_by_retained_and_exact_file_handles"
+        }
+      ]
+    },
+    {
+      "case": "stale fencing and replacement",
+      "classification": "fail-closed",
+      "evidence": [
+        {
+          "command": "tool-security-matrix",
+          "needle": "stale_write_has_zero_target_or_durable_effect"
+        },
+        {
+          "command": "tool-security-matrix",
+          "needle": "runtime_initial_check_cannot_bypass_final_windows_resume_fence"
+        }
+      ]
+    },
+    {
+      "case": "executable identity, digest, and PATH replacement",
+      "classification": "fail-closed",
+      "evidence": [
+        {
+          "command": "platform-windows",
+          "needle": "executable_registry_rejects_path_lookup_version_drift_and_replacement"
+        },
+        {
+          "command": "tool-security-matrix",
+          "needle": "old_approval_executable_identity_replacement_never_reaches_launcher"
+        }
+      ]
+    },
+    {
+      "case": "argv metacharacters and response files",
+      "classification": "preserved",
+      "evidence": [
+        {
+          "command": "tool-security-matrix",
+          "needle": "typed_process_exec_resolves_profiles_and_preserves_argv_boundaries"
+        },
+        {
+          "command": "tool-security-matrix",
+          "needle": "response_file_arguments_are_denied_before_launch"
+        }
+      ]
+    },
+    {
+      "case": "ordinary/detached/breakaway descendants",
+      "classification": "fail-closed",
+      "evidence": [
+        {
+          "command": "platform-windows",
+          "needle": "real_lpac_denies_registered_descendant_creation_modes"
+        },
+        {
+          "command": "platform-windows-seams",
+          "needle": "cancellation_terminates_descendants_and_breakaway_is_denied"
+        }
+      ]
+    },
+    {
+      "case": "output/process/memory/CPU/wall budgets",
+      "classification": "enforced",
+      "evidence": [
+        {
+          "command": "platform-windows",
+          "needle": "output_overflow_terminates_the_job_and_returns_only_the_bound"
+        },
+        {
+          "command": "platform-windows",
+          "needle": "memory_job_limit_denies_additional_committed_memory"
+        },
+        {
+          "command": "platform-windows",
+          "needle": "cpu_job_limit_terminates_busy_process_before_wall_timeout"
+        },
+        {
+          "command": "platform-windows",
+          "needle": "bounded_inert_helper_outlives_a_short_real_lpac_timeout"
+        }
+      ]
+    },
+    {
+      "case": "structured file-write size budget",
+      "classification": "enforced",
+      "evidence": [
+        {
+          "command": "platform-windows",
+          "needle": "oversized_write_is_denied_before_target_or_temp_mutation"
+        }
+      ]
+    },
+    {
+      "case": "unenforceable boundaries start no process",
+      "classification": "fail-closed",
+      "evidence": [
+        {
+          "command": "platform-windows",
+          "needle": "missing_os_containment_denies_before_child_code_runs"
+        },
+        {
+          "command": "platform-windows",
+          "needle": "lpac_rejects_non_denied_network_before_resume"
+        },
+        {
+          "command": "platform-windows-seams",
+          "needle": "requested_disk_write_budget_fails_closed_before_child_creation"
+        }
+      ]
+    },
+    {
+      "case": "structured read/write/status/diff paths",
+      "classification": "policy-bound",
+      "evidence": [
+        {
+          "command": "tool-security-matrix",
+          "needle": "file_read_forces_resolved_digest_records_authoritative_decision_and_returns_only_effective_bytes"
+        },
+        {
+          "command": "tool-security-matrix",
+          "needle": "write_holds_the_exact_durable_call_order"
+        },
+        {
+          "command": "tool-security-matrix",
+          "needle": "git_status_is_policy_bound_before_bytes_cross_the_runtime_boundary"
+        },
+        {
+          "command": "tool-security-matrix",
+          "needle": "git_diff_copies_only_validated_metadata_and_policy_bound_effective_bytes"
+        }
+      ]
+    },
+    {
+      "case": "approval, intent, execution, artifact, and event reconstruction",
+      "classification": "reconstructible",
+      "evidence": [
+        {
+          "command": "tool-broker-e2e",
+          "needle": "journaled_tool_publishers_persist_distinct_verified_artifacts_and_exact_relation"
+        },
+        {
+          "command": "tool-broker-e2e",
+          "needle": "configured_runtime_projects_exact_approval_context_and_rejects_a_stale_digest"
+        }
+      ]
+    },
+    {
+      "case": "cancellation, shutdown, and restart leave no survivor",
+      "classification": "terminated",
+      "evidence": [
+        {
+          "command": "tool-broker-e2e",
+          "needle": "stop_all_cancels_and_joins_a_runtime_owned_execution"
+        },
+        {
+          "command": "tool-broker-e2e",
+          "needle": "startup_recovery_terminates_exact_retained_job_and_never_relaunches"
+        },
+        {
+          "command": "platform-windows-seams",
+          "needle": "explicit_cancellation_terminates_a_live_real_lpac_root"
+        },
+        {
+          "command": "platform-windows-seams",
+          "needle": "app_exit_and_crash_kill_a_live_real_lpac_root"
+        }
+      ]
+    },
+    {
+      "case": "stale approval UI and accessibility",
+      "classification": "supported",
+      "evidence": [
+        {
+          "command": "browser-tests",
+          "needle": "invalidates a replaced approval without resolving the stale digest"
+        },
+        {
+          "command": "browser-tests",
+          "needle": "confirms stop-all and passes reduced-motion, zoom, reflow, contrast, and axe"
+        }
+      ]
+    }
+  ],
+  "artifactSha256": {
+    "review.md": "sha256:0b2b75b2f1560255baeda9173304929723eae053869bb71c0adc1e1a7c13e7ae",
+    "known-limitations.md": "sha256:00e50351a4f332b57d6c6421cf9c777c4ce75ca351f14767dac5fb0bb412c5b6",
+    "toolchain.txt": "sha256:25c26e9c10fc4e9724da9c34ea6e874e9a0cc8832a09009fe9952b91ea79d396"
+  }
+}
