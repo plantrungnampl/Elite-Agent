@@ -1,3 +1,5 @@
+#[path = "support/rename.rs"]
+mod rename_support;
 mod support;
 
 use std::fs;
@@ -10,6 +12,7 @@ use local_agent_terminal_domain::{LeaseClaim, RunId, TaskId};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 
+use rename_support::rename_fixture;
 use support::{WorkspaceFixture, TASK_ID};
 
 #[test]
@@ -17,7 +20,7 @@ fn startup_reconciles_a_completed_worktree_before_exposing_ready() {
     let fixture = WorkspaceFixture::new();
     fixture.seed_present_workspace();
     let moved = fixture.root.path().join("moved-before-startup");
-    fs::rename(fixture.managed_worktree(), &moved).expect("move worktree");
+    rename_fixture(&fixture.managed_worktree(), &moved, "move worktree");
 
     let bootstrap = fixture.start();
     let runtime = bootstrap.workspace_runtime().expect("runtime");
@@ -38,7 +41,7 @@ fn failed_dashboard_inspection_revokes_new_monitor_authority() {
     let bootstrap = fixture.start();
     let runtime = bootstrap.workspace_runtime().expect("runtime");
     let moved_source = fixture.root.path().join("source-moved");
-    fs::rename(&fixture.source, &moved_source).expect("move source");
+    rename_fixture(&fixture.source, &moved_source, "move source");
 
     runtime
         .get_workspace_dashboard(WorkspaceDashboardRequestDto {
@@ -87,7 +90,7 @@ fn missing_worktree_enters_durable_recovery_without_stranding_the_monitor_lease(
     let bootstrap = fixture.start();
     let runtime = bootstrap.workspace_runtime().expect("runtime");
     let moved = fixture.root.path().join("moved-worktree");
-    fs::rename(fixture.managed_worktree(), &moved).expect("move worktree");
+    rename_fixture(&fixture.managed_worktree(), &moved, "move worktree");
 
     let dashboard = runtime
         .get_workspace_dashboard(WorkspaceDashboardRequestDto {
@@ -307,8 +310,12 @@ fn retry_and_drop_leave_no_monitor_thread_holding_workspace_adapters() {
     );
     drop(bootstrap);
     let moved = fixture.root.path().join("managed-workspaces-moved");
-    fs::rename(&fixture.workspace_root, &moved).expect("workspace root is not held");
-    fs::rename(&moved, &fixture.workspace_root).expect("restore workspace root");
+    rename_fixture(
+        &fixture.workspace_root,
+        &moved,
+        "workspace root is not held",
+    );
+    rename_fixture(&moved, &fixture.workspace_root, "restore workspace root");
 }
 
 fn acquire(run_id: &str, expected_fencing_epoch: u64) -> AcquireLease {

@@ -1,3 +1,6 @@
+#[path = "support/rename.rs"]
+mod rename_support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +27,8 @@ use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, Journale
 use local_agent_terminal_storage_sqlite::{CoreSystemRunRequest, SqliteStore};
 use rusqlite::Connection;
 use tempfile::TempDir;
+
+use rename_support::rename_fixture;
 
 const PROJECT_ID: &str = "project-1";
 const FENCE_ORDER_PROJECT_ID: &str = "project-fence-order";
@@ -675,7 +680,11 @@ fn startup_marks_unknown_operations_indeterminate_without_touching_git() {
     let fixture = WorkspaceFixture::new();
     fixture.seed_started_intent("future.unknown", IdempotencyClass::Queryable);
     let unavailable_source = fixture.root.path().join("source-unavailable");
-    fs::rename(&fixture.source, &unavailable_source).expect("hide source repository");
+    rename_fixture(
+        &fixture.source,
+        &unavailable_source,
+        "hide source repository",
+    );
 
     let bootstrap = fixture.start();
 
@@ -948,7 +957,7 @@ impl OnboardingFixture {
 
     fn replace_repository(&self) -> PathBuf {
         let displaced = self.source.with_file_name("displaced-source");
-        fs::rename(&self.source, &displaced).expect("displace repository");
+        rename_fixture(&self.source, &displaced, "displace repository");
         fs::create_dir(&self.source).expect("replacement source");
         commit_repository_with_format(&self.source, git2::ObjectFormat::Sha256);
         displaced
