@@ -23,7 +23,7 @@ test("M2 evidence is complete and internally consistent", () => {
 test("Windows CI runs containment before fresh M2 evidence verification", () => {
   const workflow = readFileSync(".github/workflows/ci.yml", "utf8");
   const containment = workflow.indexOf(
-    "cargo test -p local-agent-terminal-platform-windows --features test-seams --test filesystem_matrix --test process_matrix -- --test-threads=1",
+    "cargo test -p local-agent-terminal-platform-windows --features test-seams --test filesystem_matrix --test process_matrix",
   );
   const generate = workflow.indexOf("node scripts/run-m2-evidence.mjs");
   const verify = workflow.indexOf(

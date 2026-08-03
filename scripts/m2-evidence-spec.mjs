@@ -11,14 +11,8 @@ export const commands = [
     "rust-clippy",
     "cargo clippy --workspace --all-targets --all-features -- -D warnings",
   ],
-  [
-    "rust-tests",
-    "cargo test --workspace --all-targets -- --test-threads=1",
-  ],
-  [
-    "rust-all-features",
-    "cargo test --workspace --all-features -- --test-threads=1",
-  ],
+  ["rust-tests", "cargo test --workspace --all-targets"],
+  ["rust-all-features", "cargo test --workspace --all-features"],
   ["rust-doc", "cargo test --workspace --doc"],
   [
     "probe-format",
@@ -34,11 +28,11 @@ export const commands = [
   ],
   [
     "platform-windows",
-    "cargo test -p local-agent-terminal-platform-windows --test filesystem_matrix --test process_matrix -- --test-threads=1",
+    "cargo test -p local-agent-terminal-platform-windows --test filesystem_matrix --test process_matrix",
   ],
   [
     "platform-windows-seams",
-    "cargo test -p local-agent-terminal-platform-windows --features test-seams --test filesystem_matrix --test process_matrix -- --test-threads=1",
+    "cargo test -p local-agent-terminal-platform-windows --features test-seams --test filesystem_matrix --test process_matrix",
   ],
   [
     "tool-broker-e2e",

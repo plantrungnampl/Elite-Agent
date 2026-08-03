@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import {
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -19,9 +20,13 @@ const artifactRoot = join(root, "artifacts", "verification", "m2");
 const outputRoot = join(artifactRoot, "outputs");
 const manifestPath = join(artifactRoot, "manifest.json");
 const temporaryManifestPath = `${manifestPath}.tmp`;
+let isolatedTempRoot;
 
 try {
   assertEvidenceOnlyChanges(root);
+  isolatedTempRoot = mkdtempSync(join(os.tmpdir(), "m2-evidence-"));
+  process.env.TEMP = isolatedTempRoot;
+  process.env.TMP = isolatedTempRoot;
   mkdirSync(artifactRoot, { recursive: true });
   rmSync(outputRoot, { recursive: true, force: true });
   mkdirSync(outputRoot, { recursive: true });
@@ -67,6 +72,10 @@ try {
   rmSync(temporaryManifestPath, { force: true });
   console.error(`M2 evidence generation failed: ${error.message}`);
   process.exitCode = 1;
+} finally {
+  if (isolatedTempRoot !== undefined) {
+    rmSync(isolatedTempRoot, { recursive: true, force: true });
+  }
 }
 
 async function runCommand(name, command) {
