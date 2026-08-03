@@ -28,11 +28,11 @@ export const commands = [
   ],
   [
     "platform-windows",
-    "cargo test -p local-agent-terminal-platform-windows --test filesystem_matrix --test process_matrix",
+    "cargo test -p local-agent-terminal-platform-windows --test filesystem_matrix --test process_matrix -- --test-threads=1",
   ],
   [
     "platform-windows-seams",
-    "cargo test -p local-agent-terminal-platform-windows --features test-seams --test filesystem_matrix --test process_matrix",
+    "cargo test -p local-agent-terminal-platform-windows --features test-seams --test filesystem_matrix --test process_matrix -- --test-threads=1",
   ],
   [
     "tool-broker-e2e",

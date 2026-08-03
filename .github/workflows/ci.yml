@@ -24,7 +24,7 @@ jobs:
           toolchain: 1.97.1
           components: rustfmt, clippy
       - run: cargo test -p local-agent-terminal-tool-runtime --test security_matrix
-      - run: cargo test -p local-agent-terminal-platform-windows --features test-seams --test filesystem_matrix --test process_matrix
+      - run: cargo test -p local-agent-terminal-platform-windows --features test-seams --test filesystem_matrix --test process_matrix -- --test-threads=1
       - run: cargo test -p local-agent-terminal-bootstrap --test tool_broker_e2e --test tool_recovery
       - run: node scripts/run-m2-evidence.mjs
       - run: node scripts/verify-m2-evidence.mjs --require-approved
