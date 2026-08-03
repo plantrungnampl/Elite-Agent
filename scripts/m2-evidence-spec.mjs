@@ -11,8 +11,14 @@ export const commands = [
     "rust-clippy",
     "cargo clippy --workspace --all-targets --all-features -- -D warnings",
   ],
-  ["rust-tests", "cargo test --workspace --all-targets"],
-  ["rust-all-features", "cargo test --workspace --all-features"],
+  [
+    "rust-tests",
+    "cargo test --workspace --all-targets -- --test-threads=1",
+  ],
+  [
+    "rust-all-features",
+    "cargo test --workspace --all-features -- --test-threads=1",
+  ],
   ["rust-doc", "cargo test --workspace --doc"],
   [
     "probe-format",
