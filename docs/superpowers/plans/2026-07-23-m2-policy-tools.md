@@ -801,7 +801,7 @@ Add the smallest fixtures or adapter corrections needed for the matrix. Do not w
 
 Add evidence-contract tests that reject dirty tracked source outside `artifacts/verification/m2/**`, stale/non-ancestor source commits, missing/failed commands, skipped containment cases, mismatched output hashes, changed toolchain/platform, tampered review/limitations artifacts, absent post-final contract output, and any diff under the immutable design directory.
 
-- [ ] **Step 3 - Run the complete M2 gate from a clean source commit**
+- [x] **Step 3 - Run the complete M2 gate from a clean source commit**
 
 Commit the final production/test correction before generating evidence:
 
