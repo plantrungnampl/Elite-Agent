@@ -74,7 +74,12 @@ try {
   process.exitCode = 1;
 } finally {
   if (isolatedTempRoot !== undefined) {
-    rmSync(isolatedTempRoot, { recursive: true, force: true });
+    rmSync(isolatedTempRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 200,
+    });
   }
 }
 

@@ -144,13 +144,16 @@ fn discard_requires_confirmation_and_records_intent_before_the_exact_effect() {
         .expect_err("confirmation is required");
     assert!(fixture.managed_worktree().exists());
     assert_eq!(recovery_count(&fixture, "workspace.recovery.discard"), 0);
+    let refreshed = runtime
+        .get_workspace_dashboard(dashboard_request())
+        .expect("refreshed dashboard");
 
     let discarded = runtime
         .discard_workspace(ConfirmDiscardWorkspaceRequestDto {
             candidate_id,
             project_id: PROJECT_ID.to_owned(),
             task_id: TASK_ID.to_owned(),
-            expected_workspace_version: task.workspace_version.get(),
+            expected_workspace_version: refreshed.tasks[0].workspace_version.get(),
             confirmed: true,
         })
         .expect("discard");
