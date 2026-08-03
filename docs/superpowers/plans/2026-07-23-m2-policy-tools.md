@@ -840,13 +840,13 @@ node scripts/verify-m2-post-final-log.mjs
 
 Expected GREEN: all gates pass on Windows, the design diff is empty, evidence binds the exact source commit and every required containment classification, and post-final verifier contracts run without skip.
 
-- [ ] **Step 4 - Perform task-scoped and broad independent reviews**
+- [x] **Step 4 - Perform task-scoped and broad independent reviews**
 
 For each Task 1 through 9 commit, use a fresh reviewer to compare the task diff with this plan and the normative design. Fix every Critical or Important finding with a focused failing test, a minimal correction, fresh focused/full evidence as applicable, and a re-review.
 
 After Step 3, build one baseline-to-HEAD review package. A separate reviewer checks all M2 exit criteria and specifically searches for ambient OS paths, fail-open policy/scanner errors, incomplete canonical binding, approval TOCTOU, stale-writer effects, unsafe retries, FK bypass, subprocess/shell/PATH access outside `platform-windows`, Job escape, network fallback, audit omissions, raw React capabilities, accessibility regressions, and hidden M3/M5 scope. M2 is not approved until no Critical or Important finding remains and evidence is fresh.
 
-- [ ] **Step 5 - Finalize evidence and commit approval artifacts**
+- [x] **Step 5 - Finalize evidence and commit approval artifacts**
 
 Write `review.md` with independent spec and code-quality verdicts and `known-limitations.md` even if it says `None`. Regenerate the artifact hashes, verify them, and commit only evidence output:
 
