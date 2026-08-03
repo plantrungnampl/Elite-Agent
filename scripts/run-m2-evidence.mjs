@@ -24,10 +24,10 @@ let isolatedTempRoot;
 
 try {
   assertEvidenceOnlyChanges(root);
-  isolatedTempRoot = mkdtempSync(join(os.tmpdir(), "m2-evidence-"));
+  mkdirSync(artifactRoot, { recursive: true });
+  isolatedTempRoot = mkdtempSync(join(artifactRoot, ".tmp-"));
   process.env.TEMP = isolatedTempRoot;
   process.env.TMP = isolatedTempRoot;
-  mkdirSync(artifactRoot, { recursive: true });
   rmSync(outputRoot, { recursive: true, force: true });
   mkdirSync(outputRoot, { recursive: true });
   rmSync(join(artifactRoot, "post-final-contracts.log"), { force: true });
