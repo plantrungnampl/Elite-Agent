@@ -239,11 +239,7 @@ fn locality_name(value: ActorLocality) -> &'static str {
 }
 
 fn trust_tier_name(value: TrustTier) -> &'static str {
-    match value {
-        TrustTier::CoreAdapter => "core_adapter",
-        TrustTier::BrokeredProcess => "brokered_process",
-        TrustTier::IsolatedWorker => "isolated_worker",
-    }
+    value.as_str()
 }
 
 fn resource_class_name(value: ResourceClass) -> &'static str {

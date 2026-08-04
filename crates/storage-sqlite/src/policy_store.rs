@@ -3,7 +3,7 @@ use local_agent_terminal_application::{
     SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
-    ActorLocality, CapabilityRef, PolicyEffect, ResourceClass, TaskRisk, TrustTier,
+    ActorLocality, CapabilityRef, PolicyEffect, ResourceClass, TaskRisk,
 };
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
@@ -148,11 +148,7 @@ pub(crate) fn actor_json(request: &local_agent_terminal_domain::PolicyRequest) -
     json!({
         "connectionId": request.actor.connection_id,
         "agentId": request.actor.agent_id,
-        "trustTier": match request.actor.trust_tier {
-            TrustTier::CoreAdapter => "core_adapter",
-            TrustTier::BrokeredProcess => "brokered_process",
-            TrustTier::IsolatedWorker => "isolated_worker",
-        },
+        "trustTier": request.actor.trust_tier.as_str(),
         "locality": match request.actor.locality {
             ActorLocality::Local => "local",
             ActorLocality::Cloud => "cloud",

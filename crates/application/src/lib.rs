@@ -3,12 +3,11 @@
 pub use local_agent_terminal_domain::{
     ActorId, ActorLocality, AgentCancellationReceipt, AgentClaim, AgentDescriptor, AgentError,
     AgentEvidenceRef, AgentRunMessage, AgentRunReceipt, AgentRunSnapshot, AgentRunStatus,
-    AgentRunTerminal, AgentTrustTier, AgentUsage, ArtifactId, BoundAgentConnection,
-    BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig,
-    CancelAgentRun, FencingToken, GitObjectId, LeaseClaim, Phase, PolicyAction, PolicyActor,
-    PolicyResource, ProjectId, RepositoryId, ResourceClass, RunId, Sequence, Sha256Digest,
-    TaskBranch, TaskId, TaskRisk, TrustTier, WorkspaceFingerprint, WorkspaceVersion, WorktreeId,
-    MAX_GENERATION_PARAMETERS_BYTES,
+    AgentRunTerminal, AgentUsage, ArtifactId, BoundAgentConnection, BoundAgentRunRequest,
+    BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, CancelAgentRun, FencingToken,
+    GitObjectId, LeaseClaim, Phase, PolicyAction, PolicyActor, PolicyResource, ProjectId,
+    RepositoryId, ResourceClass, RunId, Sequence, Sha256Digest, TaskBranch, TaskId, TaskRisk,
+    TrustTier, WorkspaceFingerprint, WorkspaceVersion, WorktreeId, MAX_GENERATION_PARAMETERS_BYTES,
 };
 
 mod agent;

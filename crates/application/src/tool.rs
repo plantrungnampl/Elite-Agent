@@ -2841,11 +2841,7 @@ struct RawPolicyResource {
 }
 
 const fn actor_trust_tier(value: TrustTier) -> &'static str {
-    match value {
-        TrustTier::CoreAdapter => "core_adapter",
-        TrustTier::BrokeredProcess => "brokered_process",
-        TrustTier::IsolatedWorker => "isolated_worker",
-    }
+    value.as_str()
 }
 
 const fn actor_locality(value: ActorLocality) -> &'static str {
@@ -2895,6 +2891,7 @@ fn parse_actor_trust_tier(value: &str) -> Result<TrustTier, PortError> {
         "core_adapter" => Ok(TrustTier::CoreAdapter),
         "brokered_process" => Ok(TrustTier::BrokeredProcess),
         "isolated_worker" => Ok(TrustTier::IsolatedWorker),
+        "full_access_legacy" => Ok(TrustTier::FullAccessLegacy),
         _ => Err(invalid_input()),
     }
 }

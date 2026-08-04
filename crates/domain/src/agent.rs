@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::{ArtifactId, RunId, Sha256Digest, TaskId, Timestamp, TrustTier};
+use sha2::{Digest, Sha256};
 
 const MAX_IDENTIFIER_LENGTH: usize = 256;
 const MAX_DESCRIPTOR_TEXT_LENGTH: usize = MAX_IDENTIFIER_LENGTH;
@@ -80,43 +81,11 @@ impl AgentRunStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentTrustTier {
-    CoreAdapter,
-    BrokeredProcess,
-    IsolatedWorker,
-    FullAccessLegacy,
-}
-
-impl AgentTrustTier {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::CoreAdapter => "core_adapter",
-            Self::BrokeredProcess => "brokered_process",
-            Self::IsolatedWorker => "isolated_worker",
-            Self::FullAccessLegacy => "full_access_legacy",
-        }
-    }
-
-    pub const fn trust_tier(self) -> Option<TrustTier> {
-        match self {
-            Self::CoreAdapter => Some(TrustTier::CoreAdapter),
-            Self::BrokeredProcess => Some(TrustTier::BrokeredProcess),
-            Self::IsolatedWorker => Some(TrustTier::IsolatedWorker),
-            Self::FullAccessLegacy => None,
-        }
-    }
-
-    pub const fn requires_containment(self) -> bool {
-        matches!(self, Self::BrokeredProcess | Self::IsolatedWorker)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDescriptor {
     pub agent_id: String,
     pub display_name: String,
-    pub trust_tier: AgentTrustTier,
+    pub trust_tier: TrustTier,
     pub manifest_json: Vec<u8>,
     pub manifest_digest: Sha256Digest,
     pub executable_digest: Option<Sha256Digest>,
@@ -129,6 +98,7 @@ impl AgentDescriptor {
         if !valid_identifier(&self.agent_id)
             || !valid_text(&self.display_name, MAX_DESCRIPTOR_TEXT_LENGTH)
             || !valid_json_object(&self.manifest_json, MAX_MANIFEST_BYTES)
+            || !digest_matches(&self.manifest_json, &self.manifest_digest)
         {
             return Err(AgentError::InvalidDescriptor);
         }
@@ -183,11 +153,15 @@ pub struct BoundGenerationParameters {
 
 impl BoundGenerationParameters {
     pub fn validate(&self) -> Result<(), AgentError> {
-        if valid_json_object(&self.canonical_json, MAX_GENERATION_PARAMETERS_BYTES) {
-            Ok(())
-        } else {
-            Err(AgentError::InvalidGenerationParameters)
+        let Some(canonical) =
+            canonical_json_object(&self.canonical_json, MAX_GENERATION_PARAMETERS_BYTES)
+        else {
+            return Err(AgentError::InvalidGenerationParameters);
+        };
+        if canonical != self.canonical_json || !digest_matches(&canonical, &self.digest) {
+            return Err(AgentError::InvalidGenerationParameters);
         }
+        Ok(())
     }
 }
 
@@ -200,7 +174,7 @@ pub struct BoundRunConfig {
     pub context_package_id: String,
     pub effective_context_artifact_id: ArtifactId,
     pub effective_context_digest: Sha256Digest,
-    pub trust_tier: AgentTrustTier,
+    pub trust_tier: TrustTier,
     pub manifest_digest: Sha256Digest,
     pub executable_digest: Option<Sha256Digest>,
     pub contract_version: String,
@@ -244,7 +218,7 @@ impl BoundRunConfig {
 pub struct BoundAgentConnection {
     pub connection_id: String,
     pub agent_id: String,
-    pub trust_tier: AgentTrustTier,
+    pub trust_tier: TrustTier,
     pub manifest_digest: Sha256Digest,
     pub executable_digest: Option<Sha256Digest>,
     pub contract_version: String,
@@ -266,7 +240,12 @@ impl BoundAgentConnection {
             self.executable_digest.as_ref(),
             false,
             true,
-        )
+        )?;
+        if connection_binding_digest_matches(self) {
+            Ok(())
+        } else {
+            Err(AgentError::InvalidConnection)
+        }
     }
 }
 
@@ -613,15 +592,15 @@ impl fmt::Display for AgentError {
 impl std::error::Error for AgentError {}
 
 fn validate_trust_binding(
-    trust_tier: AgentTrustTier,
+    trust_tier: TrustTier,
     executable_digest: Option<&Sha256Digest>,
     enabled: bool,
     containment_verified: bool,
 ) -> Result<(), AgentError> {
-    if matches!(trust_tier, AgentTrustTier::CoreAdapter) && executable_digest.is_none() {
+    if matches!(trust_tier, TrustTier::CoreAdapter) && executable_digest.is_none() {
         return Err(AgentError::CoreAdapterDigestRequired);
     }
-    if matches!(trust_tier, AgentTrustTier::FullAccessLegacy) && enabled {
+    if matches!(trust_tier, TrustTier::FullAccessLegacy) && enabled {
         return Err(AgentError::LegacyAgentEnabled);
     }
     if enabled && trust_tier.requires_containment() && !containment_verified {
@@ -646,4 +625,37 @@ fn valid_json_object(value: &[u8], maximum_length: usize) -> bool {
         serde_json::from_slice::<serde_json::Value>(value),
         Ok(serde_json::Value::Object(_))
     )
+}
+
+fn canonical_json_object(value: &[u8], maximum_length: usize) -> Option<Vec<u8>> {
+    if value.is_empty() || value.len() > maximum_length {
+        return None;
+    }
+    let parsed = serde_json::from_slice::<serde_json::Value>(value).ok()?;
+    if !parsed.is_object() {
+        return None;
+    }
+    serde_json_canonicalizer::to_vec(&parsed).ok()
+}
+
+fn connection_binding_digest_matches(connection: &BoundAgentConnection) -> bool {
+    let value = serde_json::json!({
+        "schema": "agent-connection-binding.v1",
+        "identity": {
+            "connectionId": connection.connection_id,
+            "agentId": connection.agent_id,
+        },
+        "manifestDigest": connection.manifest_digest.as_str(),
+        "executableDigest": connection.executable_digest.as_ref().map(Sha256Digest::as_str),
+        "trustTier": connection.trust_tier.as_str(),
+        "contractVersion": connection.contract_version,
+        "adapterVersion": connection.adapter_version,
+    });
+    serde_json_canonicalizer::to_vec(&value)
+        .ok()
+        .is_some_and(|canonical| digest_matches(&canonical, &connection.binding_digest))
+}
+
+fn digest_matches(bytes: &[u8], expected: &Sha256Digest) -> bool {
+    format!("sha256:{:x}", Sha256::digest(bytes)) == expected.as_str()
 }

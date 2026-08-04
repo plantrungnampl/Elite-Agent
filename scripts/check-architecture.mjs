@@ -70,7 +70,12 @@ function verifyCargo(metadata, requireM3) {
       throw new Error(`M3 workspace members are required: ${missing.join(", ")}`);
     }
   }
-  const domainAllowed = new Set(["serde", "serde_json"]);
+  const domainAllowed = new Set([
+    "serde",
+    "serde_json",
+    "serde_json_canonicalizer",
+    "sha2",
+  ]);
   if (allDependencies(domain).some((dependency) => workspace.has(dependency.name))) {
     throw new Error("domain may not depend on workspace packages");
   }

@@ -11,7 +11,7 @@ mod workspace;
 pub use agent::{
     AgentCancellationReceipt, AgentClaim, AgentDescriptor, AgentError, AgentEvidenceRef,
     AgentRunMessage, AgentRunReceipt, AgentRunSnapshot, AgentRunStatus, AgentRunTerminal,
-    AgentTrustTier, AgentUsage, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
+    AgentUsage, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
     BoundGenerationParameters, BoundRunConfig, CancelAgentRun, MAX_GENERATION_PARAMETERS_BYTES,
 };
 pub use event::{Effect, GuardEvaluations, GuardName, WorkflowEvent};

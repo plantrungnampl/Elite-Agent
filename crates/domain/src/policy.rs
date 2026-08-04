@@ -18,6 +18,22 @@ pub enum TrustTier {
     CoreAdapter,
     BrokeredProcess,
     IsolatedWorker,
+    FullAccessLegacy,
+}
+
+impl TrustTier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CoreAdapter => "core_adapter",
+            Self::BrokeredProcess => "brokered_process",
+            Self::IsolatedWorker => "isolated_worker",
+            Self::FullAccessLegacy => "full_access_legacy",
+        }
+    }
+
+    pub const fn requires_containment(self) -> bool {
+        matches!(self, Self::BrokeredProcess | Self::IsolatedWorker)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -948,11 +948,7 @@ const fn classification_name(classification: SafeErrorClassification) -> &'stati
 }
 
 const fn trust_tier_name(trust_tier: TrustTier) -> &'static str {
-    match trust_tier {
-        TrustTier::CoreAdapter => "core_adapter",
-        TrustTier::BrokeredProcess => "brokered_process",
-        TrustTier::IsolatedWorker => "isolated_worker",
-    }
+    trust_tier.as_str()
 }
 
 const fn network_profile_name(network_profile: NetworkProfile) -> &'static str {

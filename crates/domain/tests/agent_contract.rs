@@ -1,9 +1,14 @@
 use local_agent_terminal_domain::{
     AgentClaim, AgentDescriptor, AgentEvidenceRef, AgentRunMessage, AgentRunSnapshot,
-    AgentRunStatus, AgentRunTerminal, AgentTrustTier, AgentUsage, ArtifactId, BoundAgentConnection,
+    AgentRunStatus, AgentRunTerminal, AgentUsage, ArtifactId, BoundAgentConnection,
     BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, RunId,
-    Sha256Digest, TaskId, Timestamp, MAX_GENERATION_PARAMETERS_BYTES,
+    Sha256Digest, TaskId, Timestamp, TrustTier, MAX_GENERATION_PARAMETERS_BYTES,
 };
+
+const EMPTY_JSON_DIGEST: &str =
+    "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+const CONNECTION_BINDING_DIGEST: &str =
+    "sha256:6e171d4e7a1d7b7db1c14807e8a2a5cc9093eac495d66a2ca76439264d09b7d5";
 
 #[test]
 fn agent_run_status_moves_forward_and_never_leaves_a_terminal_status() {
@@ -42,10 +47,52 @@ fn descriptor_rejects_unbounded_identity_missing_core_digest_and_enabled_legacy(
     assert!(missing_core_digest.validate().is_err());
 
     let mut legacy = descriptor();
-    legacy.trust_tier = AgentTrustTier::FullAccessLegacy;
+    legacy.trust_tier = TrustTier::FullAccessLegacy;
     assert!(legacy.validate().is_err());
 
     assert!(Sha256Digest::new("sha256:not-a-digest").is_err());
+}
+
+#[test]
+fn generation_parameters_reject_noncanonical_json() {
+    let mut noncanonical_parameters = bound_run();
+    noncanonical_parameters
+        .run_config
+        .generation_parameters
+        .canonical_json = br#"{"z":1,"a":2}"#.to_vec();
+    assert!(noncanonical_parameters
+        .run_config
+        .generation_parameters
+        .validate()
+        .is_err());
+}
+
+#[test]
+fn generation_parameters_reject_digest_mismatch() {
+    let mut mismatched_parameters = bound_run();
+    mismatched_parameters
+        .run_config
+        .generation_parameters
+        .digest = digest('a');
+    assert!(mismatched_parameters
+        .run_config
+        .generation_parameters
+        .validate()
+        .is_err());
+}
+
+#[test]
+fn descriptor_rejects_manifest_digest_mismatch() {
+    let mut mismatched_manifest = descriptor();
+    mismatched_manifest.manifest_digest = digest('c');
+    assert!(mismatched_manifest.validate().is_err());
+}
+
+#[test]
+fn connection_rejects_binding_digest_mismatch() {
+    let mut mismatched_connection = bound_run().connection;
+    mismatched_connection.binding_digest = digest('f');
+    assert!(mismatched_connection.validate().is_err());
 }
 
 #[test]
@@ -95,9 +142,9 @@ fn descriptor() -> AgentDescriptor {
     AgentDescriptor {
         agent_id: "agent-1".to_owned(),
         display_name: "Agent One".to_owned(),
-        trust_tier: AgentTrustTier::CoreAdapter,
+        trust_tier: TrustTier::CoreAdapter,
         manifest_json: br#"{}"#.to_vec(),
-        manifest_digest: digest('a'),
+        manifest_digest: empty_json_digest(),
         executable_digest: Some(digest('b')),
         enabled: true,
         containment_verified: true,
@@ -106,7 +153,7 @@ fn descriptor() -> AgentDescriptor {
 
 fn bound_run() -> BoundAgentRunRequest {
     let task_id = task_id("task-1");
-    let manifest_digest = digest('a');
+    let manifest_digest = empty_json_digest();
     let executable_digest = Some(digest('b'));
     let context_digest = digest('c');
     let policy_digest = digest('d');
@@ -140,7 +187,7 @@ fn bound_run() -> BoundAgentRunRequest {
             context_package_id: "context-1".to_owned(),
             effective_context_artifact_id: artifact_id("artifact-context-1"),
             effective_context_digest: context_digest,
-            trust_tier: AgentTrustTier::CoreAdapter,
+            trust_tier: TrustTier::CoreAdapter,
             manifest_digest: manifest_digest.clone(),
             executable_digest: executable_digest.clone(),
             contract_version: "1.0".to_owned(),
@@ -149,7 +196,7 @@ fn bound_run() -> BoundAgentRunRequest {
             model_id: "model-1".to_owned(),
             generation_parameters: BoundGenerationParameters {
                 canonical_json: br#"{}"#.to_vec(),
-                digest: digest('e'),
+                digest: empty_json_digest(),
             },
             prompt_template_version: "prompt-1".to_owned(),
             response_schema_version: "message-1".to_owned(),
@@ -158,12 +205,12 @@ fn bound_run() -> BoundAgentRunRequest {
         connection: BoundAgentConnection {
             connection_id: "connection-1".to_owned(),
             agent_id: "agent-1".to_owned(),
-            trust_tier: AgentTrustTier::CoreAdapter,
+            trust_tier: TrustTier::CoreAdapter,
             manifest_digest,
             executable_digest,
             contract_version: "1.0".to_owned(),
             adapter_version: "adapter-1".to_owned(),
-            binding_digest: digest('f'),
+            binding_digest: connection_binding_digest(),
         },
         supersedes_run_id: None,
     }
@@ -219,6 +266,14 @@ fn artifact_id(value: &str) -> ArtifactId {
 
 fn digest(value: char) -> Sha256Digest {
     Sha256Digest::new(format!("sha256:{}", value.to_string().repeat(64))).unwrap()
+}
+
+fn empty_json_digest() -> Sha256Digest {
+    Sha256Digest::new(EMPTY_JSON_DIGEST).unwrap()
+}
+
+fn connection_binding_digest() -> Sha256Digest {
+    Sha256Digest::new(CONNECTION_BINDING_DIGEST).unwrap()
 }
 
 fn run_id(value: &str) -> RunId {
