@@ -112,7 +112,7 @@ impl NdjsonCodec {
 
 `ProtocolFrame` is the `typify::import_types!` result from `../../docs/multi-agent-terminal-design/schemas/agent-protocol.v1.schema.json`, re-exported behind stable local aliases where generated names are awkward. The normative schema remains the single source; do not copy or edit it.
 
-- [ ] **Step 1 - Write failing schema/codec tests**
+- [x] **Step 1 - Write failing schema/codec tests**
 
 Load every normative example and round-trip it. Reject missing/number request IDs, unknown required structure, request IDs over 128 bytes, invalid origin prefixes, malformed UTF-8/JSON, empty/multiple frames, embedded raw newline, and exact/one-byte-over configured limits. Assert encoding always returns exactly one LF-terminated UTF-8 object and never logs frame content on error.
 
@@ -120,11 +120,11 @@ Load every normative example and round-trip it. Reject missing/number request ID
 cargo test -p local-agent-terminal-agent-protocol --test schema_types --test codec
 ```
 
-- [ ] **Step 2 - Add generated types and minimum codec**
+- [x] **Step 2 - Add generated types and minimum codec**
 
 Use `typify = "0.7"`, `serde`, and `serde_json`; do not add a second JSON Schema validator. Check byte bounds before deserialization, rely on generated schema constraints for payload shape, and perform only protocol-specific checks not expressible by generated serde types.
 
-- [ ] **Step 3 - Verify and commit**
+- [x] **Step 3 - Verify and commit**
 
 ```powershell
 cargo fmt --all -- --check

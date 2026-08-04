@@ -2,6 +2,7 @@
 members = [
     "apps/desktop/src-tauri",
     "crates/application",
+    "crates/agent-protocol",
     "crates/bootstrap",
     "crates/domain",
     "crates/policy-engine",
