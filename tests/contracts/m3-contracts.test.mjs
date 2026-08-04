@@ -108,6 +108,60 @@ test("architecture checker rejects provider credentials through environment alia
   }
 });
 
+test("architecture checker rejects environment references before invocation", () => {
+  for (const source of [
+    "const CREDENTIAL_ENV: &str = \"OPENAI_API_KEY\";\nlet read_environment = std::env::var;\nlet _api_key = read_environment(CREDENTIAL_ENV);\n",
+    "use std as system;\nlet read_environment = system::env::var;\n",
+    "use std::env::{self as environment};\nlet read_environment = environment::var;\n",
+    "use std::{env as environment};\nlet read_environment = environment::var;\n",
+    "use std::env::{var as read_environment};\nlet _lookup = read_environment;\n",
+    "use std::{env::var as read_environment};\nlet _lookup = read_environment;\n",
+  ]) {
+    withM3Source({ "crates/provider-openai/src/lib.rs": source }, (directory) => {
+      assert.throws(
+        () => run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+        /provider credentials may not be read from environment/,
+      );
+    });
+  }
+});
+
+test("architecture checker rejects environment macro aliases", () => {
+  for (const source of [
+    "use env as read_environment;\nlet _api_key = read_environment!(\"OPENAI_API_KEY\");\n",
+    "use option_env as read_environment;\nlet _api_key = read_environment!(\"OPENAI_API_KEY\");\n",
+    "use { env as read_environment };\nlet _api_key = read_environment!(\"OPENAI_API_KEY\");\n",
+    "use { option_env as read_environment };\nlet _api_key = read_environment!(\"OPENAI_API_KEY\");\n",
+  ]) {
+    withM3Source({ "crates/provider-openai/src/lib.rs": source }, (directory) => {
+      assert.throws(
+        () => run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+        /provider credentials may not be read from environment/,
+      );
+    });
+  }
+});
+
+test("architecture checker mutation-checks every forbidden environment accessor", () => {
+  const allowed = "let _directory = std::env::temp_dir();\n";
+  withM3Source({ "crates/agent-runtime/src/lib.rs": allowed }, (directory) => {
+    assert.match(
+      run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+      /architecture contracts: ok/,
+    );
+  });
+
+  for (const accessor of ["var", "var_os", "vars", "vars_os"]) {
+    const mutated = allowed.replace("temp_dir()", accessor);
+    withM3Source({ "crates/agent-runtime/src/lib.rs": mutated }, (directory) => {
+      assert.throws(
+        () => run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+        /provider credentials may not be read from environment/,
+      );
+    });
+  }
+});
+
 test("architecture checker rejects variable-indirected environment lookups", () => {
   for (const lookup of ["var", "var_os"]) {
     withM3Source({
@@ -179,12 +233,20 @@ test("architecture checker allows narrowly justified environment access", () => 
 test("architecture checker confines justified environment access to exact calls", () => {
   for (const [path, source] of [
     [
+      "crates/agent-runtime/src/lib.rs",
+      "let _temporary_directory = std::env::temp_dir;\n",
+    ],
+    [
       "crates/repository-git/src/paths.rs",
       "let _environment = std::env::vars_os();\n",
     ],
     [
       "crates/storage-sqlite/src/other.rs",
       "let _version = env!(\"CARGO_PKG_VERSION\");\n",
+    ],
+    [
+      "crates/storage-sqlite/src/migrations.rs",
+      "let _version = option_env!(\"CARGO_PKG_VERSION\");\n",
     ],
   ]) {
     withM3Source({ [path]: source }, (directory) => {

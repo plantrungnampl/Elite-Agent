@@ -336,105 +336,65 @@ function verifyM3Sources(sourceRoot) {
 }
 
 function hasForbiddenEnvironmentAccess(source, local) {
-  return environmentAccesses(source).some(
-    (access) => !isAllowedEnvironmentAccess(source, local, access),
-  );
+  const code = maskReviewedEnvironmentAccesses(source, local);
+  return hasRuntimeEnvironmentReference(code) || hasEnvironmentMacroReference(code);
 }
 
-function environmentAccesses(source) {
+function maskReviewedEnvironmentAccesses(source, local) {
   const code = rustCodeMask(source) ?? source;
-  const standardLibraryImports = [
-    ...code.matchAll(/\buse\s+std\b[\s\S]*?;/g),
-    ...code.matchAll(/\bextern\s+crate\s+std\b[\s\S]*?;/g),
-  ].map((match) => match[0]);
-  const stdAliases = [
-    "std",
-    ...standardLibraryImports.flatMap((statement) =>
-      [...statement.matchAll(/\bstd\s+as\s+([A-Za-z_]\w*)/g)].map((match) => match[1]),
-    ),
-  ];
-  const envAliases = [
-    ...(standardLibraryImports.some((statement) => /\benv\b/.test(statement)) ? ["env"] : []),
-    ...standardLibraryImports.flatMap((statement) =>
-      [...statement.matchAll(/\benv\s+as\s+([A-Za-z_]\w*)/g)].map((match) => match[1]),
-    ),
-  ];
-  const accesses = [
-    ...runtimeEnvironmentAccesses(code, stdAliases, "::env::"),
-    ...runtimeEnvironmentAccesses(code, envAliases, "::"),
-    ...directEnvironmentImportAccesses(code, standardLibraryImports),
-    ...compileTimeEnvironmentAccesses(code),
-  ];
-  return accesses;
+  const mask = code.split("");
+  maskReviewedMatches(mask, code, source, /\bstd::env::temp_dir\s*\(\s*\)/g);
+  if (local === "crates/storage-sqlite/src/migrations.rs") {
+    maskReviewedMatches(mask, code, source, /\benv!\s*\(\s*"CARGO_PKG_VERSION"\s*\)/g);
+  }
+  if (local === "crates/repository-git/src/paths.rs") {
+    maskReviewedGitEnvironmentGuard(mask, code, source);
+  }
+  return mask.join("");
 }
 
-function runtimeEnvironmentAccesses(source, aliases, separator) {
-  if (aliases.length === 0) return [];
-  const matcher = new RegExp(
-    `\\b(?:${aliases.join("|")})${separator}(var|var_os|vars|vars_os)\\s*\\(`,
-    "g",
-  );
-  return [...source.matchAll(matcher)].map((match) => ({
-    index: match.index,
-    kind: "runtime",
-    name: match[1],
-  }));
-}
-
-function directEnvironmentImportAccesses(source, standardLibraryImports) {
-  const aliases = [];
-  for (const statement of standardLibraryImports) {
-    for (const match of statement.matchAll(
-      /\benv::(var|var_os|vars|vars_os)(?:\s+as\s+([A-Za-z_]\w*))?\s*(?=,|;|\})/g,
-    )) {
-      aliases.push([match[2] ?? match[1], match[1]]);
-    }
-    for (const match of statement.matchAll(/\benv::\{([^}]*)\}/g)) {
-      for (const entry of match[1].split(",")) {
-        const imported = entry.trim().match(/^(var|var_os|vars|vars_os)(?:\s+as\s+([A-Za-z_]\w*))?$/);
-        if (imported) aliases.push([imported[2] ?? imported[1], imported[1]]);
-      }
-    }
-    if (/\benv::\*/.test(statement)) {
-      aliases.push(...["var", "var_os", "vars", "vars_os"].map((name) => [name, name]));
+function maskReviewedMatches(mask, code, source, matcher) {
+  for (const match of source.matchAll(matcher)) {
+    if (code[match.index] === source[match.index]) {
+      maskRange(mask, match.index, match.index + match[0].length);
     }
   }
-  return aliases.flatMap(([alias, name]) =>
-    [...source.matchAll(new RegExp(`\\b${alias}\\s*\\(`, "g"))].map((match) => ({
-      index: match.index,
-      kind: "runtime",
-      name,
-    })),
-  );
 }
 
-function compileTimeEnvironmentAccesses(source) {
-  return [...source.matchAll(/\b(env|option_env)!\s*\(/g)].map((match) => ({
-    index: match.index,
-    kind: "compile-time",
-    name: match[1],
-  }));
-}
-
-function isAllowedEnvironmentAccess(source, local, access) {
-  if (
-    access.kind === "compile-time"
-    && access.name === "env"
-    && local === "crates/storage-sqlite/src/migrations.rs"
-  ) {
-    return /^env!\s*\(\s*"CARGO_PKG_VERSION"\s*\)/.test(source.slice(access.index));
-  }
-  return (
-    access.kind === "runtime"
-    && access.name === "vars_os"
-    && local === "crates/repository-git/src/paths.rs"
-    && isGitEnvironmentGuard(source, access.index)
-  );
-}
-
-function isGitEnvironmentGuard(source, index) {
+function maskReviewedGitEnvironmentGuard(mask, code, source) {
   const guard = /fn\s+reject_git_environment\s*\(\s*\)\s*->\s*Result\s*<\s*\(\s*\)\s*,\s*PortError\s*>\s*\{\s*for\s*\(\s*name\s*,\s*_\s*\)\s*in\s*std::env::vars_os\s*\(\s*\)\s*\{\s*if\s+name\s*\.to_string_lossy\s*\(\s*\)\s*\.to_ascii_uppercase\s*\(\s*\)\s*\.starts_with\s*\(\s*"GIT_"\s*\)\s*\{\s*return\s+Err\s*\(\s*conflict\s*\(\s*\)\s*\)\s*;\s*\}\s*\}\s*Ok\s*\(\s*\(\s*\)\s*\)\s*\}/.exec(source);
-  return guard !== null && index >= guard.index && index < guard.index + guard[0].length;
+  if (guard === null) return;
+  const access = /\bstd::env::vars_os\s*\(\s*\)/.exec(guard[0]);
+  if (access === null) return;
+  const index = guard.index + access.index;
+  if (code[index] === source[index]) maskRange(mask, index, index + access[0].length);
+}
+
+function hasRuntimeEnvironmentReference(code) {
+  const aliases = [
+    "std",
+    ...standardLibraryAliases(code),
+  ];
+  const prefix = `(?:${aliases.join("|")})`;
+  return (
+    new RegExp(`\\b${prefix}\\s*::\\s*env\\b`).test(code)
+    || new RegExp(`\\b${prefix}\\s*::\\s*\\{[^}]*\\benv\\b`).test(code)
+  );
+}
+
+function standardLibraryAliases(code) {
+  return [
+    ...code.matchAll(/\b(?:use|extern\s+crate)\s+(?:::)?std\s+as\s+([A-Za-z_]\w*)/g),
+    ...code.matchAll(/\buse\s+(?:::)?std\s*::\s*\{[^}]*\bself\s+as\s+([A-Za-z_]\w*)/g),
+  ].map((match) => match[1]);
+}
+
+function hasEnvironmentMacroReference(code) {
+  return (
+    /\b(?:env|option_env)\s*!/.test(code)
+    || /\b(?:pub(?:\([^)]*\))?\s+)?use\s+(?:(?:::)?(?:[A-Za-z_]\w*::)*)?(?:env|option_env)\b/.test(code)
+    || /\b(?:pub(?:\([^)]*\))?\s+)?use\s*(?:(?:::)?(?:[A-Za-z_]\w*::)*)?\{[^}]*\b(?:env|option_env)\b/.test(code)
+  );
 }
 
 function hasProviderName(source) {
