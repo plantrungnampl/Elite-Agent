@@ -93,18 +93,61 @@ test("architecture checker confines M3 provider and runtime boundaries", () => {
   }
 });
 
-test("architecture checker rejects provider credentials through a std alias", () => {
-  withM3Source({
-    "crates/repository-git/src/lib.rs": "use std as system;\nlet _api_key = system::env::var(\"OPENAI_API_KEY\");\n",
-  }, (directory) => {
-    assert.throws(
-      () => run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
-      /provider credentials may not be read from environment/,
-    );
-  });
+test("architecture checker rejects provider credentials through environment aliases", () => {
+  for (const source of [
+    "use std as system;\nconst CREDENTIAL_ENV: &str = \"OPENAI_API_KEY\";\nlet _api_key = system::env::var(CREDENTIAL_ENV);\n",
+    "use std::env::{var as read_environment};\nconst CREDENTIAL_ENV: &str = \"OPENAI_API_KEY\";\nlet _api_key = read_environment(CREDENTIAL_ENV);\n",
+    "use std::env::var;\nconst CREDENTIAL_ENV: &str = \"OPENAI_API_KEY\";\nlet _api_key = var(CREDENTIAL_ENV);\n",
+  ]) {
+    withM3Source({ "crates/repository-git/src/lib.rs": source }, (directory) => {
+      assert.throws(
+        () => run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+        /provider credentials may not be read from environment/,
+      );
+    });
+  }
 });
 
-test("architecture checker allows noncredential environment access", () => {
+test("architecture checker rejects variable-indirected environment lookups", () => {
+  for (const lookup of ["var", "var_os"]) {
+    withM3Source({
+      "crates/provider-openai/src/lib.rs": `const CREDENTIAL_ENV: &str = "OPENAI_API_KEY";\nlet _api_key = std::env::${lookup}(CREDENTIAL_ENV);\n`,
+    }, (directory) => {
+      assert.throws(
+        () => run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+        /provider credentials may not be read from environment/,
+      );
+    });
+  }
+});
+
+test("architecture checker rejects runtime environment enumeration", () => {
+  for (const lookup of ["vars", "vars_os"]) {
+    withM3Source({
+      "crates/provider-openai/src/lib.rs": `let _environment = std::env::${lookup}();\n`,
+    }, (directory) => {
+      assert.throws(
+        () => run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+        /provider credentials may not be read from environment/,
+      );
+    });
+  }
+});
+
+test("architecture checker rejects compile-time credential environment macros", () => {
+  for (const macro of ["env", "option_env"]) {
+    withM3Source({
+      "crates/provider-openai/src/lib.rs": `let _api_key = ${macro}!("OPENAI_API_KEY");\n`,
+    }, (directory) => {
+      assert.throws(
+        () => run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+        /provider credentials may not be read from environment/,
+      );
+    });
+  }
+});
+
+test("architecture checker allows narrowly justified environment access", () => {
   withM3Source({
     "crates/agent-runtime/src/lib.rs": "let _temporary_directory = std::env::temp_dir();\n",
   }, (directory) => {
@@ -113,6 +156,44 @@ test("architecture checker allows noncredential environment access", () => {
       /architecture contracts: ok/,
     );
   });
+
+  withM3Source({
+    "crates/repository-git/src/paths.rs": readFileSync("crates/repository-git/src/paths.rs", "utf8"),
+  }, (directory) => {
+    assert.match(
+      run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+      /architecture contracts: ok/,
+    );
+  });
+
+  withM3Source({
+    "crates/storage-sqlite/src/migrations.rs": readFileSync("crates/storage-sqlite/src/migrations.rs", "utf8"),
+  }, (directory) => {
+    assert.match(
+      run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+      /architecture contracts: ok/,
+    );
+  });
+});
+
+test("architecture checker confines justified environment access to exact calls", () => {
+  for (const [path, source] of [
+    [
+      "crates/repository-git/src/paths.rs",
+      "let _environment = std::env::vars_os();\n",
+    ],
+    [
+      "crates/storage-sqlite/src/other.rs",
+      "let _version = env!(\"CARGO_PKG_VERSION\");\n",
+    ],
+  ]) {
+    withM3Source({ [path]: source }, (directory) => {
+      assert.throws(
+        () => run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+        /provider credentials may not be read from environment/,
+      );
+    });
+  }
 });
 
 test("architecture checker confines provider HTTP across every production crate", () => {
