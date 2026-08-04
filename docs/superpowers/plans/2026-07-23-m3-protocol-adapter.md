@@ -470,7 +470,7 @@ Require a source-commit-bound manifest, tool versions, hashes for every retained
 ```powershell
 node --test tests/contracts/*.test.mjs
 node scripts/verify-design-contracts.mjs
-node scripts/check-architecture.mjs
+node scripts/check-architecture.mjs --require-m3
 cargo fmt --all -- --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets --all-features -- -D warnings

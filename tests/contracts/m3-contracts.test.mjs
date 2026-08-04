@@ -17,6 +17,22 @@ test("architecture checker accepts the complete M3 inward dependency graph", () 
   );
 });
 
+test("architecture checker requires all M3 crates only for the final gate", () => {
+  assert.match(
+    run(
+      "scripts/check-architecture.mjs",
+      "--require-m3",
+      "--metadata",
+      fixture("m3-valid-metadata.json"),
+    ),
+    /architecture contracts: ok/,
+  );
+  assert.throws(
+    () => run("scripts/check-architecture.mjs", "--require-m3"),
+    /M3 workspace members are required/,
+  );
+});
+
 test("architecture checker rejects outward M3 crate dependencies", () => {
   for (const [name, pattern] of [
     ["agent-protocol-outward-metadata.json", /agent-protocol has an outward internal dependency/],
@@ -45,7 +61,7 @@ test("architecture checker confines M3 provider and runtime boundaries", () => {
     [
       "crates/provider-openai/src/lib.rs",
       "let _api_key = std::env::var(\"OPENAI_API_KEY\");\n",
-      /M3 crates may not read credentials from std::env/,
+      /provider credentials may not be read from environment/,
     ],
     [
       "crates/provider-openai/src/lib.rs",
@@ -75,6 +91,72 @@ test("architecture checker confines M3 provider and runtime boundaries", () => {
       );
     });
   }
+});
+
+test("architecture checker rejects provider credentials through a std alias", () => {
+  withM3Source({
+    "crates/repository-git/src/lib.rs": "use std as system;\nlet _api_key = system::env::var(\"OPENAI_API_KEY\");\n",
+  }, (directory) => {
+    assert.throws(
+      () => run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+      /provider credentials may not be read from environment/,
+    );
+  });
+});
+
+test("architecture checker allows noncredential environment access", () => {
+  withM3Source({
+    "crates/agent-runtime/src/lib.rs": "let _temporary_directory = std::env::temp_dir();\n",
+  }, (directory) => {
+    assert.match(
+      run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+      /architecture contracts: ok/,
+    );
+  });
+});
+
+test("architecture checker confines provider HTTP across every production crate", () => {
+  withM3Source({
+    "crates/storage-files/src/lib.rs": "use reqwest::blocking::Client;\n",
+  }, (directory) => {
+    assert.throws(
+      () => run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+      /provider HTTP and raw TCP\/TLS are allowed only in provider-openai/,
+    );
+  });
+});
+
+test("architecture checker normalizes provider names in orchestration policy", () => {
+  withM3Source({
+    "crates/policy-engine/src/lib.rs": "use async_openai::Client;\nconst PROVIDER: &str = \"open_ai\";\n",
+  }, (directory) => {
+    assert.throws(
+      () => run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+      /provider names are forbidden in domain, application, and orchestration policy/,
+    );
+  });
+});
+
+test("architecture checker forbids runtime type references outside bootstrap", () => {
+  withM3Source({
+    "crates/application/src/lib.rs": "let _runtime = ProtocolAgentRuntime::try_new();\n",
+  }, (directory) => {
+    assert.throws(
+      () => run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+      /concrete M3 adapters must be constructed only in bootstrap/,
+    );
+  });
+});
+
+test("architecture checker forbids provider type references outside bootstrap", () => {
+  withM3Source({
+    "crates/storage-files/src/lib.rs": "let _provider = OpenAiResponsesAdapter::from_config();\n",
+  }, (directory) => {
+    assert.throws(
+      () => run("scripts/check-architecture.mjs", "--m3-source-fixture", directory),
+      /concrete M3 adapters must be constructed only in bootstrap/,
+    );
+  });
 });
 
 test("architecture checker allows bootstrap composition and provider HTTP", () => {

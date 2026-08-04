@@ -14,7 +14,7 @@ try {
   const metadata = metadataPath
     ? JSON.parse(readFileSync(metadataPath, "utf8"))
     : JSON.parse(execFileSync("cargo", ["metadata", "--no-deps", "--format-version", "1"], { cwd: root, encoding: "utf8" }));
-  verifyCargo(metadata);
+  verifyCargo(metadata, process.argv.includes("--require-m3"));
   verifyReact(option("--fixture") ?? join(root, "apps", "desktop"));
   verifyTauriCommands(
     option("--tauri-fixture") ?? join(root, "apps", "desktop", "src-tauri", "src"),
@@ -34,7 +34,7 @@ try {
   process.exitCode = 1;
 }
 
-function verifyCargo(metadata) {
+function verifyCargo(metadata, requireM3) {
   const packages = new Map(metadata.packages.map((pkg) => [pkg.name, pkg]));
   const workspace = new Set(
     (metadata.workspace_members ?? [...packages.keys()]).map((member) => {
@@ -62,6 +62,14 @@ function verifyCargo(metadata) {
     [agentRuntime, new Set([application, domain, agentProtocol])],
     [providerOpenAi, new Set([agentProtocol])],
   ]);
+  if (requireM3) {
+    const missing = [agentProtocol, agentRuntime, providerOpenAi].filter(
+      (name) => !workspace.has(name),
+    );
+    if (missing.length > 0) {
+      throw new Error(`M3 workspace members are required: ${missing.join(", ")}`);
+    }
+  }
   const domainAllowed = new Set(["serde", "serde_json"]);
   if (allDependencies(domain).some((dependency) => workspace.has(dependency.name))) {
     throw new Error("domain may not depend on workspace packages");
@@ -288,56 +296,6 @@ function verifyM2Sources(sourceRoot, strictM2Scope) {
 
 function verifyM3Sources(sourceRoot) {
   const crates = join(sourceRoot, "crates");
-  const rustFiles = (name) =>
-    filesUnderIfExists(join(crates, name, "src")).filter((path) => path.endsWith(".rs"));
-  for (const name of [
-    "domain",
-    "application",
-    "policy-engine",
-    "agent-protocol",
-    "agent-runtime",
-    "provider-openai",
-    "bootstrap",
-  ]) {
-    for (const path of rustFiles(name)) {
-      const source = withoutInlineTestModules(readFileSync(path, "utf8"));
-      const standardLibraryImports = [
-        ...source.matchAll(/\buse\s+std\b[\s\S]*?;/g),
-        ...source.matchAll(/\bextern\s+crate\s+std\b[\s\S]*?;/g),
-      ].map((match) => match[0]);
-      if (
-        standardLibraryImports.some((statement) => /\benv\b/.test(statement))
-        || /\bstd::env\b/.test(source)
-      ) {
-        throw new Error("M3 crates may not read credentials from std::env");
-      }
-      if (/\b(?:debug|info|warn|error|trace|println|eprintln)!\s*\([^;]*\bAuthorization\b/i.test(source)) {
-        throw new Error("Authorization values may not be logged");
-      }
-    }
-  }
-
-  for (const name of ["domain", "application", "policy-engine"]) {
-    for (const path of rustFiles(name)) {
-      const source = withoutInlineTestModules(readFileSync(path, "utf8"));
-      if (
-        /\b(?:openai|anthropic|gemini|claude)\b/i.test(source)
-        || /\b(?:OpenAi|Anthropic|Gemini|Claude)[A-Z]/.test(source)
-      ) {
-        throw new Error("provider names are forbidden in domain, application, and orchestration policy");
-      }
-    }
-  }
-
-  for (const name of ["domain", "application", "policy-engine", "agent-protocol", "agent-runtime", "bootstrap"]) {
-    for (const path of rustFiles(name)) {
-      const source = withoutInlineTestModules(readFileSync(path, "utf8"));
-      if (/\b(?:reqwest|hyper|ureq|Tcp(?:Listener|Stream)|std::net|tokio::net|rustls|native_tls)\b/.test(source)) {
-        throw new Error("provider HTTP and raw TCP/TLS are allowed only in provider-openai");
-      }
-    }
-  }
-
   const productionRoots = [
     ...(existsSync(crates)
       ? readdirSync(crates, { withFileTypes: true })
@@ -347,14 +305,75 @@ function verifyM3Sources(sourceRoot) {
     join(sourceRoot, "apps", "desktop", "src-tauri", "src"),
   ];
   for (const directory of productionRoots) {
-    if (directory === join(crates, "bootstrap", "src")) continue;
     for (const path of filesUnderIfExists(directory).filter((path) => path.endsWith(".rs"))) {
       const source = withoutInlineTestModules(readFileSync(path, "utf8"));
-      if (/\b(?:ProtocolAgentRuntime|OpenAiResponsesAdapter|OpenAIResponsesAdapter)\s*::\s*(?:new|default|build)\s*\(/.test(source)) {
+      if (hasProviderCredentialLookup(source)) {
+        throw new Error("provider credentials may not be read from environment");
+      }
+      if (/\b(?:debug|info|warn|error|trace|println|eprintln)!\s*\([^;]*\bAuthorization\b/i.test(source)) {
+        throw new Error("Authorization values may not be logged");
+      }
+      if (
+        directory !== join(crates, "provider-openai", "src")
+        && /\b(?:reqwest|hyper|ureq|Tcp(?:Listener|Stream)|std::net|tokio::net|rustls|native_tls)\b/.test(source)
+      ) {
+        throw new Error("provider HTTP and raw TCP/TLS are allowed only in provider-openai");
+      }
+      if (hasLeakedM3AdapterType(source, directory, crates)) {
         throw new Error("concrete M3 adapters must be constructed only in bootstrap");
       }
     }
   }
+
+  for (const name of ["domain", "application", "policy-engine"]) {
+    for (const path of filesUnderIfExists(join(crates, name, "src")).filter((path) => path.endsWith(".rs"))) {
+      if (hasProviderName(withoutInlineTestModules(readFileSync(path, "utf8")))) {
+        throw new Error("provider names are forbidden in domain, application, and orchestration policy");
+      }
+    }
+  }
+}
+
+function hasProviderCredentialLookup(source) {
+  const standardLibraryImports = [
+    ...source.matchAll(/\buse\s+std\b[\s\S]*?;/g),
+    ...source.matchAll(/\bextern\s+crate\s+std\b[\s\S]*?;/g),
+  ].map((match) => match[0]);
+  const stdAliases = [
+    "std",
+    ...standardLibraryImports.flatMap((statement) =>
+      [...statement.matchAll(/\bstd\s+as\s+([A-Za-z_]\w*)/g)].map((match) => match[1]),
+    ),
+  ];
+  const envAliases = [
+    ...(standardLibraryImports.some((statement) => /\benv\b/.test(statement)) ? ["env"] : []),
+    ...standardLibraryImports.flatMap((statement) =>
+      [...statement.matchAll(/\benv\s+as\s+([A-Za-z_]\w*)/g)].map((match) => match[1]),
+    ),
+  ];
+  const credential = "[\\\"'][^\\\"']*(?:api[_-]?key|secret|token|credential|authorization)[^\\\"']*[\\\"']";
+  const lookup = (names, suffix) =>
+    names.length > 0
+    && new RegExp(`\\b(?:${names.join("|")})${suffix}\\s*\\(\\s*${credential}`, "i").test(source);
+  return lookup(stdAliases, "::env::(?:var|var_os)") || lookup(envAliases, "::(?:var|var_os)");
+}
+
+function hasProviderName(source) {
+  return source
+    .split(/[^A-Za-z0-9_-]+/)
+    .some((token) => /(?:openai|anthropic|gemini|claude)/.test(token.replace(/[_-]/g, "").toLowerCase()));
+}
+
+function hasLeakedM3AdapterType(source, directory, crates) {
+  const bootstrap = join(crates, "bootstrap", "src");
+  if (directory === bootstrap) return false;
+  const types = [
+    ["ProtocolAgentRuntime", "agent-runtime"],
+    ["OpenAiResponsesAdapter", "provider-openai"],
+    ["OpenAIResponsesAdapter", "provider-openai"],
+  ];
+  return types.some(([name, owner]) =>
+    directory !== join(crates, owner, "src") && new RegExp(`\\b${name}\\b`).test(source));
 }
 
 function verifyAdapterConstruction() {
