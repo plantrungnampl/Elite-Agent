@@ -149,7 +149,7 @@ fn enforces_method_ownership_and_never_responds_to_notifications() {
 }
 
 #[test]
-fn rejects_foreign_runs_and_enforces_exact_stream_sequence_rules() {
+fn rejects_foreign_runs_and_terminalizes_runs_after_stream_sequence_violations() {
     let mut session = ready_session();
     start_run(&mut session, "run-1", 1, at(30));
 
@@ -163,14 +163,46 @@ fn rejects_foreign_runs_and_enforces_exact_stream_sequence_rules() {
     ));
     assert!(matches!(
         session.receive(stream_delta("run-1", 1, "delta"), at(0)),
-        Ok(InboundDisposition::Notification(_))
+        Err(ProtocolError::InvalidRequest)
     ));
     assert!(matches!(
-        session.receive(stream_delta("run-1", 1, "delta"), at(0)),
+        session.receive(run_complete("run-1", "agent:bad-initial", "done"), at(0)),
+        Err(ProtocolError::InvalidRequest)
+    ));
+
+    let mut duplicate_session = ready_session();
+    start_run(&mut duplicate_session, "run-duplicate", 1, at(30));
+    duplicate_session
+        .receive(stream_delta("run-duplicate", 1, "delta"), at(0))
+        .expect("the first stream delta starts at one");
+    assert!(matches!(
+        duplicate_session.receive(stream_delta("run-duplicate", 1, "delta"), at(0)),
         Ok(InboundDisposition::DuplicateStreamDelta)
     ));
+
+    let mut conflicting_duplicate_session = ready_session();
+    start_run(
+        &mut conflicting_duplicate_session,
+        "run-conflict",
+        1,
+        at(30),
+    );
+    conflicting_duplicate_session
+        .receive(stream_delta("run-conflict", 1, "delta"), at(0))
+        .expect("the first stream delta starts at one");
     assert!(matches!(
-        session.receive(stream_delta("run-1", 1, "changed"), at(0)),
+        conflicting_duplicate_session.receive(stream_delta("run-conflict", 1, "changed"), at(0)),
+        Err(ProtocolError::InvalidRequest)
+    ));
+    assert!(matches!(
+        conflicting_duplicate_session.receive(stream_delta("run-conflict", 2, "delta"), at(0)),
+        Err(ProtocolError::InvalidRequest)
+    ));
+    assert!(matches!(
+        conflicting_duplicate_session.receive(
+            run_complete("run-conflict", "agent:conflict", "done"),
+            at(0),
+        ),
         Err(ProtocolError::InvalidRequest)
     ));
 
@@ -181,6 +213,14 @@ fn rejects_foreign_runs_and_enforces_exact_stream_sequence_rules() {
         .expect("the first stream delta starts at one");
     assert!(matches!(
         gap_session.receive(stream_delta("run-2", 3, "delta"), at(0)),
+        Err(ProtocolError::InvalidRequest)
+    ));
+    assert!(matches!(
+        gap_session.receive(stream_delta("run-2", 2, "delta"), at(0)),
+        Err(ProtocolError::InvalidRequest)
+    ));
+    assert!(matches!(
+        gap_session.receive(run_complete("run-2", "agent:gap", "done"), at(0)),
         Err(ProtocolError::InvalidRequest)
     ));
 }

@@ -534,19 +534,19 @@ impl ProtocolSession {
         let max_output_bytes = self.limits.max_output_bytes;
         let run = self.active_run_mut(&run_id)?;
 
-        match run.last_sequence {
-            None if sequence != 1 => return Err(ProtocolError::InvalidRequest),
+        let invalid_sequence = match run.last_sequence {
+            None => sequence != 1,
             Some(last_sequence) if sequence == last_sequence => {
-                return if run.last_delta == delta {
-                    Ok(true)
-                } else {
-                    Err(ProtocolError::InvalidRequest)
-                };
+                if run.last_delta == delta {
+                    return Ok(true);
+                }
+                true
             }
-            Some(last_sequence) if last_sequence.checked_add(1) != Some(sequence) => {
-                return Err(ProtocolError::InvalidRequest);
-            }
-            None | Some(_) => {}
+            Some(last_sequence) => last_sequence.checked_add(1) != Some(sequence),
+        };
+        if invalid_sequence {
+            run.terminal = true;
+            return Err(ProtocolError::InvalidRequest);
         }
 
         let Some(output_bytes) = run.output_bytes.checked_add(delta.len()) else {

@@ -93,6 +93,9 @@ pub struct PeerDescriptor {
 
 pub trait PeerEventSink: Send + Sync {
     fn receive(&self, frame: ProtocolFrame) -> Result<InboundDisposition, ProtocolError>;
+
+    /// Decodes one raw transport frame before it enters the session state machine.
+    fn receive_raw(&self, bytes: &[u8]) -> Result<InboundDisposition, ProtocolError>;
     fn connection_lost(&self) -> Result<(), ProtocolError>;
 }
 
@@ -169,124 +172,91 @@ pub fn conformance_cases() -> &'static [ConformanceCase] {
     &CONFORMANCE_CASES
 }
 
-pub fn run_conformance(peer: &dyn ProtocolPeer) -> Result<(), ProtocolError> {
-    let descriptor = peer.descriptor();
-    if descriptor.protocol_version != "1.0" {
-        return Err(ProtocolError::ProtocolIncompatible);
-    }
+/// Creates a peer configured to exercise one conformance scenario.
+pub trait ConformancePeerFactory: Send + Sync {
+    fn peer_for(&self, case: ConformanceCase) -> Result<Box<dyn ProtocolPeer>, ProtocolError>;
 
-    for case in conformance_cases() {
-        run_case(peer, &descriptor, case.scenario)?;
+    /// Releases peers that defer events until the start acceptance is recorded.
+    fn start_accepted(&self, _case: ConformanceCase) -> Result<(), ProtocolError> {
+        Ok(())
     }
-    peer.shutdown()
+}
+
+/// Runs every shared scenario against peers produced by `factory`.
+pub fn run_conformance(factory: &dyn ConformancePeerFactory) -> Result<(), ProtocolError> {
+    for case in conformance_cases() {
+        let peer = factory.peer_for(*case)?;
+        let descriptor = peer.descriptor();
+        let result = if descriptor.protocol_version == "1.0" {
+            run_case(peer.as_ref(), factory, &descriptor, *case)
+        } else {
+            Err(ProtocolError::ProtocolIncompatible)
+        };
+        let shutdown_result = peer.shutdown();
+        result?;
+        shutdown_result?;
+    }
+    Ok(())
 }
 
 fn run_case(
     peer: &dyn ProtocolPeer,
+    factory: &dyn ConformancePeerFactory,
     descriptor: &PeerDescriptor,
-    scenario: ConformanceScenario,
+    case: ConformanceCase,
 ) -> Result<(), ProtocolError> {
-    match scenario {
-        ConformanceScenario::Happy => run_happy(peer, descriptor),
-        ConformanceScenario::Malicious => run_malicious(descriptor),
-        ConformanceScenario::Slow => run_slow(descriptor),
-        ConformanceScenario::Cancelled => run_cancelled(peer, descriptor),
-        ConformanceScenario::Crashed => run_crashed(descriptor),
-        ConformanceScenario::Malformed => run_malformed(),
-        ConformanceScenario::Oversize => run_oversize(),
-        ConformanceScenario::SequenceGap => run_sequence_gap(descriptor),
-        ConformanceScenario::DuplicateTerminal => run_duplicate_terminal(descriptor),
+    let sink = start_case(peer, factory, descriptor, case)?;
+    match case.scenario {
+        ConformanceScenario::Happy => sink.wait_for_happy_events(),
+        ConformanceScenario::Malicious => {
+            sink.wait_for_error(ProtocolError::IdentityBindingFailed, false)
+        }
+        ConformanceScenario::Slow => match sink.trigger_timeout() {
+            Err(ProtocolError::Timeout) => sink.wait_for_error(ProtocolError::Timeout, false),
+            _ => Err(ProtocolError::InternalAgentFailure),
+        },
+        ConformanceScenario::Cancelled => run_cancelled(peer, &sink),
+        ConformanceScenario::Crashed => {
+            sink.wait_for_error(ProtocolError::InternalAgentFailure, true)
+        }
+        ConformanceScenario::Malformed => sink.wait_for_error(ProtocolError::InvalidJson, true),
+        ConformanceScenario::Oversize => {
+            sink.wait_for_error(ProtocolError::FrameTooLarge { max_frame_bytes: 1 }, true)
+        }
+        ConformanceScenario::SequenceGap | ConformanceScenario::DuplicateTerminal => {
+            sink.wait_for_error(ProtocolError::InvalidRequest, false)
+        }
     }
 }
 
-fn run_happy(peer: &dyn ProtocolPeer, descriptor: &PeerDescriptor) -> Result<(), ProtocolError> {
-    let (session, start) = active_session(descriptor)?;
-    let sink = ConformanceSink::new(session);
+fn start_case(
+    peer: &dyn ProtocolPeer,
+    factory: &dyn ConformancePeerFactory,
+    descriptor: &PeerDescriptor,
+    case: ConformanceCase,
+) -> Result<ConformanceSink, ProtocolError> {
+    let (session, start) = pending_session(descriptor)?;
+    let sink = ConformanceSink::new(session, conformance_codec(case.scenario));
     let acceptance = peer.start(RunStart::try_from(start)?, Box::new(sink.clone()))?;
     if !acceptance.accepted || acceptance.run_id != "conformance-run" {
         return Err(ProtocolError::InternalAgentFailure);
     }
-    sink.wait_for_happy_events()
-}
-
-fn run_malicious(descriptor: &PeerDescriptor) -> Result<(), ProtocolError> {
-    let mut session = initialized_session(descriptor)?;
-    match session.receive(heartbeat("wrong-connection", 1)?, conformance_time()) {
-        Err(ProtocolError::IdentityBindingFailed) => Ok(()),
-        _ => Err(ProtocolError::InternalAgentFailure),
+    if let Some(error) = sink.error()? {
+        return Err(error);
     }
+    sink.accept_start()?;
+    factory.start_accepted(case)?;
+    Ok(sink)
 }
 
-fn run_slow(descriptor: &PeerDescriptor) -> Result<(), ProtocolError> {
-    let mut session = initialized_session(descriptor)?;
-    match session.check_timeouts(conformance_time() + chrono::Duration::seconds(6)) {
-        Err(ProtocolError::Timeout) => Ok(()),
-        _ => Err(ProtocolError::InternalAgentFailure),
-    }
-}
-
-fn run_cancelled(
-    peer: &dyn ProtocolPeer,
-    descriptor: &PeerDescriptor,
-) -> Result<(), ProtocolError> {
-    let (mut session, _) = active_session(descriptor)?;
+fn run_cancelled(peer: &dyn ProtocolPeer, sink: &ConformanceSink) -> Result<(), ProtocolError> {
     let cancel = cancel("conformance-run", "core:conformance-cancel", 10)?;
-    session.outbound(cancel.clone(), conformance_time())?;
+    sink.outbound(cancel.clone())?;
     let acceptance = peer.cancel(RunCancel::try_from(cancel)?)?;
     if acceptance.accepted && acceptance.run_id == "conformance-run" {
         Ok(())
     } else {
         Err(ProtocolError::Cancelled)
-    }
-}
-
-fn run_crashed(descriptor: &PeerDescriptor) -> Result<(), ProtocolError> {
-    let (mut session, _) = active_session(descriptor)?;
-    if session.connection_lost() == ["conformance-run"] {
-        Ok(())
-    } else {
-        Err(ProtocolError::InternalAgentFailure)
-    }
-}
-
-fn run_malformed() -> Result<(), ProtocolError> {
-    if NdjsonCodec::default().decode(b"{").is_err() {
-        Ok(())
-    } else {
-        Err(ProtocolError::InternalAgentFailure)
-    }
-}
-
-fn run_oversize() -> Result<(), ProtocolError> {
-    match NdjsonCodec::new(1).decode(b"{}") {
-        Err(ProtocolError::FrameTooLarge { .. }) => Ok(()),
-        _ => Err(ProtocolError::InternalAgentFailure),
-    }
-}
-
-fn run_sequence_gap(descriptor: &PeerDescriptor) -> Result<(), ProtocolError> {
-    let (mut session, _) = active_session(descriptor)?;
-    match session.receive(
-        stream_delta("conformance-run", 2, "gap")?,
-        conformance_time(),
-    ) {
-        Err(ProtocolError::InvalidRequest) => Ok(()),
-        _ => Err(ProtocolError::InternalAgentFailure),
-    }
-}
-
-fn run_duplicate_terminal(descriptor: &PeerDescriptor) -> Result<(), ProtocolError> {
-    let (mut session, _) = active_session(descriptor)?;
-    session.receive(
-        terminal("conformance-run", "agent:conformance-complete-1")?,
-        conformance_time(),
-    )?;
-    match session.receive(
-        terminal("conformance-run", "agent:conformance-complete-2")?,
-        conformance_time(),
-    ) {
-        Err(ProtocolError::InvalidRequest) => Ok(()),
-        _ => Err(ProtocolError::InternalAgentFailure),
     }
 }
 
@@ -310,26 +280,20 @@ fn initialized_session(descriptor: &PeerDescriptor) -> Result<ProtocolSession, P
     Ok(session)
 }
 
-fn active_session(
+fn pending_session(
     descriptor: &PeerDescriptor,
 ) -> Result<(ProtocolSession, ProtocolFrame), ProtocolError> {
     let now = conformance_time();
     let mut session = initialized_session(descriptor)?;
     let start = start("conformance-run")?;
     session.outbound(start.clone(), now)?;
-    session.receive_response(
-        success_response(
-            "core:conformance-start",
-            json!({ "accepted": true, "runId": "conformance-run" }),
-        )?,
-        now,
-    )?;
     Ok((session, start))
 }
 
 #[derive(Clone)]
 struct ConformanceSink {
     session: Arc<Mutex<ProtocolSession>>,
+    codec: NdjsonCodec,
     observations: Arc<(Mutex<ConformanceObservations>, Condvar)>,
 }
 
@@ -338,17 +302,72 @@ struct ConformanceObservations {
     saw_stream: bool,
     saw_terminal: bool,
     error: Option<ProtocolError>,
+    connection_lost: bool,
 }
 
 impl ConformanceSink {
-    fn new(session: ProtocolSession) -> Self {
+    fn new(session: ProtocolSession, codec: NdjsonCodec) -> Self {
         Self {
             session: Arc::new(Mutex::new(session)),
+            codec,
             observations: Arc::new((
                 Mutex::new(ConformanceObservations::default()),
                 Condvar::new(),
             )),
         }
+    }
+
+    fn accept_start(&self) -> Result<(), ProtocolError> {
+        let result = self
+            .session
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .receive_response(
+                success_response(
+                    "core:conformance-start",
+                    json!({ "accepted": true, "runId": "conformance-run" }),
+                )?,
+                conformance_time(),
+            );
+        if let Err(error) = result {
+            self.record_error(error)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn outbound(&self, frame: ProtocolFrame) -> Result<(), ProtocolError> {
+        let result = self
+            .session
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .outbound(frame, conformance_time());
+        if let Err(error) = result {
+            self.record_error(error)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn trigger_timeout(&self) -> Result<(), ProtocolError> {
+        let result = self
+            .session
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .check_timeouts(conformance_time() + chrono::Duration::seconds(6));
+        if let Err(error) = result {
+            self.record_error(error)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn error(&self) -> Result<Option<ProtocolError>, ProtocolError> {
+        let (observations, _) = &*self.observations;
+        Ok(observations
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .error)
     }
 
     fn wait_for_happy_events(&self) -> Result<(), ProtocolError> {
@@ -368,6 +387,32 @@ impl ConformanceSink {
             Ok(())
         } else {
             Err(ProtocolError::Timeout)
+        }
+    }
+
+    fn wait_for_error(
+        &self,
+        expected: ProtocolError,
+        requires_connection_loss: bool,
+    ) -> Result<(), ProtocolError> {
+        let (observations, ready) = &*self.observations;
+        let observations = observations
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        let (observations, _) = ready
+            .wait_timeout_while(observations, Duration::from_millis(100), |observations| {
+                observations.error.is_none()
+            })
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        match observations.error {
+            Some(error)
+                if error == expected
+                    && (!requires_connection_loss || observations.connection_lost) =>
+            {
+                Ok(())
+            }
+            Some(error) => Err(error),
+            None => Err(ProtocolError::Timeout),
         }
     }
 
@@ -396,7 +441,21 @@ impl ConformanceSink {
         let mut observations = observations
             .lock()
             .map_err(|_| ProtocolError::InternalAgentFailure)?;
-        observations.error = Some(error);
+        observations.error.get_or_insert(error);
+        ready.notify_all();
+        Ok(())
+    }
+
+    fn close_connection(&self) -> Result<(), ProtocolError> {
+        self.session
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .connection_lost();
+        let (observations, ready) = &*self.observations;
+        observations
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .connection_lost = true;
         ready.notify_all();
         Ok(())
     }
@@ -421,13 +480,35 @@ impl PeerEventSink for ConformanceSink {
         }
     }
 
+    fn receive_raw(&self, bytes: &[u8]) -> Result<InboundDisposition, ProtocolError> {
+        match self.codec.decode(bytes) {
+            Ok(frame) => self.receive(frame),
+            Err(error) => {
+                self.close_connection()?;
+                self.record_error(error)?;
+                Err(error)
+            }
+        }
+    }
+
     fn connection_lost(&self) -> Result<(), ProtocolError> {
-        self.session
-            .lock()
-            .map_err(|_| ProtocolError::InternalAgentFailure)?
-            .connection_lost();
+        self.close_connection()?;
         self.record_error(ProtocolError::InternalAgentFailure)?;
         Ok(())
+    }
+}
+
+fn conformance_codec(scenario: ConformanceScenario) -> NdjsonCodec {
+    match scenario {
+        ConformanceScenario::Oversize => NdjsonCodec::new(1),
+        ConformanceScenario::Happy
+        | ConformanceScenario::Malicious
+        | ConformanceScenario::Slow
+        | ConformanceScenario::Cancelled
+        | ConformanceScenario::Crashed
+        | ConformanceScenario::Malformed
+        | ConformanceScenario::SequenceGap
+        | ConformanceScenario::DuplicateTerminal => NdjsonCodec::default(),
     }
 }
 
@@ -519,40 +600,6 @@ fn cancel(run_id: &str, id: &str, deadline_ms: u64) -> Result<ProtocolFrame, Pro
         "id": id,
         "method": "agent.run.cancel",
         "params": { "runId": run_id, "reason": "conformance", "deadlineMs": deadline_ms }
-    }))
-}
-
-fn stream_delta(run_id: &str, sequence: u64, delta: &str) -> Result<ProtocolFrame, ProtocolError> {
-    frame(json!({
-        "jsonrpc": "2.0",
-        "method": "agent.stream.delta",
-        "params": { "runId": run_id, "sequence": sequence, "channel": "content", "delta": delta }
-    }))
-}
-
-fn heartbeat(connection_id: &str, sequence: u64) -> Result<ProtocolFrame, ProtocolError> {
-    frame(json!({
-        "jsonrpc": "2.0",
-        "method": "agent.heartbeat",
-        "params": { "connectionId": connection_id, "sequence": sequence }
-    }))
-}
-
-fn terminal(run_id: &str, id: &str) -> Result<ProtocolFrame, ProtocolError> {
-    frame(json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "agent.run.complete",
-        "params": {
-            "runId": run_id,
-            "status": "succeeded",
-            "message": {
-                "messageId": "conformance-message",
-                "type": "answer",
-                "content": "done",
-                "claims": []
-            }
-        }
     }))
 }
 
