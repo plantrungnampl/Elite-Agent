@@ -12,6 +12,38 @@ test("architecture checker accepts the production workspace", () => {
   assert.match(run("scripts/check-architecture.mjs"), /architecture contracts: ok/);
 });
 
+test("architecture checker permits staged M3 crate introduction", () => {
+  const directory = mkdtempSync(join(tmpdir(), "m3-staged-workspace-"));
+  try {
+    const metadata = join(directory, "metadata.json");
+    writeFileSync(
+      metadata,
+      JSON.stringify({
+        packages: [
+          { name: "local-agent-terminal-domain", dependencies: [] },
+          {
+            name: "local-agent-terminal-application",
+            dependencies: [{ name: "local-agent-terminal-domain" }],
+          },
+          { name: "local-agent-terminal-agent-protocol", dependencies: [] },
+        ],
+        workspace_members: [
+          "local-agent-terminal-domain",
+          "local-agent-terminal-application",
+          "local-agent-terminal-agent-protocol",
+        ],
+      }),
+      "utf8",
+    );
+    assert.match(
+      run("scripts/check-architecture.mjs", "--metadata", metadata),
+      /architecture contracts: ok/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("architecture checker rejects a frontend Tauri invoke outside its API boundary", () => {
   assert.throws(
     () =>

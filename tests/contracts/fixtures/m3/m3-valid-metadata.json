@@ -1,0 +1,53 @@
+{
+  "packages": [
+    { "name": "local-agent-terminal-domain", "dependencies": [] },
+    {
+      "name": "local-agent-terminal-application",
+      "dependencies": [{ "name": "local-agent-terminal-domain" }]
+    },
+    {
+      "name": "local-agent-terminal-storage-sqlite",
+      "dependencies": [
+        { "name": "local-agent-terminal-application" },
+        { "name": "local-agent-terminal-domain" }
+      ]
+    },
+    {
+      "name": "local-agent-terminal-storage-files",
+      "dependencies": [{ "name": "local-agent-terminal-application" }]
+    },
+    { "name": "local-agent-terminal-agent-protocol", "dependencies": [] },
+    {
+      "name": "local-agent-terminal-agent-runtime",
+      "dependencies": [
+        { "name": "local-agent-terminal-application" },
+        { "name": "local-agent-terminal-domain" },
+        { "name": "local-agent-terminal-agent-protocol" }
+      ]
+    },
+    {
+      "name": "local-agent-terminal-provider-openai",
+      "dependencies": [{ "name": "local-agent-terminal-agent-protocol" }]
+    },
+    {
+      "name": "local-agent-terminal-bootstrap",
+      "dependencies": [
+        { "name": "local-agent-terminal-application" },
+        { "name": "local-agent-terminal-storage-sqlite" },
+        { "name": "local-agent-terminal-storage-files" },
+        { "name": "local-agent-terminal-agent-runtime" },
+        { "name": "local-agent-terminal-provider-openai" }
+      ]
+    }
+  ],
+  "workspace_members": [
+    "local-agent-terminal-domain",
+    "local-agent-terminal-application",
+    "local-agent-terminal-storage-sqlite",
+    "local-agent-terminal-storage-files",
+    "local-agent-terminal-agent-protocol",
+    "local-agent-terminal-agent-runtime",
+    "local-agent-terminal-provider-openai",
+    "local-agent-terminal-bootstrap"
+  ]
+}

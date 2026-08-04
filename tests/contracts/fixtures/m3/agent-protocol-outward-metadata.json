@@ -1,0 +1,13 @@
+{
+  "packages": [
+    { "name": "local-agent-terminal-domain", "dependencies": [] },
+    {
+      "name": "local-agent-terminal-agent-protocol",
+      "dependencies": [{ "name": "local-agent-terminal-domain" }]
+    }
+  ],
+  "workspace_members": [
+    "local-agent-terminal-domain",
+    "local-agent-terminal-agent-protocol"
+  ]
+}

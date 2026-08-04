@@ -50,9 +50,9 @@ agent-protocol <- provider-openai
 application + agent-runtime + provider-openai + storage adapters <- bootstrap
 ```
 
-- [ ] **Step 1 - Write failing contract tests**
+- [x] **Step 1 - Write failing contract tests**
 
-Assert that the three new crates are required workspace members; `agent-protocol` has no internal dependency; `provider-openai` depends only on `agent-protocol` internally; `agent-runtime` depends inward on `application`, `domain`, and `agent-protocol`; only `bootstrap` constructs runtime/provider concrete types; provider names do not occur in `domain`, `application`, or orchestration policy; and direct provider HTTP/credential access is confined to `provider-openai`.
+Assert that a synthetic final workspace contains the three new crates; `agent-protocol` has no internal dependency; `provider-openai` depends only on `agent-protocol` internally; `agent-runtime` depends inward on `application`, `domain`, and `agent-protocol`; only `bootstrap` constructs runtime/provider concrete types; provider names do not occur in `domain`, `application`, or orchestration policy; and direct provider HTTP/credential access is confined to `provider-openai`. During Tasks 2, 6, and 7, the real workspace may contain zero or a partial subset of the three crates; whenever a named M3 crate is present, its exact internal allowlist applies. Task 9 requires all three actual workspace members.
 
 Also assert that the normative schema still has all fourteen frame variants, string request IDs with origin prefixes, strict top-level payloads, the 8 MiB documented default, and the M3 hostile fixtures are rejected by the future conformance binary.
 
@@ -62,11 +62,11 @@ node --test tests/contracts/m3-contracts.test.mjs
 
 Expected RED: M3 allowlists, crates, fixtures, and source guards do not exist.
 
-- [ ] **Step 2 - Implement only contract checker rules and fixtures**
+- [x] **Step 2 - Implement only contract checker rules and fixtures**
 
 Remove the temporary M2 assertion that all M3 packages are absent and replace it with the exact M3 allowlist above. Retain all M0-M2 restrictions. Reject `std::env` credential lookup, `Authorization` logging, provider construction outside bootstrap, raw TCP/TLS in inner crates, provider-name branching in application policy, and external process launch from the new crates.
 
-- [ ] **Step 3 - Verify contracts and immutable design**
+- [x] **Step 3 - Verify contracts and immutable design**
 
 ```powershell
 node --test tests/contracts/m3-contracts.test.mjs tests/contracts/architecture.test.mjs tests/contracts/design-contracts.test.mjs tests/contracts/m2-contracts.test.mjs
@@ -74,7 +74,7 @@ node scripts/check-architecture.mjs
 git diff --exit-code 321734f -- docs/multi-agent-terminal-design
 ```
 
-- [ ] **Step 4 - Commit**
+- [x] **Step 4 - Commit**
 
 ```powershell
 git add scripts/check-architecture.mjs tests/contracts

@@ -23,7 +23,11 @@ try {
   verifyRepositoryAdapter(
     option("--repository-fixture") ?? join(root, "crates", "repository-git", "src"),
   );
-  verifyM2Sources(option("--m2-source-fixture") ?? root);
+  const m2SourceFixture = option("--m2-source-fixture");
+  const m3SourceFixture = option("--m3-source-fixture");
+  const sourceRoot = m3SourceFixture ?? m2SourceFixture ?? root;
+  verifyM2Sources(sourceRoot, m2SourceFixture !== null);
+  verifyM3Sources(sourceRoot);
   console.log("architecture contracts: ok");
 } catch (error) {
   console.error(`architecture contracts: ${error.message}`);
@@ -44,11 +48,19 @@ function verifyCargo(metadata) {
   const domain = "local-agent-terminal-domain";
   const application = "local-agent-terminal-application";
   const repositoryGit = "local-agent-terminal-repository-git";
+  const agentProtocol = "local-agent-terminal-agent-protocol";
+  const agentRuntime = "local-agent-terminal-agent-runtime";
+  const providerOpenAi = "local-agent-terminal-provider-openai";
   const m2Adapters = new Map([
     ["local-agent-terminal-policy-engine", new Set([application, domain])],
     ["local-agent-terminal-tool-runtime", new Set([application, domain])],
     ["local-agent-terminal-platform-core", new Set([application, domain])],
     ["local-agent-terminal-platform-windows", new Set([application, domain])],
+  ]);
+  const m3Adapters = new Map([
+    [agentProtocol, new Set()],
+    [agentRuntime, new Set([application, domain, agentProtocol])],
+    [providerOpenAi, new Set([agentProtocol])],
   ]);
   const domainAllowed = new Set(["serde", "serde_json"]);
   if (allDependencies(domain).some((dependency) => workspace.has(dependency.name))) {
@@ -88,7 +100,7 @@ function verifyCargo(metadata) {
     ["local-agent-terminal-storage-sqlite", new Set([application, domain])],
     ["local-agent-terminal-storage-files", new Set([application, domain])],
     [repositoryGit, new Set([application, domain])],
-    ["local-agent-terminal-bootstrap", new Set([application, "local-agent-terminal-storage-sqlite", "local-agent-terminal-storage-files", repositoryGit, ...m2Adapters.keys()])],
+    ["local-agent-terminal-bootstrap", new Set([application, "local-agent-terminal-storage-sqlite", "local-agent-terminal-storage-files", repositoryGit, ...m2Adapters.keys(), agentRuntime, providerOpenAi])],
     ["local-agent-terminal-desktop", new Set(["local-agent-terminal-bootstrap"])],
     ...m2Adapters,
   ]);
@@ -106,12 +118,12 @@ function verifyCargo(metadata) {
       throw new Error(`${name} may not depend on Tauri or React`);
     }
   }
-  if (
-    [...workspace].some((name) =>
-      /local-agent-terminal-(?:agent-protocol|agent-runtime|.*provider.*)/.test(name),
-    )
-  ) {
-    throw new Error("M3 protocol or provider packages are out of scope for M2");
+  for (const [name, targets] of m3Adapters) {
+    for (const dependency of allDependencies(name)) {
+      if (workspace.has(dependency.name) && !targets.has(dependency.name)) {
+        throw new Error(`${name} has an outward internal dependency on ${dependency.name}`);
+      }
+    }
   }
   const repositoryPackage = packages.get(repositoryGit);
   if (repositoryPackage) {
@@ -199,9 +211,9 @@ function verifyTauriCommands(sourceRoot) {
   }
 }
 
-function verifyM2Sources(sourceRoot) {
+function verifyM2Sources(sourceRoot, strictM2Scope) {
   const crates = join(sourceRoot, "crates");
-  if (existsSync(crates)) {
+  if (strictM2Scope && existsSync(crates)) {
     for (const entry of readdirSync(crates, { withFileTypes: true })) {
       if (
         entry.isDirectory()
@@ -272,6 +284,77 @@ function verifyM2Sources(sourceRoot) {
     }
   }
   verifyTauriCommands(join(sourceRoot, "apps", "desktop", "src-tauri", "src"));
+}
+
+function verifyM3Sources(sourceRoot) {
+  const crates = join(sourceRoot, "crates");
+  const rustFiles = (name) =>
+    filesUnderIfExists(join(crates, name, "src")).filter((path) => path.endsWith(".rs"));
+  for (const name of [
+    "domain",
+    "application",
+    "policy-engine",
+    "agent-protocol",
+    "agent-runtime",
+    "provider-openai",
+    "bootstrap",
+  ]) {
+    for (const path of rustFiles(name)) {
+      const source = withoutInlineTestModules(readFileSync(path, "utf8"));
+      const standardLibraryImports = [
+        ...source.matchAll(/\buse\s+std\b[\s\S]*?;/g),
+        ...source.matchAll(/\bextern\s+crate\s+std\b[\s\S]*?;/g),
+      ].map((match) => match[0]);
+      if (
+        standardLibraryImports.some((statement) => /\benv\b/.test(statement))
+        || /\bstd::env\b/.test(source)
+      ) {
+        throw new Error("M3 crates may not read credentials from std::env");
+      }
+      if (/\b(?:debug|info|warn|error|trace|println|eprintln)!\s*\([^;]*\bAuthorization\b/i.test(source)) {
+        throw new Error("Authorization values may not be logged");
+      }
+    }
+  }
+
+  for (const name of ["domain", "application", "policy-engine"]) {
+    for (const path of rustFiles(name)) {
+      const source = withoutInlineTestModules(readFileSync(path, "utf8"));
+      if (
+        /\b(?:openai|anthropic|gemini|claude)\b/i.test(source)
+        || /\b(?:OpenAi|Anthropic|Gemini|Claude)[A-Z]/.test(source)
+      ) {
+        throw new Error("provider names are forbidden in domain, application, and orchestration policy");
+      }
+    }
+  }
+
+  for (const name of ["domain", "application", "policy-engine", "agent-protocol", "agent-runtime", "bootstrap"]) {
+    for (const path of rustFiles(name)) {
+      const source = withoutInlineTestModules(readFileSync(path, "utf8"));
+      if (/\b(?:reqwest|hyper|ureq|Tcp(?:Listener|Stream)|std::net|tokio::net|rustls|native_tls)\b/.test(source)) {
+        throw new Error("provider HTTP and raw TCP/TLS are allowed only in provider-openai");
+      }
+    }
+  }
+
+  const productionRoots = [
+    ...(existsSync(crates)
+      ? readdirSync(crates, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => join(crates, entry.name, "src"))
+      : []),
+    join(sourceRoot, "apps", "desktop", "src-tauri", "src"),
+  ];
+  for (const directory of productionRoots) {
+    if (directory === join(crates, "bootstrap", "src")) continue;
+    for (const path of filesUnderIfExists(directory).filter((path) => path.endsWith(".rs"))) {
+      const source = withoutInlineTestModules(readFileSync(path, "utf8"));
+      if (/\b(?:ProtocolAgentRuntime|OpenAiResponsesAdapter|OpenAIResponsesAdapter)\s*::\s*(?:new|default|build)\s*\(/.test(source)) {
+        throw new Error("concrete M3 adapters must be constructed only in bootstrap");
+      }
+    }
+  }
 }
 
 function verifyAdapterConstruction() {

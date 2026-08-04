@@ -1,0 +1,17 @@
+{
+  "packages": [
+    { "name": "local-agent-terminal-domain", "dependencies": [] },
+    { "name": "local-agent-terminal-agent-protocol", "dependencies": [] },
+    { "name": "local-agent-terminal-provider-openai", "dependencies": [] },
+    {
+      "name": "local-agent-terminal-agent-runtime",
+      "dependencies": [{ "name": "local-agent-terminal-provider-openai" }]
+    }
+  ],
+  "workspace_members": [
+    "local-agent-terminal-domain",
+    "local-agent-terminal-agent-protocol",
+    "local-agent-terminal-provider-openai",
+    "local-agent-terminal-agent-runtime"
+  ]
+}
