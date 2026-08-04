@@ -171,19 +171,19 @@ pub trait ProtocolPeer: Send + Sync {
 }
 ```
 
-- [ ] **Step 1 - Write failing state-machine tests**
+- [x] **Step 1 - Write failing state-machine tests**
 
 Cover offered/selected protocol mismatch, capability escalation, binding mismatch, reused request ID, response without pending request, response origin mismatch, notification response attempts, foreign run IDs, stream start other than one, gaps, exact duplicates, conflicting duplicates, output-byte overflow, tool-request overflow, heartbeat sequence regression/timeout, complete-before-start, duplicate/conflicting terminal, post-terminal frames, cancellation deadline, and connection loss.
 
-- [ ] **Step 2 - Implement one explicit session state machine**
+- [x] **Step 2 - Implement one explicit session state machine**
 
 Keep one `HashSet` for seen request IDs, one bounded per-run stream record with only the last sequence/delta bytes, one terminal flag, and monotonic heartbeat state. Do not retain complete streams in the protocol layer. Return typed categories matching section 13 of the protocol design.
 
-- [ ] **Step 3 - Build reusable conformance cases**
+- [x] **Step 3 - Build reusable conformance cases**
 
 Export a data-driven `run_conformance(peer)` harness covering happy start/stream/complete plus malicious, slow, cancelled, crashed, malformed, oversize, sequence-gap, and duplicate-terminal cases. The harness is reused by fake agents and OpenAI adapter tests.
 
-- [ ] **Step 4 - Verify and commit**
+- [x] **Step 4 - Verify and commit**
 
 ```powershell
 cargo test -p local-agent-terminal-agent-protocol --test session_contract --test conformance
