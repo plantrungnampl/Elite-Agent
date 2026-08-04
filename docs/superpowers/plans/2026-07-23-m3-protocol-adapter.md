@@ -248,15 +248,15 @@ pub trait AgentRunStore: Send + Sync {
 }
 ```
 
-- [ ] **Step 1 - Write failing domain and port tests**
+- [x] **Step 1 - Write failing domain and port tests**
 
 Reject invalid status transitions, empty/oversized IDs/text, malformed digests, a core adapter without an executable/core-release digest, enabled legacy agents, mismatched task/context/artifact bindings, same-run supersession, unbounded generation parameters, terminal message/run mismatch, evidence line inversion, negative usage, and terminal persistence without authoritative receipt time.
 
-- [ ] **Step 2 - Implement minimal pure values and object-safe ports**
+- [x] **Step 2 - Implement minimal pure values and object-safe ports**
 
 Reuse `RunId`, `TaskId`, `ArtifactId`, `Sha256Digest`, `Timestamp`, `TrustTier`, `PortError`, and existing artifact ports. Keep provider/model as opaque validated strings. Store generation parameters as bounded canonical JSON bytes plus digest; no OpenAI DTO crosses inward.
 
-- [ ] **Step 3 - Verify dependency direction and commit**
+- [x] **Step 3 - Verify dependency direction and commit**
 
 ```powershell
 cargo test -p local-agent-terminal-domain --test agent_contract

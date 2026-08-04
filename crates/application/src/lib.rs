@@ -1,12 +1,17 @@
 #![forbid(unsafe_code)]
 
 pub use local_agent_terminal_domain::{
-    ActorId, ActorLocality, ArtifactId, FencingToken, GitObjectId, LeaseClaim, Phase, PolicyAction,
-    PolicyActor, PolicyResource, ProjectId, RepositoryId, ResourceClass, RunId, Sequence,
-    Sha256Digest, TaskBranch, TaskId, TaskRisk, TrustTier, WorkspaceFingerprint, WorkspaceVersion,
-    WorktreeId,
+    ActorId, ActorLocality, AgentCancellationReceipt, AgentClaim, AgentDescriptor, AgentError,
+    AgentEvidenceRef, AgentRunMessage, AgentRunReceipt, AgentRunSnapshot, AgentRunStatus,
+    AgentRunTerminal, AgentTrustTier, AgentUsage, ArtifactId, BoundAgentConnection,
+    BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig,
+    CancelAgentRun, FencingToken, GitObjectId, LeaseClaim, Phase, PolicyAction, PolicyActor,
+    PolicyResource, ProjectId, RepositoryId, ResourceClass, RunId, Sequence, Sha256Digest,
+    TaskBranch, TaskId, TaskRisk, TrustTier, WorkspaceFingerprint, WorkspaceVersion, WorktreeId,
+    MAX_GENERATION_PARAMETERS_BYTES,
 };
 
+mod agent;
 mod append_events;
 mod approval;
 mod authority;
@@ -23,6 +28,7 @@ mod resume;
 mod tool;
 mod workspace;
 
+pub use agent::{AgentRunStore, AgentRuntime};
 pub use append_events::AppendEvents;
 pub use approval::{
     build_approval_request, canonical_approval_payload, parse_approval_payload, ApprovalCheck,
