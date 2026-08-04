@@ -219,68 +219,152 @@ fn rejects_array_cardinality_uniqueness_and_property_constraints() {
 #[test]
 fn enforces_every_numeric_schema_boundary() {
     let codec = NdjsonCodec::default();
-    for (name, frame, min, max) in [
+    let schema = normative_schema();
+
+    for (name, frame, path) in [
         (
             "transport max frame bytes",
             initialize_with_max_frame_bytes as fn(i64) -> Value,
-            1_024,
-            Some(67_108_864),
+            "/$defs/initializeRequest/allOf/1/properties/params/properties/transport/properties/maxFrameBytes",
         ),
         (
             "run output tokens",
             run_start_with_output_tokens,
-            1,
-            Some(1_000_000),
+            "/$defs/runStartRequest/allOf/1/properties/params/properties/limits/properties/maxOutputTokens",
         ),
         (
             "run tool requests",
             run_start_with_tool_requests,
-            0,
-            Some(10_000),
+            "/$defs/runStartRequest/allOf/1/properties/params/properties/limits/properties/maxToolRequests",
         ),
         (
             "cancel deadline",
             run_cancel_with_deadline,
-            1,
-            Some(300_000),
+            "/$defs/runCancelRequest/allOf/1/properties/params/properties/deadlineMs",
         ),
-        ("evidence start line", run_complete_with_start_line, 1, None),
-        ("evidence end line", run_complete_with_end_line, 1, None),
-        ("input token usage", run_complete_with_input_tokens, 0, None),
+        (
+            "evidence start line",
+            run_complete_with_start_line,
+            "/$defs/evidenceRef/properties/startLine",
+        ),
+        (
+            "evidence end line",
+            run_complete_with_end_line,
+            "/$defs/evidenceRef/properties/endLine",
+        ),
+        (
+            "input token usage",
+            run_complete_with_input_tokens,
+            "/$defs/runCompleteRequest/allOf/1/properties/params/properties/usage/properties/inputTokens",
+        ),
         (
             "output token usage",
             run_complete_with_output_tokens,
-            0,
-            None,
+            "/$defs/runCompleteRequest/allOf/1/properties/params/properties/usage/properties/outputTokens",
         ),
-        ("stream sequence", stream_delta_with_sequence, 1, None),
+        (
+            "stream sequence",
+            stream_delta_with_sequence,
+            "/$defs/streamDeltaNotification/allOf/1/properties/params/properties/sequence",
+        ),
         (
             "context max items",
             context_query_with_max_items,
-            1,
-            Some(1_000),
+            "/$defs/contextQueryRequest/allOf/1/properties/params/properties/maxItems",
         ),
         (
             "context max tokens",
             context_query_with_max_tokens,
-            1,
-            Some(1_000_000),
+            "/$defs/contextQueryRequest/allOf/1/properties/params/properties/maxTokens",
         ),
-        ("fencing token", tool_request_with_fence, 1, None),
-        ("heartbeat sequence", heartbeat_with_sequence, 1, None),
+        (
+            "fencing token",
+            tool_request_with_fence,
+            "/$defs/toolRequest/allOf/1/properties/params/properties/executorFencingToken",
+        ),
+        (
+            "heartbeat sequence",
+            heartbeat_with_sequence,
+            "/$defs/heartbeatNotification/allOf/1/properties/params/properties/sequence",
+        ),
     ] {
+        let (min, max) = schema_integer_bounds(&schema, path);
         assert_integer_boundaries(&codec, name, frame, min, max);
     }
 
+    let (min, max) = schema_number_bounds(&schema, "/$defs/claim/properties/confidence");
     assert_number_boundaries(
         &codec,
         "claim confidence",
         run_complete_with_confidence,
-        0.0,
-        Some(1.0),
+        min,
+        max,
     );
-    assert_number_boundaries(&codec, "reported cost", run_complete_with_cost, 0.0, None);
+    let (min, max) = schema_number_bounds(
+        &schema,
+        "/$defs/runCompleteRequest/allOf/1/properties/params/properties/usage/properties/providerReportedCost",
+    );
+    assert_number_boundaries(&codec, "reported cost", run_complete_with_cost, min, max);
     assert!(codec.decode(&tool_request_with_null_fence()).is_ok());
+}
+
+#[test]
+fn rejects_unsigned_values_that_exceed_i64_for_bounded_integer_constraints() {
+    let codec = NdjsonCodec::default();
+    let beyond_i64 = json!(9_223_372_036_854_775_808_u64);
+
+    for (name, frame) in [
+        (
+            "transport max frame bytes",
+            with_value(
+                initialize_request(),
+                &["params", "transport", "maxFrameBytes"],
+                beyond_i64.clone(),
+            ),
+        ),
+        (
+            "run output tokens",
+            with_value(
+                run_start_request(),
+                &["params", "limits", "maxOutputTokens"],
+                beyond_i64.clone(),
+            ),
+        ),
+        (
+            "run tool requests",
+            with_value(
+                run_start_request(),
+                &["params", "limits", "maxToolRequests"],
+                beyond_i64.clone(),
+            ),
+        ),
+        (
+            "cancel deadline",
+            with_value(
+                run_cancel_with_deadline(1),
+                &["params", "deadlineMs"],
+                beyond_i64.clone(),
+            ),
+        ),
+        (
+            "context max items",
+            with_value(
+                context_query_request(),
+                &["params", "maxItems"],
+                beyond_i64.clone(),
+            ),
+        ),
+        (
+            "context max tokens",
+            with_value(
+                context_query_request(),
+                &["params", "maxTokens"],
+                beyond_i64,
+            ),
+        ),
+    ] {
+        assert_rejected(&codec, frame, name);
+    }
 }
 
 #[test]
@@ -338,6 +422,14 @@ fn encoding_rechecks_representable_schema_constraints() {
             "output tokens above",
             run_start_with_output_tokens(1_000_001),
         ),
+        (
+            "output tokens above i64 max",
+            with_value(
+                run_start_request(),
+                &["params", "limits", "maxOutputTokens"],
+                json!(9_223_372_036_854_775_808_u64),
+            ),
+        ),
         ("tool requests above", run_start_with_tool_requests(10_001)),
         ("cancel deadline above", run_cancel_with_deadline(300_001)),
         ("confidence above", run_complete_with_confidence(1.1)),
@@ -384,6 +476,43 @@ fn assert_rejected(codec: &NdjsonCodec, frame: Value, name: &str) {
         codec.decode(&json_bytes(&frame)).is_err(),
         "{name} must be rejected"
     );
+}
+
+fn normative_schema() -> Value {
+    serde_json::from_str(include_str!(
+        "../../../docs/multi-agent-terminal-design/schemas/agent-protocol.v1.schema.json"
+    ))
+    .expect("normative schema must be valid JSON")
+}
+
+fn schema_integer_bounds(schema: &Value, path: &str) -> (i64, Option<i64>) {
+    let constraint = schema
+        .pointer(path)
+        .expect("numeric constraint path must exist");
+    let min = constraint
+        .get("minimum")
+        .and_then(Value::as_u64)
+        .and_then(|value| i64::try_from(value).ok())
+        .expect("numeric minimum must fit i64");
+    let max = constraint.get("maximum").map(|value| {
+        value
+            .as_u64()
+            .and_then(|value| i64::try_from(value).ok())
+            .expect("numeric maximum must fit i64")
+    });
+    (min, max)
+}
+
+fn schema_number_bounds(schema: &Value, path: &str) -> (f64, Option<f64>) {
+    let constraint = schema
+        .pointer(path)
+        .expect("numeric constraint path must exist");
+    let min = constraint
+        .get("minimum")
+        .and_then(Value::as_f64)
+        .expect("numeric minimum must exist");
+    let max = constraint.get("maximum").and_then(Value::as_f64);
+    (min, max)
 }
 
 fn assert_integer_boundaries(
