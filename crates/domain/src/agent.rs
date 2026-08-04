@@ -204,12 +204,7 @@ impl BoundRunConfig {
         {
             return Err(AgentError::InvalidRunConfig);
         }
-        validate_trust_binding(
-            self.trust_tier,
-            self.executable_digest.as_ref(),
-            false,
-            true,
-        )?;
+        validate_executable_trust_binding(self.trust_tier, self.executable_digest.as_ref())?;
         self.generation_parameters.validate()
     }
 }
@@ -235,12 +230,7 @@ impl BoundAgentConnection {
         {
             return Err(AgentError::InvalidConnection);
         }
-        validate_trust_binding(
-            self.trust_tier,
-            self.executable_digest.as_ref(),
-            false,
-            true,
-        )?;
+        validate_executable_trust_binding(self.trust_tier, self.executable_digest.as_ref())?;
         if connection_binding_digest_matches(self) {
             Ok(())
         } else {
@@ -607,6 +597,16 @@ fn validate_trust_binding(
         return Err(AgentError::ContainmentRequired);
     }
     Ok(())
+}
+
+fn validate_executable_trust_binding(
+    trust_tier: TrustTier,
+    executable_digest: Option<&Sha256Digest>,
+) -> Result<(), AgentError> {
+    if matches!(trust_tier, TrustTier::FullAccessLegacy) {
+        return Err(AgentError::LegacyAgentEnabled);
+    }
+    validate_trust_binding(trust_tier, executable_digest, false, true)
 }
 
 fn valid_identifier(value: &str) -> bool {

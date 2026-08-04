@@ -9,6 +9,8 @@ const EMPTY_JSON_DIGEST: &str =
     "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 const CONNECTION_BINDING_DIGEST: &str =
     "sha256:6e171d4e7a1d7b7db1c14807e8a2a5cc9093eac495d66a2ca76439264d09b7d5";
+const FULL_ACCESS_LEGACY_CONNECTION_BINDING_DIGEST: &str =
+    "sha256:bdcaa025b4f264fee3c7126b6a0d70c1988c2e0d378cd276202701193f857be2";
 
 #[test]
 fn agent_run_status_moves_forward_and_never_leaves_a_terminal_status() {
@@ -51,6 +53,25 @@ fn descriptor_rejects_unbounded_identity_missing_core_digest_and_enabled_legacy(
     assert!(legacy.validate().is_err());
 
     assert!(Sha256Digest::new("sha256:not-a-digest").is_err());
+}
+
+#[test]
+fn disabled_full_access_legacy_descriptor_is_valid() {
+    let mut legacy = descriptor();
+    legacy.trust_tier = TrustTier::FullAccessLegacy;
+    legacy.enabled = false;
+
+    assert!(legacy.validate().is_ok());
+}
+
+#[test]
+fn bound_run_rejects_full_access_legacy() {
+    let mut legacy_run = bound_run();
+    legacy_run.run_config.trust_tier = TrustTier::FullAccessLegacy;
+    legacy_run.connection.trust_tier = TrustTier::FullAccessLegacy;
+    legacy_run.connection.binding_digest = full_access_legacy_connection_binding_digest();
+
+    assert!(legacy_run.validate().is_err());
 }
 
 #[test]
@@ -274,6 +295,10 @@ fn empty_json_digest() -> Sha256Digest {
 
 fn connection_binding_digest() -> Sha256Digest {
     Sha256Digest::new(CONNECTION_BINDING_DIGEST).unwrap()
+}
+
+fn full_access_legacy_connection_binding_digest() -> Sha256Digest {
+    Sha256Digest::new(FULL_ACCESS_LEGACY_CONNECTION_BINDING_DIGEST).unwrap()
 }
 
 fn run_id(value: &str) -> RunId {
