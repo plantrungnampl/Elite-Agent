@@ -284,15 +284,15 @@ terminal -> insert authoritative message + update run terminal + usage/error in 
 acknowledge agent only after terminal transaction commit
 ```
 
-- [ ] **Step 1 - Write failing persistence tests**
+- [x] **Step 1 - Write failing persistence tests**
 
 Cover idempotent descriptor registration with exact-byte equality; manifest/executable drift conflict; missing/foreign context and run-config artifacts; duplicate idempotency key; valid supersession; forward-only status; exact message/run binding; separate provider/core usage; duplicate terminal rollback; forced SQLite failure before acknowledgement; active-run interruption by connection digest; startup reopen; and provider outage leaving task sequence/workflow projection unchanged.
 
-- [ ] **Step 2 - Implement `AgentRunStore` with existing schema**
+- [x] **Step 2 - Implement `AgentRunStore` with existing schema**
 
 Use the existing `agent_descriptors`, `context_packages`, `agent_runs`, and `messages` tables. Do not add a migration unless a test proves the approved schema cannot represent a required field. Persist the canonical run-config artifact before `create_bound_run`; compare every referenced artifact's task, availability, content hash, and kind.
 
-- [ ] **Step 3 - Verify and commit**
+- [x] **Step 3 - Verify and commit**
 
 ```powershell
 cargo test -p local-agent-terminal-storage-sqlite --test agent_store
