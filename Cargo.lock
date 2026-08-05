@@ -1880,6 +1880,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "local-agent-terminal-agent-runtime"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "local-agent-terminal-agent-protocol",
+ "local-agent-terminal-application",
+ "local-agent-terminal-domain",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "local-agent-terminal-application"
 version = "0.1.0"
 dependencies = [

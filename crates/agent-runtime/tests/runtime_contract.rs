@@ -1,0 +1,559 @@
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+
+use chrono::{TimeZone, Utc};
+use local_agent_terminal_agent_protocol::{
+    ConnectionBinding, PeerDescriptor, ProtocolCapabilities, ProtocolError, ProtocolPeer,
+    ProtocolTrustTier,
+};
+use local_agent_terminal_agent_runtime::{
+    MaliciousScript, ProtocolAgentRuntime, Script, ScriptLog, ScriptedPeer,
+    DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_RUN_DEADLINE_SECS,
+};
+use local_agent_terminal_application::{
+    AgentRunStore, AgentRuntime, Clock, PortError, Retryability, SafeErrorClassification,
+};
+use local_agent_terminal_domain::{
+    AgentDescriptor, AgentRunSnapshot, AgentRunStatus, AgentRunTerminal, ArtifactId,
+    BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters,
+    BoundRunConfig, CancelAgentRun, RunId, Sha256Digest, TaskId, Timestamp, TrustTier,
+};
+
+const EMPTY_JSON_DIGEST: &str =
+    "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+const CONNECTION_BINDING_DIGEST: &str =
+    "sha256:6e171d4e7a1d7b7db1c14807e8a2a5cc9093eac495d66a2ca76439264d09b7d5";
+const EXECUTABLE_DIGEST: &str =
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const CONTEXT_DIGEST: &str =
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const POLICY_DIGEST: &str =
+    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+#[test]
+fn start_returns_after_durable_acceptance_and_scripted_output_is_deterministic() {
+    let log = script_log();
+    let store = Arc::new(RecordingStore::new(Arc::clone(&log)));
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(ScriptedPeer::with_log(
+        Script::Proposer,
+        peer_descriptor(),
+        Arc::clone(&log),
+    ));
+    let runtime = runtime(Arc::clone(&store), Arc::clone(&clock), Arc::clone(&peer));
+
+    let receipt = runtime.start_run(run_request("run-1", None)).unwrap();
+
+    assert_eq!(receipt.run_id, run_id("run-1"));
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+    assert_eq!(store.terminal_count(), 0);
+
+    peer.drive().unwrap();
+
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Succeeded));
+    assert_eq!(peer.duplicate_stream_deltas(), 1);
+    assert_eq!(peer.terminal_acknowledgements(), 1);
+    assert_eq!(
+        peer.outputs(),
+        vec![format!("proposer:core:2:{CONTEXT_DIGEST}")]
+    );
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        ["store.terminal.committed", "peer.terminal.acknowledged"]
+    );
+}
+
+#[test]
+fn proposer_critic_and_verifier_outputs_are_stable_for_the_same_bound_input() {
+    for (script, role) in [
+        (Script::Proposer, "proposer"),
+        (Script::Critic, "critic"),
+        (Script::Verifier, "verifier"),
+    ] {
+        let store = Arc::new(RecordingStore::default());
+        let clock = Arc::new(ManualClock::new(1_800_000_000));
+        let peer = Arc::new(ScriptedPeer::new(script, peer_descriptor()));
+        let runtime = runtime(store, clock, Arc::clone(&peer));
+        runtime.start_run(run_request("run-1", None)).unwrap();
+
+        peer.drive().unwrap();
+
+        assert_eq!(
+            peer.outputs(),
+            vec![format!("{role}:core:2:{CONTEXT_DIGEST}")]
+        );
+    }
+}
+
+#[test]
+fn terminal_store_failure_is_never_acknowledged() {
+    let log = script_log();
+    let store = Arc::new(RecordingStore::new(Arc::clone(&log)));
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(ScriptedPeer::with_log(
+        Script::Verifier,
+        peer_descriptor(),
+        Arc::clone(&log),
+    ));
+    let runtime = runtime(Arc::clone(&store), clock, Arc::clone(&peer));
+    runtime.start_run(run_request("run-1", None)).unwrap();
+    store.fail_terminal();
+
+    assert_eq!(peer.drive(), Err(ProtocolError::InternalAgentFailure));
+    assert_eq!(peer.terminal_acknowledgements(), 0);
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+}
+
+#[test]
+fn duplicate_and_conflicting_terminal_requests_commit_one_result() {
+    for malicious in [
+        MaliciousScript::DuplicateTerminal,
+        MaliciousScript::ConflictingTerminal,
+    ] {
+        let store = Arc::new(RecordingStore::default());
+        let clock = Arc::new(ManualClock::new(1_800_000_000));
+        let peer = Arc::new(ScriptedPeer::new(
+            Script::Malicious(malicious),
+            peer_descriptor(),
+        ));
+        let runtime = runtime(Arc::clone(&store), clock, Arc::clone(&peer));
+        runtime.start_run(run_request("run-1", None)).unwrap();
+
+        peer.drive().unwrap();
+
+        assert_eq!(store.terminal_count(), 1);
+        assert_eq!(peer.terminal_acknowledgements(), 1);
+    }
+}
+
+#[test]
+fn output_limit_persists_failure_and_triggers_peer_cancellation() {
+    let store = Arc::new(RecordingStore::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(ScriptedPeer::new(
+        Script::Malicious(MaliciousScript::OversizeOutput),
+        peer_descriptor(),
+    ));
+    let runtime = runtime(Arc::clone(&store), clock, Arc::clone(&peer));
+    runtime.start_run(run_request("run-1", None)).unwrap();
+
+    peer.drive().unwrap();
+
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Failed));
+    assert_eq!(peer.cancel_count(), 1);
+}
+
+#[test]
+fn cooperative_cancellation_is_terminal_before_the_receipt_returns() {
+    let store = Arc::new(RecordingStore::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(ScriptedPeer::new(Script::Critic, peer_descriptor()));
+    let runtime = runtime(Arc::clone(&store), clock, Arc::clone(&peer));
+    runtime.start_run(run_request("run-1", None)).unwrap();
+
+    let receipt = runtime
+        .cancel(CancelAgentRun {
+            run_id: run_id("run-1"),
+            reason: "user_cancelled".to_owned(),
+            deadline_ms: 5_000,
+        })
+        .unwrap();
+
+    assert_eq!(receipt.run_id, run_id("run-1"));
+    assert_eq!(
+        store.status("run-1"),
+        Some(AgentRunStatus::CancelledCleanly)
+    );
+}
+
+#[test]
+fn cancellation_and_run_deadlines_are_classified_as_terminated() {
+    for cancellation_deadline in [true, false] {
+        let store = Arc::new(RecordingStore::default());
+        let clock = Arc::new(ManualClock::new(1_800_000_000));
+        let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+        let runtime = runtime(Arc::clone(&store), Arc::clone(&clock), peer);
+        runtime.start_run(run_request("run-1", None)).unwrap();
+        if cancellation_deadline {
+            runtime
+                .cancel(CancelAgentRun {
+                    run_id: run_id("run-1"),
+                    reason: "user_cancelled".to_owned(),
+                    deadline_ms: 1_000,
+                })
+                .unwrap();
+            clock.advance(1);
+        } else {
+            clock.advance(DEFAULT_RUN_DEADLINE_SECS);
+        }
+
+        runtime.check_timeouts().unwrap();
+
+        assert_eq!(store.status("run-1"), Some(AgentRunStatus::Terminated));
+    }
+}
+
+#[test]
+fn heartbeat_timeout_and_crash_interrupt_without_workflow_projection_changes() {
+    for script in [Script::Slow, Script::Crashing] {
+        let store = Arc::new(RecordingStore::default());
+        let clock = Arc::new(ManualClock::new(1_800_000_000));
+        let peer = Arc::new(ScriptedPeer::new(script, peer_descriptor()));
+        let runtime = runtime(Arc::clone(&store), Arc::clone(&clock), Arc::clone(&peer));
+        runtime.start_run(run_request("run-1", None)).unwrap();
+        if script == Script::Crashing {
+            peer.drive().unwrap();
+        } else {
+            clock.advance(DEFAULT_HEARTBEAT_TIMEOUT_SECS);
+            runtime.check_timeouts().unwrap();
+        }
+
+        assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
+        assert_eq!(store.workflow_projection_mutations(), 0);
+    }
+}
+
+#[test]
+fn retry_uses_a_new_run_and_exact_supersession_binding() {
+    let store = Arc::new(RecordingStore::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(ScriptedPeer::new(Script::Crashing, peer_descriptor()));
+    let runtime = runtime(Arc::clone(&store), clock, Arc::clone(&peer));
+    runtime.start_run(run_request("run-1", None)).unwrap();
+    peer.drive().unwrap();
+
+    runtime
+        .start_run(run_request("run-2", Some("run-1")))
+        .unwrap();
+
+    assert_eq!(
+        store.snapshot("run-2").unwrap().request.supersedes_run_id,
+        Some(run_id("run-1"))
+    );
+}
+
+#[test]
+fn shutdown_interrupts_active_runs_before_reporting_completion() {
+    let store = Arc::new(RecordingStore::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+    let runtime = runtime(Arc::clone(&store), clock, Arc::clone(&peer));
+    runtime.start_run(run_request("run-1", None)).unwrap();
+
+    runtime.shutdown().unwrap();
+
+    assert!(peer.was_shutdown());
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
+}
+
+#[test]
+fn every_hostile_peer_failure_leaves_task_projection_untouched() {
+    let scripts = [
+        MaliciousScript::MalformedFrame,
+        MaliciousScript::WrongConnection,
+        MaliciousScript::WrongRun,
+        MaliciousScript::SequenceGap,
+        MaliciousScript::OversizeFrame,
+    ];
+    for malicious in scripts {
+        let store = Arc::new(RecordingStore::default());
+        let clock = Arc::new(ManualClock::new(1_800_000_000));
+        let peer = Arc::new(ScriptedPeer::new(
+            Script::Malicious(malicious),
+            peer_descriptor(),
+        ));
+        let runtime = runtime(Arc::clone(&store), clock, Arc::clone(&peer));
+        runtime.start_run(run_request("run-1", None)).unwrap();
+
+        peer.drive().unwrap();
+
+        assert!(store.status("run-1").unwrap().is_terminal());
+        assert_eq!(store.workflow_projection_mutations(), 0);
+    }
+}
+
+fn runtime(
+    store: Arc<RecordingStore>,
+    clock: Arc<ManualClock>,
+    peer: Arc<ScriptedPeer>,
+) -> ProtocolAgentRuntime {
+    let protocol_peer: Arc<dyn ProtocolPeer> = peer;
+    ProtocolAgentRuntime::new(store, clock, vec![(agent_descriptor(), protocol_peer)]).unwrap()
+}
+
+fn agent_descriptor() -> AgentDescriptor {
+    AgentDescriptor {
+        agent_id: "agent-1".to_owned(),
+        display_name: "Agent One".to_owned(),
+        trust_tier: TrustTier::CoreAdapter,
+        manifest_json: br#"{}"#.to_vec(),
+        manifest_digest: digest(EMPTY_JSON_DIGEST),
+        executable_digest: Some(digest(EXECUTABLE_DIGEST)),
+        enabled: true,
+        containment_verified: true,
+    }
+}
+
+fn peer_descriptor() -> PeerDescriptor {
+    PeerDescriptor {
+        binding: ConnectionBinding {
+            connection_id: "connection-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            manifest_digest: EMPTY_JSON_DIGEST.to_owned(),
+            executable_digest: EXECUTABLE_DIGEST.to_owned(),
+            trust_tier: ProtocolTrustTier::CoreAdapter,
+        },
+        protocol_version: "1.0".to_owned(),
+        capabilities: ProtocolCapabilities {
+            roles: ["reviewer".to_owned()].into_iter().collect(),
+            skills: ["testing".to_owned()].into_iter().collect(),
+            streaming: true,
+            context_query: false,
+            tool_requests: false,
+            specialist_requests: false,
+            max_concurrent_runs: 1,
+            max_context_tokens: 1_024,
+        },
+    }
+}
+
+fn run_request(run: &str, supersedes: Option<&str>) -> BoundAgentRunRequest {
+    let task_id = task_id("task-1");
+    BoundAgentRunRequest {
+        run_id: run_id(run),
+        task_id: task_id.clone(),
+        agent_id: "agent-1".to_owned(),
+        role: "reviewer".to_owned(),
+        phase: "analysis".to_owned(),
+        idempotency_key: format!("task-1:reviewer:{run}"),
+        context: BoundEffectiveContext {
+            context_package_id: "context-1".to_owned(),
+            task_id: task_id.clone(),
+            agent_id: "agent-1".to_owned(),
+            role: "reviewer".to_owned(),
+            objective: "Review the task.".to_owned(),
+            manifest_artifact_id: artifact_id("artifact-context-manifest-1"),
+            effective_context_artifact_id: artifact_id("artifact-context-1"),
+            content_digest: digest(CONTEXT_DIGEST),
+            policy_snapshot_digest: digest(POLICY_DIGEST),
+            prompt_template_version: "prompt-1".to_owned(),
+            retrieval_pipeline_version: "retrieval-1".to_owned(),
+            created_at: Timestamp::from_unix_seconds(1),
+        },
+        run_config: BoundRunConfig {
+            run_config_artifact_id: artifact_id(&format!("artifact-run-config-{run}")),
+            task_id: task_id.clone(),
+            agent_id: "agent-1".to_owned(),
+            role: "reviewer".to_owned(),
+            context_package_id: "context-1".to_owned(),
+            effective_context_artifact_id: artifact_id("artifact-context-1"),
+            effective_context_digest: digest(CONTEXT_DIGEST),
+            trust_tier: TrustTier::CoreAdapter,
+            manifest_digest: digest(EMPTY_JSON_DIGEST),
+            executable_digest: Some(digest(EXECUTABLE_DIGEST)),
+            contract_version: "1.0".to_owned(),
+            adapter_version: "adapter-1".to_owned(),
+            provider_id: "provider-1".to_owned(),
+            model_id: "model-1".to_owned(),
+            generation_parameters: BoundGenerationParameters {
+                canonical_json: br#"{}"#.to_vec(),
+                digest: digest(EMPTY_JSON_DIGEST),
+            },
+            prompt_template_version: "prompt-1".to_owned(),
+            response_schema_version: "agent-message.v1".to_owned(),
+            policy_snapshot_digest: digest(POLICY_DIGEST),
+        },
+        connection: BoundAgentConnection {
+            connection_id: "connection-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            trust_tier: TrustTier::CoreAdapter,
+            manifest_digest: digest(EMPTY_JSON_DIGEST),
+            executable_digest: Some(digest(EXECUTABLE_DIGEST)),
+            contract_version: "1.0".to_owned(),
+            adapter_version: "adapter-1".to_owned(),
+            binding_digest: digest(CONNECTION_BINDING_DIGEST),
+        },
+        supersedes_run_id: supersedes.map(run_id),
+    }
+}
+
+#[derive(Default)]
+struct RecordingStore {
+    runs: Mutex<BTreeMap<String, AgentRunSnapshot>>,
+    terminals: Mutex<Vec<AgentRunTerminal>>,
+    fail_terminal: Mutex<bool>,
+    log: ScriptLog,
+}
+
+impl RecordingStore {
+    fn new(log: ScriptLog) -> Self {
+        Self {
+            log,
+            ..Self::default()
+        }
+    }
+
+    fn snapshot(&self, run_id: &str) -> Option<AgentRunSnapshot> {
+        self.runs.lock().unwrap().get(run_id).cloned()
+    }
+
+    fn status(&self, run_id: &str) -> Option<AgentRunStatus> {
+        self.snapshot(run_id).map(|run| run.status)
+    }
+
+    fn terminal_count(&self) -> usize {
+        self.terminals.lock().unwrap().len()
+    }
+
+    fn fail_terminal(&self) {
+        *self.fail_terminal.lock().unwrap() = true;
+    }
+
+    const fn workflow_projection_mutations(&self) -> usize {
+        0
+    }
+}
+
+impl AgentRunStore for RecordingStore {
+    fn register_descriptor(&self, descriptor: &AgentDescriptor) -> Result<(), PortError> {
+        descriptor.validate().map_err(|_| invalid_input())
+    }
+
+    fn create_bound_run(
+        &self,
+        request: &BoundAgentRunRequest,
+    ) -> Result<AgentRunSnapshot, PortError> {
+        let snapshot = AgentRunSnapshot::created(request.clone()).map_err(|_| invalid_input())?;
+        self.runs
+            .lock()
+            .unwrap()
+            .insert(request.run_id.as_str().to_owned(), snapshot.clone());
+        Ok(snapshot)
+    }
+
+    fn accept_run(&self, run_id: &RunId, accepted_at: &str) -> Result<(), PortError> {
+        transition(self, run_id, AgentRunStatus::Accepted, accepted_at)
+    }
+
+    fn mark_running(&self, run_id: &RunId, started_at: &str) -> Result<(), PortError> {
+        transition(self, run_id, AgentRunStatus::Running, started_at)
+    }
+
+    fn persist_terminal(&self, terminal: &AgentRunTerminal) -> Result<(), PortError> {
+        if *self.fail_terminal.lock().unwrap() {
+            return Err(PortError::failure(
+                SafeErrorClassification::StorageFull,
+                Retryability::Retryable,
+            ));
+        }
+        terminal.validate().map_err(|_| invalid_input())?;
+        let mut runs = self.runs.lock().unwrap();
+        let run = runs
+            .get_mut(terminal.run_id.as_str())
+            .ok_or_else(invalid_input)?;
+        run.transition_to(terminal.status, terminal.core_received_at.unwrap())
+            .map_err(|_| invalid_input())?;
+        self.terminals.lock().unwrap().push(terminal.clone());
+        self.log.lock().unwrap().push("store.terminal.committed");
+        Ok(())
+    }
+
+    fn interrupt_connection(
+        &self,
+        connection_digest: &str,
+        at: &str,
+    ) -> Result<Vec<RunId>, PortError> {
+        let at = parse_timestamp(at)?;
+        let mut interrupted = Vec::new();
+        for run in self.runs.lock().unwrap().values_mut() {
+            if run.request.connection.binding_digest.as_str() == connection_digest
+                && !run.status.is_terminal()
+            {
+                run.transition_to(AgentRunStatus::Interrupted, at)
+                    .map_err(|_| invalid_input())?;
+                interrupted.push(run.request.run_id.clone());
+            }
+        }
+        Ok(interrupted)
+    }
+
+    fn load_run(&self, run_id: &RunId) -> Result<Option<AgentRunSnapshot>, PortError> {
+        Ok(self.snapshot(run_id.as_str()))
+    }
+}
+
+struct ManualClock {
+    seconds: Mutex<i64>,
+}
+
+impl ManualClock {
+    fn new(seconds: i64) -> Self {
+        Self {
+            seconds: Mutex::new(seconds),
+        }
+    }
+
+    fn advance(&self, seconds: i64) {
+        *self.seconds.lock().unwrap() += seconds;
+    }
+}
+
+impl Clock for ManualClock {
+    fn now_utc(&self) -> Result<String, PortError> {
+        Ok(Utc
+            .timestamp_opt(*self.seconds.lock().unwrap(), 0)
+            .single()
+            .unwrap()
+            .to_rfc3339())
+    }
+}
+
+fn transition(
+    store: &RecordingStore,
+    run_id: &RunId,
+    status: AgentRunStatus,
+    at: &str,
+) -> Result<(), PortError> {
+    store
+        .runs
+        .lock()
+        .unwrap()
+        .get_mut(run_id.as_str())
+        .ok_or_else(invalid_input)?
+        .transition_to(status, parse_timestamp(at)?)
+        .map_err(|_| invalid_input())
+}
+
+fn parse_timestamp(value: &str) -> Result<Timestamp, PortError> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(value).map_err(|_| invalid_input())?;
+    Ok(Timestamp::from_unix_seconds(parsed.timestamp()))
+}
+
+fn invalid_input() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::InvalidInput,
+        Retryability::NonRetryable,
+    )
+}
+
+fn script_log() -> ScriptLog {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+fn artifact_id(value: &str) -> ArtifactId {
+    ArtifactId::new(value).unwrap()
+}
+
+fn digest(value: &str) -> Sha256Digest {
+    Sha256Digest::new(value).unwrap()
+}
+
+fn run_id(value: &str) -> RunId {
+    RunId::new(value).unwrap()
+}
+
+fn task_id(value: &str) -> TaskId {
+    TaskId::new(value).unwrap()
+}

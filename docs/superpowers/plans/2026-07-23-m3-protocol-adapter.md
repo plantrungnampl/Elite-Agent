@@ -325,22 +325,22 @@ pub struct ProtocolAgentRuntime {
 
 `start_run` validates descriptor/connection/context/config, durably creates the run, asks the peer to accept promptly, marks accepted/running, and returns. Peer events arrive through a sink that validates session state and persists a terminal before returning terminal acknowledgement. Runtime-owned worker handles are joined on shutdown; no detached task owns authoritative state.
 
-- [ ] **Step 1 - Write failing runtime tests**
+- [x] **Step 1 - Write failing runtime tests**
 
 Prove prompt acceptance, one result per request ID, terminal persistence before ack, exact stream deduplication, limit-triggered cancel, cooperative cancellation, deadline termination classification, heartbeat timeout, crash-to-interrupted, retry with new run/supersedes, shutdown interruption, and no workflow projection mutation on every peer failure.
 
-- [ ] **Step 2 - Implement five deterministic roles plus hostile modes**
+- [x] **Step 2 - Implement five deterministic roles plus hostile modes**
 
 Provide proposer, critic, verifier, malicious, slow, and crashing peers as one small scripted peer with an enum script rather than six implementations. Each output is deterministic from the request IDs/context digest. The malicious script covers malformed frame, wrong connection/run, duplicate/conflicting terminal, sequence gap, and oversize output.
 
-- [ ] **Step 3 - Run shared conformance against all scripts**
+- [x] **Step 3 - Run shared conformance against all scripts**
 
 ```powershell
 cargo test -p local-agent-terminal-agent-runtime --test runtime_contract --test fake_conformance
 cargo test -p local-agent-terminal-agent-protocol --test conformance
 ```
 
-- [ ] **Step 4 - Commit**
+- [x] **Step 4 - Commit**
 
 ```powershell
 git add Cargo.toml Cargo.lock crates/agent-runtime
