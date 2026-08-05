@@ -18,6 +18,10 @@ const EMPTY_JSON_DIGEST: &str =
 const CONNECTION_BINDING_DIGEST: &str =
     "sha256:6e171d4e7a1d7b7db1c14807e8a2a5cc9093eac495d66a2ca76439264d09b7d5";
 const CONTEXT_BYTES: &[u8] = br#"{"context":"bound"}"#;
+const RFC8785_GENERATION_DIGEST: &str =
+    "sha256:0ac6c8907856746804e71de596b1ddceed49d53b3c52035da285c42271851863";
+const RFC8785_RUN_CONFIG_DIGEST: &str =
+    "sha256:21b6ec8f124f344cde1ac27280015761e8c6ac264087eacbd1f74ff62e1c7ba2";
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -162,6 +166,65 @@ fn descriptor_registration_is_idempotent_only_for_exact_canonical_bytes() {
             .unwrap_err()
             .safe_classification(),
         SafeErrorClassification::InvalidInput,
+    );
+}
+
+#[test]
+fn rfc8785_canonical_bytes_and_digests_survive_run_reconstruction() {
+    let raw: Value = serde_json::from_str(r#"{"\uE000":1,"\uD83D\uDE00":-0.0}"#).unwrap();
+    let canonical = serde_json_canonicalizer::to_vec(&raw).unwrap();
+    assert_eq!(
+        canonical,
+        format!(r#"{{"{}":0,"{}":1}}"#, '\u{1f600}', '\u{e000}').as_bytes(),
+    );
+    assert_eq!(digest_bytes(&canonical).as_str(), RFC8785_GENERATION_DIGEST);
+
+    let database = TestDatabase::new();
+    let store = database.store();
+    let mut canonical_descriptor = descriptor();
+    canonical_descriptor.agent_id = "agent-rfc8785".to_owned();
+    canonical_descriptor.manifest_json = canonical.clone();
+    canonical_descriptor.manifest_digest = digest_from_str(RFC8785_GENERATION_DIGEST);
+    store.register_descriptor(&canonical_descriptor).unwrap();
+
+    let mut noncanonical_descriptor = canonical_descriptor;
+    noncanonical_descriptor.agent_id = "agent-rfc8785-noncanonical".to_owned();
+    noncanonical_descriptor.manifest_json =
+        r#"{"\uE000":1,"\uD83D\uDE00":-0.0}"#.as_bytes().to_vec();
+    noncanonical_descriptor.manifest_digest = digest_bytes(&noncanonical_descriptor.manifest_json);
+    assert_eq!(
+        store
+            .register_descriptor(&noncanonical_descriptor)
+            .unwrap_err()
+            .safe_classification(),
+        SafeErrorClassification::InvalidInput,
+    );
+
+    let descriptor = descriptor();
+    store.register_descriptor(&descriptor).unwrap();
+    let mut request = bound_run("rfc8785", "rfc8785-key");
+    request.run_config.generation_parameters = BoundGenerationParameters {
+        canonical_json: canonical,
+        digest: digest_from_str(RFC8785_GENERATION_DIGEST),
+    };
+    request.validate().unwrap();
+    let run_config = canonical_agent_run_config_artifact(&request).unwrap();
+    assert_eq!(
+        digest_bytes(&run_config).as_str(),
+        RFC8785_RUN_CONFIG_DIGEST,
+    );
+    seed_default_artifacts(&database, &request, &descriptor);
+    store.create_bound_run(&request).unwrap();
+    drop(store);
+
+    assert_eq!(
+        database
+            .store()
+            .load_run(&request.run_id)
+            .unwrap()
+            .unwrap()
+            .request,
+        request,
     );
 }
 
@@ -462,6 +525,103 @@ fn interruption_marks_every_active_run_for_the_connection() {
             Some(Timestamp::from_unix_seconds(30)),
         );
     }
+}
+
+#[test]
+fn interruption_uses_only_lifecycle_state_when_bound_artifacts_are_unavailable() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let descriptor = descriptor();
+    store.register_descriptor(&descriptor).unwrap();
+    let created = bound_run("artifact-blind-created", "artifact-blind-created-key");
+    let running = bound_run("artifact-blind-running", "artifact-blind-running-key");
+    let unaffected = bound_run("artifact-blind-unaffected", "artifact-blind-unaffected-key");
+    for request in [&created, &running, &unaffected] {
+        seed_default_artifacts(&database, request, &descriptor);
+        store.create_bound_run(request).unwrap();
+    }
+    store.accept_run(&running.run_id, timestamp(10)).unwrap();
+    store.mark_running(&running.run_id, timestamp(11)).unwrap();
+
+    let connection = database.connection();
+    connection
+        .execute(
+            "UPDATE agent_runs SET connection_binding_digest = ?1 WHERE id = ?2",
+            params![digest('e').as_str(), unaffected.run_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE artifacts SET availability = 'missing'
+             WHERE id IN (?1, ?2, ?3, ?4)",
+            params![
+                created.context.effective_context_artifact_id.as_str(),
+                created.run_config.run_config_artifact_id.as_str(),
+                running.context.effective_context_artifact_id.as_str(),
+                running.run_config.run_config_artifact_id.as_str(),
+            ],
+        )
+        .unwrap();
+
+    assert!(store
+        .interrupt_connection(CONNECTION_BINDING_DIGEST, timestamp(9))
+        .is_err());
+    for run_id in [&created.run_id, &running.run_id] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM agent_runs WHERE id = ?1",
+                    [run_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            if run_id == &running.run_id {
+                "running"
+            } else {
+                "created"
+            },
+        );
+    }
+
+    assert_eq!(
+        store
+            .interrupt_connection(CONNECTION_BINDING_DIGEST, timestamp(30))
+            .unwrap(),
+        vec![created.run_id.clone(), running.run_id.clone()],
+    );
+    for run_id in [&created.run_id, &running.run_id] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status, completed_at FROM agent_runs WHERE id = ?1",
+                    [run_id.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            ("interrupted".to_owned(), timestamp(30).to_owned()),
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE stream_id = ?1 AND event_type = 'agent.run.completed'",
+                    [format!("agent-run:{}", run_id.as_str())],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+        );
+    }
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status, completed_at FROM agent_runs WHERE id = ?1",
+                [unaffected.run_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap(),
+        ("created".to_owned(), None),
+    );
 }
 
 #[test]

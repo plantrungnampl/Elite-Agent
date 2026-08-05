@@ -63,7 +63,7 @@ pub fn canonical_agent_run_config_artifact(
             "trustTier": request.run_config.trust_tier.as_str(),
         },
     });
-    serde_json::to_vec(&value).map_err(|_| internal_failure())
+    serde_json_canonicalizer::to_vec(&value).map_err(|_| internal_failure())
 }
 
 impl AgentRunStore for SqliteStore {
@@ -377,35 +377,45 @@ impl AgentRunStore for SqliteStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
-        let run_ids = {
+        let active_runs = {
             let mut statement = transaction
                 .prepare(
-                    "SELECT id FROM agent_runs
+                    "SELECT id, status, started_at, completed_at FROM agent_runs
                      WHERE connection_binding_digest = ?1
                        AND status IN ('created', 'accepted', 'running')
                      ORDER BY id",
                 )
                 .map_err(sqlite_error_to_port)?;
             let rows = statement
-                .query_map([connection_digest], |row| row.get::<_, String>(0))
+                .query_map([connection_digest], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })
                 .map_err(sqlite_error_to_port)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(sqlite_error_to_port)?;
             rows
         };
-        let mut interrupted = Vec::with_capacity(run_ids.len());
-        for value in run_ids {
+        let mut interrupted = Vec::with_capacity(active_runs.len());
+        for (value, status, started_at, existing_completed_at) in active_runs {
             let run_id = RunId::new(value).map_err(|_| integrity_failure())?;
-            let mut snapshot =
-                load_run_on_connection(&transaction, &run_id)?.ok_or_else(integrity_failure)?;
-            snapshot
-                .transition_to(AgentRunStatus::Interrupted, completed_at)
-                .map_err(|_| conflict())?;
+            validate_interruption_lifecycle(
+                &transaction,
+                &run_id,
+                &status,
+                started_at.as_deref(),
+                existing_completed_at.as_deref(),
+                completed_at,
+            )?;
             let updated = transaction
                 .execute(
                     "UPDATE agent_runs SET status = 'interrupted', completed_at = ?1
-                     WHERE id = ?2 AND status IN ('created', 'accepted', 'running')",
-                    params![at, run_id.as_str()],
+                     WHERE id = ?2 AND status = ?3 AND completed_at IS NULL",
+                    params![at, run_id.as_str(), status],
                 )
                 .map_err(sqlite_error_to_port)?;
             if updated != 1 {
@@ -862,11 +872,50 @@ fn load_run_event_timestamp(
         .transpose()
 }
 
+fn validate_interruption_lifecycle(
+    connection: &Connection,
+    run_id: &RunId,
+    status: &str,
+    started_at: Option<&str>,
+    completed_at: Option<&str>,
+    interruption_at: Timestamp,
+) -> Result<(), PortError> {
+    let status = parse_status(status).ok_or_else(integrity_failure)?;
+    if !status.can_transition_to(AgentRunStatus::Interrupted) {
+        return Err(conflict());
+    }
+    if completed_at.is_some() {
+        return Err(integrity_failure());
+    }
+    let accepted_at = load_run_event_timestamp(connection, run_id, "agent.run.accepted")?;
+    let started_at = started_at
+        .map(|value| validated_timestamp(connection, value))
+        .transpose()?;
+    let lifecycle_is_consistent = match status {
+        AgentRunStatus::Created => accepted_at.is_none() && started_at.is_none(),
+        AgentRunStatus::Accepted => accepted_at.is_some() && started_at.is_none(),
+        AgentRunStatus::Running => accepted_at
+            .zip(started_at)
+            .is_some_and(|(accepted_at, started_at)| started_at >= accepted_at),
+        _ => false,
+    };
+    if !lifecycle_is_consistent {
+        return Err(integrity_failure());
+    }
+    if started_at
+        .or(accepted_at)
+        .is_some_and(|at| interruption_at < at)
+    {
+        return Err(conflict());
+    }
+    Ok(())
+}
+
 fn parse_run_config_artifact(
     bytes: &[u8],
 ) -> Result<(BoundRunConfig, BoundAgentConnection), PortError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| integrity_failure())?;
-    if serde_json::to_vec(&value).map_err(|_| integrity_failure())? != bytes
+    if serde_json_canonicalizer::to_vec(&value).map_err(|_| integrity_failure())? != bytes
         || required_string(&value, "schema")? != RUN_CONFIG_SCHEMA
     {
         return Err(integrity_failure());
@@ -892,7 +941,7 @@ fn parse_run_config_artifact(
         provider_id: required_string(config, "providerId")?.to_owned(),
         model_id: required_string(config, "modelId")?.to_owned(),
         generation_parameters: BoundGenerationParameters {
-            canonical_json: serde_json::to_vec(generation_parameters)
+            canonical_json: serde_json_canonicalizer::to_vec(generation_parameters)
                 .map_err(|_| integrity_failure())?,
             digest: digest(config, "generationParametersDigest")?,
         },
@@ -992,7 +1041,7 @@ fn usage_json(usage: &AgentUsage) -> String {
 
 fn canonical_manifest(bytes: &[u8]) -> Result<String, PortError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| invalid_input())?;
-    let canonical = serde_json::to_vec(&value).map_err(|_| invalid_input())?;
+    let canonical = serde_json_canonicalizer::to_vec(&value).map_err(|_| invalid_input())?;
     if canonical != bytes {
         return Err(invalid_input());
     }

@@ -2004,6 +2004,7 @@ dependencies = [
  "local-agent-terminal-domain",
  "rusqlite",
  "serde_json",
+ "serde_json_canonicalizer",
  "sha2",
 ]
 
