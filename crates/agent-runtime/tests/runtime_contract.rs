@@ -159,6 +159,52 @@ fn threaded_terminal_ack_waits_for_durable_run_readiness_and_commit() {
 }
 
 #[test]
+fn background_callback_entering_before_peer_start_returns_waits_for_durable_readiness() {
+    let store = Arc::new(RecordingStore::default());
+    let (peer, completed) = PreReturnRacePeer::new();
+    let runtime = runtime_with_protocol_peer(
+        store.clone(),
+        Arc::new(ManualClock::new(1_800_000_000)),
+        peer.clone(),
+    );
+
+    runtime.start_run(run_request("run-1", None)).unwrap();
+
+    assert!(matches!(
+        completed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Ok(InboundDisposition::Notification(_))
+    ));
+    peer.join_worker().unwrap();
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+    runtime
+        .cancel(CancelAgentRun {
+            run_id: run_id("run-1"),
+            reason: "proves-active-commit".to_owned(),
+            deadline_ms: 1,
+        })
+        .unwrap();
+}
+
+#[test]
+fn synchronous_callback_during_peer_start_is_rejected() {
+    let store = Arc::new(RecordingStore::default());
+    let peer = Arc::new(SynchronousCallbackPeer::default());
+    let runtime = runtime_with_protocol_peer(
+        store.clone(),
+        Arc::new(ManualClock::new(1_800_000_000)),
+        peer.clone(),
+    );
+
+    runtime.start_run(run_request("run-1", None)).unwrap();
+
+    assert_eq!(
+        peer.callback_result(),
+        Some(Err(ProtocolError::InvalidRequest))
+    );
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+}
+
+#[test]
 fn proposer_critic_and_verifier_outputs_are_stable_for_the_same_bound_input() {
     for (script, role) in [
         (Script::Proposer, "proposer"),
@@ -325,6 +371,75 @@ fn compensation_shutdown_interrupts_and_removes_sibling_connection_runs() {
             .safe_classification(),
         SafeErrorClassification::NotFound
     );
+}
+
+#[test]
+fn compensation_shutdown_retires_connection_after_durable_cleanup() {
+    let store = Arc::new(RecordingStore::default());
+    let peer = Arc::new(MultiRunPeer::new(peer_descriptor()));
+    let runtime = runtime_with_protocol_peer(
+        store.clone(),
+        Arc::new(AdvancingClock::new(1_800_000_000)),
+        peer.clone(),
+    );
+    store.fail_start_at(StartStoreFailure::Running);
+
+    let start_error = runtime.start_run(run_request("run-1", None)).unwrap_err();
+
+    assert_eq!(
+        start_error.safe_classification(),
+        SafeErrorClassification::StorageFull
+    );
+    assert!(peer.was_shutdown());
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
+    store.allow_start();
+    assert_start_conflict_without_row(&runtime, &store, "run-2");
+    assert_eq!(peer.start_count(), 1);
+}
+
+#[test]
+fn runtime_shutdown_retires_connection_after_durable_cleanup() {
+    let store = Arc::new(RecordingStore::default());
+    let peer = Arc::new(MultiRunPeer::new(peer_descriptor()));
+    let runtime = runtime_with_protocol_peer(
+        store.clone(),
+        Arc::new(AdvancingClock::new(1_800_000_000)),
+        peer.clone(),
+    );
+    runtime.start_run(run_request("run-1", None)).unwrap();
+
+    runtime.shutdown().unwrap();
+
+    assert!(peer.was_shutdown());
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
+    assert_start_conflict_without_row(&runtime, &store, "run-2");
+    assert_eq!(peer.start_count(), 1);
+}
+
+#[test]
+fn compensation_clock_failure_retires_connection_until_later_cleanup() {
+    let store = Arc::new(RecordingStore::default());
+    let clock = Arc::new(AdvancingClock::new(1_800_000_000));
+    clock.fail_on_call(4);
+    let peer = Arc::new(MultiRunPeer::new(peer_descriptor()));
+    let runtime = runtime_with_protocol_peer(store.clone(), clock.clone(), peer.clone());
+    store.fail_start_at(StartStoreFailure::Running);
+
+    let start_error = runtime.start_run(run_request("run-1", None)).unwrap_err();
+
+    assert_eq!(
+        start_error.safe_classification(),
+        SafeErrorClassification::StorageFull
+    );
+    assert!(peer.was_shutdown());
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Accepted));
+    store.allow_start();
+    assert_start_conflict_without_row(&runtime, &store, "run-2");
+
+    clock.recover();
+    runtime.shutdown().unwrap();
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
+    assert_start_conflict_without_row(&runtime, &store, "run-3");
 }
 
 #[test]
@@ -578,6 +693,67 @@ fn heartbeat_timeout_and_crash_interrupt_active_runs() {
 
         assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
     }
+}
+
+#[test]
+fn interruption_store_failure_retains_active_state_and_capacity_until_retry_succeeds() {
+    let store = Arc::new(RecordingStore::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(MultiRunPeer::new(peer_descriptor()));
+    let runtime = runtime_with_protocol_peer(store.clone(), clock.clone(), peer);
+    runtime.start_run(run_request("run-1", None)).unwrap();
+    clock.advance(DEFAULT_HEARTBEAT_TIMEOUT_SECS);
+    store.fail_interrupt();
+
+    let error = runtime.check_timeouts().unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::StorageFull
+    );
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+    assert_start_conflict_without_row(&runtime, &store, "run-2");
+
+    store.allow_interrupt();
+    assert_eq!(runtime.check_timeouts().unwrap(), vec![run_id("run-1")]);
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
+    assert_eq!(
+        runtime
+            .cancel(CancelAgentRun {
+                run_id: run_id("run-1"),
+                reason: "already-interrupted".to_owned(),
+                deadline_ms: 1,
+            })
+            .unwrap_err()
+            .safe_classification(),
+        SafeErrorClassification::NotFound
+    );
+    runtime.start_run(run_request("run-2", None)).unwrap();
+}
+
+#[test]
+fn interruption_clock_failure_retains_active_state_and_capacity_until_retry_succeeds() {
+    let store = Arc::new(RecordingStore::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(MultiRunPeer::new(peer_descriptor()));
+    let runtime = runtime_with_protocol_peer(store.clone(), clock.clone(), peer);
+    runtime.start_run(run_request("run-1", None)).unwrap();
+    clock.advance(DEFAULT_HEARTBEAT_TIMEOUT_SECS);
+    clock.fail();
+
+    let error = runtime.check_timeouts().unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Internal
+    );
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+    clock.recover();
+    assert_start_conflict_without_row(&runtime, &store, "run-2");
+
+    assert_eq!(runtime.check_timeouts().unwrap(), vec![run_id("run-1")]);
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
+    runtime.start_run(run_request("run-2", None)).unwrap();
 }
 
 #[test]
@@ -846,6 +1022,158 @@ impl ProtocolPeer for ThreadedRacePeer {
     }
 }
 
+struct EnteredSink {
+    sink: Box<dyn PeerEventSink>,
+    entered: Mutex<Option<mpsc::Sender<()>>>,
+}
+
+impl EnteredSink {
+    fn notify_entered(&self) {
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            entered.send(()).expect("sink entry observer");
+        }
+    }
+}
+
+impl PeerEventSink for EnteredSink {
+    fn receive(&self, frame: ProtocolFrame) -> Result<InboundDisposition, ProtocolError> {
+        self.notify_entered();
+        self.sink.receive(frame)
+    }
+
+    fn request(&self, frame: ProtocolFrame) -> Result<ProtocolFrame, ProtocolError> {
+        self.notify_entered();
+        self.sink.request(frame)
+    }
+
+    fn receive_raw(&self, bytes: &[u8]) -> Result<InboundDisposition, ProtocolError> {
+        self.notify_entered();
+        self.sink.receive_raw(bytes)
+    }
+
+    fn connection_lost(&self) -> Result<(), ProtocolError> {
+        self.notify_entered();
+        self.sink.connection_lost()
+    }
+}
+
+struct PreReturnRacePeer {
+    completed: mpsc::Sender<Result<InboundDisposition, ProtocolError>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl PreReturnRacePeer {
+    fn new() -> (
+        Arc<Self>,
+        mpsc::Receiver<Result<InboundDisposition, ProtocolError>>,
+    ) {
+        let (completed, completed_receiver) = mpsc::channel();
+        (
+            Arc::new(Self {
+                completed,
+                worker: Mutex::new(None),
+            }),
+            completed_receiver,
+        )
+    }
+
+    fn join_worker(&self) -> Result<(), ProtocolError> {
+        self.worker
+            .lock()
+            .unwrap()
+            .take()
+            .expect("pre-return worker")
+            .join()
+            .map_err(|_| ProtocolError::InternalAgentFailure)
+    }
+}
+
+impl ProtocolPeer for PreReturnRacePeer {
+    fn descriptor(&self) -> PeerDescriptor {
+        peer_descriptor()
+    }
+
+    fn start(
+        &self,
+        request: RunStart,
+        sink: Box<dyn PeerEventSink>,
+    ) -> Result<RunAcceptance, ProtocolError> {
+        let run_id = request.run_id();
+        let worker_run_id = run_id.clone();
+        let completed = self.completed.clone();
+        let (entered, entered_receiver) = mpsc::channel();
+        *self.worker.lock().unwrap() = Some(thread::spawn(move || {
+            let sink = EnteredSink {
+                sink,
+                entered: Mutex::new(Some(entered)),
+            };
+            completed
+                .send(sink.receive(threaded_delta(&worker_run_id)))
+                .expect("pre-return callback result observer");
+        }));
+        entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| ProtocolError::Timeout)?;
+        Ok(RunAcceptance {
+            run_id,
+            accepted: true,
+        })
+    }
+
+    fn cancel(&self, request: RunCancel) -> Result<CancelAcceptance, ProtocolError> {
+        Ok(CancelAcceptance {
+            run_id: request.run_id(),
+            accepted: true,
+        })
+    }
+
+    fn shutdown(&self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct SynchronousCallbackPeer {
+    callback_result: Mutex<Option<Result<(), ProtocolError>>>,
+}
+
+impl SynchronousCallbackPeer {
+    fn callback_result(&self) -> Option<Result<(), ProtocolError>> {
+        *self.callback_result.lock().unwrap()
+    }
+}
+
+impl ProtocolPeer for SynchronousCallbackPeer {
+    fn descriptor(&self) -> PeerDescriptor {
+        peer_descriptor()
+    }
+
+    fn start(
+        &self,
+        request: RunStart,
+        sink: Box<dyn PeerEventSink>,
+    ) -> Result<RunAcceptance, ProtocolError> {
+        let run_id = request.run_id();
+        *self.callback_result.lock().unwrap() =
+            Some(sink.receive(threaded_delta(&run_id)).map(|_| ()));
+        Ok(RunAcceptance {
+            run_id,
+            accepted: true,
+        })
+    }
+
+    fn cancel(&self, request: RunCancel) -> Result<CancelAcceptance, ProtocolError> {
+        Ok(CancelAcceptance {
+            run_id: request.run_id(),
+            accepted: true,
+        })
+    }
+
+    fn shutdown(&self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+}
+
 struct MultiRunPeer {
     descriptor: PeerDescriptor,
     sinks: Mutex<Vec<Box<dyn PeerEventSink>>>,
@@ -863,6 +1191,10 @@ impl MultiRunPeer {
 
     fn was_shutdown(&self) -> bool {
         *self.shutdown.lock().unwrap()
+    }
+
+    fn start_count(&self) -> usize {
+        self.sinks.lock().unwrap().len()
     }
 }
 
@@ -960,6 +1292,35 @@ fn runtime_with_artifacts(
         vec![(agent_descriptor(), protocol_peer)],
     )
     .unwrap()
+}
+
+fn runtime_with_protocol_peer(
+    store: Arc<RecordingStore>,
+    clock: Arc<dyn Clock>,
+    peer: Arc<dyn ProtocolPeer>,
+) -> ProtocolAgentRuntime {
+    ProtocolAgentRuntime::new(
+        store,
+        Arc::new(RecordingArtifacts::default()),
+        clock,
+        vec![(agent_descriptor(), peer)],
+    )
+    .unwrap()
+}
+
+fn assert_start_conflict_without_row(
+    runtime: &ProtocolAgentRuntime,
+    store: &RecordingStore,
+    run: &str,
+) {
+    assert_eq!(
+        runtime
+            .start_run(run_request(run, None))
+            .unwrap_err()
+            .safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert!(store.snapshot(run).is_none());
 }
 
 fn agent_descriptor() -> AgentDescriptor {
@@ -1069,6 +1430,7 @@ struct RecordingStore {
     terminals: Mutex<Vec<AgentRunTerminal>>,
     fail_terminal: Mutex<bool>,
     fail_start: Mutex<Option<StartStoreFailure>>,
+    fail_interrupt: Mutex<bool>,
     acceptance_gate: Mutex<Option<Arc<AcceptanceGate>>>,
     log: ScriptLog,
 }
@@ -1162,6 +1524,18 @@ impl RecordingStore {
         *self.fail_start.lock().unwrap() = Some(failure);
     }
 
+    fn allow_start(&self) {
+        *self.fail_start.lock().unwrap() = None;
+    }
+
+    fn fail_interrupt(&self) {
+        *self.fail_interrupt.lock().unwrap() = true;
+    }
+
+    fn allow_interrupt(&self) {
+        *self.fail_interrupt.lock().unwrap() = false;
+    }
+
     fn block_acceptance(&self) -> Arc<AcceptanceGate> {
         let gate = Arc::new(AcceptanceGate::new());
         *self.acceptance_gate.lock().unwrap() = Some(Arc::clone(&gate));
@@ -1227,6 +1601,9 @@ impl AgentRunStore for RecordingStore {
         connection_digest: &str,
         at: &str,
     ) -> Result<Vec<RunId>, PortError> {
+        if *self.fail_interrupt.lock().unwrap() {
+            return Err(storage_full());
+        }
         let at = parse_timestamp(at)?;
         let mut interrupted = Vec::new();
         for run in self.runs.lock().unwrap().values_mut() {
@@ -1248,22 +1625,35 @@ impl AgentRunStore for RecordingStore {
 
 struct ManualClock {
     seconds: Mutex<i64>,
+    fail: Mutex<bool>,
 }
 
 impl ManualClock {
     fn new(seconds: i64) -> Self {
         Self {
             seconds: Mutex::new(seconds),
+            fail: Mutex::new(false),
         }
     }
 
     fn advance(&self, seconds: i64) {
         *self.seconds.lock().unwrap() += seconds;
     }
+
+    fn fail(&self) {
+        *self.fail.lock().unwrap() = true;
+    }
+
+    fn recover(&self) {
+        *self.fail.lock().unwrap() = false;
+    }
 }
 
 impl Clock for ManualClock {
     fn now_utc(&self) -> Result<String, PortError> {
+        if *self.fail.lock().unwrap() {
+            return Err(internal_failure());
+        }
         Ok(Utc
             .timestamp_opt(*self.seconds.lock().unwrap(), 0)
             .single()
@@ -1274,18 +1664,35 @@ impl Clock for ManualClock {
 
 struct AdvancingClock {
     next_seconds: Mutex<i64>,
+    calls: Mutex<usize>,
+    fail_on_call: Mutex<Option<usize>>,
 }
 
 impl AdvancingClock {
     fn new(seconds: i64) -> Self {
         Self {
             next_seconds: Mutex::new(seconds),
+            calls: Mutex::new(0),
+            fail_on_call: Mutex::new(None),
         }
+    }
+
+    fn fail_on_call(&self, call: usize) {
+        *self.fail_on_call.lock().unwrap() = Some(call);
+    }
+
+    fn recover(&self) {
+        *self.fail_on_call.lock().unwrap() = None;
     }
 }
 
 impl Clock for AdvancingClock {
     fn now_utc(&self) -> Result<String, PortError> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        if *self.fail_on_call.lock().unwrap() == Some(*calls) {
+            return Err(internal_failure());
+        }
         let mut seconds = self.next_seconds.lock().unwrap();
         let current = *seconds;
         *seconds += 1;

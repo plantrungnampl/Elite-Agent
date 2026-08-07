@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex,
     },
+    thread::{self, ThreadId},
     time::Duration,
 };
 
@@ -53,18 +54,37 @@ struct ActiveRun {
 
 #[derive(Default)]
 struct ConnectionSlots {
-    runs: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    state: Mutex<ConnectionSlotState>,
+}
+
+#[derive(Default)]
+struct ConnectionSlotState {
+    runs: BTreeMap<String, BTreeSet<String>>,
+    digests: BTreeMap<String, String>,
+    retired_connection_ids: BTreeSet<String>,
 }
 
 impl ConnectionSlots {
     fn reserve(
         self: &Arc<Self>,
+        connection_id: &str,
         connection_digest: &str,
         run_id: &RunId,
         capacity: u64,
     ) -> Result<RunSlot, PortError> {
-        let mut connections = self.runs.lock().map_err(|_| internal_failure())?;
-        let runs = connections.entry(connection_digest.to_owned()).or_default();
+        let mut state = self.state.lock().map_err(|_| internal_failure())?;
+        if state.retired_connection_ids.contains(connection_id)
+            || state
+                .digests
+                .get(connection_id)
+                .is_some_and(|digest| digest != connection_digest)
+        {
+            return Err(conflict());
+        }
+        state
+            .digests
+            .insert(connection_id.to_owned(), connection_digest.to_owned());
+        let runs = state.runs.entry(connection_digest.to_owned()).or_default();
         if u64::try_from(runs.len()).map_err(|_| internal_failure())? >= capacity
             || !runs.insert(run_id.as_str().to_owned())
         {
@@ -79,20 +99,40 @@ impl ConnectionSlots {
     }
 
     fn release(&self, connection_digest: &str, run_id: &str) {
-        if let Ok(mut connections) = self.runs.lock() {
-            if let Some(runs) = connections.get_mut(connection_digest) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(runs) = state.runs.get_mut(connection_digest) {
                 runs.remove(run_id);
                 if runs.is_empty() {
-                    connections.remove(connection_digest);
+                    state.runs.remove(connection_digest);
                 }
             }
         }
     }
 
     fn release_connection(&self, connection_digest: &str) {
-        if let Ok(mut connections) = self.runs.lock() {
-            connections.remove(connection_digest);
+        if let Ok(mut state) = self.state.lock() {
+            state.runs.remove(connection_digest);
         }
+    }
+
+    fn retire_connection(&self, connection_id: &str) -> Result<(), PortError> {
+        self.state
+            .lock()
+            .map_err(|_| internal_failure())?
+            .retired_connection_ids
+            .insert(connection_id.to_owned());
+        Ok(())
+    }
+
+    fn known_digests(&self) -> Result<BTreeSet<String>, PortError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| internal_failure())?
+            .digests
+            .values()
+            .cloned()
+            .collect())
     }
 }
 
@@ -138,6 +178,7 @@ enum SinkReadiness {
 }
 
 struct SinkGate {
+    starting_thread: ThreadId,
     readiness: Mutex<SinkReadiness>,
     changed: Condvar,
 }
@@ -145,6 +186,7 @@ struct SinkGate {
 impl SinkGate {
     fn new() -> Self {
         Self {
+            starting_thread: thread::current().id(),
             readiness: Mutex::new(SinkReadiness::Starting),
             changed: Condvar::new(),
         }
@@ -176,16 +218,17 @@ impl SinkGate {
             .map_err(|_| ProtocolError::InternalAgentFailure)?;
         loop {
             match *readiness {
-                SinkReadiness::Starting | SinkReadiness::Failed => {
-                    return Err(ProtocolError::InvalidRequest)
+                SinkReadiness::Starting if thread::current().id() == self.starting_thread => {
+                    return Err(ProtocolError::InvalidRequest);
                 }
-                SinkReadiness::Ready => return Ok(()),
-                SinkReadiness::Accepted => {
+                SinkReadiness::Starting | SinkReadiness::Accepted => {
                     readiness = self
                         .changed
                         .wait(readiness)
                         .map_err(|_| ProtocolError::InternalAgentFailure)?;
                 }
+                SinkReadiness::Failed => return Err(ProtocolError::InvalidRequest),
+                SinkReadiness::Ready => return Ok(()),
             }
         }
     }
@@ -300,18 +343,14 @@ impl ProtocolAgentRuntime {
     pub fn shutdown(&self) -> Result<(), PortError> {
         let mut peer_error = None;
         for peer in self.peers.values() {
+            self.slots
+                .retire_connection(&peer.descriptor().binding.connection_id)?;
             if let Err(error) = peer.shutdown() {
                 peer_error.get_or_insert(error);
             }
         }
         let now = self.now()?;
-        let digests = self
-            .active_runs
-            .lock()
-            .map_err(|_| internal_failure())?
-            .values()
-            .map(|run| run.request.connection.binding_digest.as_str().to_owned())
-            .collect::<BTreeSet<_>>();
+        let digests = self.slots.known_digests()?;
         for digest in digests {
             self.interrupt_connection(&digest, &now.text)?;
         }
@@ -346,6 +385,7 @@ impl ProtocolAgentRuntime {
             return Err(invalid_input());
         }
         let slot = self.slots.reserve(
+            &request.connection.connection_id,
             request.connection.binding_digest.as_str(),
             &request.run_id,
             peer.descriptor().capabilities.max_concurrent_runs,
@@ -422,7 +462,6 @@ impl ProtocolAgentRuntime {
                     peer.as_ref(),
                     AgentRunStatus::Failed,
                     "peer rejected the bound run",
-                    &slot,
                 );
                 return Err(error);
             }
@@ -434,7 +473,6 @@ impl ProtocolAgentRuntime {
                     peer.as_ref(),
                     AgentRunStatus::Interrupted,
                     "peer failed before acceptance",
-                    &slot,
                 );
                 return Err(original);
             }
@@ -446,7 +484,6 @@ impl ProtocolAgentRuntime {
                 peer.as_ref(),
                 AgentRunStatus::Interrupted,
                 "peer start could not be committed",
-                &slot,
             );
             return Err(error);
         }
@@ -493,7 +530,6 @@ impl ProtocolAgentRuntime {
                     peer.as_ref(),
                     AgentRunStatus::Interrupted,
                     "peer start could not be committed",
-                    &slot,
                 );
                 return Err(error);
             }
@@ -638,7 +674,6 @@ impl ProtocolAgentRuntime {
         peer: &dyn ProtocolPeer,
         status: AgentRunStatus,
         error: &str,
-        slot: &RunSlot,
     ) {
         if let Ok(frame) = cancel_frame(
             &request.run_id,
@@ -650,18 +685,23 @@ impl ProtocolAgentRuntime {
                 let _ = peer.cancel(cancel);
             }
         }
+        if self
+            .slots
+            .retire_connection(&request.connection.connection_id)
+            .is_err()
+        {
+            return;
+        }
         let _ = peer.shutdown();
+        let connection_digest = request.connection.binding_digest.as_str();
         if let Ok(now) = self.now() {
             let _ = self.persist_runtime_terminal(request, status, error, now.timestamp);
-            let _ =
-                self.interrupt_connection(request.connection.binding_digest.as_str(), &now.text);
-        } else {
-            slot.release_connection();
+            let _ = self.interrupt_connection(connection_digest, &now.text);
         }
     }
 
     fn interrupt_connection(&self, digest: &str, at: &str) -> Result<Vec<RunId>, PortError> {
-        let interrupted = self.store.interrupt_connection(digest, at);
+        let interrupted = self.store.interrupt_connection(digest, at)?;
         self.active_runs
             .lock()
             .map_err(|_| internal_failure())?
@@ -671,7 +711,7 @@ impl ProtocolAgentRuntime {
             .map_err(|_| internal_failure())?
             .remove(digest);
         self.slots.release_connection(digest);
-        interrupted
+        Ok(interrupted)
     }
 
     fn is_active(&self, run_id: &RunId) -> Result<bool, PortError> {
