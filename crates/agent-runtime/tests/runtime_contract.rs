@@ -186,7 +186,7 @@ fn background_callback_entering_before_peer_start_returns_waits_for_durable_read
 }
 
 #[test]
-fn synchronous_callback_during_peer_start_is_rejected() {
+fn synchronous_callbacks_during_peer_start_are_rejected() {
     let store = Arc::new(RecordingStore::default());
     let peer = Arc::new(SynchronousCallbackPeer::default());
     let runtime = runtime_with_protocol_peer(
@@ -199,6 +199,10 @@ fn synchronous_callback_during_peer_start_is_rejected() {
 
     assert_eq!(
         peer.callback_result(),
+        Some(Err(ProtocolError::InvalidRequest))
+    );
+    assert_eq!(
+        peer.connection_lost_result(),
         Some(Err(ProtocolError::InvalidRequest))
     );
     assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
@@ -770,7 +774,38 @@ fn interruption_store_failure_retains_active_state_and_capacity_until_retry_succ
 }
 
 #[test]
-fn interruption_clock_failure_retains_active_state_and_capacity_until_retry_succeeds() {
+fn interruption_poison_blocks_a_concurrent_start_before_the_store_call_finishes() {
+    let store = Arc::new(RecordingStore::default());
+    let interrupt_gate = store.block_interrupt();
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let runtime = Arc::new(runtime_with_protocol_peer(
+        store.clone(),
+        clock.clone(),
+        peer.clone(),
+    ));
+    runtime.start_run(run_request("run-1", None)).unwrap();
+    clock.advance(DEFAULT_HEARTBEAT_TIMEOUT_SECS);
+    store.fail_interrupt();
+    let checking_runtime = Arc::clone(&runtime);
+    let checking = thread::spawn(move || checking_runtime.check_timeouts());
+    interrupt_gate.wait_until_entered();
+
+    assert_start_conflict_without_row(&runtime, &store, "run-2");
+    assert_eq!(peer.start_count(), 1);
+
+    interrupt_gate.release();
+    assert_eq!(
+        checking.join().unwrap().unwrap_err().safe_classification(),
+        SafeErrorClassification::StorageFull
+    );
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+}
+
+#[test]
+fn clock_recovery_retries_poison_without_waiting_for_a_session_timeout() {
     let store = Arc::new(RecordingStore::default());
     let clock = Arc::new(ManualClock::new(1_800_000_000));
     let mut descriptor = peer_descriptor();
@@ -778,7 +813,6 @@ fn interruption_clock_failure_retains_active_state_and_capacity_until_retry_succ
     let peer = Arc::new(MultiRunPeer::new(descriptor));
     let runtime = runtime_with_protocol_peer(store.clone(), clock.clone(), peer.clone());
     runtime.start_run(run_request("run-1", None)).unwrap();
-    clock.advance(DEFAULT_HEARTBEAT_TIMEOUT_SECS);
     clock.fail();
 
     let error = runtime.check_timeouts().unwrap_err();
@@ -795,6 +829,76 @@ fn interruption_clock_failure_retains_active_state_and_capacity_until_retry_succ
     assert_eq!(runtime.check_timeouts().unwrap(), vec![run_id("run-1")]);
     assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
     runtime.start_run(run_request("run-2", None)).unwrap();
+    assert_eq!(peer.start_count(), 2);
+}
+
+#[test]
+fn connection_loss_store_failure_is_retried_by_check_timeouts() {
+    let store = Arc::new(RecordingStore::default());
+    let interrupt_gate = store.block_interrupt();
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let runtime = runtime_with_protocol_peer(store.clone(), clock, peer.clone());
+    runtime.start_run(run_request("run-1", None)).unwrap();
+    store.fail_interrupt();
+    let losing_peer = Arc::clone(&peer);
+    let losing = thread::spawn(move || losing_peer.connection_lost(0));
+    interrupt_gate.wait_until_entered();
+
+    assert_start_conflict_without_row(&runtime, &store, "run-2");
+    interrupt_gate.release();
+    assert_eq!(
+        losing.join().unwrap(),
+        Err(ProtocolError::InternalAgentFailure)
+    );
+
+    store.allow_interrupt();
+    assert_eq!(runtime.check_timeouts().unwrap(), vec![run_id("run-1")]);
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
+}
+
+#[test]
+fn rejected_handshake_cleanup_failure_preserves_conflict_and_poisoned_capacity() {
+    let store = Arc::new(RecordingStore::default());
+    let creation_gate = store.block_creation("run-2");
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let runtime = Arc::new(runtime_with_protocol_peer(
+        store.clone(),
+        clock.clone(),
+        peer.clone(),
+    ));
+    runtime.start_run(run_request("run-1", None)).unwrap();
+    let starting_runtime = Arc::clone(&runtime);
+    let starting = thread::spawn(move || starting_runtime.start_run(run_request("run-2", None)));
+    creation_gate.wait_until_entered();
+    clock.fail();
+    assert_eq!(
+        runtime.check_timeouts().unwrap_err().safe_classification(),
+        SafeErrorClassification::Internal
+    );
+    clock.recover();
+    store.fail_interrupt();
+
+    creation_gate.release();
+    assert_eq!(
+        starting.join().unwrap().unwrap_err().safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(peer.start_count(), 1);
+    assert_eq!(store.status("run-2"), Some(AgentRunStatus::Created));
+    assert_start_conflict_without_row(&runtime, &store, "run-3");
+
+    store.allow_interrupt();
+    assert_eq!(
+        runtime.check_timeouts().unwrap(),
+        vec![run_id("run-1"), run_id("run-2")]
+    );
+    runtime.start_run(run_request("run-4", None)).unwrap();
     assert_eq!(peer.start_count(), 2);
 }
 
@@ -1177,11 +1281,16 @@ impl ProtocolPeer for PreReturnRacePeer {
 #[derive(Default)]
 struct SynchronousCallbackPeer {
     callback_result: Mutex<Option<Result<(), ProtocolError>>>,
+    connection_lost_result: Mutex<Option<Result<(), ProtocolError>>>,
 }
 
 impl SynchronousCallbackPeer {
     fn callback_result(&self) -> Option<Result<(), ProtocolError>> {
         *self.callback_result.lock().unwrap()
+    }
+
+    fn connection_lost_result(&self) -> Option<Result<(), ProtocolError>> {
+        *self.connection_lost_result.lock().unwrap()
     }
 }
 
@@ -1198,6 +1307,7 @@ impl ProtocolPeer for SynchronousCallbackPeer {
         let run_id = request.run_id();
         *self.callback_result.lock().unwrap() =
             Some(sink.receive(threaded_delta(&run_id)).map(|_| ()));
+        *self.connection_lost_result.lock().unwrap() = Some(sink.connection_lost());
         Ok(RunAcceptance {
             run_id,
             accepted: true,
@@ -1218,7 +1328,7 @@ impl ProtocolPeer for SynchronousCallbackPeer {
 
 struct MultiRunPeer {
     descriptor: PeerDescriptor,
-    sinks: Mutex<Vec<Box<dyn PeerEventSink>>>,
+    sinks: Mutex<Vec<Arc<dyn PeerEventSink>>>,
     shutdown: Mutex<bool>,
 }
 
@@ -1238,6 +1348,10 @@ impl MultiRunPeer {
     fn start_count(&self) -> usize {
         self.sinks.lock().unwrap().len()
     }
+
+    fn connection_lost(&self, index: usize) -> Result<(), ProtocolError> {
+        Arc::clone(&self.sinks.lock().unwrap()[index]).connection_lost()
+    }
 }
 
 impl ProtocolPeer for MultiRunPeer {
@@ -1250,7 +1364,7 @@ impl ProtocolPeer for MultiRunPeer {
         request: RunStart,
         sink: Box<dyn PeerEventSink>,
     ) -> Result<RunAcceptance, ProtocolError> {
-        self.sinks.lock().unwrap().push(sink);
+        self.sinks.lock().unwrap().push(Arc::from(sink));
         Ok(RunAcceptance {
             run_id: request.run_id(),
             accepted: true,
@@ -1473,6 +1587,7 @@ struct RecordingStore {
     fail_terminal: Mutex<bool>,
     fail_start: Mutex<Option<StartStoreFailure>>,
     fail_interrupt: Mutex<bool>,
+    interrupt_gate: Mutex<Option<Arc<AcceptanceGate>>>,
     creation_gate: Mutex<Option<(String, Arc<AcceptanceGate>)>>,
     acceptance_gate: Mutex<Option<Arc<AcceptanceGate>>>,
     log: ScriptLog,
@@ -1579,6 +1694,12 @@ impl RecordingStore {
         *self.fail_interrupt.lock().unwrap() = false;
     }
 
+    fn block_interrupt(&self) -> Arc<AcceptanceGate> {
+        let gate = Arc::new(AcceptanceGate::new());
+        *self.interrupt_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
     fn block_acceptance(&self) -> Arc<AcceptanceGate> {
         let gate = Arc::new(AcceptanceGate::new());
         *self.acceptance_gate.lock().unwrap() = Some(Arc::clone(&gate));
@@ -1660,6 +1781,9 @@ impl AgentRunStore for RecordingStore {
         connection_digest: &str,
         at: &str,
     ) -> Result<Vec<RunId>, PortError> {
+        if let Some(gate) = self.interrupt_gate.lock().unwrap().clone() {
+            gate.block();
+        }
         if *self.fail_interrupt.lock().unwrap() {
             return Err(storage_full());
         }
