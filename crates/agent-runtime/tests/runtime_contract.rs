@@ -374,6 +374,40 @@ fn compensation_shutdown_interrupts_and_removes_sibling_connection_runs() {
 }
 
 #[test]
+fn retirement_prevents_a_reserved_start_from_reaching_the_shutdown_peer() {
+    let store = Arc::new(RecordingStore::default());
+    let creation_gate = store.block_creation("run-b");
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let runtime = Arc::new(runtime_with_protocol_peer(
+        store.clone(),
+        Arc::new(AdvancingClock::new(1_800_000_000)),
+        peer.clone(),
+    ));
+    let starting_runtime = Arc::clone(&runtime);
+    let start_b = thread::spawn(move || starting_runtime.start_run(run_request("run-b", None)));
+    creation_gate.wait_until_entered();
+    store.fail_start_at(StartStoreFailure::Running);
+
+    let start_a = runtime.start_run(run_request("run-a", None)).unwrap_err();
+
+    assert_eq!(
+        start_a.safe_classification(),
+        SafeErrorClassification::StorageFull
+    );
+    assert!(peer.was_shutdown());
+    creation_gate.release();
+    let start_b = start_b.join().unwrap().unwrap_err();
+    assert_eq!(
+        start_b.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(store.status("run-b"), Some(AgentRunStatus::Interrupted));
+    assert_eq!(peer.start_count(), 1);
+}
+
+#[test]
 fn compensation_shutdown_retires_connection_after_durable_cleanup() {
     let store = Arc::new(RecordingStore::default());
     let peer = Arc::new(MultiRunPeer::new(peer_descriptor()));
@@ -699,8 +733,10 @@ fn heartbeat_timeout_and_crash_interrupt_active_runs() {
 fn interruption_store_failure_retains_active_state_and_capacity_until_retry_succeeds() {
     let store = Arc::new(RecordingStore::default());
     let clock = Arc::new(ManualClock::new(1_800_000_000));
-    let peer = Arc::new(MultiRunPeer::new(peer_descriptor()));
-    let runtime = runtime_with_protocol_peer(store.clone(), clock.clone(), peer);
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let runtime = runtime_with_protocol_peer(store.clone(), clock.clone(), peer.clone());
     runtime.start_run(run_request("run-1", None)).unwrap();
     clock.advance(DEFAULT_HEARTBEAT_TIMEOUT_SECS);
     store.fail_interrupt();
@@ -713,6 +749,7 @@ fn interruption_store_failure_retains_active_state_and_capacity_until_retry_succ
     );
     assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
     assert_start_conflict_without_row(&runtime, &store, "run-2");
+    assert_eq!(peer.start_count(), 1);
 
     store.allow_interrupt();
     assert_eq!(runtime.check_timeouts().unwrap(), vec![run_id("run-1")]);
@@ -729,14 +766,17 @@ fn interruption_store_failure_retains_active_state_and_capacity_until_retry_succ
         SafeErrorClassification::NotFound
     );
     runtime.start_run(run_request("run-2", None)).unwrap();
+    assert_eq!(peer.start_count(), 2);
 }
 
 #[test]
 fn interruption_clock_failure_retains_active_state_and_capacity_until_retry_succeeds() {
     let store = Arc::new(RecordingStore::default());
     let clock = Arc::new(ManualClock::new(1_800_000_000));
-    let peer = Arc::new(MultiRunPeer::new(peer_descriptor()));
-    let runtime = runtime_with_protocol_peer(store.clone(), clock.clone(), peer);
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let runtime = runtime_with_protocol_peer(store.clone(), clock.clone(), peer.clone());
     runtime.start_run(run_request("run-1", None)).unwrap();
     clock.advance(DEFAULT_HEARTBEAT_TIMEOUT_SECS);
     clock.fail();
@@ -750,10 +790,12 @@ fn interruption_clock_failure_retains_active_state_and_capacity_until_retry_succ
     assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
     clock.recover();
     assert_start_conflict_without_row(&runtime, &store, "run-2");
+    assert_eq!(peer.start_count(), 1);
 
     assert_eq!(runtime.check_timeouts().unwrap(), vec![run_id("run-1")]);
     assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
     runtime.start_run(run_request("run-2", None)).unwrap();
+    assert_eq!(peer.start_count(), 2);
 }
 
 #[test]
@@ -1431,6 +1473,7 @@ struct RecordingStore {
     fail_terminal: Mutex<bool>,
     fail_start: Mutex<Option<StartStoreFailure>>,
     fail_interrupt: Mutex<bool>,
+    creation_gate: Mutex<Option<(String, Arc<AcceptanceGate>)>>,
     acceptance_gate: Mutex<Option<Arc<AcceptanceGate>>>,
     log: ScriptLog,
 }
@@ -1541,6 +1584,12 @@ impl RecordingStore {
         *self.acceptance_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
     }
+
+    fn block_creation(&self, run_id: &str) -> Arc<AcceptanceGate> {
+        let gate = Arc::new(AcceptanceGate::new());
+        *self.creation_gate.lock().unwrap() = Some((run_id.to_owned(), Arc::clone(&gate)));
+        gate
+    }
 }
 
 impl AgentRunStore for RecordingStore {
@@ -1557,6 +1606,16 @@ impl AgentRunStore for RecordingStore {
             .lock()
             .unwrap()
             .insert(request.run_id.as_str().to_owned(), snapshot.clone());
+        let creation_gate = self
+            .creation_gate
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(run_id, _)| run_id == request.run_id.as_str())
+            .cloned();
+        if let Some((_, gate)) = creation_gate {
+            gate.block();
+        }
         Ok(snapshot)
     }
 
