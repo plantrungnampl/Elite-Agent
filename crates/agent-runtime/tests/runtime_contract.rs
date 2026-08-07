@@ -30,6 +30,8 @@ const EMPTY_JSON_DIGEST: &str =
     "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 const CONNECTION_BINDING_DIGEST: &str =
     "sha256:6e171d4e7a1d7b7db1c14807e8a2a5cc9093eac495d66a2ca76439264d09b7d5";
+const ALTERNATE_CONNECTION_BINDING_DIGEST: &str =
+    "sha256:19c626cd039614b089a6696156e732bc42c438da19ce49ae9f0380b2224f568d";
 const EXECUTABLE_DIGEST: &str =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const CONTEXT_DIGEST: &str =
@@ -120,6 +122,30 @@ fn peer_receives_every_bound_execution_field_and_wire_limit_exactly() {
         8_000
     );
     assert_eq!(wire.pointer("/params/limits/maxToolRequests").unwrap(), 8);
+}
+
+#[test]
+fn dispatch_rejects_a_binding_digest_not_authorized_at_registration() {
+    let store = Arc::new(RecordingStore::default());
+    let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+    let runtime = runtime(
+        store.clone(),
+        Arc::new(ManualClock::new(1_800_000_000)),
+        peer.clone(),
+    );
+    let mut request = run_request("run-other-binding", None);
+    request.connection.adapter_version = "adapter-2".to_owned();
+    request.connection.binding_digest = digest(ALTERNATE_CONNECTION_BINDING_DIGEST);
+    request.run_config.adapter_version = "adapter-2".to_owned();
+
+    let error = runtime.start_run(request).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::InvalidInput
+    );
+    assert!(store.snapshot("run-other-binding").is_none());
+    assert!(peer.start_requests().is_empty());
 }
 
 #[test]
@@ -243,7 +269,11 @@ fn disabled_descriptor_is_listed_but_never_dispatched() {
         store,
         artifacts,
         clock,
-        vec![(descriptor.clone(), protocol_peer)],
+        vec![(
+            descriptor.clone(),
+            digest(CONNECTION_BINDING_DIGEST),
+            protocol_peer,
+        )],
     )
     .unwrap();
 
@@ -275,7 +305,10 @@ fn duplicate_peer_connection_ids_are_rejected_at_construction() {
         store,
         artifacts,
         clock,
-        vec![(agent_descriptor(), first), (second_descriptor, second)],
+        vec![
+            (agent_descriptor(), digest(CONNECTION_BINDING_DIGEST), first),
+            (second_descriptor, digest(CONNECTION_BINDING_DIGEST), second),
+        ],
     );
 
     let error = match result {
@@ -289,6 +322,84 @@ fn duplicate_peer_connection_ids_are_rejected_at_construction() {
 }
 
 #[test]
+fn startup_recovery_deduplicates_authoritative_connection_digests() {
+    let store = Arc::new(RecordingStore::default());
+    let first: Arc<dyn ProtocolPeer> = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+    let mut second_descriptor = agent_descriptor();
+    second_descriptor.agent_id = "agent-2".to_owned();
+    let mut second_peer_descriptor = peer_descriptor();
+    second_peer_descriptor.binding.connection_id = "connection-2".to_owned();
+    second_peer_descriptor.binding.agent_id = "agent-2".to_owned();
+    let second: Arc<dyn ProtocolPeer> =
+        Arc::new(ScriptedPeer::new(Script::Slow, second_peer_descriptor));
+
+    ProtocolAgentRuntime::new(
+        store.clone(),
+        Arc::new(RecordingArtifacts::default()),
+        Arc::new(ManualClock::new(1_800_000_000)),
+        vec![
+            (agent_descriptor(), digest(CONNECTION_BINDING_DIGEST), first),
+            (second_descriptor, digest(CONNECTION_BINDING_DIGEST), second),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(store.interrupt_count(), 1);
+}
+
+#[test]
+fn startup_clock_failure_is_returned_before_runtime_is_available() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    clock.fail();
+    let protocol_peer: Arc<dyn ProtocolPeer> =
+        Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+
+    let result = ProtocolAgentRuntime::new(
+        store.clone(),
+        artifacts,
+        clock,
+        vec![agent_registration(protocol_peer)],
+    );
+
+    let error = match result {
+        Ok(_) => panic!("clock failure must fail startup recovery"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Internal
+    );
+    assert_eq!(store.interrupt_count(), 0);
+}
+
+#[test]
+fn startup_store_recovery_failure_is_returned_before_runtime_is_available() {
+    let store = Arc::new(RecordingStore::default());
+    store.fail_interrupt();
+    let protocol_peer: Arc<dyn ProtocolPeer> =
+        Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+
+    let result = ProtocolAgentRuntime::new(
+        store.clone(),
+        Arc::new(RecordingArtifacts::default()),
+        Arc::new(ManualClock::new(1_800_000_000)),
+        vec![agent_registration(protocol_peer)],
+    );
+
+    let error = match result {
+        Ok(_) => panic!("store failure must fail startup recovery"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::StorageFull
+    );
+    assert_eq!(store.interrupt_count(), 1);
+}
+
+#[test]
 fn capacity_one_reserves_an_in_flight_start_before_durable_create() {
     let store = Arc::new(RecordingStore::default());
     let acceptance_gate = store.block_acceptance();
@@ -299,7 +410,7 @@ fn capacity_one_reserves_an_in_flight_start_before_durable_create() {
             store.clone(),
             Arc::new(RecordingArtifacts::default()),
             Arc::new(ManualClock::new(1_800_000_000)),
-            vec![(agent_descriptor(), protocol_peer)],
+            vec![agent_registration(protocol_peer)],
         )
         .unwrap(),
     );
@@ -349,7 +460,7 @@ fn compensation_shutdown_interrupts_and_removes_sibling_connection_runs() {
         store.clone(),
         Arc::new(RecordingArtifacts::default()),
         Arc::new(AdvancingClock::new(1_800_000_000)),
-        vec![(agent_descriptor(), protocol_peer)],
+        vec![agent_registration(protocol_peer)],
     )
     .unwrap();
     runtime.start_run(run_request("run-1", None)).unwrap();
@@ -535,7 +646,7 @@ fn runtime_shutdown_retires_connection_after_durable_cleanup() {
 fn compensation_clock_failure_retires_connection_until_later_cleanup() {
     let store = Arc::new(RecordingStore::default());
     let clock = Arc::new(AdvancingClock::new(1_800_000_000));
-    clock.fail_on_call(4);
+    clock.fail_on_call(5);
     let peer = Arc::new(MultiRunPeer::new(peer_descriptor()));
     let runtime = runtime_with_protocol_peer(store.clone(), clock.clone(), peer.clone());
     store.fail_start_at(StartStoreFailure::Running);
@@ -651,7 +762,7 @@ fn compensation_uses_a_fresh_monotonic_timestamp_after_running_store_failure() {
         store.clone(),
         Arc::new(RecordingArtifacts::default()),
         clock,
-        vec![(agent_descriptor(), protocol_peer)],
+        vec![agent_registration(protocol_peer)],
     )
     .unwrap();
 
@@ -853,7 +964,6 @@ fn interruption_store_failure_retains_active_state_and_capacity_until_retry_succ
 #[test]
 fn interruption_poison_blocks_a_concurrent_start_before_the_store_call_finishes() {
     let store = Arc::new(RecordingStore::default());
-    let interrupt_gate = store.block_interrupt();
     let clock = Arc::new(ManualClock::new(1_800_000_000));
     let mut descriptor = peer_descriptor();
     descriptor.capabilities.max_concurrent_runs = 2;
@@ -865,6 +975,7 @@ fn interruption_poison_blocks_a_concurrent_start_before_the_store_call_finishes(
     ));
     runtime.start_run(run_request("run-1", None)).unwrap();
     clock.advance(DEFAULT_HEARTBEAT_TIMEOUT_SECS);
+    let interrupt_gate = store.block_interrupt();
     store.fail_interrupt();
     let checking_runtime = Arc::clone(&runtime);
     let checking = thread::spawn(move || checking_runtime.check_timeouts());
@@ -959,7 +1070,7 @@ fn two_retries_for_one_poison_do_not_interrupt_post_recovery_work() {
         .unwrap()
         .is_empty());
     retry_b.join().unwrap();
-    assert_eq!(store.interrupt_count(), 1);
+    assert_eq!(store.interrupt_count(), 2);
     assert_eq!(store.status("run-2"), Some(AgentRunStatus::Running));
     assert_eq!(peer.start_count(), 2);
     runtime.start_run(run_request("run-3", None)).unwrap();
@@ -969,13 +1080,13 @@ fn two_retries_for_one_poison_do_not_interrupt_post_recovery_work() {
 #[test]
 fn connection_loss_store_failure_is_retried_by_check_timeouts() {
     let store = Arc::new(RecordingStore::default());
-    let interrupt_gate = store.block_interrupt();
     let clock = Arc::new(ManualClock::new(1_800_000_000));
     let mut descriptor = peer_descriptor();
     descriptor.capabilities.max_concurrent_runs = 2;
     let peer = Arc::new(MultiRunPeer::new(descriptor));
     let runtime = runtime_with_protocol_peer(store.clone(), clock, peer.clone());
     runtime.start_run(run_request("run-1", None)).unwrap();
+    let interrupt_gate = store.block_interrupt();
     store.fail_interrupt();
     let losing_peer = Arc::clone(&peer);
     let losing = thread::spawn(move || losing_peer.connection_lost(0));
@@ -1031,6 +1142,68 @@ fn rejected_handshake_preserves_conflict_and_poisoned_capacity() {
     assert_eq!(peer.start_count(), 2);
 }
 
+struct StaleCleanupRace {
+    store: Arc<RecordingStore>,
+    artifacts: Arc<RecordingArtifacts>,
+    clock: Arc<ManualClock>,
+    peer: Arc<MultiRunPeer>,
+    runtime: Arc<ProtocolAgentRuntime>,
+    creation_gate: Arc<AcceptanceGate>,
+    stale_start: Mutex<Option<JoinHandle<Result<(), PortError>>>>,
+}
+
+impl StaleCleanupRace {
+    fn new() -> Self {
+        let store = Arc::new(RecordingStore::default());
+        let artifacts = Arc::new(RecordingArtifacts::default());
+        let creation_gate = store.block_creation("run-stale");
+        let clock = Arc::new(ManualClock::new(1_800_000_000));
+        let mut descriptor = peer_descriptor();
+        descriptor.capabilities.max_concurrent_runs = 2;
+        let peer = Arc::new(MultiRunPeer::new(descriptor));
+        let protocol_peer: Arc<dyn ProtocolPeer> = peer.clone();
+        let runtime = Arc::new(
+            ProtocolAgentRuntime::new(
+                store.clone(),
+                artifacts.clone(),
+                clock.clone(),
+                vec![agent_registration(protocol_peer)],
+            )
+            .unwrap(),
+        );
+        runtime.start_run(run_request("run-active", None)).unwrap();
+        let stale_runtime = Arc::clone(&runtime);
+        let stale_start = thread::spawn(move || {
+            stale_runtime
+                .start_run(run_request("run-stale", None))
+                .map(|_| ())
+        });
+        creation_gate.wait_until_entered();
+        peer.connection_lost(0).unwrap();
+        Self {
+            store,
+            artifacts,
+            clock,
+            peer,
+            runtime,
+            creation_gate,
+            stale_start: Mutex::new(Some(stale_start)),
+        }
+    }
+
+    fn release_stale(&self) -> PortError {
+        self.creation_gate.release();
+        self.stale_start
+            .lock()
+            .unwrap()
+            .take()
+            .expect("stale start handle")
+            .join()
+            .unwrap()
+            .unwrap_err()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ExactCleanupFailure {
     ArtifactPublication,
@@ -1047,43 +1220,154 @@ fn failed_stale_terminal_cleanup_retries_without_poisoning_current_work() {
     assert_failed_stale_cleanup_retries(ExactCleanupFailure::TerminalStore);
 }
 
-fn assert_failed_stale_cleanup_retries(failure: ExactCleanupFailure) {
-    let store = Arc::new(RecordingStore::default());
-    let artifacts = Arc::new(RecordingArtifacts::default());
-    let creation_gate = store.block_creation("run-stale");
-    let clock = Arc::new(ManualClock::new(1_800_000_000));
+#[test]
+fn stale_cleanup_survives_clock_failure_before_its_first_attempt() {
+    let race = StaleCleanupRace::new();
+    let store = &race.store;
+    let artifacts = &race.artifacts;
+    let clock = &race.clock;
+    let runtime = &race.runtime;
+    clock.fail();
+
+    assert_eq!(
+        race.release_stale().safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(store.status("run-stale"), Some(AgentRunStatus::Created));
+    assert!(artifacts.published_contents().is_empty());
+
+    clock.recover();
+    clock.advance(1);
+    assert!(runtime.check_timeouts().unwrap().is_empty());
+    assert_eq!(store.status("run-stale"), Some(AgentRunStatus::Interrupted));
+    assert_eq!(
+        store.terminal_time("run-stale"),
+        Some(Timestamp::from_unix_seconds(1_800_000_001))
+    );
+    assert_eq!(artifacts.published_contents().len(), 1);
+}
+
+#[test]
+fn runtime_recreation_recovers_memory_lost_stale_cleanup() {
+    let race = StaleCleanupRace::new();
+    race.store.fail_terminal();
+    assert_eq!(
+        race.release_stale().safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(
+        race.store.status("run-stale"),
+        Some(AgentRunStatus::Created)
+    );
+    assert_eq!(race.artifacts.published_contents().len(), 1);
+    let store = Arc::clone(&race.store);
+    let artifacts = Arc::clone(&race.artifacts);
+    let clock = Arc::clone(&race.clock);
+    drop(race);
+
+    store.allow_terminal();
+    clock.advance(1);
     let mut descriptor = peer_descriptor();
     descriptor.capabilities.max_concurrent_runs = 2;
-    let peer = Arc::new(MultiRunPeer::new(descriptor));
-    let protocol_peer: Arc<dyn ProtocolPeer> = peer.clone();
-    let runtime = Arc::new(
-        ProtocolAgentRuntime::new(
-            store.clone(),
-            artifacts.clone(),
-            clock.clone(),
-            vec![(agent_descriptor(), protocol_peer)],
-        )
-        .unwrap(),
+    let second_peer = Arc::new(MultiRunPeer::new(descriptor));
+    let second_protocol_peer: Arc<dyn ProtocolPeer> = second_peer.clone();
+    let second_runtime = ProtocolAgentRuntime::new(
+        store.clone(),
+        artifacts.clone(),
+        clock,
+        vec![agent_registration(second_protocol_peer)],
+    )
+    .unwrap();
+
+    assert_eq!(store.status("run-stale"), Some(AgentRunStatus::Interrupted));
+    assert_eq!(
+        store.status("run-active"),
+        Some(AgentRunStatus::Interrupted)
     );
-    runtime.start_run(run_request("run-active", None)).unwrap();
-    let stale_runtime = Arc::clone(&runtime);
-    let stale_start =
-        thread::spawn(move || stale_runtime.start_run(run_request("run-stale", None)));
-    creation_gate.wait_until_entered();
-    peer.connection_lost(0).unwrap();
+    assert_eq!(artifacts.published_contents().len(), 1);
+    second_runtime
+        .start_run(run_request("run-current", None))
+        .unwrap();
+    assert_eq!(store.status("run-current"), Some(AgentRunStatus::Running));
+    assert_eq!(second_peer.start_count(), 1);
+}
+
+#[test]
+fn concurrent_cleanup_retries_claim_once_and_reuse_published_artifact() {
+    let race = StaleCleanupRace::new();
+    let store = &race.store;
+    let artifacts = &race.artifacts;
+    let runtime = &race.runtime;
+    store.fail_terminal();
+    assert_eq!(
+        race.release_stale().safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(store.status("run-stale"), Some(AgentRunStatus::Created));
+    assert_eq!(artifacts.published_contents().len(), 1);
+
+    store.allow_terminal();
+    let terminal_gate = store.block_terminal();
+    let (retry_a_done, retry_a_done_rx) = mpsc::channel();
+    let retry_a_runtime = Arc::clone(runtime);
+    let retry_a = thread::spawn(move || {
+        retry_a_done.send(retry_a_runtime.check_timeouts()).unwrap();
+    });
+    terminal_gate.wait_until_entered();
+    let (retry_b_started, retry_b_started_rx) = mpsc::channel();
+    let (retry_b_done, retry_b_done_rx) = mpsc::channel();
+    let retry_b_runtime = Arc::clone(runtime);
+    let retry_b = thread::spawn(move || {
+        retry_b_started.send(()).unwrap();
+        retry_b_done.send(retry_b_runtime.check_timeouts()).unwrap();
+    });
+    retry_b_started_rx.recv().unwrap();
+    let retry_b_before_release = match retry_b_done_rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(result) => Some(result),
+        Err(mpsc::RecvTimeoutError::Timeout) => None,
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("retry B result channel disconnected"),
+    };
+    terminal_gate.release();
+
+    let retry_a_result = retry_a_done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("retry A must finish after terminal persistence is released");
+    let retry_b_completed_before_release = retry_b_before_release.is_some();
+    let retry_b_result = match retry_b_before_release {
+        Some(result) => result,
+        None => retry_b_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retry B must finish after terminal persistence is released"),
+    };
+    retry_a.join().unwrap();
+    retry_b.join().unwrap();
+
+    assert!(
+        retry_b_completed_before_release,
+        "retry B must not wait on retry A"
+    );
+    assert!(retry_a_result.unwrap().is_empty());
+    assert!(retry_b_result.unwrap().is_empty());
+    assert_eq!(artifacts.published_contents().len(), 1);
+    assert_eq!(store.terminal_count(), 1);
+    assert_eq!(store.status("run-stale"), Some(AgentRunStatus::Interrupted));
+}
+
+fn assert_failed_stale_cleanup_retries(failure: ExactCleanupFailure) {
+    let race = StaleCleanupRace::new();
+    let store = &race.store;
+    let artifacts = &race.artifacts;
+    let clock = &race.clock;
+    let peer = &race.peer;
+    let runtime = &race.runtime;
     runtime.start_run(run_request("run-current", None)).unwrap();
     match failure {
         ExactCleanupFailure::ArtifactPublication => artifacts.fail_publish(),
         ExactCleanupFailure::TerminalStore => store.fail_terminal(),
     }
-    creation_gate.release();
 
     assert_eq!(
-        stale_start
-            .join()
-            .unwrap()
-            .unwrap_err()
-            .safe_classification(),
+        race.release_stale().safe_classification(),
         SafeErrorClassification::Conflict,
         "{failure:?}"
     );
@@ -1097,7 +1381,7 @@ fn assert_failed_stale_cleanup_retries(failure: ExactCleanupFailure) {
     assert_eq!(store.status("run-stale"), Some(AgentRunStatus::Created));
     assert_eq!(store.status("run-current"), Some(AgentRunStatus::Running));
     assert_eq!(store.status("run-current-2"), Some(AgentRunStatus::Running));
-    assert_eq!(store.interrupt_count(), 1);
+    assert_eq!(store.interrupt_count(), 2);
 
     match failure {
         ExactCleanupFailure::ArtifactPublication => artifacts.allow_publish(),
@@ -1113,7 +1397,7 @@ fn assert_failed_stale_cleanup_retries(failure: ExactCleanupFailure) {
     );
     assert_eq!(store.status("run-current"), Some(AgentRunStatus::Running));
     assert_eq!(store.status("run-current-2"), Some(AgentRunStatus::Running));
-    assert_eq!(store.interrupt_count(), 1);
+    assert_eq!(store.interrupt_count(), 2);
     assert_eq!(peer.start_count(), 3);
     let terminal_count = store.terminal_count();
     assert!(runtime.check_timeouts().unwrap().is_empty());
@@ -1205,7 +1489,7 @@ impl ThreadedRaceFixture {
                 store.clone(),
                 Arc::new(RecordingArtifacts::default()),
                 Arc::new(ManualClock::new(1_800_000_000)),
-                vec![(agent_descriptor(), protocol_peer)],
+                vec![agent_registration(protocol_peer)],
             )
             .unwrap(),
         );
@@ -1663,7 +1947,7 @@ fn runtime_with_artifacts(
         store,
         artifacts,
         clock,
-        vec![(agent_descriptor(), protocol_peer)],
+        vec![agent_registration(protocol_peer)],
     )
     .unwrap()
 }
@@ -1677,7 +1961,7 @@ fn runtime_with_protocol_peer(
         store,
         Arc::new(RecordingArtifacts::default()),
         clock,
-        vec![(agent_descriptor(), peer)],
+        vec![agent_registration(peer)],
     )
     .unwrap()
 }
@@ -1708,6 +1992,12 @@ fn agent_descriptor() -> AgentDescriptor {
         enabled: true,
         containment_verified: true,
     }
+}
+
+fn agent_registration(
+    peer: Arc<dyn ProtocolPeer>,
+) -> (AgentDescriptor, Sha256Digest, Arc<dyn ProtocolPeer>) {
+    (agent_descriptor(), digest(CONNECTION_BINDING_DIGEST), peer)
 }
 
 fn peer_descriptor() -> PeerDescriptor {
@@ -1813,6 +2103,7 @@ struct RecordingStore {
     fail_interrupt: Mutex<bool>,
     interrupt_calls: Mutex<usize>,
     interrupt_gate: Mutex<Option<Arc<AcceptanceGate>>>,
+    terminal_gate: Mutex<Option<Arc<AcceptanceGate>>>,
     creation_gate: Mutex<Option<(String, Arc<AcceptanceGate>)>>,
     acceptance_gate: Mutex<Option<Arc<AcceptanceGate>>>,
     log: ScriptLog,
@@ -1946,6 +2237,12 @@ impl RecordingStore {
         gate
     }
 
+    fn block_terminal(&self) -> Arc<AcceptanceGate> {
+        let gate = Arc::new(AcceptanceGate::new());
+        *self.terminal_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
     fn block_acceptance(&self) -> Arc<AcceptanceGate> {
         let gate = Arc::new(AcceptanceGate::new());
         *self.acceptance_gate.lock().unwrap() = Some(Arc::clone(&gate));
@@ -2009,6 +2306,9 @@ impl AgentRunStore for RecordingStore {
                 SafeErrorClassification::StorageFull,
                 Retryability::Retryable,
             ));
+        }
+        if let Some(gate) = self.terminal_gate.lock().unwrap().clone() {
+            gate.block();
         }
         terminal.validate().map_err(|_| invalid_input())?;
         let mut runs = self.runs.lock().unwrap();

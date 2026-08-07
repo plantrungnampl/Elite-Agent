@@ -36,10 +36,11 @@ pub struct ProtocolAgentRuntime {
     clock: Arc<dyn Clock>,
     peers: BTreeMap<String, Arc<dyn ProtocolPeer>>,
     descriptors: BTreeMap<String, AgentDescriptor>,
+    authoritative_connection_digests: BTreeMap<String, Sha256Digest>,
     sessions: Arc<Mutex<BTreeMap<String, Arc<Mutex<ProtocolSession>>>>>,
     active_runs: Arc<Mutex<BTreeMap<String, ActiveRun>>>,
     slots: Arc<ConnectionSlots>,
-    pending_run_cleanups: Mutex<BTreeMap<String, BoundAgentRunRequest>>,
+    pending_run_cleanups: Mutex<BTreeMap<String, PendingCleanup>>,
     next_request_id: AtomicU64,
 }
 
@@ -51,6 +52,11 @@ struct ActiveRun {
     slot: RunSlot,
     deadline: DateTime<Utc>,
     cancellation_deadline: Option<DateTime<Utc>>,
+}
+
+struct PendingCleanup {
+    request: BoundAgentRunRequest,
+    content_artifact_id: Option<ArtifactId>,
 }
 
 #[derive(Default)]
@@ -520,25 +526,37 @@ impl ProtocolAgentRuntime {
         store: Arc<dyn AgentRunStore>,
         artifacts: Arc<dyn AgentArtifactStore>,
         clock: Arc<dyn Clock>,
-        agents: Vec<(AgentDescriptor, Arc<dyn ProtocolPeer>)>,
+        agents: Vec<(AgentDescriptor, Sha256Digest, Arc<dyn ProtocolPeer>)>,
     ) -> Result<Self, PortError> {
         let mut agent_ids = BTreeSet::new();
         let mut connection_ids = BTreeSet::new();
-        for (descriptor, peer) in &agents {
+        let mut recovery_digests = BTreeSet::new();
+        let mut authoritative_connection_digests = BTreeMap::new();
+        for (descriptor, connection_digest, peer) in &agents {
+            let peer_descriptor = peer.descriptor();
             descriptor.validate().map_err(|_| invalid_input())?;
-            validate_descriptor(descriptor, &peer.descriptor())?;
+            validate_descriptor(descriptor, &peer_descriptor)?;
             if !agent_ids.insert(descriptor.agent_id.clone())
-                || !connection_ids.insert(peer.descriptor().binding.connection_id)
+                || !connection_ids.insert(peer_descriptor.binding.connection_id.clone())
             {
                 return Err(conflict());
             }
+            authoritative_connection_digests.insert(
+                peer_descriptor.binding.connection_id,
+                connection_digest.clone(),
+            );
+            recovery_digests.insert(connection_digest.as_str().to_owned());
         }
         let mut peers = BTreeMap::new();
         let mut descriptors = BTreeMap::new();
-        for (descriptor, peer) in agents {
+        for (descriptor, _, peer) in agents {
             store.register_descriptor(&descriptor)?;
             peers.insert(descriptor.agent_id.clone(), peer);
             descriptors.insert(descriptor.agent_id.clone(), descriptor);
+        }
+        let recovery_time = runtime_time(clock.as_ref())?;
+        for connection_digest in recovery_digests {
+            store.interrupt_connection(&connection_digest, &recovery_time.text)?;
         }
         Ok(Self {
             store,
@@ -546,6 +564,7 @@ impl ProtocolAgentRuntime {
             clock,
             peers,
             descriptors,
+            authoritative_connection_digests,
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             active_runs: Arc::new(Mutex::new(BTreeMap::new())),
             slots: Arc::new(ConnectionSlots::default()),
@@ -685,7 +704,15 @@ impl ProtocolAgentRuntime {
         {
             return Err(permission_denied());
         }
-        validate_request_peer(&request, &peer.descriptor())?;
+        let authoritative_connection_digest = self
+            .authoritative_connection_digests
+            .get(&request.connection.connection_id)
+            .ok_or_else(invalid_input)?;
+        validate_request_peer(
+            &request,
+            &peer.descriptor(),
+            authoritative_connection_digest,
+        )?;
         let effective_context = self.artifacts.load_effective_context(&request.context)?;
         if digest_bytes(&effective_context) != request.context.content_digest {
             return Err(invalid_input());
@@ -1020,50 +1047,107 @@ impl ProtocolAgentRuntime {
     }
 
     fn cleanup_unstarted_run(&self, request: &BoundAgentRunRequest) -> Result<(), PortError> {
+        self.queue_pending_run_cleanup(request)?;
         let now = self.now()?;
-        let cleanup = self.persist_runtime_terminal(
-            request,
-            AgentRunStatus::Interrupted,
-            "stale connection generation",
-            now.timestamp,
-        );
-        if cleanup.is_err() {
-            self.pending_run_cleanups
-                .lock()
-                .map_err(|_| internal_failure())?
-                .insert(request.run_id.as_str().to_owned(), request.clone());
-        }
-        cleanup
+        self.retry_pending_run_cleanup(request.run_id.as_str(), now.timestamp)
     }
 
     fn retry_pending_run_cleanups(&self, at: Timestamp) -> Result<(), PortError> {
-        let pending = self
-            .pending_run_cleanups
-            .lock()
-            .map_err(|_| internal_failure())?
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let pending = {
+            let mut pending = self
+                .pending_run_cleanups
+                .lock()
+                .map_err(|_| internal_failure())?;
+            std::mem::take(&mut *pending)
+        };
         let mut retry_error = None;
-        for request in pending {
-            match self.persist_runtime_terminal(
-                &request,
-                AgentRunStatus::Interrupted,
-                "stale connection generation",
-                at,
-            ) {
-                Ok(()) => {
-                    self.pending_run_cleanups
-                        .lock()
-                        .map_err(|_| internal_failure())?
-                        .remove(request.run_id.as_str());
-                }
+        for (_, mut cleanup) in pending {
+            match self.persist_pending_run_cleanup(&mut cleanup, at) {
+                Ok(()) => {}
                 Err(error) => {
+                    let error = match self.requeue_pending_run_cleanup(cleanup) {
+                        Ok(()) => error,
+                        Err(requeue_error) => requeue_error,
+                    };
                     retry_error.get_or_insert(error);
                 }
             }
         }
         retry_error.map_or(Ok(()), Err)
+    }
+
+    fn retry_pending_run_cleanup(&self, run_id: &str, at: Timestamp) -> Result<(), PortError> {
+        let Some(mut cleanup) = self
+            .pending_run_cleanups
+            .lock()
+            .map_err(|_| internal_failure())?
+            .remove(run_id)
+        else {
+            return Ok(());
+        };
+        if let Err(error) = self.persist_pending_run_cleanup(&mut cleanup, at) {
+            self.requeue_pending_run_cleanup(cleanup)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn queue_pending_run_cleanup(&self, request: &BoundAgentRunRequest) -> Result<(), PortError> {
+        self.pending_run_cleanups
+            .lock()
+            .map_err(|_| internal_failure())?
+            .entry(request.run_id.as_str().to_owned())
+            .or_insert_with(|| PendingCleanup {
+                request: request.clone(),
+                content_artifact_id: None,
+            });
+        Ok(())
+    }
+
+    fn requeue_pending_run_cleanup(&self, cleanup: PendingCleanup) -> Result<(), PortError> {
+        let run_id = cleanup.request.run_id.as_str().to_owned();
+        self.pending_run_cleanups
+            .lock()
+            .map_err(|_| internal_failure())?
+            .entry(run_id)
+            .and_modify(|pending| {
+                if pending.content_artifact_id.is_none() {
+                    pending.content_artifact_id = cleanup.content_artifact_id.clone();
+                }
+            })
+            .or_insert(cleanup);
+        Ok(())
+    }
+
+    fn persist_pending_run_cleanup(
+        &self,
+        cleanup: &mut PendingCleanup,
+        at: Timestamp,
+    ) -> Result<(), PortError> {
+        let error = "stale connection generation";
+        let content_artifact_id = match &cleanup.content_artifact_id {
+            Some(content_artifact_id) => content_artifact_id.clone(),
+            None => {
+                let message_id = stable_id("runtime-message", cleanup.request.run_id.as_str());
+                let content_artifact_id =
+                    self.artifacts
+                        .publish_agent_message(&AgentMessageArtifact {
+                            task_id: cleanup.request.task_id.clone(),
+                            run_id: cleanup.request.run_id.clone(),
+                            message_id,
+                            content: error.as_bytes().to_vec(),
+                        })?;
+                cleanup.content_artifact_id = Some(content_artifact_id.clone());
+                content_artifact_id
+            }
+        };
+        self.store.persist_terminal(&runtime_terminal(
+            &cleanup.request,
+            AgentRunStatus::Interrupted,
+            error,
+            content_artifact_id,
+            at,
+        ))
     }
 
     fn interrupt_connection(&self, digest: &str, at: &str) -> Result<Vec<RunId>, PortError> {
@@ -1380,6 +1464,7 @@ fn validate_descriptor(
 fn validate_request_peer(
     request: &BoundAgentRunRequest,
     peer: &PeerDescriptor,
+    authoritative_connection_digest: &Sha256Digest,
 ) -> Result<(), PortError> {
     if request.connection.connection_id != peer.binding.connection_id
         || request.connection.agent_id != peer.binding.agent_id
@@ -1392,6 +1477,7 @@ fn validate_request_peer(
             != Some(peer.binding.executable_digest.as_str())
         || trust_tier(request.connection.trust_tier) != peer.binding.trust_tier
         || request.connection.contract_version != peer.protocol_version
+        || &request.connection.binding_digest != authoritative_connection_digest
         || !peer.capabilities.roles.contains(&request.role)
     {
         return Err(invalid_input());

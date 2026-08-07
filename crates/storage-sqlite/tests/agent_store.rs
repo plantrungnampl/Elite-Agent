@@ -692,7 +692,11 @@ fn runtime_terminal_publishes_exact_bytes_through_sqlite_and_content_addressed_s
         store.clone(),
         artifacts.clone(),
         clock,
-        vec![(descriptor, peer.clone() as Arc<dyn ProtocolPeer>)],
+        vec![(
+            descriptor,
+            digest_from_str(CONNECTION_BINDING_DIGEST),
+            peer.clone() as Arc<dyn ProtocolPeer>,
+        )],
     )
     .unwrap();
 
@@ -746,7 +750,11 @@ fn hostile_crashed_and_timed_out_runtime_runs_do_not_mutate_real_task_workflow_s
             store.clone(),
             artifacts,
             clock.clone(),
-            vec![(descriptor, peer.clone() as Arc<dyn ProtocolPeer>)],
+            vec![(
+                descriptor,
+                digest_from_str(CONNECTION_BINDING_DIGEST),
+                peer.clone() as Arc<dyn ProtocolPeer>,
+            )],
         )
         .unwrap();
         let before = task_workflow_state(&database.path);
@@ -795,7 +803,11 @@ fn artifact_and_terminal_store_failures_do_not_mutate_real_task_workflow_state()
             store,
             artifacts,
             Arc::new(ManualClock::new(1_800_000_000)),
-            vec![(descriptor, peer.clone() as Arc<dyn ProtocolPeer>)],
+            vec![(
+                descriptor,
+                digest_from_str(CONNECTION_BINDING_DIGEST),
+                peer.clone() as Arc<dyn ProtocolPeer>,
+            )],
         )
         .unwrap();
         let before = task_workflow_state(&database.path);
@@ -823,7 +835,11 @@ fn post_start_store_failures_do_not_mutate_real_task_workflow_state() {
             store,
             Arc::new(RuntimeArtifacts::new(&database)),
             Arc::new(ManualClock::new(1_800_000_000)),
-            vec![(descriptor, peer as Arc<dyn ProtocolPeer>)],
+            vec![(
+                descriptor,
+                digest_from_str(CONNECTION_BINDING_DIGEST),
+                peer as Arc<dyn ProtocolPeer>,
+            )],
         )
         .unwrap();
         let before = task_workflow_state(&database.path);
