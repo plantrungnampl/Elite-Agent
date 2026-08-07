@@ -304,6 +304,157 @@ fn shutdown_cancels_and_joins_an_active_worker() {
 }
 
 #[test]
+fn concurrent_shutdown_callers_wait_for_the_authoritative_worker() {
+    const SHUTDOWN_CALLERS: usize = 2;
+
+    let mut server = LoopbackServer::gated(
+        sse_fragments(&[
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"early\"}\n\n",
+        ]),
+        sse_fragments(&[": delayed\n"]),
+    );
+    let request_count = Arc::clone(&server.request_count);
+    let adapter = Arc::new(adapter(server.endpoint(), Duration::from_secs(1)));
+    let sink = BlockingSink::default();
+
+    adapter
+        .start(run_start("concurrent-shutdown"), Box::new(sink.clone()))
+        .unwrap();
+    server.wait_for_request();
+    sink.wait_until_delta_delivery();
+
+    let barrier = Arc::new(Barrier::new(SHUTDOWN_CALLERS + 1));
+    let (entered, wait_for_entry) = mpsc::channel();
+    let (completed, wait_for_completion) = mpsc::channel();
+    let shutdowns = (0..SHUTDOWN_CALLERS)
+        .map(|caller| {
+            let adapter = Arc::clone(&adapter);
+            let barrier = Arc::clone(&barrier);
+            let entered = entered.clone();
+            let completed = completed.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                entered.send(caller).unwrap();
+                completed.send((caller, adapter.shutdown())).unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+    drop(entered);
+    drop(completed);
+
+    barrier.wait();
+    for _ in 0..SHUTDOWN_CALLERS {
+        wait_for_entry.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+    assert!(
+        wait_for_completion
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "a shutdown caller returned while the worker terminal was gated"
+    );
+
+    sink.release();
+    server.release();
+    let results = (0..SHUTDOWN_CALLERS)
+        .map(|_| {
+            wait_for_completion
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    for shutdown in shutdowns {
+        shutdown.join().unwrap();
+    }
+    let terminal = sink.inner.wait_for_terminal();
+
+    assert_eq!(request_count.load(Ordering::Relaxed), 1);
+    assert_eq!(sink.inner.terminal_count(), 1);
+    assert_eq!(
+        terminal.pointer("/params/status").and_then(Value::as_str),
+        Some("cancelled_cleanly")
+    );
+    assert!(results.into_iter().all(|(_, result)| result == Ok(())));
+    assert!(
+        !adapter
+            .cancel(run_cancel("concurrent-shutdown"))
+            .unwrap()
+            .accepted
+    );
+    server.join();
+}
+
+#[test]
+fn concurrent_shutdown_callers_share_the_authoritative_join_failure() {
+    const SHUTDOWN_CALLERS: usize = 2;
+
+    let server = LoopbackServer::responding(sse_fragments(&[
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"panic\"}\n\n",
+    ]));
+    let request_count = Arc::clone(&server.request_count);
+    let adapter = Arc::new(adapter(server.endpoint(), Duration::from_secs(1)));
+    let sink = BlockingSink::panicking_after_release();
+
+    adapter
+        .start(
+            run_start("concurrent-shutdown-failure"),
+            Box::new(sink.clone()),
+        )
+        .unwrap();
+    server.wait_for_request();
+    sink.wait_until_delta_delivery();
+
+    let barrier = Arc::new(Barrier::new(SHUTDOWN_CALLERS + 1));
+    let (entered, wait_for_entry) = mpsc::channel();
+    let (completed, wait_for_completion) = mpsc::channel();
+    let shutdowns = (0..SHUTDOWN_CALLERS)
+        .map(|caller| {
+            let adapter = Arc::clone(&adapter);
+            let barrier = Arc::clone(&barrier);
+            let entered = entered.clone();
+            let completed = completed.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                entered.send(caller).unwrap();
+                completed.send((caller, adapter.shutdown())).unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+    drop(entered);
+    drop(completed);
+
+    barrier.wait();
+    for _ in 0..SHUTDOWN_CALLERS {
+        wait_for_entry.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+    assert!(
+        wait_for_completion
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "a shutdown caller returned before the gated worker could panic"
+    );
+
+    sink.release();
+    let results = (0..SHUTDOWN_CALLERS)
+        .map(|_| {
+            wait_for_completion
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    for shutdown in shutdowns {
+        shutdown.join().unwrap();
+    }
+
+    assert_eq!(request_count.load(Ordering::Relaxed), 1);
+    assert_eq!(sink.inner.deltas(), vec!["panic"]);
+    assert!(results
+        .into_iter()
+        .all(|(_, result)| result == Err(ProtocolError::InternalAgentFailure)));
+    assert_eq!(adapter.shutdown(), Err(ProtocolError::InternalAgentFailure));
+    server.join();
+}
+
+#[test]
 fn rejects_start_after_shutdown() {
     let adapter = adapter(
         Url::parse("http://127.0.0.1:9/v1/responses").unwrap(),
@@ -771,6 +922,7 @@ impl PeerEventSink for RecordingSink {
 struct BlockingSink {
     inner: RecordingSink,
     state: Arc<(Mutex<BlockingState>, Condvar)>,
+    panic_after_release: bool,
 }
 
 #[derive(Default)]
@@ -784,11 +936,19 @@ impl Default for BlockingSink {
         Self {
             inner: RecordingSink::default(),
             state: Arc::new((Mutex::new(BlockingState::default()), Condvar::new())),
+            panic_after_release: false,
         }
     }
 }
 
 impl BlockingSink {
+    fn panicking_after_release() -> Self {
+        Self {
+            panic_after_release: true,
+            ..Self::default()
+        }
+    }
+
     fn wait_until_delta_delivery(&self) {
         let (state, ready) = &*self.state;
         let state = state.lock().unwrap();
@@ -816,6 +976,7 @@ impl PeerEventSink for BlockingSink {
             .wait_timeout_while(state, Duration::from_secs(1), |state| !state.released)
             .map_err(|_| ProtocolError::InternalAgentFailure)?;
         if state.released {
+            assert!(!self.panic_after_release, "test sink panics after release");
             Ok(disposition)
         } else {
             Err(ProtocolError::Timeout)

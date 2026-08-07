@@ -42,16 +42,36 @@ pub struct OpenAiResponsesAdapter {
     config: OpenAiProviderConfig,
     descriptor: PeerDescriptor,
     client: Client,
-    lifecycle: Arc<Mutex<AdapterLifecycle>>,
+    lifecycle: Arc<AdapterLifecycle>,
     diagnostics: Arc<Mutex<BTreeMap<String, OpenAiDiagnostic>>>,
     terminal_ids: AtomicU64,
 }
 
 #[derive(Default)]
 struct AdapterLifecycle {
-    closed: bool,
+    state: Mutex<LifecycleState>,
+    shutdown_complete: Condvar,
+}
+
+#[derive(Default)]
+struct LifecycleState {
+    shutdown: ShutdownState,
     active_runs: BTreeMap<String, RunPhase>,
     workers: Vec<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+enum ShutdownState {
+    #[default]
+    Open,
+    Closing,
+    Closed(Result<(), ProtocolError>),
+}
+
+impl ShutdownState {
+    fn is_open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
 }
 
 enum RunPhase {
@@ -167,7 +187,7 @@ impl OpenAiResponsesAdapter {
             config,
             descriptor,
             client,
-            lifecycle: Arc::new(Mutex::new(AdapterLifecycle::default())),
+            lifecycle: Arc::new(AdapterLifecycle::default()),
             diagnostics: Arc::new(Mutex::new(BTreeMap::new())),
             terminal_ids: AtomicU64::new(1),
         })
@@ -188,8 +208,12 @@ impl OpenAiResponsesAdapter {
         let finished = {
             let mut lifecycle = self
                 .lifecycle
+                .state
                 .lock()
                 .map_err(|_| ProtocolError::InternalAgentFailure)?;
+            if !lifecycle.shutdown.is_open() {
+                return Ok(());
+            }
             let mut finished = Vec::new();
             let mut unfinished = Vec::new();
             for worker in std::mem::take(&mut lifecycle.workers) {
@@ -214,8 +238,8 @@ impl OpenAiResponsesAdapter {
     }
 }
 
-fn mark_run_completing(lifecycle: &Mutex<AdapterLifecycle>, run_id: &str) {
-    if let Ok(mut lifecycle) = lifecycle.lock() {
+fn mark_run_completing(lifecycle: &AdapterLifecycle, run_id: &str) {
+    if let Ok(mut lifecycle) = lifecycle.state.lock() {
         if matches!(
             lifecycle.active_runs.get(run_id),
             Some(RunPhase::Running(_))
@@ -227,8 +251,8 @@ fn mark_run_completing(lifecycle: &Mutex<AdapterLifecycle>, run_id: &str) {
     }
 }
 
-fn remove_completed_run(lifecycle: &Mutex<AdapterLifecycle>, run_id: &str) {
-    if let Ok(mut lifecycle) = lifecycle.lock() {
+fn remove_completed_run(lifecycle: &AdapterLifecycle, run_id: &str) {
+    if let Ok(mut lifecycle) = lifecycle.state.lock() {
         lifecycle.active_runs.remove(run_id);
     }
 }
@@ -243,6 +267,7 @@ impl fmt::Debug for OpenAiResponsesAdapter {
                 "active_runs",
                 &self
                     .lifecycle
+                    .state
                     .lock()
                     .map_or(0, |lifecycle| lifecycle.active_runs.len()),
             )
@@ -277,9 +302,10 @@ impl ProtocolPeer for OpenAiResponsesAdapter {
         {
             let mut lifecycle = self
                 .lifecycle
+                .state
                 .lock()
                 .map_err(|_| ProtocolError::InternalAgentFailure)?;
-            if lifecycle.closed || lifecycle.active_runs.contains_key(&run_id) {
+            if !lifecycle.shutdown.is_open() || lifecycle.active_runs.contains_key(&run_id) {
                 return Err(ProtocolError::InvalidRequest);
             }
             let worker_lifecycle = Arc::clone(&worker_lifecycle_state);
@@ -352,6 +378,7 @@ impl ProtocolPeer for OpenAiResponsesAdapter {
         let run_id = request.run_id();
         let accepted = self
             .lifecycle
+            .state
             .lock()
             .map_err(|_| ProtocolError::InternalAgentFailure)?
             .active_runs
@@ -372,30 +399,49 @@ impl ProtocolPeer for OpenAiResponsesAdapter {
         let workers = {
             let mut lifecycle = self
                 .lifecycle
+                .state
                 .lock()
                 .map_err(|_| ProtocolError::InternalAgentFailure)?;
-            lifecycle.closed = true;
-            for phase in lifecycle.active_runs.values() {
-                if let RunPhase::Running(cancellation) = phase {
-                    cancellation.store(true, Ordering::Release);
+            loop {
+                match &lifecycle.shutdown {
+                    ShutdownState::Open => {
+                        lifecycle.shutdown = ShutdownState::Closing;
+                        for phase in lifecycle.active_runs.values() {
+                            if let RunPhase::Running(cancellation) = phase {
+                                cancellation.store(true, Ordering::Release);
+                            }
+                        }
+                        break std::mem::take(&mut lifecycle.workers);
+                    }
+                    ShutdownState::Closing => {
+                        lifecycle = self
+                            .lifecycle
+                            .shutdown_complete
+                            .wait(lifecycle)
+                            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+                    }
+                    ShutdownState::Closed(result) => return *result,
                 }
             }
-            std::mem::take(&mut lifecycle.workers)
         };
         let mut failed = false;
         for worker in workers {
             failed |= worker.join().is_err();
         }
-        self.lifecycle
-            .lock()
-            .map_err(|_| ProtocolError::InternalAgentFailure)?
-            .active_runs
-            .clear();
-        if failed {
+        let result = if failed {
             Err(ProtocolError::InternalAgentFailure)
         } else {
             Ok(())
-        }
+        };
+        let mut lifecycle = self
+            .lifecycle
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        lifecycle.active_runs.clear();
+        lifecycle.shutdown = ShutdownState::Closed(result);
+        self.lifecycle.shutdown_complete.notify_all();
+        result
     }
 }
 
