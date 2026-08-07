@@ -384,7 +384,7 @@ fn execution_binding() -> RunExecutionBinding {
         effective_context: b"context".to_vec(),
         effective_context_artifact_id: "artifact-context-1".to_owned(),
         effective_context_digest:
-            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+            "sha256:ea7792a26f405e2ae9c6f49ca93bbe6076ceac0a1fc53d83426c7d7f2d9377e4".to_owned(),
         supersedes_run_id: None,
     }
 }
@@ -560,7 +560,7 @@ fn run_start_request(
             "objective": "Review the implementation",
             "contextPackage": {
                 "packageId": "context-1",
-                "contentDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "contentDigest": "sha256:ea7792a26f405e2ae9c6f49ca93bbe6076ceac0a1fc53d83426c7d7f2d9377e4",
                 "manifestRef": "artifact:context-1"
             },
             "permissions": {

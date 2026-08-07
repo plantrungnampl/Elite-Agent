@@ -67,24 +67,58 @@ fn shared_harness_rejects_a_peer_that_never_emits_a_terminal_result() {
 
 #[test]
 fn run_start_carries_provider_neutral_execution_bytes_outside_the_wire_frame() {
-    let binding = RunExecutionBinding {
-        provider_id: "provider-1".to_owned(),
-        model_id: "model-1".to_owned(),
-        generation_parameters: br#"{\"temperature\":0}"#.to_vec(),
-        generation_parameters_digest:
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-        effective_context: b"exact context".to_vec(),
-        effective_context_artifact_id: "artifact-context-1".to_owned(),
-        effective_context_digest:
-            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-        supersedes_run_id: Some("run-previous".to_owned()),
-    };
+    let binding = valid_execution_binding();
 
     let start = RunStart::new(run_start_frame(), binding.clone()).unwrap();
 
     assert_eq!(start.execution_binding(), &binding);
     let wire = serde_json::to_value(start.as_frame()).unwrap();
     assert!(wire.pointer("/params/providerId").is_none());
+}
+
+#[test]
+fn run_start_rejects_noncanonical_generation_parameters() {
+    let mut binding = valid_execution_binding();
+    binding.generation_parameters = br#"{"temperature":0.0}"#.to_vec();
+    binding.generation_parameters_digest =
+        "sha256:a9636e1ad83fa94ab18777a9f8313c8d4c0638de56ded723343a0f922d867cc0".to_owned();
+
+    assert_eq!(
+        RunStart::new(run_start_frame(), binding).unwrap_err(),
+        ProtocolError::InvalidRequest
+    );
+}
+
+#[test]
+fn run_start_rejects_generation_or_context_digest_mismatch() {
+    let mut generation_mismatch = valid_execution_binding();
+    generation_mismatch.generation_parameters_digest =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned();
+    let mut context_mismatch = valid_execution_binding();
+    context_mismatch.effective_context_digest =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned();
+
+    for binding in [generation_mismatch, context_mismatch] {
+        assert_eq!(
+            RunStart::new(run_start_frame(), binding).unwrap_err(),
+            ProtocolError::InvalidRequest
+        );
+    }
+}
+
+fn valid_execution_binding() -> RunExecutionBinding {
+    RunExecutionBinding {
+        provider_id: "provider-1".to_owned(),
+        model_id: "model-1".to_owned(),
+        generation_parameters: br#"{"temperature":0}"#.to_vec(),
+        generation_parameters_digest:
+            "sha256:e4ff491169b8a9ea78518a7972422b5a24d5e3790e0d9a9e5cbfb384d9b621e0".to_owned(),
+        effective_context: b"exact context".to_vec(),
+        effective_context_artifact_id: "artifact-context-1".to_owned(),
+        effective_context_digest:
+            "sha256:7ce2a62fec3ddf55f1cede952bdcd4170bb0b01fa53da3ded734e531337d2b58".to_owned(),
+        supersedes_run_id: Some("run-previous".to_owned()),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -440,7 +474,7 @@ fn run_start_frame() -> ProtocolFrame {
             "objective": "Test",
             "contextPackage": {
                 "packageId": "context-1",
-                "contentDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "contentDigest": "sha256:7ce2a62fec3ddf55f1cede952bdcd4170bb0b01fa53da3ded734e531337d2b58",
                 "manifestRef": "artifact:context-1"
             },
             "permissions": { "contextQuery": true, "toolRequest": true, "writeFiles": false },

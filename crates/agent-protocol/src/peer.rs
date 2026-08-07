@@ -6,6 +6,7 @@ use std::{
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::{
     ConnectionBinding, InboundDisposition, NdjsonCodec, ProtocolCapabilities, ProtocolError,
@@ -78,11 +79,14 @@ impl RunExecutionBinding {
     fn is_valid(&self) -> bool {
         !self.provider_id.trim().is_empty()
             && !self.model_id.trim().is_empty()
-            && !self.generation_parameters.is_empty()
-            && valid_digest(&self.generation_parameters_digest)
+            && canonical_json(&self.generation_parameters)
+            && digest_matches(
+                &self.generation_parameters,
+                &self.generation_parameters_digest,
+            )
             && !self.effective_context.is_empty()
             && !self.effective_context_artifact_id.trim().is_empty()
-            && valid_digest(&self.effective_context_digest)
+            && digest_matches(&self.effective_context, &self.effective_context_digest)
             && self
                 .supersedes_run_id
                 .as_deref()
@@ -603,6 +607,17 @@ fn valid_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn canonical_json(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|value| serde_json_canonicalizer::to_vec(&value).ok())
+        .is_some_and(|canonical| canonical == bytes)
+}
+
+fn digest_matches(bytes: &[u8], digest: &str) -> bool {
+    valid_digest(digest) && format!("sha256:{:x}", Sha256::digest(bytes)) == digest
+}
+
 fn conformance_execution_binding() -> RunExecutionBinding {
     RunExecutionBinding {
         provider_id: "conformance-provider".to_owned(),
@@ -613,7 +628,7 @@ fn conformance_execution_binding() -> RunExecutionBinding {
         effective_context: b"conformance context".to_vec(),
         effective_context_artifact_id: "artifact-conformance-context".to_owned(),
         effective_context_digest:
-            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+            "sha256:cf5515229a79d1eeed0c2281346c68418af289215570fe3135a624217bec0c29".to_owned(),
         supersedes_run_id: None,
     }
 }
@@ -677,7 +692,7 @@ fn start(run_id: &str) -> Result<ProtocolFrame, ProtocolError> {
             "objective": "Conformance check",
             "contextPackage": {
                 "packageId": "conformance-context",
-                "contentDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "contentDigest": "sha256:cf5515229a79d1eeed0c2281346c68418af289215570fe3135a624217bec0c29",
                 "manifestRef": "artifact:conformance-context"
             },
             "permissions": { "contextQuery": true, "toolRequest": true, "writeFiles": false },

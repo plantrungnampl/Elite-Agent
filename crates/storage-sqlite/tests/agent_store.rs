@@ -1,10 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use local_agent_terminal_agent_protocol::{
-    ConnectionBinding, PeerDescriptor, ProtocolCapabilities, ProtocolPeer, ProtocolTrustTier,
+    ConnectionBinding, PeerDescriptor, ProtocolCapabilities, ProtocolError, ProtocolPeer,
+    ProtocolTrustTier,
 };
 use local_agent_terminal_agent_runtime::{
     MaliciousScript, ProtocolAgentRuntime, Script, ScriptedPeer, DEFAULT_HEARTBEAT_TIMEOUT_SECS,
@@ -724,6 +725,9 @@ fn hostile_crashed_and_timed_out_runtime_runs_do_not_mutate_real_task_workflow_s
         Script::Malicious(MaliciousScript::WrongRun),
         Script::Malicious(MaliciousScript::SequenceGap),
         Script::Malicious(MaliciousScript::OversizeFrame),
+        Script::Malicious(MaliciousScript::OversizeOutput),
+        Script::Malicious(MaliciousScript::DuplicateTerminal),
+        Script::Malicious(MaliciousScript::ConflictingTerminal),
         Script::Crashing,
         Script::Slow,
     ];
@@ -765,9 +769,75 @@ fn hostile_crashed_and_timed_out_runtime_runs_do_not_mutate_real_task_workflow_s
     }
 }
 
+#[test]
+fn artifact_and_terminal_store_failures_do_not_mutate_real_task_workflow_state() {
+    for fail_artifact_publication in [true, false] {
+        let database = TestDatabase::new();
+        seed_workflow_event(&database);
+        let suffix = if fail_artifact_publication {
+            "runtime-artifact-failure"
+        } else {
+            "runtime-terminal-store-failure"
+        };
+        let request = bound_run(suffix, &format!("{suffix}-key"));
+        let descriptor = descriptor();
+        seed_default_artifacts(&database, &request, &descriptor);
+        if !fail_artifact_publication {
+            fail_agent_run_status(&database, "succeeded");
+        }
+        let store = Arc::new(database.store());
+        let artifacts = Arc::new(RuntimeArtifacts::new(&database));
+        if fail_artifact_publication {
+            artifacts.fail_publication();
+        }
+        let peer = Arc::new(ScriptedPeer::new(Script::Proposer, peer_descriptor()));
+        let runtime = ProtocolAgentRuntime::new(
+            store,
+            artifacts,
+            Arc::new(ManualClock::new(1_800_000_000)),
+            vec![(descriptor, peer.clone() as Arc<dyn ProtocolPeer>)],
+        )
+        .unwrap();
+        let before = task_workflow_state(&database.path);
+
+        runtime.start_run(request).unwrap();
+        assert_eq!(peer.drive(), Err(ProtocolError::InternalAgentFailure));
+
+        assert_eq!(task_workflow_state(&database.path), before);
+    }
+}
+
+#[test]
+fn post_start_store_failures_do_not_mutate_real_task_workflow_state() {
+    for failed_status in ["accepted", "running"] {
+        let database = TestDatabase::new();
+        seed_workflow_event(&database);
+        let suffix = format!("runtime-{failed_status}-failure");
+        let request = bound_run(&suffix, &format!("{suffix}-key"));
+        let descriptor = descriptor();
+        seed_default_artifacts(&database, &request, &descriptor);
+        fail_agent_run_status(&database, failed_status);
+        let store = Arc::new(database.store());
+        let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+        let runtime = ProtocolAgentRuntime::new(
+            store,
+            Arc::new(RuntimeArtifacts::new(&database)),
+            Arc::new(ManualClock::new(1_800_000_000)),
+            vec![(descriptor, peer as Arc<dyn ProtocolPeer>)],
+        )
+        .unwrap();
+        let before = task_workflow_state(&database.path);
+
+        assert!(runtime.start_run(request).is_err());
+
+        assert_eq!(task_workflow_state(&database.path), before);
+    }
+}
+
 struct RuntimeArtifacts {
     database_path: PathBuf,
     content: ContentAddressedArtifactStore,
+    fail_publication: AtomicBool,
 }
 
 impl RuntimeArtifacts {
@@ -775,7 +845,12 @@ impl RuntimeArtifacts {
         Self {
             database_path: database.path.clone(),
             content: ContentAddressedArtifactStore::open(&database.artifact_root).unwrap(),
+            fail_publication: AtomicBool::new(false),
         }
+    }
+
+    fn fail_publication(&self) {
+        self.fail_publication.store(true, Ordering::Relaxed);
     }
 
     fn read_artifact(&self, artifact_id: &str) -> Result<Vec<u8>, PortError> {
@@ -796,6 +871,9 @@ impl AgentArtifactStore for RuntimeArtifacts {
         &self,
         artifact: &AgentMessageArtifact,
     ) -> Result<ArtifactId, PortError> {
+        if self.fail_publication.load(Ordering::Relaxed) {
+            return Err(internal_failure());
+        }
         let content_hash = digest_bytes(&artifact.content);
         let reference = self.content.put(NewArtifact {
             expected_hash: content_hash.as_str().to_owned(),
@@ -1103,6 +1181,19 @@ fn seed_workflow_event(database: &TestDatabase) {
         )
         .unwrap();
     transaction.commit().unwrap();
+}
+
+fn fail_agent_run_status(database: &TestDatabase, status: &str) {
+    assert!(matches!(status, "accepted" | "running" | "succeeded"));
+    database
+        .connection()
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_runtime_agent_status
+             BEFORE UPDATE OF status ON agent_runs
+             FOR EACH ROW WHEN NEW.status = '{status}'
+             BEGIN SELECT RAISE(ABORT, 'forced runtime status failure'); END;"
+        ))
+        .unwrap();
 }
 
 fn task_workflow_state(path: &Path) -> ((String, String, String, i64, i64), i64) {

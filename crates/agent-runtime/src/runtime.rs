@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     time::Duration,
 };
@@ -37,6 +37,7 @@ pub struct ProtocolAgentRuntime {
     descriptors: BTreeMap<String, AgentDescriptor>,
     sessions: Arc<Mutex<BTreeMap<String, Arc<Mutex<ProtocolSession>>>>>,
     active_runs: Arc<Mutex<BTreeMap<String, ActiveRun>>>,
+    slots: Arc<ConnectionSlots>,
     next_request_id: AtomicU64,
 }
 
@@ -45,8 +46,149 @@ struct ActiveRun {
     request: BoundAgentRunRequest,
     peer: Arc<dyn ProtocolPeer>,
     session: Arc<Mutex<ProtocolSession>>,
+    slot: RunSlot,
     deadline: DateTime<Utc>,
     cancellation_deadline: Option<DateTime<Utc>>,
+}
+
+#[derive(Default)]
+struct ConnectionSlots {
+    runs: Mutex<BTreeMap<String, BTreeSet<String>>>,
+}
+
+impl ConnectionSlots {
+    fn reserve(
+        self: &Arc<Self>,
+        connection_digest: &str,
+        run_id: &RunId,
+        capacity: u64,
+    ) -> Result<RunSlot, PortError> {
+        let mut connections = self.runs.lock().map_err(|_| internal_failure())?;
+        let runs = connections.entry(connection_digest.to_owned()).or_default();
+        if u64::try_from(runs.len()).map_err(|_| internal_failure())? >= capacity
+            || !runs.insert(run_id.as_str().to_owned())
+        {
+            return Err(conflict());
+        }
+        Ok(RunSlot(Arc::new(RunSlotInner {
+            slots: Arc::clone(self),
+            connection_digest: connection_digest.to_owned(),
+            run_id: run_id.as_str().to_owned(),
+            released: AtomicBool::new(false),
+        })))
+    }
+
+    fn release(&self, connection_digest: &str, run_id: &str) {
+        if let Ok(mut connections) = self.runs.lock() {
+            if let Some(runs) = connections.get_mut(connection_digest) {
+                runs.remove(run_id);
+                if runs.is_empty() {
+                    connections.remove(connection_digest);
+                }
+            }
+        }
+    }
+
+    fn release_connection(&self, connection_digest: &str) {
+        if let Ok(mut connections) = self.runs.lock() {
+            connections.remove(connection_digest);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RunSlot(Arc<RunSlotInner>);
+
+struct RunSlotInner {
+    slots: Arc<ConnectionSlots>,
+    connection_digest: String,
+    run_id: String,
+    released: AtomicBool,
+}
+
+impl RunSlot {
+    fn release(&self) {
+        if !self.0.released.swap(true, Ordering::AcqRel) {
+            self.0
+                .slots
+                .release(&self.0.connection_digest, &self.0.run_id);
+        }
+    }
+
+    fn release_connection(&self) {
+        self.0.slots.release_connection(&self.0.connection_digest);
+        self.0.released.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for RunSlotInner {
+    fn drop(&mut self) {
+        if !self.released.load(Ordering::Acquire) {
+            self.slots.release(&self.connection_digest, &self.run_id);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SinkReadiness {
+    Starting,
+    Accepted,
+    Ready,
+    Failed,
+}
+
+struct SinkGate {
+    readiness: Mutex<SinkReadiness>,
+    changed: Condvar,
+}
+
+impl SinkGate {
+    fn new() -> Self {
+        Self {
+            readiness: Mutex::new(SinkReadiness::Starting),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn accepted(&self) -> Result<(), PortError> {
+        *self.readiness.lock().map_err(|_| internal_failure())? = SinkReadiness::Accepted;
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn ready(&self) -> Result<(), PortError> {
+        *self.readiness.lock().map_err(|_| internal_failure())? = SinkReadiness::Ready;
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn fail(&self) {
+        if let Ok(mut readiness) = self.readiness.lock() {
+            *readiness = SinkReadiness::Failed;
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait_until_ready(&self) -> Result<(), ProtocolError> {
+        let mut readiness = self
+            .readiness
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        loop {
+            match *readiness {
+                SinkReadiness::Starting | SinkReadiness::Failed => {
+                    return Err(ProtocolError::InvalidRequest)
+                }
+                SinkReadiness::Ready => return Ok(()),
+                SinkReadiness::Accepted => {
+                    readiness = self
+                        .changed
+                        .wait(readiness)
+                        .map_err(|_| ProtocolError::InternalAgentFailure)?;
+                }
+            }
+        }
+    }
 }
 
 impl ProtocolAgentRuntime {
@@ -82,6 +224,7 @@ impl ProtocolAgentRuntime {
             descriptors,
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             active_runs: Arc::new(Mutex::new(BTreeMap::new())),
+            slots: Arc::new(ConnectionSlots::default()),
             next_request_id: AtomicU64::new(1),
         })
     }
@@ -121,6 +264,7 @@ impl ProtocolAgentRuntime {
                     .lock()
                     .map_err(|_| internal_failure())?
                     .remove(run.request.run_id.as_str());
+                run.slot.release();
                 if let Ok(frame) =
                     cancel_frame(&run.request.run_id, &self.request_id(), "deadline", 1)
                 {
@@ -201,6 +345,11 @@ impl ProtocolAgentRuntime {
         if request.run_config.limits.deadline <= now.timestamp {
             return Err(invalid_input());
         }
+        let slot = self.slots.reserve(
+            request.connection.binding_digest.as_str(),
+            &request.run_id,
+            peer.descriptor().capabilities.max_concurrent_runs,
+        )?;
         self.store.create_bound_run(&request)?;
 
         let session = self.session(&request, &peer.descriptor(), now.date_time)?;
@@ -213,7 +362,7 @@ impl ProtocolAgentRuntime {
             .outbound(start.clone(), now.date_time)
             .map_err(protocol_port_error)?;
 
-        let ready = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(SinkGate::new());
         let sink = RuntimeSink {
             store: Arc::clone(&self.store),
             artifacts: Arc::clone(&self.artifacts),
@@ -223,7 +372,8 @@ impl ProtocolAgentRuntime {
             request: request.clone(),
             active_runs: Arc::clone(&self.active_runs),
             sessions: Arc::clone(&self.sessions),
-            ready: Arc::clone(&ready),
+            slot: slot.clone(),
+            gate: Arc::clone(&gate),
             codec: NdjsonCodec::default(),
         };
         let acceptance = match peer.start(
@@ -265,28 +415,41 @@ impl ProtocolAgentRuntime {
                 acceptance
             }
             Ok(_) => {
+                gate.fail();
                 let error = invalid_input();
                 self.compensate_started_run(
                     &request,
                     peer.as_ref(),
                     AgentRunStatus::Failed,
                     "peer rejected the bound run",
-                    now.timestamp,
+                    &slot,
                 );
                 return Err(error);
             }
             Err(error) => {
+                gate.fail();
                 let original = protocol_port_error(error);
                 self.compensate_started_run(
                     &request,
                     peer.as_ref(),
                     AgentRunStatus::Interrupted,
                     "peer failed before acceptance",
-                    now.timestamp,
+                    &slot,
                 );
                 return Err(original);
             }
         };
+        if let Err(error) = gate.accepted() {
+            gate.fail();
+            self.compensate_started_run(
+                &request,
+                peer.as_ref(),
+                AgentRunStatus::Interrupted,
+                "peer start could not be committed",
+                &slot,
+            );
+            return Err(error);
+        }
 
         let after_start = (|| {
             let accepted = self.now()?;
@@ -313,26 +476,28 @@ impl ProtocolAgentRuntime {
                         request: request.clone(),
                         peer: Arc::clone(&peer),
                         session: Arc::clone(&session),
+                        slot: slot.clone(),
                         deadline,
                         cancellation_deadline: None,
                     },
                 );
+            gate.ready()?;
             Ok::<_, PortError>(accepted)
         })();
         let accepted = match after_start {
             Ok(accepted) => accepted,
             Err(error) => {
+                gate.fail();
                 self.compensate_started_run(
                     &request,
                     peer.as_ref(),
                     AgentRunStatus::Interrupted,
                     "peer start could not be committed",
-                    now.timestamp,
+                    &slot,
                 );
                 return Err(error);
             }
         };
-        ready.store(true, Ordering::Release);
         Ok(AgentRunReceipt {
             run_id: request.run_id,
             accepted_at: accepted.timestamp,
@@ -473,7 +638,7 @@ impl ProtocolAgentRuntime {
         peer: &dyn ProtocolPeer,
         status: AgentRunStatus,
         error: &str,
-        at: Timestamp,
+        slot: &RunSlot,
     ) {
         if let Ok(frame) = cancel_frame(
             &request.run_id,
@@ -486,14 +651,27 @@ impl ProtocolAgentRuntime {
             }
         }
         let _ = peer.shutdown();
-        let _ = self.persist_runtime_terminal(request, status, error, at);
+        if let Ok(now) = self.now() {
+            let _ = self.persist_runtime_terminal(request, status, error, now.timestamp);
+            let _ =
+                self.interrupt_connection(request.connection.binding_digest.as_str(), &now.text);
+        } else {
+            slot.release_connection();
+        }
     }
 
     fn interrupt_connection(&self, digest: &str, at: &str) -> Result<Vec<RunId>, PortError> {
-        let interrupted = self.store.interrupt_connection(digest, at)?;
-        let mut active = self.active_runs.lock().map_err(|_| internal_failure())?;
-        active.retain(|_, run| run.request.connection.binding_digest.as_str() != digest);
-        Ok(interrupted)
+        let interrupted = self.store.interrupt_connection(digest, at);
+        self.active_runs
+            .lock()
+            .map_err(|_| internal_failure())?
+            .retain(|_, run| run.request.connection.binding_digest.as_str() != digest);
+        self.sessions
+            .lock()
+            .map_err(|_| internal_failure())?
+            .remove(digest);
+        self.slots.release_connection(digest);
+        interrupted
     }
 
     fn is_active(&self, run_id: &RunId) -> Result<bool, PortError> {
@@ -528,15 +706,14 @@ struct RuntimeSink {
     request: BoundAgentRunRequest,
     active_runs: Arc<Mutex<BTreeMap<String, ActiveRun>>>,
     sessions: Arc<Mutex<BTreeMap<String, Arc<Mutex<ProtocolSession>>>>>,
-    ready: Arc<AtomicBool>,
+    slot: RunSlot,
+    gate: Arc<SinkGate>,
     codec: NdjsonCodec,
 }
 
 impl RuntimeSink {
     fn receive_frame(&self, frame: ProtocolFrame) -> Result<InboundDisposition, ProtocolError> {
-        if !self.ready.load(Ordering::Acquire) {
-            return Err(ProtocolError::InvalidRequest);
-        }
+        self.gate.wait_until_ready()?;
         if matches!(
             frame,
             ProtocolFrame::RunCompleteRequest(_)
@@ -566,9 +743,7 @@ impl RuntimeSink {
     }
 
     fn request_frame(&self, frame: ProtocolFrame) -> Result<ProtocolFrame, ProtocolError> {
-        if !self.ready.load(Ordering::Acquire) {
-            return Err(ProtocolError::InvalidRequest);
-        }
+        self.gate.wait_until_ready()?;
         let now =
             runtime_time(self.clock.as_ref()).map_err(|_| ProtocolError::InternalAgentFailure)?;
         let received = self
@@ -606,6 +781,7 @@ impl RuntimeSink {
                 .lock()
                 .map_err(|_| ProtocolError::InternalAgentFailure)?
                 .remove(self.request.run_id.as_str());
+            self.slot.release();
             success_response(&id, json!({ "accepted": true }))
                 .map_err(|_| ProtocolError::InternalAgentFailure)?
         } else {
@@ -638,6 +814,7 @@ impl RuntimeSink {
                 .lock()
                 .map_err(|_| ProtocolError::InternalAgentFailure)?
                 .remove(self.request.run_id.as_str());
+            self.slot.release();
             let frame = cancel_frame(&self.request.run_id, "core:limit", "output_limit", 1)
                 .map_err(|_| ProtocolError::InternalAgentFailure)?;
             let cancel = RunCancel::try_from(frame)?;
@@ -665,6 +842,7 @@ impl RuntimeSink {
             .lock()
             .map_err(|_| ProtocolError::InternalAgentFailure)?
             .remove(self.request.connection.binding_digest.as_str());
+        self.slot.release_connection();
         Ok(())
     }
 }
