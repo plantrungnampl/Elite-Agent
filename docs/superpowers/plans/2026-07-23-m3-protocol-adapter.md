@@ -420,19 +420,19 @@ pub struct OpenAiResponsesAdapter { /* reqwest blocking client + active cancella
 
 The adapter implements `ProtocolPeer`. It accepts provider-neutral run input, posts `model`, `input`, `stream: true`, `store: false`, and the bound output limit, then translates provider semantic events into protocol deltas and one terminal. It does not expose the API key through `Debug` or serialization and does not provide hosted tools.
 
-- [ ] **Step 1 - Write failing request and secret-boundary tests**
+- [x] **Step 1 - Write failing request and secret-boundary tests**
 
 Use a loopback `TcpListener` fixture to capture the request. Assert exact endpoint/method/headers/body; required caller-supplied model; `stream: true`; `store: false`; no hosted tools; bounded prompt and output; authorization canary present only on the wire; and canary absent from all errors, `Debug`, artifacts, run config, and captured sanitized diagnostics. Reject non-HTTPS production endpoints; allow HTTP only through a test-only constructor scoped to loopback.
 
-- [ ] **Step 2 - Write failing SSE/lifecycle tests**
+- [x] **Step 2 - Write failing SSE/lifecycle tests**
 
 Cover chunk boundaries across lines, CRLF, comments, multiple `data:` lines, output deltas, completed usage, failed/incomplete/error events, invalid JSON, oversized event, premature EOF, 401/429/5xx classification, `Retry-After`, timeout, user cancellation, response ID capture, and refusal/no-text terminal behavior.
 
-- [ ] **Step 3 - Implement with existing/std dependencies only where possible**
+- [x] **Step 3 - Implement with existing/std dependencies only where possible**
 
 Use `reqwest` blocking + rustls for HTTP/TLS and `BufRead` for SSE; do not add an EventSource/SSE crate or OpenAI SDK. Maintain one cancellation flag per active run and remove it at terminal. Map provider sequence numbers to protocol sequence, but let protocol session validation remain authoritative.
 
-- [ ] **Step 4 - Run shared conformance and commit**
+- [x] **Step 4 - Run shared conformance and commit**
 
 ```powershell
 cargo test -p local-agent-terminal-provider-openai

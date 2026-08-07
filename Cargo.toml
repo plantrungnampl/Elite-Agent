@@ -4,6 +4,7 @@ members = [
     "crates/application",
     "crates/agent-protocol",
     "crates/agent-runtime",
+    "crates/provider-openai",
     "crates/bootstrap",
     "crates/domain",
     "crates/policy-engine",
