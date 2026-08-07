@@ -1,6 +1,6 @@
 use local_agent_terminal_domain::{
     AgentCancellationReceipt, AgentDescriptor, AgentRunReceipt, AgentRunSnapshot, AgentRunTerminal,
-    BoundAgentRunRequest, CancelAgentRun, RunId,
+    ArtifactId, BoundAgentRunRequest, BoundEffectiveContext, CancelAgentRun, RunId, TaskId,
 };
 
 use crate::PortError;
@@ -9,6 +9,23 @@ pub trait AgentRuntime: Send + Sync {
     fn list_agents(&self) -> Result<Vec<AgentDescriptor>, PortError>;
     fn start_run(&self, request: BoundAgentRunRequest) -> Result<AgentRunReceipt, PortError>;
     fn cancel(&self, request: CancelAgentRun) -> Result<AgentCancellationReceipt, PortError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMessageArtifact {
+    pub task_id: TaskId,
+    pub run_id: RunId,
+    pub message_id: String,
+    pub content: Vec<u8>,
+}
+
+pub trait AgentArtifactStore: Send + Sync {
+    fn load_effective_context(&self, context: &BoundEffectiveContext)
+        -> Result<Vec<u8>, PortError>;
+    fn publish_agent_message(
+        &self,
+        artifact: &AgentMessageArtifact,
+    ) -> Result<ArtifactId, PortError>;
 }
 
 pub trait AgentRunStore: Send + Sync {

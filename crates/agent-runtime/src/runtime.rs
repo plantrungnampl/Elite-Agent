@@ -11,10 +11,11 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use local_agent_terminal_agent_protocol::{
     InboundDisposition, NdjsonCodec, PeerDescriptor, PeerEventSink, ProtocolCapabilities,
     ProtocolError, ProtocolFrame, ProtocolOffer, ProtocolPeer, ProtocolSession, ProtocolTrustTier,
-    RunCancel, RunStart, SessionLimits, DEFAULT_MAX_FRAME_BYTES,
+    RunCancel, RunExecutionBinding, RunStart, SessionLimits, DEFAULT_MAX_FRAME_BYTES,
 };
 use local_agent_terminal_application::{
-    AgentRunStore, AgentRuntime, Clock, PortError, Retryability, SafeErrorClassification,
+    AgentArtifactStore, AgentMessageArtifact, AgentRunStore, AgentRuntime, Clock, PortError,
+    Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     AgentCancellationReceipt, AgentClaim, AgentDescriptor, AgentEvidenceRef, AgentRunMessage,
@@ -30,6 +31,7 @@ pub(crate) const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 pub struct ProtocolAgentRuntime {
     store: Arc<dyn AgentRunStore>,
+    artifacts: Arc<dyn AgentArtifactStore>,
     clock: Arc<dyn Clock>,
     peers: BTreeMap<String, Arc<dyn ProtocolPeer>>,
     descriptors: BTreeMap<String, AgentDescriptor>,
@@ -50,22 +52,31 @@ struct ActiveRun {
 impl ProtocolAgentRuntime {
     pub fn new(
         store: Arc<dyn AgentRunStore>,
+        artifacts: Arc<dyn AgentArtifactStore>,
         clock: Arc<dyn Clock>,
         agents: Vec<(AgentDescriptor, Arc<dyn ProtocolPeer>)>,
     ) -> Result<Self, PortError> {
+        let mut agent_ids = BTreeSet::new();
+        let mut connection_ids = BTreeSet::new();
+        for (descriptor, peer) in &agents {
+            descriptor.validate().map_err(|_| invalid_input())?;
+            validate_descriptor(descriptor, &peer.descriptor())?;
+            if !agent_ids.insert(descriptor.agent_id.clone())
+                || !connection_ids.insert(peer.descriptor().binding.connection_id)
+            {
+                return Err(conflict());
+            }
+        }
         let mut peers = BTreeMap::new();
         let mut descriptors = BTreeMap::new();
         for (descriptor, peer) in agents {
-            descriptor.validate().map_err(|_| invalid_input())?;
-            validate_descriptor(&descriptor, &peer.descriptor())?;
             store.register_descriptor(&descriptor)?;
-            if peers.insert(descriptor.agent_id.clone(), peer).is_some() {
-                return Err(conflict());
-            }
+            peers.insert(descriptor.agent_id.clone(), peer);
             descriptors.insert(descriptor.agent_id.clone(), descriptor);
         }
         Ok(Self {
             store,
+            artifacts,
             clock,
             peers,
             descriptors,
@@ -174,14 +185,28 @@ impl ProtocolAgentRuntime {
             .get(&request.agent_id)
             .cloned()
             .ok_or_else(not_found)?;
+        if !self
+            .descriptors
+            .get(&request.agent_id)
+            .is_some_and(|descriptor| descriptor.enabled)
+        {
+            return Err(permission_denied());
+        }
         validate_request_peer(&request, &peer.descriptor())?;
+        let effective_context = self.artifacts.load_effective_context(&request.context)?;
+        if digest_bytes(&effective_context) != request.context.content_digest {
+            return Err(invalid_input());
+        }
+        let now = self.now()?;
+        if request.run_config.limits.deadline <= now.timestamp {
+            return Err(invalid_input());
+        }
         self.store.create_bound_run(&request)?;
 
-        let now = self.now()?;
         let session = self.session(&request, &peer.descriptor(), now.date_time)?;
         let request_id = self.request_id();
-        let deadline = now.date_time + ChronoDuration::seconds(DEFAULT_RUN_DEADLINE_SECS);
-        let start = run_start_frame(&request, &peer.descriptor(), &request_id, deadline)?;
+        let deadline = timestamp_date_time(request.run_config.limits.deadline)?;
+        let start = run_start_frame(&request, &peer.descriptor(), &request_id)?;
         session
             .lock()
             .map_err(|_| internal_failure())?
@@ -191,6 +216,7 @@ impl ProtocolAgentRuntime {
         let ready = Arc::new(AtomicBool::new(false));
         let sink = RuntimeSink {
             store: Arc::clone(&self.store),
+            artifacts: Arc::clone(&self.artifacts),
             clock: Arc::clone(&self.clock),
             session: Arc::clone(&session),
             peer: Arc::clone(&peer),
@@ -201,7 +227,36 @@ impl ProtocolAgentRuntime {
             codec: NdjsonCodec::default(),
         };
         let acceptance = match peer.start(
-            RunStart::try_from(start).map_err(protocol_port_error)?,
+            RunStart::new(
+                start,
+                RunExecutionBinding {
+                    provider_id: request.run_config.provider_id.clone(),
+                    model_id: request.run_config.model_id.clone(),
+                    generation_parameters: request
+                        .run_config
+                        .generation_parameters
+                        .canonical_json
+                        .clone(),
+                    generation_parameters_digest: request
+                        .run_config
+                        .generation_parameters
+                        .digest
+                        .as_str()
+                        .to_owned(),
+                    effective_context,
+                    effective_context_artifact_id: request
+                        .context
+                        .effective_context_artifact_id
+                        .as_str()
+                        .to_owned(),
+                    effective_context_digest: request.context.content_digest.as_str().to_owned(),
+                    supersedes_run_id: request
+                        .supersedes_run_id
+                        .as_ref()
+                        .map(|run_id| run_id.as_str().to_owned()),
+                },
+            )
+            .map_err(protocol_port_error)?,
             Box::new(sink),
         ) {
             Ok(acceptance)
@@ -210,53 +265,73 @@ impl ProtocolAgentRuntime {
                 acceptance
             }
             Ok(_) => {
-                self.persist_runtime_terminal(
+                let error = invalid_input();
+                self.compensate_started_run(
                     &request,
+                    peer.as_ref(),
                     AgentRunStatus::Failed,
                     "peer rejected the bound run",
                     now.timestamp,
-                )?;
-                return Err(invalid_input());
+                );
+                return Err(error);
             }
             Err(error) => {
-                self.persist_runtime_terminal(
+                let original = protocol_port_error(error);
+                self.compensate_started_run(
                     &request,
+                    peer.as_ref(),
                     AgentRunStatus::Interrupted,
                     "peer failed before acceptance",
                     now.timestamp,
-                )?;
-                return Err(protocol_port_error(error));
+                );
+                return Err(original);
             }
         };
 
-        let accepted = self.now()?;
-        session
-            .lock()
-            .map_err(|_| internal_failure())?
-            .receive_response(
-                success_response(
-                    &request_id,
-                    json!({ "accepted": acceptance.accepted, "runId": acceptance.run_id }),
-                )?,
-                accepted.date_time,
-            )
-            .map_err(protocol_port_error)?;
-        self.store.accept_run(&request.run_id, &accepted.text)?;
-        let running = self.now()?;
-        self.store.mark_running(&request.run_id, &running.text)?;
-        self.active_runs
-            .lock()
-            .map_err(|_| internal_failure())?
-            .insert(
-                request.run_id.as_str().to_owned(),
-                ActiveRun {
-                    request: request.clone(),
-                    peer,
-                    session,
-                    deadline,
-                    cancellation_deadline: None,
-                },
-            );
+        let after_start = (|| {
+            let accepted = self.now()?;
+            session
+                .lock()
+                .map_err(|_| internal_failure())?
+                .receive_response(
+                    success_response(
+                        &request_id,
+                        json!({ "accepted": acceptance.accepted, "runId": acceptance.run_id }),
+                    )?,
+                    accepted.date_time,
+                )
+                .map_err(protocol_port_error)?;
+            self.store.accept_run(&request.run_id, &accepted.text)?;
+            let running = self.now()?;
+            self.store.mark_running(&request.run_id, &running.text)?;
+            self.active_runs
+                .lock()
+                .map_err(|_| internal_failure())?
+                .insert(
+                    request.run_id.as_str().to_owned(),
+                    ActiveRun {
+                        request: request.clone(),
+                        peer: Arc::clone(&peer),
+                        session: Arc::clone(&session),
+                        deadline,
+                        cancellation_deadline: None,
+                    },
+                );
+            Ok::<_, PortError>(accepted)
+        })();
+        let accepted = match after_start {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                self.compensate_started_run(
+                    &request,
+                    peer.as_ref(),
+                    AgentRunStatus::Interrupted,
+                    "peer start could not be committed",
+                    now.timestamp,
+                );
+                return Err(error);
+            }
+        };
         ready.store(true, Ordering::Release);
         Ok(AgentRunReceipt {
             run_id: request.run_id,
@@ -330,7 +405,8 @@ impl ProtocolAgentRuntime {
         now: DateTime<Utc>,
     ) -> Result<Arc<Mutex<ProtocolSession>>, PortError> {
         let mut sessions = self.sessions.lock().map_err(|_| internal_failure())?;
-        if let Some(session) = sessions.get(&request.connection.connection_id) {
+        let session_key = request.connection.binding_digest.as_str();
+        if let Some(session) = sessions.get(session_key) {
             return Ok(Arc::clone(session));
         }
         let mut session = ProtocolSession::new(
@@ -359,10 +435,7 @@ impl ProtocolAgentRuntime {
             .outbound(initialized_frame(descriptor)?, now)
             .map_err(protocol_port_error)?;
         let session = Arc::new(Mutex::new(session));
-        sessions.insert(
-            request.connection.connection_id.clone(),
-            Arc::clone(&session),
-        );
+        sessions.insert(session_key.to_owned(), Arc::clone(&session));
         Ok(session)
     }
 
@@ -384,8 +457,36 @@ impl ProtocolAgentRuntime {
         error: &str,
         at: Timestamp,
     ) -> Result<(), PortError> {
-        self.store
-            .persist_terminal(&runtime_terminal(request, status, error, at))
+        publish_runtime_terminal(
+            self.artifacts.as_ref(),
+            self.store.as_ref(),
+            request,
+            status,
+            error,
+            at,
+        )
+    }
+
+    fn compensate_started_run(
+        &self,
+        request: &BoundAgentRunRequest,
+        peer: &dyn ProtocolPeer,
+        status: AgentRunStatus,
+        error: &str,
+        at: Timestamp,
+    ) {
+        if let Ok(frame) = cancel_frame(
+            &request.run_id,
+            "core:start-compensation",
+            "start_failed",
+            1,
+        ) {
+            if let Ok(cancel) = RunCancel::try_from(frame) {
+                let _ = peer.cancel(cancel);
+            }
+        }
+        let _ = peer.shutdown();
+        let _ = self.persist_runtime_terminal(request, status, error, at);
     }
 
     fn interrupt_connection(&self, digest: &str, at: &str) -> Result<Vec<RunId>, PortError> {
@@ -420,6 +521,7 @@ impl AgentRuntime for ProtocolAgentRuntime {
 
 struct RuntimeSink {
     store: Arc<dyn AgentRunStore>,
+    artifacts: Arc<dyn AgentArtifactStore>,
     clock: Arc<dyn Clock>,
     session: Arc<Mutex<ProtocolSession>>,
     peer: Arc<dyn ProtocolPeer>,
@@ -433,6 +535,15 @@ struct RuntimeSink {
 impl RuntimeSink {
     fn receive_frame(&self, frame: ProtocolFrame) -> Result<InboundDisposition, ProtocolError> {
         if !self.ready.load(Ordering::Acquire) {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        if matches!(
+            frame,
+            ProtocolFrame::RunCompleteRequest(_)
+                | ProtocolFrame::ContextQueryRequest(_)
+                | ProtocolFrame::ToolRequest(_)
+                | ProtocolFrame::SpecialistRequest(_)
+        ) {
             return Err(ProtocolError::InvalidRequest);
         }
         let now =
@@ -451,29 +562,61 @@ impl RuntimeSink {
                 return Err(error);
             }
         };
-        if matches!(
-            &disposition,
-            InboundDisposition::Request(ProtocolFrame::RunCompleteRequest(_))
-        ) {
-            let terminal = terminal_from_frame(&frame, &self.request, now.timestamp)?;
+        Ok(disposition)
+    }
+
+    fn request_frame(&self, frame: ProtocolFrame) -> Result<ProtocolFrame, ProtocolError> {
+        if !self.ready.load(Ordering::Acquire) {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        let now =
+            runtime_time(self.clock.as_ref()).map_err(|_| ProtocolError::InternalAgentFailure)?;
+        let received = self
+            .session
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .receive(frame.clone(), now.date_time);
+        let disposition = match received {
+            Ok(InboundDisposition::Request(frame)) => frame,
+            Ok(_) => return Err(ProtocolError::InvalidRequest),
+            Err(error) => {
+                self.handle_protocol_error(error, now)?;
+                return Err(error);
+            }
+        };
+        let id = required_string(&frame_value(&frame)?, "/id")?;
+        let response = if matches!(disposition, ProtocolFrame::RunCompleteRequest(_)) {
+            let content = terminal_content(&frame)?;
+            let message_id = required_string(&frame_value(&frame)?, "/params/message/messageId")?;
+            let content_artifact_id = self
+                .artifacts
+                .publish_agent_message(&AgentMessageArtifact {
+                    task_id: self.request.task_id.clone(),
+                    run_id: self.request.run_id.clone(),
+                    message_id,
+                    content: content.into_bytes(),
+                })
+                .map_err(|_| ProtocolError::InternalAgentFailure)?;
+            let terminal =
+                terminal_from_frame(&frame, &self.request, content_artifact_id, now.timestamp)?;
             self.store
                 .persist_terminal(&terminal)
                 .map_err(|_| ProtocolError::InternalAgentFailure)?;
-            let id = required_string(&frame_value(&frame)?, "/id")?;
-            self.session
-                .lock()
-                .map_err(|_| ProtocolError::InternalAgentFailure)?
-                .outbound(
-                    success_response(&id, json!({ "accepted": true }))
-                        .map_err(|_| ProtocolError::InternalAgentFailure)?,
-                    now.date_time,
-                )?;
             self.active_runs
                 .lock()
                 .map_err(|_| ProtocolError::InternalAgentFailure)?
                 .remove(self.request.run_id.as_str());
-        }
-        Ok(disposition)
+            success_response(&id, json!({ "accepted": true }))
+                .map_err(|_| ProtocolError::InternalAgentFailure)?
+        } else {
+            error_response(&id, "policy_denied", false)
+                .map_err(|_| ProtocolError::InternalAgentFailure)?
+        };
+        self.session
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .outbound(response.clone(), now.date_time)?;
+        Ok(response)
     }
 
     fn handle_protocol_error(
@@ -482,14 +625,15 @@ impl RuntimeSink {
         now: RuntimeTime,
     ) -> Result<(), ProtocolError> {
         if error == ProtocolError::OutputLimitExceeded {
-            self.store
-                .persist_terminal(&runtime_terminal(
-                    &self.request,
-                    AgentRunStatus::Failed,
-                    "agent output limit exceeded",
-                    now.timestamp,
-                ))
-                .map_err(|_| ProtocolError::InternalAgentFailure)?;
+            publish_runtime_terminal(
+                self.artifacts.as_ref(),
+                self.store.as_ref(),
+                &self.request,
+                AgentRunStatus::Failed,
+                "agent output limit exceeded",
+                now.timestamp,
+            )
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
             self.active_runs
                 .lock()
                 .map_err(|_| ProtocolError::InternalAgentFailure)?
@@ -520,7 +664,7 @@ impl RuntimeSink {
         self.sessions
             .lock()
             .map_err(|_| ProtocolError::InternalAgentFailure)?
-            .remove(&self.request.connection.connection_id);
+            .remove(self.request.connection.binding_digest.as_str());
         Ok(())
     }
 }
@@ -538,6 +682,10 @@ impl PeerEventSink for RuntimeSink {
                 Err(error)
             }
         }
+    }
+
+    fn request(&self, frame: ProtocolFrame) -> Result<ProtocolFrame, ProtocolError> {
+        self.request_frame(frame)
     }
 
     fn connection_lost(&self) -> Result<(), ProtocolError> {
@@ -568,6 +716,10 @@ fn runtime_time(clock: &dyn Clock) -> Result<RuntimeTime, PortError> {
         date_time,
         timestamp: Timestamp::from_unix_seconds(date_time.timestamp()),
     })
+}
+
+fn timestamp_date_time(timestamp: Timestamp) -> Result<DateTime<Utc>, PortError> {
+    DateTime::from_timestamp(timestamp.unix_seconds(), 0).ok_or_else(invalid_input)
 }
 
 fn validate_descriptor(
@@ -675,9 +827,8 @@ fn run_start_frame(
     request: &BoundAgentRunRequest,
     descriptor: &PeerDescriptor,
     request_id: &str,
-    deadline: DateTime<Utc>,
 ) -> Result<ProtocolFrame, PortError> {
-    decode_frame(json!({
+    let mut value = json!({
         "jsonrpc": "2.0",
         "id": request_id,
         "method": "agent.run.start",
@@ -699,12 +850,23 @@ fn run_start_frame(
             },
             "responseSchema": request.run_config.response_schema_version,
             "limits": {
-                "deadline": deadline.to_rfc3339(),
-                "maxOutputTokens": 1_000_000,
-                "maxToolRequests": 128
+                "deadline": timestamp_date_time(request.run_config.limits.deadline)?.to_rfc3339(),
+                "maxOutputTokens": request.run_config.limits.max_output_tokens,
+                "maxToolRequests": request.run_config.limits.max_tool_requests
             }
         }
-    }))
+    });
+    if let Some(supersedes_run_id) = &request.supersedes_run_id {
+        value
+            .pointer_mut("/params")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(internal_failure)?
+            .insert(
+                "supersedesRunId".to_owned(),
+                Value::String(supersedes_run_id.as_str().to_owned()),
+            );
+    }
+    decode_frame(value)
 }
 
 fn cancel_frame(
@@ -723,6 +885,22 @@ fn cancel_frame(
 
 fn success_response(request_id: &str, result: Value) -> Result<ProtocolFrame, PortError> {
     decode_frame(json!({ "jsonrpc": "2.0", "id": request_id, "result": result }))
+}
+
+fn error_response(
+    request_id: &str,
+    category: &str,
+    retryable: bool,
+) -> Result<ProtocolFrame, PortError> {
+    decode_frame(json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {
+            "code": -32040,
+            "message": "Agent-originated request is not available",
+            "data": { "category": category, "retryable": retryable }
+        }
+    }))
 }
 
 fn decode_frame(value: Value) -> Result<ProtocolFrame, PortError> {
@@ -765,6 +943,7 @@ fn capabilities_json(capabilities: &ProtocolCapabilities) -> Value {
 fn terminal_from_frame(
     frame: &ProtocolFrame,
     request: &BoundAgentRunRequest,
+    content_artifact_id: ArtifactId,
     at: Timestamp,
 ) -> Result<AgentRunTerminal, ProtocolError> {
     let value = frame_value(frame)?;
@@ -777,7 +956,6 @@ fn terminal_from_frame(
         .and_then(Value::as_object)
         .ok_or(ProtocolError::InvalidRequest)?;
     let message_id = required_string(&value, "/params/message/messageId")?;
-    let content = required_string(&value, "/params/message/content")?;
     let status = match required_string(&value, "/params/status")?.as_str() {
         "succeeded" => AgentRunStatus::Succeeded,
         "failed" => AgentRunStatus::Failed,
@@ -826,7 +1004,7 @@ fn terminal_from_frame(
                 .get("replyTo")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            content_artifact_id: content_artifact_id(&content)?,
+            content_artifact_id,
             claims,
         },
         provider_usage: usage,
@@ -893,6 +1071,7 @@ fn runtime_terminal(
     request: &BoundAgentRunRequest,
     status: AgentRunStatus,
     error: &str,
+    content_artifact_id: ArtifactId,
     at: Timestamp,
 ) -> AgentRunTerminal {
     AgentRunTerminal {
@@ -906,11 +1085,7 @@ fn runtime_terminal(
             thread_id: stable_id("thread", request.run_id.as_str()),
             message_type: "status".to_owned(),
             reply_to: None,
-            content_artifact_id: ArtifactId::new(stable_id(
-                "runtime-content",
-                request.run_id.as_str(),
-            ))
-            .expect("stable runtime artifact IDs are valid"),
+            content_artifact_id,
             claims: Vec::new(),
         },
         provider_usage: None,
@@ -921,16 +1096,41 @@ fn runtime_terminal(
     }
 }
 
-fn content_artifact_id(content: &str) -> Result<ArtifactId, ProtocolError> {
-    ArtifactId::new(format!(
-        "agent-content-{:x}",
-        Sha256::digest(content.as_bytes())
+fn terminal_content(frame: &ProtocolFrame) -> Result<String, ProtocolError> {
+    required_string(&frame_value(frame)?, "/params/message/content")
+}
+
+fn publish_runtime_terminal(
+    artifacts: &dyn AgentArtifactStore,
+    store: &dyn AgentRunStore,
+    request: &BoundAgentRunRequest,
+    status: AgentRunStatus,
+    error: &str,
+    at: Timestamp,
+) -> Result<(), PortError> {
+    let message_id = stable_id("runtime-message", request.run_id.as_str());
+    let content_artifact_id = artifacts.publish_agent_message(&AgentMessageArtifact {
+        task_id: request.task_id.clone(),
+        run_id: request.run_id.clone(),
+        message_id,
+        content: error.as_bytes().to_vec(),
+    })?;
+    store.persist_terminal(&runtime_terminal(
+        request,
+        status,
+        error,
+        content_artifact_id,
+        at,
     ))
-    .map_err(|_| ProtocolError::InvalidRequest)
 }
 
 fn stable_id(prefix: &str, value: &str) -> String {
     format!("{prefix}-{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn digest_bytes(bytes: &[u8]) -> Sha256Digest {
+    Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes)))
+        .expect("SHA-256 formatting is valid")
 }
 
 fn frame_value(frame: &ProtocolFrame) -> Result<Value, ProtocolError> {
@@ -1002,6 +1202,13 @@ fn invalid_input() -> PortError {
 fn not_found() -> PortError {
     PortError::failure(
         SafeErrorClassification::NotFound,
+        Retryability::NonRetryable,
+    )
+}
+
+fn permission_denied() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::PermissionDenied,
         Retryability::NonRetryable,
     )
 }

@@ -1,8 +1,9 @@
 use local_agent_terminal_domain::{
-    AgentClaim, AgentDescriptor, AgentEvidenceRef, AgentRunMessage, AgentRunSnapshot,
-    AgentRunStatus, AgentRunTerminal, AgentUsage, ArtifactId, BoundAgentConnection,
-    BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, RunId,
-    Sha256Digest, TaskId, Timestamp, TrustTier, MAX_GENERATION_PARAMETERS_BYTES,
+    AgentClaim, AgentDescriptor, AgentEvidenceRef, AgentRunLimits, AgentRunMessage,
+    AgentRunSnapshot, AgentRunStatus, AgentRunTerminal, AgentUsage, ArtifactId,
+    BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters,
+    BoundRunConfig, RunId, Sha256Digest, TaskId, Timestamp, TrustTier,
+    MAX_GENERATION_PARAMETERS_BYTES,
 };
 
 const EMPTY_JSON_DIGEST: &str =
@@ -100,6 +101,25 @@ fn generation_parameters_reject_digest_mismatch() {
         .generation_parameters
         .validate()
         .is_err());
+}
+
+#[test]
+fn run_limits_reject_wire_values_outside_the_immutable_schema() {
+    let mut request = bound_run();
+    request.run_config.limits.deadline = Timestamp::from_unix_seconds(0);
+    assert!(request.validate().is_err());
+
+    let mut request = bound_run();
+    request.run_config.limits.max_output_tokens = 0;
+    assert!(request.validate().is_err());
+
+    let mut request = bound_run();
+    request.run_config.limits.max_output_tokens = 1_000_001;
+    assert!(request.validate().is_err());
+
+    let mut request = bound_run();
+    request.run_config.limits.max_tool_requests = 10_001;
+    assert!(request.validate().is_err());
 }
 
 #[test]
@@ -222,6 +242,11 @@ fn bound_run() -> BoundAgentRunRequest {
             prompt_template_version: "prompt-1".to_owned(),
             response_schema_version: "message-1".to_owned(),
             policy_snapshot_digest: policy_digest,
+            limits: AgentRunLimits {
+                deadline: Timestamp::from_unix_seconds(1_800_000_300),
+                max_output_tokens: 8_000,
+                max_tool_requests: 8,
+            },
         },
         connection: BoundAgentConnection {
             connection_id: "connection-1".to_owned(),

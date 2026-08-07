@@ -151,6 +151,26 @@ pub struct BoundGenerationParameters {
     pub digest: Sha256Digest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentRunLimits {
+    pub deadline: Timestamp,
+    pub max_output_tokens: u64,
+    pub max_tool_requests: u64,
+}
+
+impl AgentRunLimits {
+    pub fn validate(self) -> Result<(), AgentError> {
+        if self.deadline.unix_seconds() <= 0
+            || !(1..=1_000_000).contains(&self.max_output_tokens)
+            || self.max_tool_requests > 10_000
+        {
+            Err(AgentError::InvalidRunLimits)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl BoundGenerationParameters {
     pub fn validate(&self) -> Result<(), AgentError> {
         let Some(canonical) =
@@ -185,6 +205,7 @@ pub struct BoundRunConfig {
     pub prompt_template_version: String,
     pub response_schema_version: String,
     pub policy_snapshot_digest: Sha256Digest,
+    pub limits: AgentRunLimits,
 }
 
 impl BoundRunConfig {
@@ -205,7 +226,8 @@ impl BoundRunConfig {
             return Err(AgentError::InvalidRunConfig);
         }
         validate_executable_trust_binding(self.trust_tier, self.executable_digest.as_ref())?;
-        self.generation_parameters.validate()
+        self.generation_parameters.validate()?;
+        self.limits.validate()
     }
 }
 
@@ -535,6 +557,7 @@ pub enum AgentError {
     ContainmentRequired,
     InvalidContext,
     InvalidGenerationParameters,
+    InvalidRunLimits,
     InvalidRunConfig,
     InvalidConnection,
     InvalidRunRequest,
@@ -561,6 +584,7 @@ impl fmt::Display for AgentError {
             Self::ContainmentRequired => "enabled agent requires verified containment",
             Self::InvalidContext => "bound context is invalid",
             Self::InvalidGenerationParameters => "generation parameters are invalid",
+            Self::InvalidRunLimits => "agent run limits are invalid",
             Self::InvalidRunConfig => "bound run configuration is invalid",
             Self::InvalidConnection => "bound connection is invalid",
             Self::InvalidRunRequest => "bound run request is invalid",

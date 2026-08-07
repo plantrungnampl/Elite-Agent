@@ -3,8 +3,8 @@ use std::{collections::BTreeSet, time::Duration};
 use chrono::{DateTime, TimeZone, Utc};
 use local_agent_terminal_agent_protocol::{
     ConnectionBinding, InboundDisposition, NdjsonCodec, ProtocolCapabilities, ProtocolError,
-    ProtocolFrame, ProtocolOffer, ProtocolSession, ProtocolTrustTier, RunCancel, RunStart,
-    SessionLimits,
+    ProtocolFrame, ProtocolOffer, ProtocolSession, ProtocolTrustTier, RunCancel,
+    RunExecutionBinding, RunStart, SessionLimits,
 };
 use serde_json::{json, Value};
 
@@ -364,10 +364,29 @@ fn connection_loss_only_interrupts_runs_accepted_by_the_agent() {
 
 #[test]
 fn opaque_run_requests_only_wrap_their_schema_method() {
-    assert!(RunStart::try_from(run_start_request("run-1", "core:start-1", 1, at(30))).is_ok());
-    assert!(RunStart::try_from(stream_delta("run-1", 1, "delta")).is_err());
+    assert!(RunStart::new(
+        run_start_request("run-1", "core:start-1", 1, at(30)),
+        execution_binding(),
+    )
+    .is_ok());
+    assert!(RunStart::new(stream_delta("run-1", 1, "delta"), execution_binding()).is_err());
     assert!(RunCancel::try_from(run_cancel_request("run-1", "core:cancel-1", 1)).is_ok());
     assert!(RunCancel::try_from(run_complete("run-1", "agent:complete-1", "done")).is_err());
+}
+
+fn execution_binding() -> RunExecutionBinding {
+    RunExecutionBinding {
+        provider_id: "provider-1".to_owned(),
+        model_id: "model-1".to_owned(),
+        generation_parameters: b"{}".to_vec(),
+        generation_parameters_digest:
+            "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".to_owned(),
+        effective_context: b"context".to_vec(),
+        effective_context_artifact_id: "artifact-context-1".to_owned(),
+        effective_context_digest:
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+        supersedes_run_id: None,
+    }
 }
 
 fn ready_session() -> ProtocolSession {

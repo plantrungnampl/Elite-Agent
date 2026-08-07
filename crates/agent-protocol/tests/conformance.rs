@@ -8,7 +8,7 @@ use local_agent_terminal_agent_protocol::{
     conformance_cases, run_conformance, CancelAcceptance, ConformanceCase, ConformancePeerFactory,
     ConformanceScenario, ConnectionBinding, NdjsonCodec, PeerDescriptor, PeerEventSink,
     ProtocolCapabilities, ProtocolError, ProtocolFrame, ProtocolPeer, ProtocolTrustTier,
-    RunAcceptance, RunCancel, RunStart,
+    RunAcceptance, RunCancel, RunExecutionBinding, RunStart,
 };
 use serde_json::json;
 
@@ -63,6 +63,28 @@ fn shared_harness_rejects_a_peer_that_never_emits_a_terminal_result() {
 
     assert_eq!(run_conformance(&factory), Err(ProtocolError::Timeout));
     assert_eq!(factory.calls().started, vec![ConformanceScenario::Happy]);
+}
+
+#[test]
+fn run_start_carries_provider_neutral_execution_bytes_outside_the_wire_frame() {
+    let binding = RunExecutionBinding {
+        provider_id: "provider-1".to_owned(),
+        model_id: "model-1".to_owned(),
+        generation_parameters: br#"{\"temperature\":0}"#.to_vec(),
+        generation_parameters_digest:
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        effective_context: b"exact context".to_vec(),
+        effective_context_artifact_id: "artifact-context-1".to_owned(),
+        effective_context_digest:
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        supersedes_run_id: Some("run-previous".to_owned()),
+    };
+
+    let start = RunStart::new(run_start_frame(), binding.clone()).unwrap();
+
+    assert_eq!(start.execution_binding(), &binding);
+    let wire = serde_json::to_value(start.as_frame()).unwrap();
+    assert!(wire.pointer("/params/providerId").is_none());
 }
 
 #[derive(Clone, Copy)]
@@ -248,7 +270,7 @@ fn emit_scenario(
     match scenario {
         ConformanceScenario::Happy => {
             sink.receive(stream_delta(run_id, 1))?;
-            sink.receive(terminal(run_id, "agent:conformance-complete"))?;
+            sink.request(terminal(run_id, "agent:conformance-complete"))?;
         }
         ConformanceScenario::Malicious => {
             expect_rejection(sink.receive(heartbeat("wrong-connection", 1)))?;
@@ -289,8 +311,13 @@ fn emit_scenario(
             expect_rejection(sink.receive(stream_delta(run_id, 2)))?;
         }
         ConformanceScenario::DuplicateTerminal => {
-            sink.receive(terminal(run_id, "agent:conformance-complete-1"))?;
-            expect_rejection(sink.receive(terminal(run_id, "agent:conformance-complete-2")))?;
+            sink.request(terminal(run_id, "agent:conformance-complete-1"))?;
+            if sink
+                .request(terminal(run_id, "agent:conformance-complete-2"))
+                .is_ok()
+            {
+                return Err(ProtocolError::InternalAgentFailure);
+            }
         }
         ConformanceScenario::Slow | ConformanceScenario::Cancelled => {}
     }
@@ -396,6 +423,34 @@ fn terminal(run_id: &str, id: &str) -> ProtocolFrame {
                 "content": "done",
                 "claims": []
             }
+        }
+    }))
+}
+
+fn run_start_frame() -> ProtocolFrame {
+    decode(json!({
+        "jsonrpc": "2.0",
+        "id": "core:test-start",
+        "method": "agent.run.start",
+        "params": {
+            "runId": "run-1",
+            "idempotencyKey": "test-key",
+            "taskId": "task-1",
+            "role": "critic",
+            "objective": "Test",
+            "contextPackage": {
+                "packageId": "context-1",
+                "contentDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "manifestRef": "artifact:context-1"
+            },
+            "permissions": { "contextQuery": true, "toolRequest": true, "writeFiles": false },
+            "responseSchema": "agent-message.v1",
+            "limits": {
+                "deadline": "2026-07-23T13:30:00Z",
+                "maxOutputTokens": 100,
+                "maxToolRequests": 1
+            },
+            "supersedesRunId": "run-previous"
         }
     }))
 }

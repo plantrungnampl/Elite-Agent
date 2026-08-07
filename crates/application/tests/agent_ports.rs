@@ -1,7 +1,8 @@
 use local_agent_terminal_application::{
-    AgentCancellationReceipt, AgentDescriptor, AgentRunReceipt, AgentRunSnapshot, AgentRunStatus,
-    AgentRunStore, AgentRunTerminal, AgentRuntime, BoundAgentRunRequest, CancelAgentRun, PortError,
-    RunId,
+    AgentArtifactStore, AgentCancellationReceipt, AgentDescriptor, AgentMessageArtifact,
+    AgentRunReceipt, AgentRunSnapshot, AgentRunStatus, AgentRunStore, AgentRunTerminal,
+    AgentRuntime, ArtifactId, BoundAgentRunRequest, BoundEffectiveContext, CancelAgentRun,
+    PortError, RunId,
 };
 use local_agent_terminal_domain::Timestamp;
 
@@ -30,6 +31,16 @@ fn agent_ports_are_object_safe_and_keep_only_bound_values_at_the_boundary() {
     }
 
     struct Store;
+
+    impl AgentArtifactStore for Store {
+        fn load_effective_context(&self, _: &BoundEffectiveContext) -> Result<Vec<u8>, PortError> {
+            Ok(vec![])
+        }
+
+        fn publish_agent_message(&self, _: &AgentMessageArtifact) -> Result<ArtifactId, PortError> {
+            ArtifactId::new("artifact-message-1").map_err(|_| invalid_input())
+        }
+    }
 
     impl AgentRunStore for Store {
         fn register_descriptor(&self, _: &AgentDescriptor) -> Result<(), PortError> {
@@ -66,11 +77,13 @@ fn agent_ports_are_object_safe_and_keep_only_bound_values_at_the_boundary() {
 
     fn accepts_runtime(_: &dyn AgentRuntime) {}
     fn accepts_store(_: &dyn AgentRunStore) {}
+    fn accepts_artifact_store(_: &dyn AgentArtifactStore) {}
 
     let runtime = Runtime;
     let store = Store;
     accepts_runtime(&runtime);
     accepts_store(&store);
+    accepts_artifact_store(&store);
 
     let _: AgentRunStatus = AgentRunStatus::Created;
 }

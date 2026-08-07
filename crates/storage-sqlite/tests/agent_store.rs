@@ -1,13 +1,24 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
 
-use local_agent_terminal_application::{AgentRunStore, SafeErrorClassification};
-use local_agent_terminal_domain::{
-    AgentDescriptor, AgentRunMessage, AgentRunStatus, AgentRunTerminal, AgentUsage, ArtifactId,
-    BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters,
-    BoundRunConfig, RunId, Sha256Digest, TaskId, Timestamp, TrustTier,
+use local_agent_terminal_agent_protocol::{
+    ConnectionBinding, PeerDescriptor, ProtocolCapabilities, ProtocolPeer, ProtocolTrustTier,
 };
+use local_agent_terminal_agent_runtime::{
+    MaliciousScript, ProtocolAgentRuntime, Script, ScriptedPeer, DEFAULT_HEARTBEAT_TIMEOUT_SECS,
+};
+use local_agent_terminal_application::{
+    AgentArtifactStore, AgentMessageArtifact, AgentRunStore, AgentRuntime, ArtifactRef,
+    ArtifactStore, Clock, NewArtifact, PortError, Retryability, SafeErrorClassification,
+};
+use local_agent_terminal_domain::{
+    AgentDescriptor, AgentRunLimits, AgentRunMessage, AgentRunStatus, AgentRunTerminal, AgentUsage,
+    ArtifactId, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
+    BoundGenerationParameters, BoundRunConfig, RunId, Sha256Digest, TaskId, Timestamp, TrustTier,
+};
+use local_agent_terminal_storage_files::ContentAddressedArtifactStore;
 use local_agent_terminal_storage_sqlite::{canonical_agent_run_config_artifact, SqliteStore};
 use rusqlite::{params, Connection};
 use serde_json::Value;
@@ -21,7 +32,7 @@ const CONTEXT_BYTES: &[u8] = br#"{"context":"bound"}"#;
 const RFC8785_GENERATION_DIGEST: &str =
     "sha256:0ac6c8907856746804e71de596b1ddceed49d53b3c52035da285c42271851863";
 const RFC8785_RUN_CONFIG_DIGEST: &str =
-    "sha256:21b6ec8f124f344cde1ac27280015761e8c6ac264087eacbd1f74ff62e1c7ba2";
+    "sha256:aaee7e5993f31b532ca87c06d8d1249fc8b1ef2ef438ced1cfae35cac54928b3";
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -92,10 +103,15 @@ impl TestDatabase {
     }
 
     fn put_artifact(&self, artifact_id: &ArtifactId, task_id: &str, kind: &str, bytes: &[u8]) {
-        let storage_key = format!("objects/{}.json", artifact_id.as_str());
-        let path = self.artifact_root.join(&storage_key);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, bytes).unwrap();
+        let content_hash = digest_bytes(bytes);
+        let reference = ContentAddressedArtifactStore::open(&self.artifact_root)
+            .unwrap()
+            .put(NewArtifact {
+                expected_hash: content_hash.as_str().to_owned(),
+                expected_size: u64::try_from(bytes.len()).unwrap(),
+                content: bytes.to_vec(),
+            })
+            .unwrap();
         self.connection()
             .execute(
                 "INSERT OR REPLACE INTO artifacts (
@@ -109,8 +125,8 @@ impl TestDatabase {
                     task_id,
                     kind,
                     format!("agent/{}.json", artifact_id.as_str()),
-                    digest_bytes(bytes).as_str(),
-                    storage_key,
+                    content_hash.as_str(),
+                    reference.storage_key,
                     i64::try_from(bytes.len()).unwrap(),
                 ],
             )
@@ -225,6 +241,24 @@ fn rfc8785_canonical_bytes_and_digests_survive_run_reconstruction() {
             .unwrap()
             .request,
         request,
+    );
+}
+
+#[test]
+fn run_limits_survive_canonical_config_reconstruction() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let descriptor = descriptor();
+    let request = bound_run("limits", "limits-key");
+    store.register_descriptor(&descriptor).unwrap();
+    seed_default_artifacts(&database, &request, &descriptor);
+
+    store.create_bound_run(&request).unwrap();
+    let reconstructed = database.store().load_run(&request.run_id).unwrap().unwrap();
+
+    assert_eq!(
+        reconstructed.request.run_config.limits,
+        request.run_config.limits
     );
 }
 
@@ -643,6 +677,184 @@ fn provider_outage_terminal_does_not_mutate_task_workflow_projection() {
     assert_eq!(task_projection(&database.path), before);
 }
 
+#[test]
+fn runtime_terminal_publishes_exact_bytes_through_sqlite_and_content_addressed_storage() {
+    let database = TestDatabase::new();
+    let request = bound_run("runtime-success", "runtime-success-key");
+    let descriptor = descriptor();
+    seed_default_artifacts(&database, &request, &descriptor);
+    let store = Arc::new(database.store());
+    let artifacts = Arc::new(RuntimeArtifacts::new(&database));
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(ScriptedPeer::new(Script::Proposer, peer_descriptor()));
+    let runtime = ProtocolAgentRuntime::new(
+        store.clone(),
+        artifacts.clone(),
+        clock,
+        vec![(descriptor, peer.clone() as Arc<dyn ProtocolPeer>)],
+    )
+    .unwrap();
+
+    runtime.start_run(request.clone()).unwrap();
+    peer.drive().unwrap();
+
+    assert_eq!(
+        store.load_run(&request.run_id).unwrap().unwrap().status,
+        AgentRunStatus::Succeeded
+    );
+    let content_artifact_id: String = database
+        .connection()
+        .query_row(
+            "SELECT content_artifact_id FROM messages WHERE run_id = ?1",
+            [request.run_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        artifacts.read_artifact(&content_artifact_id).unwrap(),
+        peer.outputs()[0].as_bytes()
+    );
+}
+
+#[test]
+fn hostile_crashed_and_timed_out_runtime_runs_do_not_mutate_real_task_workflow_state() {
+    let scripts = [
+        Script::Malicious(MaliciousScript::MalformedFrame),
+        Script::Malicious(MaliciousScript::WrongConnection),
+        Script::Malicious(MaliciousScript::WrongRun),
+        Script::Malicious(MaliciousScript::SequenceGap),
+        Script::Malicious(MaliciousScript::OversizeFrame),
+        Script::Crashing,
+        Script::Slow,
+    ];
+    for (index, script) in scripts.into_iter().enumerate() {
+        let database = TestDatabase::new();
+        seed_workflow_event(&database);
+        let suffix = format!("runtime-hostile-{index}");
+        let request = bound_run(&suffix, &format!("{suffix}-key"));
+        let descriptor = descriptor();
+        seed_default_artifacts(&database, &request, &descriptor);
+        let store = Arc::new(database.store());
+        let artifacts = Arc::new(RuntimeArtifacts::new(&database));
+        let clock = Arc::new(ManualClock::new(1_800_000_000));
+        let peer = Arc::new(ScriptedPeer::new(script, peer_descriptor()));
+        let runtime = ProtocolAgentRuntime::new(
+            store.clone(),
+            artifacts,
+            clock.clone(),
+            vec![(descriptor, peer.clone() as Arc<dyn ProtocolPeer>)],
+        )
+        .unwrap();
+        let before = task_workflow_state(&database.path);
+
+        runtime.start_run(request.clone()).unwrap();
+        if script == Script::Slow {
+            clock.advance(DEFAULT_HEARTBEAT_TIMEOUT_SECS);
+            runtime.check_timeouts().unwrap();
+        } else {
+            peer.drive().unwrap();
+        }
+
+        assert!(store
+            .load_run(&request.run_id)
+            .unwrap()
+            .unwrap()
+            .status
+            .is_terminal());
+        assert_eq!(task_workflow_state(&database.path), before);
+    }
+}
+
+struct RuntimeArtifacts {
+    database_path: PathBuf,
+    content: ContentAddressedArtifactStore,
+}
+
+impl RuntimeArtifacts {
+    fn new(database: &TestDatabase) -> Self {
+        Self {
+            database_path: database.path.clone(),
+            content: ContentAddressedArtifactStore::open(&database.artifact_root).unwrap(),
+        }
+    }
+
+    fn read_artifact(&self, artifact_id: &str) -> Result<Vec<u8>, PortError> {
+        let reference = artifact_reference(&self.database_path, artifact_id)?;
+        Ok(self.content.read(&reference)?.bytes)
+    }
+}
+
+impl AgentArtifactStore for RuntimeArtifacts {
+    fn load_effective_context(
+        &self,
+        context: &BoundEffectiveContext,
+    ) -> Result<Vec<u8>, PortError> {
+        self.read_artifact(context.effective_context_artifact_id.as_str())
+    }
+
+    fn publish_agent_message(
+        &self,
+        artifact: &AgentMessageArtifact,
+    ) -> Result<ArtifactId, PortError> {
+        let content_hash = digest_bytes(&artifact.content);
+        let reference = self.content.put(NewArtifact {
+            expected_hash: content_hash.as_str().to_owned(),
+            expected_size: u64::try_from(artifact.content.len()).map_err(|_| internal_failure())?,
+            content: artifact.content.clone(),
+        })?;
+        let artifact_id = ArtifactId::new(format!("artifact-{}", artifact.message_id))
+            .map_err(|_| internal_failure())?;
+        Connection::open(&self.database_path)
+            .map_err(|_| internal_failure())?
+            .execute(
+                "INSERT INTO artifacts (
+                    id, task_id, project_id, artifact_type, logical_path, content_hash,
+                    storage_key, size_bytes, mime_type, availability, created_by_type,
+                    created_by_id, created_at, supersedes, verification_state
+                 ) VALUES (?1, ?2, 'project-1', 'agent-message', ?3, ?4, ?5, ?6,
+                    'text/plain', 'available', 'agent', ?7,
+                    '2027-01-15T08:00:00Z', NULL, 'hash_verified')",
+                params![
+                    artifact_id.as_str(),
+                    artifact.task_id.as_str(),
+                    format!("agent/{}.txt", artifact.message_id),
+                    reference.content_hash,
+                    reference.storage_key,
+                    i64::try_from(reference.size_bytes).map_err(|_| internal_failure())?,
+                    artifact.run_id.as_str(),
+                ],
+            )
+            .map_err(|_| internal_failure())?;
+        Ok(artifact_id)
+    }
+}
+
+struct ManualClock {
+    seconds: AtomicI64,
+}
+
+impl ManualClock {
+    const fn new(seconds: i64) -> Self {
+        Self {
+            seconds: AtomicI64::new(seconds),
+        }
+    }
+
+    fn advance(&self, seconds: i64) {
+        self.seconds.fetch_add(seconds, Ordering::Relaxed);
+    }
+}
+
+impl Clock for ManualClock {
+    fn now_utc(&self) -> Result<String, PortError> {
+        match self.seconds.load(Ordering::Relaxed) {
+            1_800_000_000 => Ok("2027-01-15T08:00:00Z".to_owned()),
+            1_800_000_030 => Ok("2027-01-15T08:00:30Z".to_owned()),
+            _ => Err(internal_failure()),
+        }
+    }
+}
+
 fn prepared_running_store(database: &TestDatabase, suffix: &str) -> SqliteStore {
     let store = database.store();
     let descriptor = descriptor();
@@ -714,6 +926,29 @@ fn descriptor() -> AgentDescriptor {
     }
 }
 
+fn peer_descriptor() -> PeerDescriptor {
+    PeerDescriptor {
+        binding: ConnectionBinding {
+            connection_id: "connection-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            manifest_digest: EMPTY_JSON_DIGEST.to_owned(),
+            executable_digest: digest('b').as_str().to_owned(),
+            trust_tier: ProtocolTrustTier::CoreAdapter,
+        },
+        protocol_version: "1.0".to_owned(),
+        capabilities: ProtocolCapabilities {
+            roles: ["reviewer".to_owned()].into_iter().collect(),
+            skills: ["testing".to_owned()].into_iter().collect(),
+            streaming: true,
+            context_query: false,
+            tool_requests: false,
+            specialist_requests: false,
+            max_concurrent_runs: 1,
+            max_context_tokens: 1_024,
+        },
+    }
+}
+
 fn bound_run(suffix: &str, idempotency_key: &str) -> BoundAgentRunRequest {
     let task_id = task_id("task-1");
     let manifest_digest = digest_from_str(EMPTY_JSON_DIGEST);
@@ -764,6 +999,11 @@ fn bound_run(suffix: &str, idempotency_key: &str) -> BoundAgentRunRequest {
             prompt_template_version: "prompt-1".to_owned(),
             response_schema_version: "message-1".to_owned(),
             policy_snapshot_digest: policy_digest,
+            limits: AgentRunLimits {
+                deadline: Timestamp::from_unix_seconds(1_800_000_300),
+                max_output_tokens: 8_000,
+                max_tool_requests: 8,
+            },
         },
         connection: BoundAgentConnection {
             connection_id: "connection-1".to_owned(),
@@ -841,6 +1081,60 @@ fn task_projection(path: &Path) -> (String, String, String, i64, i64) {
         .unwrap()
 }
 
+fn seed_workflow_event(database: &TestDatabase) {
+    let connection = database.connection();
+    let transaction = connection.unchecked_transaction().unwrap();
+    transaction
+        .execute(
+            "INSERT INTO events (
+                event_id, stream_id, sequence, event_type, schema_version, actor_type,
+                actor_id, observation_class, payload_json, metadata_json, causation_id,
+                correlation_id, created_at
+             ) VALUES ('event-task-1', 'task-1', 1, 'task.created', 1, 'core',
+                'core', 'core_observed', '{}', '{}', NULL, 'task-1',
+                '1970-01-01T00:00:01Z')",
+            [],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "UPDATE tasks SET current_sequence = 1 WHERE id = 'task-1'",
+            [],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+}
+
+fn task_workflow_state(path: &Path) -> ((String, String, String, i64, i64), i64) {
+    let connection = Connection::open(path).unwrap();
+    let event_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE stream_id = 'task-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    (task_projection(path), event_count)
+}
+
+fn artifact_reference(path: &Path, artifact_id: &str) -> Result<ArtifactRef, PortError> {
+    Connection::open(path)
+        .map_err(|_| internal_failure())?
+        .query_row(
+            "SELECT content_hash, storage_key, size_bytes
+             FROM artifacts WHERE id = ?1 AND availability = 'available'",
+            [artifact_id],
+            |row| {
+                Ok(ArtifactRef {
+                    content_hash: row.get(0)?,
+                    storage_key: row.get(1)?,
+                    size_bytes: row.get(2)?,
+                })
+            },
+        )
+        .map_err(|_| internal_failure())
+}
+
 fn row_count(path: &Path, table: &str) -> i64 {
     Connection::open(path)
         .unwrap()
@@ -848,6 +1142,13 @@ fn row_count(path: &Path, table: &str) -> i64 {
             row.get(0)
         })
         .unwrap()
+}
+
+const fn internal_failure() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::Internal,
+        Retryability::NonRetryable,
+    )
 }
 
 fn timestamp(second: u32) -> &'static str {

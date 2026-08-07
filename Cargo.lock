@@ -2012,8 +2012,11 @@ dependencies = [
 name = "local-agent-terminal-storage-sqlite"
 version = "0.1.0"
 dependencies = [
+ "local-agent-terminal-agent-protocol",
+ "local-agent-terminal-agent-runtime",
  "local-agent-terminal-application",
  "local-agent-terminal-domain",
+ "local-agent-terminal-storage-files",
  "rusqlite",
  "serde_json",
  "serde_json_canonicalizer",

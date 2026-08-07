@@ -5,9 +5,9 @@ use local_agent_terminal_application::{
     AgentRunStore, PortError, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
-    AgentDescriptor, AgentRunSnapshot, AgentRunStatus, AgentRunTerminal, AgentUsage, ArtifactId,
-    BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters,
-    BoundRunConfig, RunId, Sha256Digest, TaskId, Timestamp, TrustTier,
+    AgentDescriptor, AgentRunLimits, AgentRunSnapshot, AgentRunStatus, AgentRunTerminal,
+    AgentUsage, ArtifactId, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
+    BoundGenerationParameters, BoundRunConfig, RunId, Sha256Digest, TaskId, Timestamp, TrustTier,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
@@ -51,6 +51,11 @@ pub fn canonical_agent_run_config_artifact(
             "executableDigest": request.run_config.executable_digest.as_ref().map(Sha256Digest::as_str),
             "generationParameters": generation_parameters,
             "generationParametersDigest": request.run_config.generation_parameters.digest.as_str(),
+            "limits": {
+                "deadlineUnixSeconds": request.run_config.limits.deadline.unix_seconds(),
+                "maxOutputTokens": request.run_config.limits.max_output_tokens,
+                "maxToolRequests": request.run_config.limits.max_tool_requests,
+            },
             "manifestDigest": request.run_config.manifest_digest.as_str(),
             "modelId": request.run_config.model_id,
             "policySnapshotDigest": request.run_config.policy_snapshot_digest.as_str(),
@@ -925,6 +930,7 @@ fn parse_run_config_artifact(
     let generation_parameters = config
         .get("generationParameters")
         .ok_or_else(integrity_failure)?;
+    let limits = required_object(config, "limits")?;
     let run_config = BoundRunConfig {
         run_config_artifact_id: artifact_id(config, "runConfigArtifactId")?,
         task_id: task_id(config, "taskId")?,
@@ -948,6 +954,11 @@ fn parse_run_config_artifact(
         prompt_template_version: required_string(config, "promptTemplateVersion")?.to_owned(),
         response_schema_version: required_string(config, "responseSchemaVersion")?.to_owned(),
         policy_snapshot_digest: digest(config, "policySnapshotDigest")?,
+        limits: AgentRunLimits {
+            deadline: Timestamp::from_unix_seconds(required_i64(limits, "deadlineUnixSeconds")?),
+            max_output_tokens: required_u64(limits, "maxOutputTokens")?,
+            max_tool_requests: required_u64(limits, "maxToolRequests")?,
+        },
     };
     let connection = BoundAgentConnection {
         connection_id: required_string(connection, "connectionId")?.to_owned(),
@@ -975,6 +986,20 @@ fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, PortError
     value
         .get(key)
         .and_then(Value::as_str)
+        .ok_or_else(integrity_failure)
+}
+
+fn required_i64(value: &Value, key: &str) -> Result<i64, PortError> {
+    value
+        .get(key)
+        .and_then(Value::as_i64)
+        .ok_or_else(integrity_failure)
+}
+
+fn required_u64(value: &Value, key: &str) -> Result<u64, PortError> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
         .ok_or_else(integrity_failure)
 }
 

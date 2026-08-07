@@ -16,6 +16,7 @@ pub enum Script {
     Proposer,
     Critic,
     Verifier,
+    Requesting,
     Malicious(MaliciousScript),
     Slow,
     Crashing,
@@ -42,6 +43,8 @@ struct ScriptedPeerInner {
     script: Script,
     descriptor: PeerDescriptor,
     pending: Mutex<Option<PendingRun>>,
+    start_requests: Mutex<Vec<RunStart>>,
+    request_responses: Mutex<Vec<ProtocolFrame>>,
     outputs: Mutex<Vec<String>>,
     duplicate_stream_deltas: Mutex<usize>,
     terminal_acknowledgements: Mutex<usize>,
@@ -68,6 +71,8 @@ impl ScriptedPeer {
                 script,
                 descriptor,
                 pending: Mutex::new(None),
+                start_requests: Mutex::new(Vec::new()),
+                request_responses: Mutex::new(Vec::new()),
                 outputs: Mutex::new(Vec::new()),
                 duplicate_stream_deltas: Mutex::new(0),
                 terminal_acknowledgements: Mutex::new(0),
@@ -90,6 +95,7 @@ impl ScriptedPeer {
             Script::Proposer => self.emit_success(pending, "proposer"),
             Script::Critic => self.emit_success(pending, "critic"),
             Script::Verifier => self.emit_success(pending, "verifier"),
+            Script::Requesting => self.emit_requests(pending),
             Script::Slow => {
                 *self
                     .inner
@@ -105,6 +111,22 @@ impl ScriptedPeer {
 
     pub fn outputs(&self) -> Vec<String> {
         self.inner.outputs.lock().expect("script log lock").clone()
+    }
+
+    pub fn start_requests(&self) -> Vec<RunStart> {
+        self.inner
+            .start_requests
+            .lock()
+            .expect("script request lock")
+            .clone()
+    }
+
+    pub fn request_responses(&self) -> Vec<ProtocolFrame> {
+        self.inner
+            .request_responses
+            .lock()
+            .expect("script response lock")
+            .clone()
     }
 
     pub fn duplicate_stream_deltas(&self) -> usize {
@@ -180,14 +202,14 @@ impl ScriptedPeer {
             MaliciousScript::DuplicateTerminal => {
                 let terminal = terminal(&pending, "succeeded", "done", "one")?;
                 self.acknowledge_terminal(&pending, terminal.clone())?;
-                expect_rejected(pending.sink.receive(terminal))
+                expect_request_rejected(pending.sink.request(terminal))
             }
             MaliciousScript::ConflictingTerminal => {
                 self.acknowledge_terminal(
                     &pending,
                     terminal(&pending, "succeeded", "done", "one")?,
                 )?;
-                expect_rejected(pending.sink.receive(terminal(
+                expect_request_rejected(pending.sink.request(terminal(
                     &pending,
                     "failed",
                     "different",
@@ -202,7 +224,7 @@ impl ScriptedPeer {
         pending: &PendingRun,
         frame: ProtocolFrame,
     ) -> Result<(), ProtocolError> {
-        pending.sink.receive(frame)?;
+        pending.sink.request(frame)?;
         *self
             .inner
             .terminal_acknowledgements
@@ -213,6 +235,24 @@ impl ScriptedPeer {
             .lock()
             .map_err(|_| ProtocolError::InternalAgentFailure)?
             .push("peer.terminal.acknowledged");
+        Ok(())
+    }
+
+    fn emit_requests(&self, pending: PendingRun) -> Result<(), ProtocolError> {
+        let frames = [
+            context_query(&pending.run_id)?,
+            tool_request(&pending.run_id)?,
+            specialist_request(&pending.run_id)?,
+        ];
+        let mut responses = Vec::with_capacity(frames.len());
+        for frame in frames {
+            responses.push(pending.sink.request(frame)?);
+        }
+        self.inner
+            .request_responses
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .extend(responses);
         Ok(())
     }
 }
@@ -227,6 +267,11 @@ impl ProtocolPeer for ScriptedPeer {
         request: RunStart,
         sink: Box<dyn PeerEventSink>,
     ) -> Result<RunAcceptance, ProtocolError> {
+        self.inner
+            .start_requests
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .push(request.clone());
         let value = frame_value(request.as_frame())?;
         let request_id = required_string(&value, "/id")?;
         let context_digest = required_string(&value, "/params/contextPackage/contentDigest")?;
@@ -377,6 +422,53 @@ fn heartbeat(connection_id: &str, sequence: u64) -> Result<ProtocolFrame, Protoc
     }))
 }
 
+fn context_query(run_id: &str) -> Result<ProtocolFrame, ProtocolError> {
+    decode(json!({
+        "jsonrpc": "2.0",
+        "id": "agent:context-1",
+        "method": "context.query",
+        "params": {
+            "runId": run_id,
+            "queryId": "query-1",
+            "query": "More context",
+            "scopes": ["repository"],
+            "maxItems": 1,
+            "maxTokens": 1
+        }
+    }))
+}
+
+fn tool_request(run_id: &str) -> Result<ProtocolFrame, ProtocolError> {
+    decode(json!({
+        "jsonrpc": "2.0",
+        "id": "agent:tool-1",
+        "method": "tool.request",
+        "params": {
+            "runId": run_id,
+            "requestId": "tool-1",
+            "planStepId": "step-1",
+            "executorFencingToken": null,
+            "tool": "git.diff",
+            "arguments": {},
+            "reason": "Verify"
+        }
+    }))
+}
+
+fn specialist_request(run_id: &str) -> Result<ProtocolFrame, ProtocolError> {
+    decode(json!({
+        "jsonrpc": "2.0",
+        "id": "agent:specialist-1",
+        "method": "specialist.request",
+        "params": {
+            "runId": run_id,
+            "capability": "review",
+            "reason": "Need review",
+            "requiredContext": []
+        }
+    }))
+}
+
 fn decode(value: Value) -> Result<ProtocolFrame, ProtocolError> {
     NdjsonCodec::default()
         .decode(&serde_json::to_vec(&value).map_err(|_| ProtocolError::InternalAgentFailure)?)
@@ -395,6 +487,16 @@ fn required_string(value: &Value, pointer: &str) -> Result<String, ProtocolError
 }
 
 fn expect_rejected(result: Result<InboundDisposition, ProtocolError>) -> Result<(), ProtocolError> {
+    if result.is_err() {
+        Ok(())
+    } else {
+        Err(ProtocolError::InternalAgentFailure)
+    }
+}
+
+fn expect_request_rejected(
+    result: Result<ProtocolFrame, ProtocolError>,
+) -> Result<(), ProtocolError> {
     if result.is_err() {
         Ok(())
     } else {

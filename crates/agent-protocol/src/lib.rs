@@ -12,7 +12,7 @@ pub use generated::OpenAgentProtocolV1Frame as ProtocolFrame;
 pub use peer::{
     conformance_cases, run_conformance, CancelAcceptance, ConformanceCase, ConformancePeerFactory,
     ConformanceScenario, PeerDescriptor, PeerEventSink, ProtocolPeer, RunAcceptance, RunCancel,
-    RunStart,
+    RunExecutionBinding, RunStart,
 };
 pub use session::{
     ConnectionBinding, InboundDisposition, ProtocolCapabilities, ProtocolOffer, ProtocolSession,

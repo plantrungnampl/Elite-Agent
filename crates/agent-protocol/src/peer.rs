@@ -16,9 +16,39 @@ use crate::{
 pub struct RunStart {
     frame: ProtocolFrame,
     run_id: String,
+    execution_binding: RunExecutionBinding,
 }
 
 impl RunStart {
+    pub fn new(
+        frame: ProtocolFrame,
+        execution_binding: RunExecutionBinding,
+    ) -> Result<Self, ProtocolError> {
+        if !matches!(&frame, ProtocolFrame::RunStartRequest(_)) {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        let run_id = run_id(&frame)?;
+        let value = serde_json::to_value(&frame).map_err(|_| ProtocolError::InvalidRequest)?;
+        let wire_context_digest = value
+            .pointer("/params/contextPackage/contentDigest")
+            .and_then(Value::as_str)
+            .ok_or(ProtocolError::InvalidRequest)?;
+        let wire_supersedes = value
+            .pointer("/params/supersedesRunId")
+            .and_then(Value::as_str);
+        if !execution_binding.is_valid()
+            || wire_context_digest != execution_binding.effective_context_digest
+            || wire_supersedes != execution_binding.supersedes_run_id.as_deref()
+        {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        Ok(Self {
+            frame,
+            run_id,
+            execution_binding,
+        })
+    }
+
     pub fn as_frame(&self) -> &ProtocolFrame {
         &self.frame
     }
@@ -26,19 +56,37 @@ impl RunStart {
     pub fn run_id(&self) -> String {
         self.run_id.clone()
     }
+
+    pub fn execution_binding(&self) -> &RunExecutionBinding {
+        &self.execution_binding
+    }
 }
 
-impl TryFrom<ProtocolFrame> for RunStart {
-    type Error = ProtocolError;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunExecutionBinding {
+    pub provider_id: String,
+    pub model_id: String,
+    pub generation_parameters: Vec<u8>,
+    pub generation_parameters_digest: String,
+    pub effective_context: Vec<u8>,
+    pub effective_context_artifact_id: String,
+    pub effective_context_digest: String,
+    pub supersedes_run_id: Option<String>,
+}
 
-    fn try_from(frame: ProtocolFrame) -> Result<Self, Self::Error> {
-        if !matches!(&frame, ProtocolFrame::RunStartRequest(_)) {
-            return Err(ProtocolError::InvalidRequest);
-        }
-        Ok(Self {
-            run_id: run_id(&frame)?,
-            frame,
-        })
+impl RunExecutionBinding {
+    fn is_valid(&self) -> bool {
+        !self.provider_id.trim().is_empty()
+            && !self.model_id.trim().is_empty()
+            && !self.generation_parameters.is_empty()
+            && valid_digest(&self.generation_parameters_digest)
+            && !self.effective_context.is_empty()
+            && !self.effective_context_artifact_id.trim().is_empty()
+            && valid_digest(&self.effective_context_digest)
+            && self
+                .supersedes_run_id
+                .as_deref()
+                .is_none_or(|run_id| !run_id.trim().is_empty())
     }
 }
 
@@ -93,6 +141,7 @@ pub struct PeerDescriptor {
 
 pub trait PeerEventSink: Send + Sync {
     fn receive(&self, frame: ProtocolFrame) -> Result<InboundDisposition, ProtocolError>;
+    fn request(&self, frame: ProtocolFrame) -> Result<ProtocolFrame, ProtocolError>;
 
     /// Decodes one raw transport frame before it enters the session state machine.
     fn receive_raw(&self, bytes: &[u8]) -> Result<InboundDisposition, ProtocolError>;
@@ -237,7 +286,10 @@ fn start_case(
 ) -> Result<ConformanceSink, ProtocolError> {
     let (session, start) = pending_session(descriptor)?;
     let sink = ConformanceSink::new(session, conformance_codec(case.scenario));
-    let acceptance = peer.start(RunStart::try_from(start)?, Box::new(sink.clone()))?;
+    let acceptance = peer.start(
+        RunStart::new(start, conformance_execution_binding())?,
+        Box::new(sink.clone()),
+    )?;
     if !acceptance.accepted || acceptance.run_id != "conformance-run" {
         return Err(ProtocolError::InternalAgentFailure);
     }
@@ -491,6 +543,21 @@ impl PeerEventSink for ConformanceSink {
         }
     }
 
+    fn request(&self, frame: ProtocolFrame) -> Result<ProtocolFrame, ProtocolError> {
+        let disposition = self.receive(frame.clone())?;
+        if !matches!(disposition, InboundDisposition::Request(_)) {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        let response = success_response(
+            frame_request_id(
+                &serde_json::to_value(&frame).map_err(|_| ProtocolError::InvalidRequest)?,
+            )?,
+            json!({ "accepted": true }),
+        )?;
+        self.outbound(response.clone())?;
+        Ok(response)
+    }
+
     fn connection_lost(&self) -> Result<(), ProtocolError> {
         self.close_connection()?;
         self.record_error(ProtocolError::InternalAgentFailure)?;
@@ -519,6 +586,36 @@ fn run_id(frame: &ProtocolFrame) -> Result<String, ProtocolError> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or(ProtocolError::InvalidRequest)
+}
+
+fn frame_request_id(value: &Value) -> Result<&str, ProtocolError> {
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or(ProtocolError::InvalidRequest)
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn conformance_execution_binding() -> RunExecutionBinding {
+    RunExecutionBinding {
+        provider_id: "conformance-provider".to_owned(),
+        model_id: "conformance-model".to_owned(),
+        generation_parameters: b"{}".to_vec(),
+        generation_parameters_digest:
+            "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".to_owned(),
+        effective_context: b"conformance context".to_vec(),
+        effective_context_artifact_id: "artifact-conformance-context".to_owned(),
+        effective_context_digest:
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+        supersedes_run_id: None,
+    }
 }
 
 fn initialize(descriptor: &PeerDescriptor) -> Result<ProtocolFrame, ProtocolError> {

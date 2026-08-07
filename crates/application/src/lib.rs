@@ -2,12 +2,13 @@
 
 pub use local_agent_terminal_domain::{
     ActorId, ActorLocality, AgentCancellationReceipt, AgentClaim, AgentDescriptor, AgentError,
-    AgentEvidenceRef, AgentRunMessage, AgentRunReceipt, AgentRunSnapshot, AgentRunStatus,
-    AgentRunTerminal, AgentUsage, ArtifactId, BoundAgentConnection, BoundAgentRunRequest,
-    BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, CancelAgentRun, FencingToken,
-    GitObjectId, LeaseClaim, Phase, PolicyAction, PolicyActor, PolicyResource, ProjectId,
-    RepositoryId, ResourceClass, RunId, Sequence, Sha256Digest, TaskBranch, TaskId, TaskRisk,
-    TrustTier, WorkspaceFingerprint, WorkspaceVersion, WorktreeId, MAX_GENERATION_PARAMETERS_BYTES,
+    AgentEvidenceRef, AgentRunLimits, AgentRunMessage, AgentRunReceipt, AgentRunSnapshot,
+    AgentRunStatus, AgentRunTerminal, AgentUsage, ArtifactId, BoundAgentConnection,
+    BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig,
+    CancelAgentRun, FencingToken, GitObjectId, LeaseClaim, Phase, PolicyAction, PolicyActor,
+    PolicyResource, ProjectId, RepositoryId, ResourceClass, RunId, Sequence, Sha256Digest,
+    TaskBranch, TaskId, TaskRisk, TrustTier, WorkspaceFingerprint, WorkspaceVersion, WorktreeId,
+    MAX_GENERATION_PARAMETERS_BYTES,
 };
 
 mod agent;
@@ -27,7 +28,7 @@ mod resume;
 mod tool;
 mod workspace;
 
-pub use agent::{AgentRunStore, AgentRuntime};
+pub use agent::{AgentArtifactStore, AgentMessageArtifact, AgentRunStore, AgentRuntime};
 pub use append_events::AppendEvents;
 pub use approval::{
     build_approval_request, canonical_approval_payload, parse_approval_payload, ApprovalCheck,

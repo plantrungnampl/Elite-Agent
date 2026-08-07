@@ -13,12 +13,14 @@ use local_agent_terminal_agent_runtime::{
     DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_RUN_DEADLINE_SECS,
 };
 use local_agent_terminal_application::{
-    AgentRunStore, AgentRuntime, Clock, PortError, Retryability, SafeErrorClassification,
+    AgentArtifactStore, AgentMessageArtifact, AgentRunStore, AgentRuntime, Clock, PortError,
+    Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
-    AgentDescriptor, AgentRunSnapshot, AgentRunStatus, AgentRunTerminal, ArtifactId,
-    BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters,
-    BoundRunConfig, CancelAgentRun, RunId, Sha256Digest, TaskId, Timestamp, TrustTier,
+    AgentDescriptor, AgentRunLimits, AgentRunSnapshot, AgentRunStatus, AgentRunTerminal,
+    ArtifactId, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
+    BoundGenerationParameters, BoundRunConfig, CancelAgentRun, RunId, Sha256Digest, TaskId,
+    Timestamp, TrustTier,
 };
 
 const EMPTY_JSON_DIGEST: &str =
@@ -28,7 +30,8 @@ const CONNECTION_BINDING_DIGEST: &str =
 const EXECUTABLE_DIGEST: &str =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const CONTEXT_DIGEST: &str =
-    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    "sha256:7ce2a62fec3ddf55f1cede952bdcd4170bb0b01fa53da3ded734e531337d2b58";
+const CONTEXT_BYTES: &[u8] = b"exact context";
 const POLICY_DIGEST: &str =
     "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
@@ -36,13 +39,19 @@ const POLICY_DIGEST: &str =
 fn start_returns_after_durable_acceptance_and_scripted_output_is_deterministic() {
     let log = script_log();
     let store = Arc::new(RecordingStore::new(Arc::clone(&log)));
+    let artifacts = Arc::new(RecordingArtifacts::new(Arc::clone(&log)));
     let clock = Arc::new(ManualClock::new(1_800_000_000));
     let peer = Arc::new(ScriptedPeer::with_log(
         Script::Proposer,
         peer_descriptor(),
         Arc::clone(&log),
     ));
-    let runtime = runtime(Arc::clone(&store), Arc::clone(&clock), Arc::clone(&peer));
+    let runtime = runtime_with_artifacts(
+        Arc::clone(&store),
+        Arc::clone(&artifacts),
+        Arc::clone(&clock),
+        Arc::clone(&peer),
+    );
 
     let receipt = runtime.start_run(run_request("run-1", None)).unwrap();
 
@@ -61,8 +70,53 @@ fn start_returns_after_durable_acceptance_and_scripted_output_is_deterministic()
     );
     assert_eq!(
         log.lock().unwrap().as_slice(),
-        ["store.terminal.committed", "peer.terminal.acknowledged"]
+        [
+            "artifact.message.published",
+            "store.terminal.committed",
+            "peer.terminal.acknowledged"
+        ]
     );
+    assert_eq!(
+        artifacts.published_contents(),
+        vec![peer.outputs()[0].as_bytes()]
+    );
+}
+
+#[test]
+fn peer_receives_every_bound_execution_field_and_wire_limit_exactly() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+    let runtime = runtime_with_artifacts(store, artifacts, clock, Arc::clone(&peer));
+
+    runtime
+        .start_run(run_request("run-2", Some("run-1")))
+        .unwrap();
+
+    let starts = peer.start_requests();
+    let start = starts.first().unwrap();
+    let binding = start.execution_binding();
+    assert_eq!(binding.provider_id, "provider-1");
+    assert_eq!(binding.model_id, "model-1");
+    assert_eq!(binding.generation_parameters, br#"{}"#);
+    assert_eq!(binding.generation_parameters_digest, EMPTY_JSON_DIGEST);
+    assert_eq!(binding.effective_context, CONTEXT_BYTES);
+    assert_eq!(binding.effective_context_artifact_id, "artifact-context-1");
+    assert_eq!(binding.effective_context_digest, CONTEXT_DIGEST);
+    assert_eq!(binding.supersedes_run_id.as_deref(), Some("run-1"));
+
+    let wire = serde_json::to_value(start.as_frame()).unwrap();
+    assert_eq!(wire.pointer("/params/supersedesRunId").unwrap(), "run-1");
+    assert_eq!(
+        wire.pointer("/params/limits/deadline").unwrap(),
+        "2027-01-15T08:05:00Z"
+    );
+    assert_eq!(
+        wire.pointer("/params/limits/maxOutputTokens").unwrap(),
+        8_000
+    );
+    assert_eq!(wire.pointer("/params/limits/maxToolRequests").unwrap(), 8);
 }
 
 #[test]
@@ -88,6 +142,64 @@ fn proposer_critic_and_verifier_outputs_are_stable_for_the_same_bound_input() {
 }
 
 #[test]
+fn disabled_descriptor_is_listed_but_never_dispatched() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+    let protocol_peer: Arc<dyn ProtocolPeer> = peer.clone();
+    let mut descriptor = agent_descriptor();
+    descriptor.enabled = false;
+    let runtime = ProtocolAgentRuntime::new(
+        store,
+        artifacts,
+        clock,
+        vec![(descriptor.clone(), protocol_peer)],
+    )
+    .unwrap();
+
+    assert_eq!(runtime.list_agents().unwrap(), vec![descriptor]);
+    let error = runtime
+        .start_run(run_request("run-disabled", None))
+        .unwrap_err();
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::PermissionDenied
+    );
+    assert!(peer.start_requests().is_empty());
+}
+
+#[test]
+fn duplicate_peer_connection_ids_are_rejected_at_construction() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let first: Arc<dyn ProtocolPeer> = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+    let mut second_descriptor = agent_descriptor();
+    second_descriptor.agent_id = "agent-2".to_owned();
+    let mut second_peer_descriptor = peer_descriptor();
+    second_peer_descriptor.binding.agent_id = "agent-2".to_owned();
+    let second: Arc<dyn ProtocolPeer> =
+        Arc::new(ScriptedPeer::new(Script::Slow, second_peer_descriptor));
+
+    let result = ProtocolAgentRuntime::new(
+        store,
+        artifacts,
+        clock,
+        vec![(agent_descriptor(), first), (second_descriptor, second)],
+    );
+
+    let error = match result {
+        Ok(_) => panic!("duplicate connection IDs must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+}
+
+#[test]
 fn terminal_store_failure_is_never_acknowledged() {
     let log = script_log();
     let store = Arc::new(RecordingStore::new(Arc::clone(&log)));
@@ -104,6 +216,70 @@ fn terminal_store_failure_is_never_acknowledged() {
     assert_eq!(peer.drive(), Err(ProtocolError::InternalAgentFailure));
     assert_eq!(peer.terminal_acknowledgements(), 0);
     assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+}
+
+#[test]
+fn terminal_artifact_publication_failure_is_never_persisted_or_acknowledged() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(ScriptedPeer::new(Script::Verifier, peer_descriptor()));
+    let runtime = runtime_with_artifacts(
+        Arc::clone(&store),
+        Arc::clone(&artifacts),
+        clock,
+        Arc::clone(&peer),
+    );
+    runtime.start_run(run_request("run-1", None)).unwrap();
+    artifacts.fail_publish();
+
+    assert_eq!(peer.drive(), Err(ProtocolError::InternalAgentFailure));
+    assert_eq!(peer.terminal_acknowledgements(), 0);
+    assert_eq!(store.terminal_count(), 0);
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+}
+
+#[test]
+fn post_start_store_failures_cancel_shutdown_and_persist_interruption() {
+    for failure in [StartStoreFailure::Acceptance, StartStoreFailure::Running] {
+        let store = Arc::new(RecordingStore::default());
+        store.fail_start_at(failure);
+        let artifacts = Arc::new(RecordingArtifacts::default());
+        let clock = Arc::new(ManualClock::new(1_800_000_000));
+        let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+        let runtime =
+            runtime_with_artifacts(Arc::clone(&store), artifacts, clock, Arc::clone(&peer));
+
+        let error = runtime.start_run(run_request("run-1", None)).unwrap_err();
+
+        assert_eq!(
+            error.safe_classification(),
+            SafeErrorClassification::StorageFull
+        );
+        assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
+        assert_eq!(peer.cancel_count(), 1);
+        assert!(peer.was_shutdown());
+    }
+}
+
+#[test]
+fn compensation_failure_preserves_the_original_start_failure() {
+    let store = Arc::new(RecordingStore::default());
+    store.fail_start_at(StartStoreFailure::Acceptance);
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    artifacts.fail_publish();
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+    let runtime = runtime_with_artifacts(store, artifacts, clock, Arc::clone(&peer));
+
+    let error = runtime.start_run(run_request("run-1", None)).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::StorageFull
+    );
+    assert_eq!(peer.cancel_count(), 1);
+    assert!(peer.was_shutdown());
 }
 
 #[test]
@@ -126,6 +302,42 @@ fn duplicate_and_conflicting_terminal_requests_commit_one_result() {
         assert_eq!(store.terminal_count(), 1);
         assert_eq!(peer.terminal_acknowledgements(), 1);
     }
+}
+
+#[test]
+fn every_agent_originated_request_receives_one_typed_response() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    descriptor.capabilities.tool_requests = true;
+    descriptor.capabilities.specialist_requests = true;
+    let peer = Arc::new(ScriptedPeer::new(Script::Requesting, descriptor));
+    let runtime = runtime_with_artifacts(store, artifacts, clock, Arc::clone(&peer));
+    runtime.start_run(run_request("run-1", None)).unwrap();
+
+    peer.drive().unwrap();
+
+    let responses = peer.request_responses();
+    assert_eq!(responses.len(), 3);
+    let values = responses
+        .iter()
+        .map(|response| serde_json::to_value(response).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values
+            .iter()
+            .map(|value| value.pointer("/id").unwrap().as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["agent:context-1", "agent:tool-1", "agent:specialist-1"]
+    );
+    assert!(values.iter().all(|value| {
+        value
+            .pointer("/error/data/category")
+            .and_then(serde_json::Value::as_str)
+            == Some("policy_denied")
+    }));
 }
 
 #[test]
@@ -196,7 +408,7 @@ fn cancellation_and_run_deadlines_are_classified_as_terminated() {
 }
 
 #[test]
-fn heartbeat_timeout_and_crash_interrupt_without_workflow_projection_changes() {
+fn heartbeat_timeout_and_crash_interrupt_active_runs() {
     for script in [Script::Slow, Script::Crashing] {
         let store = Arc::new(RecordingStore::default());
         let clock = Arc::new(ManualClock::new(1_800_000_000));
@@ -211,7 +423,6 @@ fn heartbeat_timeout_and_crash_interrupt_without_workflow_projection_changes() {
         }
 
         assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
-        assert_eq!(store.workflow_projection_mutations(), 0);
     }
 }
 
@@ -249,7 +460,7 @@ fn shutdown_interrupts_active_runs_before_reporting_completion() {
 }
 
 #[test]
-fn every_hostile_peer_failure_leaves_task_projection_untouched() {
+fn every_hostile_peer_failure_terminates_the_run() {
     let scripts = [
         MaliciousScript::MalformedFrame,
         MaliciousScript::WrongConnection,
@@ -270,7 +481,6 @@ fn every_hostile_peer_failure_leaves_task_projection_untouched() {
         peer.drive().unwrap();
 
         assert!(store.status("run-1").unwrap().is_terminal());
-        assert_eq!(store.workflow_projection_mutations(), 0);
     }
 }
 
@@ -279,8 +489,23 @@ fn runtime(
     clock: Arc<ManualClock>,
     peer: Arc<ScriptedPeer>,
 ) -> ProtocolAgentRuntime {
+    runtime_with_artifacts(store, Arc::new(RecordingArtifacts::default()), clock, peer)
+}
+
+fn runtime_with_artifacts(
+    store: Arc<RecordingStore>,
+    artifacts: Arc<RecordingArtifacts>,
+    clock: Arc<ManualClock>,
+    peer: Arc<ScriptedPeer>,
+) -> ProtocolAgentRuntime {
     let protocol_peer: Arc<dyn ProtocolPeer> = peer;
-    ProtocolAgentRuntime::new(store, clock, vec![(agent_descriptor(), protocol_peer)]).unwrap()
+    ProtocolAgentRuntime::new(
+        store,
+        artifacts,
+        clock,
+        vec![(agent_descriptor(), protocol_peer)],
+    )
+    .unwrap()
 }
 
 fn agent_descriptor() -> AgentDescriptor {
@@ -364,6 +589,11 @@ fn run_request(run: &str, supersedes: Option<&str>) -> BoundAgentRunRequest {
             prompt_template_version: "prompt-1".to_owned(),
             response_schema_version: "agent-message.v1".to_owned(),
             policy_snapshot_digest: digest(POLICY_DIGEST),
+            limits: AgentRunLimits {
+                deadline: Timestamp::from_unix_seconds(1_800_000_300),
+                max_output_tokens: 8_000,
+                max_tool_requests: 8,
+            },
         },
         connection: BoundAgentConnection {
             connection_id: "connection-1".to_owned(),
@@ -384,7 +614,69 @@ struct RecordingStore {
     runs: Mutex<BTreeMap<String, AgentRunSnapshot>>,
     terminals: Mutex<Vec<AgentRunTerminal>>,
     fail_terminal: Mutex<bool>,
+    fail_start: Mutex<Option<StartStoreFailure>>,
     log: ScriptLog,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartStoreFailure {
+    Acceptance,
+    Running,
+}
+
+#[derive(Default)]
+struct RecordingArtifacts {
+    published: Mutex<Vec<AgentMessageArtifact>>,
+    fail_publish: Mutex<bool>,
+    log: ScriptLog,
+}
+
+impl RecordingArtifacts {
+    fn new(log: ScriptLog) -> Self {
+        Self {
+            log,
+            ..Self::default()
+        }
+    }
+
+    fn published_contents(&self) -> Vec<Vec<u8>> {
+        self.published
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|artifact| artifact.content.clone())
+            .collect()
+    }
+
+    fn fail_publish(&self) {
+        *self.fail_publish.lock().unwrap() = true;
+    }
+}
+
+impl AgentArtifactStore for RecordingArtifacts {
+    fn load_effective_context(
+        &self,
+        context: &BoundEffectiveContext,
+    ) -> Result<Vec<u8>, PortError> {
+        assert_eq!(
+            context.effective_context_artifact_id.as_str(),
+            "artifact-context-1"
+        );
+        assert_eq!(context.content_digest.as_str(), CONTEXT_DIGEST);
+        Ok(CONTEXT_BYTES.to_vec())
+    }
+
+    fn publish_agent_message(
+        &self,
+        artifact: &AgentMessageArtifact,
+    ) -> Result<ArtifactId, PortError> {
+        if *self.fail_publish.lock().unwrap() {
+            return Err(internal_failure());
+        }
+        self.published.lock().unwrap().push(artifact.clone());
+        self.log.lock().unwrap().push("artifact.message.published");
+        ArtifactId::new(format!("artifact-{}", artifact.message_id)).map_err(|_| invalid_input())
+    }
 }
 
 impl RecordingStore {
@@ -411,8 +703,8 @@ impl RecordingStore {
         *self.fail_terminal.lock().unwrap() = true;
     }
 
-    const fn workflow_projection_mutations(&self) -> usize {
-        0
+    fn fail_start_at(&self, failure: StartStoreFailure) {
+        *self.fail_start.lock().unwrap() = Some(failure);
     }
 }
 
@@ -434,10 +726,16 @@ impl AgentRunStore for RecordingStore {
     }
 
     fn accept_run(&self, run_id: &RunId, accepted_at: &str) -> Result<(), PortError> {
+        if *self.fail_start.lock().unwrap() == Some(StartStoreFailure::Acceptance) {
+            return Err(storage_full());
+        }
         transition(self, run_id, AgentRunStatus::Accepted, accepted_at)
     }
 
     fn mark_running(&self, run_id: &RunId, started_at: &str) -> Result<(), PortError> {
+        if *self.fail_start.lock().unwrap() == Some(StartStoreFailure::Running) {
+            return Err(storage_full());
+        }
         transition(self, run_id, AgentRunStatus::Running, started_at)
     }
 
@@ -534,6 +832,20 @@ fn parse_timestamp(value: &str) -> Result<Timestamp, PortError> {
 fn invalid_input() -> PortError {
     PortError::failure(
         SafeErrorClassification::InvalidInput,
+        Retryability::NonRetryable,
+    )
+}
+
+fn storage_full() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::StorageFull,
+        Retryability::Retryable,
+    )
+}
+
+fn internal_failure() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::Internal,
         Retryability::NonRetryable,
     )
 }

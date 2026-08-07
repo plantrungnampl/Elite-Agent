@@ -10,9 +10,10 @@ mod workspace;
 
 pub use agent::{
     AgentCancellationReceipt, AgentClaim, AgentDescriptor, AgentError, AgentEvidenceRef,
-    AgentRunMessage, AgentRunReceipt, AgentRunSnapshot, AgentRunStatus, AgentRunTerminal,
-    AgentUsage, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
-    BoundGenerationParameters, BoundRunConfig, CancelAgentRun, MAX_GENERATION_PARAMETERS_BYTES,
+    AgentRunLimits, AgentRunMessage, AgentRunReceipt, AgentRunSnapshot, AgentRunStatus,
+    AgentRunTerminal, AgentUsage, BoundAgentConnection, BoundAgentRunRequest,
+    BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, CancelAgentRun,
+    MAX_GENERATION_PARAMETERS_BYTES,
 };
 pub use event::{Effect, GuardEvaluations, GuardName, WorkflowEvent};
 pub use identity::{
