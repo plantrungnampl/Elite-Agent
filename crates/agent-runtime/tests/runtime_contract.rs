@@ -451,6 +451,44 @@ fn poison_cleanup_invalidates_a_start_blocked_before_durable_create() {
 }
 
 #[test]
+fn stale_start_never_registers_in_the_current_generation_session() {
+    let store = Arc::new(RecordingStore::default());
+    let creation_gate = store.block_creation("run-stale");
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let runtime = Arc::new(runtime_with_protocol_peer(
+        store.clone(),
+        clock.clone(),
+        peer.clone(),
+    ));
+    runtime.start_run(run_request("run-active", None)).unwrap();
+    let stale_runtime = Arc::clone(&runtime);
+    let stale_start = thread::spawn(move || {
+        stale_runtime.start_run(run_request_with_deadline("run-stale", 1_800_000_005))
+    });
+    creation_gate.wait_until_entered();
+
+    peer.connection_lost(0).unwrap();
+    runtime.start_run(run_request("run-current", None)).unwrap();
+    creation_gate.release();
+    assert_eq!(
+        stale_start
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    clock.advance(5);
+
+    assert!(runtime.check_timeouts().unwrap().is_empty());
+    assert_eq!(store.status("run-current"), Some(AgentRunStatus::Running));
+    assert_eq!(peer.start_count(), 2);
+}
+
+#[test]
 fn compensation_shutdown_retires_connection_after_durable_cleanup() {
     let store = Arc::new(RecordingStore::default());
     let peer = Arc::new(MultiRunPeer::new(peer_descriptor()));
@@ -978,7 +1016,6 @@ fn rejected_handshake_preserves_conflict_and_poisoned_capacity() {
         SafeErrorClassification::Internal
     );
     clock.recover();
-    store.fail_interrupt();
 
     creation_gate.release();
     assert_eq!(
@@ -989,10 +1026,98 @@ fn rejected_handshake_preserves_conflict_and_poisoned_capacity() {
     assert_eq!(store.status("run-2"), Some(AgentRunStatus::Interrupted));
     assert_start_conflict_without_row(&runtime, &store, "run-3");
 
-    store.allow_interrupt();
     assert_eq!(runtime.check_timeouts().unwrap(), vec![run_id("run-1")]);
     runtime.start_run(run_request("run-4", None)).unwrap();
     assert_eq!(peer.start_count(), 2);
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExactCleanupFailure {
+    ArtifactPublication,
+    TerminalStore,
+}
+
+#[test]
+fn failed_stale_artifact_cleanup_retries_without_poisoning_current_work() {
+    assert_failed_stale_cleanup_retries(ExactCleanupFailure::ArtifactPublication);
+}
+
+#[test]
+fn failed_stale_terminal_cleanup_retries_without_poisoning_current_work() {
+    assert_failed_stale_cleanup_retries(ExactCleanupFailure::TerminalStore);
+}
+
+fn assert_failed_stale_cleanup_retries(failure: ExactCleanupFailure) {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let creation_gate = store.block_creation("run-stale");
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let protocol_peer: Arc<dyn ProtocolPeer> = peer.clone();
+    let runtime = Arc::new(
+        ProtocolAgentRuntime::new(
+            store.clone(),
+            artifacts.clone(),
+            clock.clone(),
+            vec![(agent_descriptor(), protocol_peer)],
+        )
+        .unwrap(),
+    );
+    runtime.start_run(run_request("run-active", None)).unwrap();
+    let stale_runtime = Arc::clone(&runtime);
+    let stale_start =
+        thread::spawn(move || stale_runtime.start_run(run_request("run-stale", None)));
+    creation_gate.wait_until_entered();
+    peer.connection_lost(0).unwrap();
+    runtime.start_run(run_request("run-current", None)).unwrap();
+    match failure {
+        ExactCleanupFailure::ArtifactPublication => artifacts.fail_publish(),
+        ExactCleanupFailure::TerminalStore => store.fail_terminal(),
+    }
+    creation_gate.release();
+
+    assert_eq!(
+        stale_start
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .safe_classification(),
+        SafeErrorClassification::Conflict,
+        "{failure:?}"
+    );
+    assert_eq!(store.status("run-stale"), Some(AgentRunStatus::Created));
+    assert_eq!(store.status("run-current"), Some(AgentRunStatus::Running));
+    runtime
+        .start_run(run_request("run-current-2", None))
+        .unwrap();
+    clock.advance(1);
+    assert!(runtime.check_timeouts().is_err());
+    assert_eq!(store.status("run-stale"), Some(AgentRunStatus::Created));
+    assert_eq!(store.status("run-current"), Some(AgentRunStatus::Running));
+    assert_eq!(store.status("run-current-2"), Some(AgentRunStatus::Running));
+    assert_eq!(store.interrupt_count(), 1);
+
+    match failure {
+        ExactCleanupFailure::ArtifactPublication => artifacts.allow_publish(),
+        ExactCleanupFailure::TerminalStore => store.allow_terminal(),
+    }
+    clock.advance(1);
+
+    assert!(runtime.check_timeouts().unwrap().is_empty());
+    assert_eq!(store.status("run-stale"), Some(AgentRunStatus::Interrupted));
+    assert_eq!(
+        store.terminal_time("run-stale"),
+        Some(Timestamp::from_unix_seconds(1_800_000_002))
+    );
+    assert_eq!(store.status("run-current"), Some(AgentRunStatus::Running));
+    assert_eq!(store.status("run-current-2"), Some(AgentRunStatus::Running));
+    assert_eq!(store.interrupt_count(), 1);
+    assert_eq!(peer.start_count(), 3);
+    let terminal_count = store.terminal_count();
+    assert!(runtime.check_timeouts().unwrap().is_empty());
+    assert_eq!(store.terminal_count(), terminal_count);
 }
 
 #[test]
@@ -1673,6 +1798,12 @@ fn run_request(run: &str, supersedes: Option<&str>) -> BoundAgentRunRequest {
     }
 }
 
+fn run_request_with_deadline(run: &str, deadline: i64) -> BoundAgentRunRequest {
+    let mut request = run_request(run, None);
+    request.run_config.limits.deadline = Timestamp::from_unix_seconds(deadline);
+    request
+}
+
 #[derive(Default)]
 struct RecordingStore {
     runs: Mutex<BTreeMap<String, AgentRunSnapshot>>,
@@ -1719,6 +1850,10 @@ impl RecordingArtifacts {
 
     fn fail_publish(&self) {
         *self.fail_publish.lock().unwrap() = true;
+    }
+
+    fn allow_publish(&self) {
+        *self.fail_publish.lock().unwrap() = false;
     }
 }
 
@@ -1770,6 +1905,19 @@ impl RecordingStore {
 
     fn fail_terminal(&self) {
         *self.fail_terminal.lock().unwrap() = true;
+    }
+
+    fn allow_terminal(&self) {
+        *self.fail_terminal.lock().unwrap() = false;
+    }
+
+    fn terminal_time(&self, run_id: &str) -> Option<Timestamp> {
+        self.terminals
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|terminal| terminal.run_id.as_str() == run_id)
+            .and_then(|terminal| terminal.core_received_at)
     }
 
     fn fail_start_at(&self, failure: StartStoreFailure) {

@@ -39,6 +39,7 @@ pub struct ProtocolAgentRuntime {
     sessions: Arc<Mutex<BTreeMap<String, Arc<Mutex<ProtocolSession>>>>>,
     active_runs: Arc<Mutex<BTreeMap<String, ActiveRun>>>,
     slots: Arc<ConnectionSlots>,
+    pending_run_cleanups: Mutex<BTreeMap<String, BoundAgentRunRequest>>,
     next_request_id: AtomicU64,
 }
 
@@ -548,6 +549,7 @@ impl ProtocolAgentRuntime {
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             active_runs: Arc::new(Mutex::new(BTreeMap::new())),
             slots: Arc::new(ConnectionSlots::default()),
+            pending_run_cleanups: Mutex::new(BTreeMap::new()),
             next_request_id: AtomicU64::new(1),
         })
     }
@@ -571,7 +573,7 @@ impl ProtocolAgentRuntime {
             }
         };
         let mut resolved = Vec::new();
-        let mut retry_error = None;
+        let mut retry_error = self.retry_pending_run_cleanups(now.timestamp).err();
         for poison in poisoned {
             match self.retry_interruption(&poison, &now.text) {
                 Ok(interrupted) => resolved.extend(interrupted),
@@ -700,99 +702,99 @@ impl ProtocolAgentRuntime {
         )?;
         self.store.create_bound_run(&request)?;
 
-        let session = self.session(&request, &peer.descriptor(), now.date_time)?;
-        let request_id = self.request_id();
         let deadline = timestamp_date_time(request.run_config.limits.deadline)?;
-        let start = run_start_frame(&request, &peer.descriptor(), &request_id)?;
-        session
-            .lock()
-            .map_err(|_| internal_failure())?
-            .outbound(start.clone(), now.date_time)
-            .map_err(protocol_port_error)?;
-
         let gate = Arc::new(SinkGate::new());
-        let sink = RuntimeSink {
-            store: Arc::clone(&self.store),
-            artifacts: Arc::clone(&self.artifacts),
-            clock: Arc::clone(&self.clock),
-            session: Arc::clone(&session),
-            peer: Arc::clone(&peer),
-            request: request.clone(),
-            active_runs: Arc::clone(&self.active_runs),
-            sessions: Arc::clone(&self.sessions),
-            slot: slot.clone(),
-            gate: Arc::clone(&gate),
-            slots: Arc::clone(&self.slots),
-            codec: NdjsonCodec::default(),
-        };
-        let run_start = RunStart::new(
-            start,
-            RunExecutionBinding {
-                provider_id: request.run_config.provider_id.clone(),
-                model_id: request.run_config.model_id.clone(),
-                generation_parameters: request
-                    .run_config
-                    .generation_parameters
-                    .canonical_json
-                    .clone(),
-                generation_parameters_digest: request
-                    .run_config
-                    .generation_parameters
-                    .digest
-                    .as_str()
-                    .to_owned(),
-                effective_context,
-                effective_context_artifact_id: request
-                    .context
-                    .effective_context_artifact_id
-                    .as_str()
-                    .to_owned(),
-                effective_context_digest: request.context.content_digest.as_str().to_owned(),
-                supersedes_run_id: request
-                    .supersedes_run_id
-                    .as_ref()
-                    .map(|run_id| run_id.as_str().to_owned()),
-            },
-        )
-        .map_err(protocol_port_error)?;
-        let started = self
-            .slots
-            .start_handshake(&slot, || peer.start(run_start, Box::new(sink)));
-        let acceptance = match started {
+        let started = self.slots.start_handshake(&slot, || {
+            let session = self.session(&request, &peer.descriptor(), now.date_time)?;
+            let request_id = self.request_id();
+            let start = run_start_frame(&request, &peer.descriptor(), &request_id)?;
+            session
+                .lock()
+                .map_err(|_| internal_failure())?
+                .outbound(start.clone(), now.date_time)
+                .map_err(protocol_port_error)?;
+            let run_start = RunStart::new(
+                start,
+                RunExecutionBinding {
+                    provider_id: request.run_config.provider_id.clone(),
+                    model_id: request.run_config.model_id.clone(),
+                    generation_parameters: request
+                        .run_config
+                        .generation_parameters
+                        .canonical_json
+                        .clone(),
+                    generation_parameters_digest: request
+                        .run_config
+                        .generation_parameters
+                        .digest
+                        .as_str()
+                        .to_owned(),
+                    effective_context,
+                    effective_context_artifact_id: request
+                        .context
+                        .effective_context_artifact_id
+                        .as_str()
+                        .to_owned(),
+                    effective_context_digest: request.context.content_digest.as_str().to_owned(),
+                    supersedes_run_id: request
+                        .supersedes_run_id
+                        .as_ref()
+                        .map(|run_id| run_id.as_str().to_owned()),
+                },
+            )
+            .map_err(protocol_port_error)?;
+            let sink = RuntimeSink {
+                store: Arc::clone(&self.store),
+                artifacts: Arc::clone(&self.artifacts),
+                clock: Arc::clone(&self.clock),
+                session: Arc::clone(&session),
+                peer: Arc::clone(&peer),
+                request: request.clone(),
+                active_runs: Arc::clone(&self.active_runs),
+                sessions: Arc::clone(&self.sessions),
+                slot: slot.clone(),
+                gate: Arc::clone(&gate),
+                slots: Arc::clone(&self.slots),
+                codec: NdjsonCodec::default(),
+            };
+            Ok::<_, PortError>((session, request_id, peer.start(run_start, Box::new(sink))))
+        });
+        let (session, request_id, started) = match started {
+            Ok(started) => started?,
             Err(error) => {
                 gate.fail();
                 let _ = self.cleanup_unstarted_run(&request);
                 return Err(error);
             }
-            Ok(started) => match started {
-                Ok(acceptance)
-                    if acceptance.accepted && acceptance.run_id == request.run_id.as_str() =>
-                {
-                    acceptance
-                }
-                Ok(_) => {
-                    gate.fail();
-                    let error = invalid_input();
-                    self.compensate_started_run(
-                        &request,
-                        peer.as_ref(),
-                        AgentRunStatus::Failed,
-                        "peer rejected the bound run",
-                    );
-                    return Err(error);
-                }
-                Err(error) => {
-                    gate.fail();
-                    let original = protocol_port_error(error);
-                    self.compensate_started_run(
-                        &request,
-                        peer.as_ref(),
-                        AgentRunStatus::Interrupted,
-                        "peer failed before acceptance",
-                    );
-                    return Err(original);
-                }
-            },
+        };
+        let acceptance = match started {
+            Ok(acceptance)
+                if acceptance.accepted && acceptance.run_id == request.run_id.as_str() =>
+            {
+                acceptance
+            }
+            Ok(_) => {
+                gate.fail();
+                let error = invalid_input();
+                self.compensate_started_run(
+                    &request,
+                    peer.as_ref(),
+                    AgentRunStatus::Failed,
+                    "peer rejected the bound run",
+                );
+                return Err(error);
+            }
+            Err(error) => {
+                gate.fail();
+                let original = protocol_port_error(error);
+                self.compensate_started_run(
+                    &request,
+                    peer.as_ref(),
+                    AgentRunStatus::Interrupted,
+                    "peer failed before acceptance",
+                );
+                return Err(original);
+            }
         };
         if let Err(error) = gate.accepted() {
             gate.fail();
@@ -1019,12 +1021,49 @@ impl ProtocolAgentRuntime {
 
     fn cleanup_unstarted_run(&self, request: &BoundAgentRunRequest) -> Result<(), PortError> {
         let now = self.now()?;
-        self.persist_runtime_terminal(
+        let cleanup = self.persist_runtime_terminal(
             request,
             AgentRunStatus::Interrupted,
             "stale connection generation",
             now.timestamp,
-        )
+        );
+        if cleanup.is_err() {
+            self.pending_run_cleanups
+                .lock()
+                .map_err(|_| internal_failure())?
+                .insert(request.run_id.as_str().to_owned(), request.clone());
+        }
+        cleanup
+    }
+
+    fn retry_pending_run_cleanups(&self, at: Timestamp) -> Result<(), PortError> {
+        let pending = self
+            .pending_run_cleanups
+            .lock()
+            .map_err(|_| internal_failure())?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut retry_error = None;
+        for request in pending {
+            match self.persist_runtime_terminal(
+                &request,
+                AgentRunStatus::Interrupted,
+                "stale connection generation",
+                at,
+            ) {
+                Ok(()) => {
+                    self.pending_run_cleanups
+                        .lock()
+                        .map_err(|_| internal_failure())?
+                        .remove(request.run_id.as_str());
+                }
+                Err(error) => {
+                    retry_error.get_or_insert(error);
+                }
+            }
+        }
+        retry_error.map_or(Ok(()), Err)
     }
 
     fn interrupt_connection(&self, digest: &str, at: &str) -> Result<Vec<RunId>, PortError> {
