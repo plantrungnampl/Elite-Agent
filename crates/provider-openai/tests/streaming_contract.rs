@@ -4,7 +4,7 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, Condvar, Mutex,
+        mpsc, Arc, Barrier, Condvar, Mutex,
     },
     thread,
     time::Duration,
@@ -304,6 +304,169 @@ fn shutdown_cancels_and_joins_an_active_worker() {
 }
 
 #[test]
+fn rejects_start_after_shutdown() {
+    let adapter = adapter(
+        Url::parse("http://127.0.0.1:9/v1/responses").unwrap(),
+        Duration::from_millis(20),
+    );
+
+    adapter.shutdown().unwrap();
+    let start = adapter.start(run_start("closed"), Box::new(RecordingSink::default()));
+    adapter.shutdown().unwrap();
+
+    assert_eq!(start, Err(ProtocolError::InvalidRequest));
+}
+
+#[test]
+fn rejects_duplicate_run_and_cancel_while_terminal_delivery_is_in_progress() {
+    for (run_id, fragments) in [
+        (
+            "terminal-success",
+            sse_fragments(&[
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-success\"}}\n\n",
+            ]),
+        ),
+        (
+            "terminal-failure",
+            sse_fragments(&[
+                "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failure\"}}\n\n",
+            ]),
+        ),
+    ] {
+        let server = LoopbackServer::responding(fragments);
+        let adapter = adapter(server.endpoint(), Duration::from_secs(1));
+        let sink = TerminalBlockingSink::default();
+
+        adapter.start(run_start(run_id), Box::new(sink.clone())).unwrap();
+        sink.wait_until_terminal_delivery();
+        let duplicate = adapter.start(run_start(run_id), Box::new(RecordingSink::default()));
+        let cancel = adapter.cancel(run_cancel(run_id)).unwrap();
+
+        sink.release();
+        adapter.shutdown().unwrap();
+        server.join();
+
+        assert_eq!(duplicate, Err(ProtocolError::InvalidRequest));
+        assert!(!cancel.accepted);
+    }
+}
+
+#[test]
+fn concurrent_duplicate_starts_accept_exactly_one_active_run() {
+    const STARTERS: usize = 8;
+
+    let server = LoopbackServer::responding(sse_fragments(&[
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-concurrent\"}}\n\n",
+    ]));
+    let adapter = Arc::new(adapter(server.endpoint(), Duration::from_secs(1)));
+    let sink = BlockingSink::default();
+    let barrier = Arc::new(Barrier::new(STARTERS));
+    let starters = (0..STARTERS)
+        .map(|_| {
+            let adapter = Arc::clone(&adapter);
+            let sink = sink.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                adapter.start(run_start("concurrent"), Box::new(sink))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let results = starters
+        .into_iter()
+        .map(|starter| starter.join().unwrap())
+        .collect::<Vec<_>>();
+    sink.wait_until_delta_delivery();
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == Err(ProtocolError::InvalidRequest))
+            .count(),
+        STARTERS - 1
+    );
+
+    sink.release();
+    sink.inner.wait_for_terminal();
+    adapter.shutdown().unwrap();
+    server.join();
+}
+
+#[test]
+fn cancellation_reaps_a_live_comment_only_stream() {
+    let mut server = CommentStreamServer::new();
+    let adapter = adapter(server.endpoint(), Duration::from_secs(1));
+    let sink = BlockingSink::default();
+
+    adapter
+        .start(run_start("comment-only"), Box::new(sink.clone()))
+        .unwrap();
+    server.wait_for_request();
+    sink.wait_until_delta_delivery();
+    server.start_comments();
+    sink.release();
+    server.wait_until_comments_flow();
+
+    assert!(adapter.cancel(run_cancel("comment-only")).unwrap().accepted);
+    server.close();
+    let terminal = sink.inner.wait_for_terminal();
+
+    assert_eq!(
+        terminal.pointer("/params/status").and_then(Value::as_str),
+        Some("cancelled_cleanly")
+    );
+    adapter.shutdown().unwrap();
+    assert!(!adapter.cancel(run_cancel("comment-only")).unwrap().accepted);
+    server.join();
+}
+
+#[test]
+fn shutdown_reaps_a_live_comment_only_stream() {
+    let mut server = CommentStreamServer::new();
+    let adapter = Arc::new(adapter(server.endpoint(), Duration::from_secs(1)));
+    let sink = BlockingSink::default();
+
+    adapter
+        .start(run_start("comment-only-shutdown"), Box::new(sink.clone()))
+        .unwrap();
+    server.wait_for_request();
+    sink.wait_until_delta_delivery();
+    server.start_comments();
+    sink.release();
+    server.wait_until_comments_flow();
+
+    let (done, wait_for_shutdown) = mpsc::channel();
+    let shutdown_adapter = Arc::clone(&adapter);
+    let shutdown = thread::spawn(move || done.send(shutdown_adapter.shutdown()).unwrap());
+    server.close();
+
+    assert_eq!(
+        wait_for_shutdown
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap(),
+        Ok(())
+    );
+    shutdown.join().unwrap();
+    let terminal = sink.inner.wait_for_terminal();
+
+    assert_eq!(
+        terminal.pointer("/params/status").and_then(Value::as_str),
+        Some("cancelled_cleanly")
+    );
+    assert!(
+        !adapter
+            .cancel(run_cancel("comment-only-shutdown"))
+            .unwrap()
+            .accepted
+    );
+    server.join();
+}
+
+#[test]
 fn completed_refusal_or_no_text_emits_a_failed_terminal() {
     for (run_id, fragments, response_id, expected_message) in [
         (
@@ -338,6 +501,59 @@ fn completed_refusal_or_no_text_emits_a_failed_terminal() {
             .unwrap(), expected_message);
         assert!(sink.deltas().is_empty());
         assert_eq!(adapter.diagnostics()[0].response_id.as_deref(), Some(response_id));
+        adapter.shutdown().unwrap();
+        server.join();
+    }
+}
+
+#[test]
+fn sanitizes_api_key_reflected_by_provider_response_ids() {
+    for (run_id, headers, fragments) in [
+        (
+            "reflected-header-raw",
+            vec![("x-request-id".to_owned(), API_KEY_CANARY.to_owned())],
+            sse_fragments(&[
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+            ]),
+        ),
+        (
+            "reflected-header-bearer",
+            vec![(
+                "x-request-id".to_owned(),
+                format!("Bearer {API_KEY_CANARY}"),
+            )],
+            sse_fragments(&[
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+            ]),
+        ),
+        (
+            "reflected-success-event",
+            Vec::new(),
+            sse_fragments(&[
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"sk-streaming-canary\"}}\n\n",
+            ]),
+        ),
+        (
+            "reflected-error-event",
+            Vec::new(),
+            sse_fragments(&[
+                "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"Bearer sk-streaming-canary\"}}\n\n",
+            ]),
+        ),
+    ] {
+        let server = LoopbackServer::responding_with_headers(headers, fragments);
+        let adapter = adapter(server.endpoint(), Duration::from_secs(1));
+        let sink = RecordingSink::default();
+
+        adapter.start(run_start(run_id), Box::new(sink.clone())).unwrap();
+        sink.wait_for_terminal();
+
+        assert_eq!(adapter.diagnostics()[0].response_id, None);
+        assert!(!format!("{:?}", adapter.diagnostics()).contains(API_KEY_CANARY));
+        assert!(!format!("{adapter:?}").contains(API_KEY_CANARY));
         adapter.shutdown().unwrap();
         server.join();
     }
@@ -619,6 +835,68 @@ impl PeerEventSink for BlockingSink {
     }
 }
 
+#[derive(Clone)]
+struct TerminalBlockingSink {
+    inner: RecordingSink,
+    state: Arc<(Mutex<BlockingState>, Condvar)>,
+}
+
+impl Default for TerminalBlockingSink {
+    fn default() -> Self {
+        Self {
+            inner: RecordingSink::default(),
+            state: Arc::new((Mutex::new(BlockingState::default()), Condvar::new())),
+        }
+    }
+}
+
+impl TerminalBlockingSink {
+    fn wait_until_terminal_delivery(&self) {
+        let (state, ready) = &*self.state;
+        let state = state.lock().unwrap();
+        let (state, _) = ready
+            .wait_timeout_while(state, Duration::from_secs(1), |state| !state.entered)
+            .unwrap();
+        assert!(state.entered);
+    }
+
+    fn release(&self) {
+        let (state, ready) = &*self.state;
+        state.lock().unwrap().released = true;
+        ready.notify_all();
+    }
+}
+
+impl PeerEventSink for TerminalBlockingSink {
+    fn receive(&self, frame: ProtocolFrame) -> Result<InboundDisposition, ProtocolError> {
+        self.inner.receive(frame)
+    }
+
+    fn request(&self, frame: ProtocolFrame) -> Result<ProtocolFrame, ProtocolError> {
+        let response = self.inner.request(frame)?;
+        let (state, ready) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state.entered = true;
+        ready.notify_all();
+        let (state, _) = ready
+            .wait_timeout_while(state, Duration::from_secs(1), |state| !state.released)
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        if state.released {
+            Ok(response)
+        } else {
+            Err(ProtocolError::Timeout)
+        }
+    }
+
+    fn receive_raw(&self, bytes: &[u8]) -> Result<InboundDisposition, ProtocolError> {
+        self.inner.receive_raw(bytes)
+    }
+
+    fn connection_lost(&self) -> Result<(), ProtocolError> {
+        self.inner.connection_lost()
+    }
+}
+
 fn frame_value(frame: &ProtocolFrame) -> Value {
     serde_json::to_value(frame).unwrap()
 }
@@ -635,9 +913,99 @@ struct LoopbackServer {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+struct CommentStreamServer {
+    endpoint: Url,
+    request_ready: mpsc::Receiver<()>,
+    comments_sent: mpsc::Receiver<()>,
+    start_comments: Option<mpsc::Sender<()>>,
+    close: Option<mpsc::Sender<()>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl CommentStreamServer {
+    fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = Url::parse(&format!(
+            "http://{}/v1/responses",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let (request_ready_sender, request_ready) = mpsc::channel();
+        let (comments_sent_sender, comments_sent) = mpsc::channel();
+        let (start_comments, wait_for_comments) = mpsc::channel();
+        let (close, wait_for_close) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&stream);
+            request_ready_sender.send(()).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            stream
+                .write_all(
+                    b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            if wait_for_comments.recv().is_err() {
+                return;
+            }
+            let comments = b": keepalive\n".repeat(96_000);
+            if stream.write_all(&comments).is_err() {
+                return;
+            }
+            stream.flush().unwrap();
+            comments_sent_sender.send(()).unwrap();
+            let _ = wait_for_close.recv();
+        });
+        Self {
+            endpoint,
+            request_ready,
+            comments_sent,
+            start_comments: Some(start_comments),
+            close: Some(close),
+            worker: Some(worker),
+        }
+    }
+
+    fn endpoint(&self) -> Url {
+        self.endpoint.clone()
+    }
+
+    fn wait_for_request(&self) {
+        self.request_ready
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+    }
+
+    fn start_comments(&mut self) {
+        self.start_comments.take().unwrap().send(()).unwrap();
+    }
+
+    fn wait_until_comments_flow(&self) {
+        self.comments_sent
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+    }
+
+    fn close(&mut self) {
+        self.close.take().unwrap().send(()).unwrap();
+    }
+
+    fn join(mut self) {
+        self.worker.take().unwrap().join().unwrap();
+    }
+}
+
 impl LoopbackServer {
     fn responding(fragments: Vec<Vec<u8>>) -> Self {
         Self::response(200, Vec::new(), fragments, None, None)
+    }
+
+    fn responding_with_headers(headers: Vec<(String, String)>, fragments: Vec<Vec<u8>>) -> Self {
+        Self::response(200, headers, fragments, None, None)
     }
 
     fn status(status: u16, headers: Vec<(String, String)>) -> Self {

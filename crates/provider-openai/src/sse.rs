@@ -1,4 +1,7 @@
-use std::io::{self, BufRead};
+use std::{
+    io::{self, BufRead},
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use local_agent_terminal_agent_protocol::ProtocolError;
 use serde_json::Value;
@@ -18,16 +21,22 @@ impl<R: BufRead> SseReader<R> {
         }
     }
 
-    pub(crate) fn next_event(&mut self) -> Result<Option<Value>, ProtocolError> {
+    pub(crate) fn next_event(
+        &mut self,
+        cancellation: &AtomicBool,
+    ) -> Result<Option<Value>, ProtocolError> {
         let mut data = Vec::new();
         loop {
+            check_cancelled(cancellation)?;
             let Some(line) = self.next_line()? else {
+                check_cancelled(cancellation)?;
                 return if data.is_empty() {
                     Ok(None)
                 } else {
                     parse_event(&data).map(Some)
                 };
             };
+            check_cancelled(cancellation)?;
             let line = strip_carriage_return(&line);
             if line.is_empty() {
                 if !data.is_empty() {
@@ -68,6 +77,14 @@ impl<R: BufRead> SseReader<R> {
                 return Ok(Some(line));
             }
         }
+    }
+}
+
+fn check_cancelled(cancellation: &AtomicBool) -> Result<(), ProtocolError> {
+    if cancellation.load(Ordering::Acquire) {
+        Err(ProtocolError::Cancelled)
+    } else {
+        Ok(())
     }
 }
 

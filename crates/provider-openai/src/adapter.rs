@@ -4,11 +4,14 @@ use std::{
     io::BufReader,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, SystemTime},
 };
+
+#[cfg(test)]
+use std::sync::{mpsc, OnceLock};
 
 use local_agent_terminal_agent_protocol::{
     CancelAcceptance, NdjsonCodec, PeerDescriptor, PeerEventSink, ProtocolError, ProtocolPeer,
@@ -39,10 +42,50 @@ pub struct OpenAiResponsesAdapter {
     config: OpenAiProviderConfig,
     descriptor: PeerDescriptor,
     client: Client,
-    cancellations: Arc<Mutex<BTreeMap<String, Arc<AtomicBool>>>>,
+    lifecycle: Arc<Mutex<AdapterLifecycle>>,
     diagnostics: Arc<Mutex<BTreeMap<String, OpenAiDiagnostic>>>,
-    workers: Mutex<Vec<JoinHandle<()>>>,
     terminal_ids: AtomicU64,
+}
+
+#[derive(Default)]
+struct AdapterLifecycle {
+    closed: bool,
+    active_runs: BTreeMap<String, RunPhase>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+enum RunPhase {
+    Running(Arc<AtomicBool>),
+    Completing,
+}
+
+#[derive(Default)]
+struct WorkerLaunchGate {
+    opened: Mutex<bool>,
+    ready: Condvar,
+}
+
+impl WorkerLaunchGate {
+    fn wait(&self) {
+        let mut opened = self
+            .opened
+            .lock()
+            .expect("worker launch gate mutex must not be poisoned");
+        while !*opened {
+            opened = self
+                .ready
+                .wait(opened)
+                .expect("worker launch gate mutex must not be poisoned");
+        }
+    }
+
+    fn open(&self) {
+        *self
+            .opened
+            .lock()
+            .expect("worker launch gate mutex must not be poisoned") = true;
+        self.ready.notify_all();
+    }
 }
 
 struct Completion {
@@ -61,6 +104,28 @@ struct StreamFailure {
     response_id: Option<String>,
     retry_after: Option<Duration>,
     message: &'static str,
+}
+
+#[cfg(test)]
+struct StartRegistrationGate {
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static START_REGISTRATION_GATE: OnceLock<Mutex<Option<StartRegistrationGate>>> = OnceLock::new();
+
+#[cfg(test)]
+fn pause_start_registration_for_test() {
+    let gate = START_REGISTRATION_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|mut gate| gate.take());
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.recv();
+    }
 }
 
 impl StreamFailure {
@@ -93,6 +158,7 @@ impl OpenAiResponsesAdapter {
         descriptor: PeerDescriptor,
     ) -> Result<Self, ProtocolError> {
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(config.connect_timeout())
             .timeout(config.read_timeout())
             .build()
@@ -101,9 +167,8 @@ impl OpenAiResponsesAdapter {
             config,
             descriptor,
             client,
-            cancellations: Arc::new(Mutex::new(BTreeMap::new())),
+            lifecycle: Arc::new(Mutex::new(AdapterLifecycle::default())),
             diagnostics: Arc::new(Mutex::new(BTreeMap::new())),
-            workers: Mutex::new(Vec::new()),
             terminal_ids: AtomicU64::new(1),
         })
     }
@@ -120,25 +185,51 @@ impl OpenAiResponsesAdapter {
     }
 
     fn reap_finished_workers(&self) -> Result<(), ProtocolError> {
-        let mut workers = self
-            .workers
-            .lock()
-            .map_err(|_| ProtocolError::InternalAgentFailure)?;
-        let mut unfinished = Vec::new();
-        let mut failed = false;
-        for worker in std::mem::take(&mut *workers) {
-            if worker.is_finished() {
-                failed |= worker.join().is_err();
-            } else {
-                unfinished.push(worker);
+        let finished = {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|_| ProtocolError::InternalAgentFailure)?;
+            let mut finished = Vec::new();
+            let mut unfinished = Vec::new();
+            for worker in std::mem::take(&mut lifecycle.workers) {
+                if worker.is_finished() {
+                    finished.push(worker);
+                } else {
+                    unfinished.push(worker);
+                }
             }
+            lifecycle.workers = unfinished;
+            finished
+        };
+        let mut failed = false;
+        for worker in finished {
+            failed |= worker.join().is_err();
         }
-        *workers = unfinished;
         if failed {
             Err(ProtocolError::InternalAgentFailure)
         } else {
             Ok(())
         }
+    }
+}
+
+fn mark_run_completing(lifecycle: &Mutex<AdapterLifecycle>, run_id: &str) {
+    if let Ok(mut lifecycle) = lifecycle.lock() {
+        if matches!(
+            lifecycle.active_runs.get(run_id),
+            Some(RunPhase::Running(_))
+        ) {
+            lifecycle
+                .active_runs
+                .insert(run_id.to_owned(), RunPhase::Completing);
+        }
+    }
+}
+
+fn remove_completed_run(lifecycle: &Mutex<AdapterLifecycle>, run_id: &str) {
+    if let Ok(mut lifecycle) = lifecycle.lock() {
+        lifecycle.active_runs.remove(run_id);
     }
 }
 
@@ -150,7 +241,10 @@ impl fmt::Debug for OpenAiResponsesAdapter {
             .field("descriptor", &self.descriptor)
             .field(
                 "active_runs",
-                &self.cancellations.lock().map_or(0, |runs| runs.len()),
+                &self
+                    .lifecycle
+                    .lock()
+                    .map_or(0, |lifecycle| lifecycle.active_runs.len()),
             )
             .field("diagnostics", &self.diagnostics())
             .finish()
@@ -170,96 +264,84 @@ impl ProtocolPeer for OpenAiResponsesAdapter {
         self.reap_finished_workers()?;
         let prepared = prepare(&request)?;
         let cancellation = Arc::new(AtomicBool::new(false));
-        {
-            let mut cancellations = self
-                .cancellations
-                .lock()
-                .map_err(|_| ProtocolError::InternalAgentFailure)?;
-            if cancellations.contains_key(&prepared.run_id) {
-                return Err(ProtocolError::InvalidRequest);
-            }
-            cancellations.insert(prepared.run_id.clone(), Arc::clone(&cancellation));
-        }
-
         let config = self.config.clone();
         let client = self.client.clone();
-        let cancellations = Arc::clone(&self.cancellations);
+        let worker_lifecycle_state = Arc::clone(&self.lifecycle);
         let diagnostics = Arc::clone(&self.diagnostics);
         let terminal_id = self.next_terminal_id();
         let run_id = prepared.run_id.clone();
         let worker_run_id = run_id.clone();
         let worker_cancellation = Arc::clone(&cancellation);
-        let worker = thread::Builder::new()
-            .name(format!("openai-response-{terminal_id}"))
-            .spawn(move || {
-                let outcome =
-                    stream_response(&client, &config, prepared, &*sink, &worker_cancellation);
-                if let Ok(mut cancellations) = cancellations.lock() {
-                    cancellations.remove(&worker_run_id);
-                }
-                match outcome {
-                    Ok(completion) => {
-                        record_diagnostic(
-                            &diagnostics,
-                            &worker_run_id,
-                            completion.response_id,
-                            None,
-                            None,
-                        );
-                        let _ = terminal(
-                            &*sink,
-                            &worker_run_id,
-                            terminal_id,
-                            "succeeded",
-                            &completion.text,
-                            completion.usage,
-                        );
-                    }
-                    Err(failure) => {
-                        let status = if failure.error == ProtocolError::Cancelled {
-                            "cancelled_cleanly"
-                        } else {
-                            "failed"
-                        };
-                        record_diagnostic(
-                            &diagnostics,
-                            &worker_run_id,
-                            failure.response_id,
-                            failure.retry_after,
-                            Some(failure.error),
-                        );
-                        let _ = terminal(
-                            &*sink,
-                            &worker_run_id,
-                            terminal_id,
-                            status,
-                            failure.message,
-                            None,
-                        );
-                    }
-                }
-            });
-        let worker = match worker {
-            Ok(worker) => worker,
-            Err(_) => {
-                self.cancellations
-                    .lock()
-                    .map_err(|_| ProtocolError::InternalAgentFailure)?
-                    .remove(&run_id);
-                return Err(ProtocolError::ProviderUnavailable);
+        let launch = Arc::new(WorkerLaunchGate::default());
+        let worker_launch = Arc::clone(&launch);
+        {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|_| ProtocolError::InternalAgentFailure)?;
+            if lifecycle.closed || lifecycle.active_runs.contains_key(&run_id) {
+                return Err(ProtocolError::InvalidRequest);
             }
-        };
-        match self.workers.lock() {
-            Ok(mut workers) => workers.push(worker),
-            Err(_) => {
-                cancellation.store(true, Ordering::Release);
-                let _ = worker.join();
-                if let Ok(mut cancellations) = self.cancellations.lock() {
-                    cancellations.remove(&run_id);
-                }
-                return Err(ProtocolError::InternalAgentFailure);
-            }
+            let worker_lifecycle = Arc::clone(&worker_lifecycle_state);
+            let worker = thread::Builder::new()
+                .name(format!("openai-response-{terminal_id}"))
+                .spawn(move || {
+                    worker_launch.wait();
+                    let outcome =
+                        stream_response(&client, &config, prepared, &*sink, &worker_cancellation);
+                    mark_run_completing(&worker_lifecycle, &worker_run_id);
+                    match outcome {
+                        Ok(completion) => {
+                            record_diagnostic(
+                                &diagnostics,
+                                &worker_run_id,
+                                completion.response_id,
+                                None,
+                                None,
+                            );
+                            let _ = terminal(
+                                &*sink,
+                                &worker_run_id,
+                                terminal_id,
+                                "succeeded",
+                                &completion.text,
+                                completion.usage,
+                            );
+                        }
+                        Err(failure) => {
+                            let status = if failure.error == ProtocolError::Cancelled {
+                                "cancelled_cleanly"
+                            } else {
+                                "failed"
+                            };
+                            record_diagnostic(
+                                &diagnostics,
+                                &worker_run_id,
+                                failure.response_id,
+                                failure.retry_after,
+                                Some(failure.error),
+                            );
+                            let _ = terminal(
+                                &*sink,
+                                &worker_run_id,
+                                terminal_id,
+                                status,
+                                failure.message,
+                                None,
+                            );
+                        }
+                    }
+                    remove_completed_run(&worker_lifecycle, &worker_run_id);
+                })
+                .map_err(|_| ProtocolError::ProviderUnavailable)?;
+            #[cfg(test)]
+            pause_start_registration_for_test();
+            lifecycle
+                .active_runs
+                .insert(run_id.clone(), RunPhase::Running(cancellation));
+            lifecycle.workers.push(worker);
         }
+        launch.open();
         Ok(RunAcceptance {
             run_id,
             accepted: true,
@@ -269,10 +351,15 @@ impl ProtocolPeer for OpenAiResponsesAdapter {
     fn cancel(&self, request: RunCancel) -> Result<CancelAcceptance, ProtocolError> {
         let run_id = request.run_id();
         let accepted = self
-            .cancellations
+            .lifecycle
             .lock()
             .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .active_runs
             .get(&run_id)
+            .and_then(|phase| match phase {
+                RunPhase::Running(cancellation) => Some(cancellation),
+                RunPhase::Completing => None,
+            })
             .map(|cancellation| {
                 cancellation.store(true, Ordering::Release);
                 true
@@ -282,28 +369,27 @@ impl ProtocolPeer for OpenAiResponsesAdapter {
     }
 
     fn shutdown(&self) -> Result<(), ProtocolError> {
-        {
-            let cancellations = self
-                .cancellations
+        let workers = {
+            let mut lifecycle = self
+                .lifecycle
                 .lock()
                 .map_err(|_| ProtocolError::InternalAgentFailure)?;
-            for cancellation in cancellations.values() {
-                cancellation.store(true, Ordering::Release);
+            lifecycle.closed = true;
+            for phase in lifecycle.active_runs.values() {
+                if let RunPhase::Running(cancellation) = phase {
+                    cancellation.store(true, Ordering::Release);
+                }
             }
-        }
-        let workers = std::mem::take(
-            &mut *self
-                .workers
-                .lock()
-                .map_err(|_| ProtocolError::InternalAgentFailure)?,
-        );
+            std::mem::take(&mut lifecycle.workers)
+        };
         let mut failed = false;
         for worker in workers {
             failed |= worker.join().is_err();
         }
-        self.cancellations
+        self.lifecycle
             .lock()
             .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .active_runs
             .clear();
         if failed {
             Err(ProtocolError::InternalAgentFailure)
@@ -325,7 +411,7 @@ fn stream_response(
     }
     let run_id = prepared.run_id.clone();
     let response = send_request(client, config, prepared)?;
-    let mut response_id = response_id_from_headers(response.headers());
+    let mut response_id = response_id_from_headers(response.headers(), config.api_key().secret());
     if !is_event_stream(response.headers()) {
         return Err(StreamFailure::from_error(
             ProtocolError::ProviderUnavailable,
@@ -345,7 +431,7 @@ fn stream_response(
             ));
         }
         let event = reader
-            .next_event()
+            .next_event(cancellation)
             .map_err(|error| StreamFailure::from_error(error, response_id.clone()))?;
         let Some(event) = event else {
             return Err(StreamFailure::from_error(
@@ -353,7 +439,7 @@ fn stream_response(
                 response_id,
             ));
         };
-        response_id = event_response_id(&event).or(response_id);
+        response_id = event_response_id(&event, config.api_key().secret()).or(response_id);
         let event_type = event.get("type").and_then(Value::as_str).ok_or_else(|| {
             StreamFailure::from_error(ProtocolError::InvalidJson, response_id.clone())
         })?;
@@ -430,7 +516,7 @@ fn send_request(
     } else {
         Err(StreamFailure {
             error: status_error(response.status()),
-            response_id: response_id_from_headers(response.headers()),
+            response_id: response_id_from_headers(response.headers(), config.api_key().secret()),
             retry_after: retry_after(response.headers()),
             message: "provider request failed",
         })
@@ -523,18 +609,26 @@ fn usage(event: &Value) -> Option<Usage> {
     })
 }
 
-fn event_response_id(event: &Value) -> Option<String> {
+fn event_response_id(event: &Value, api_key: &str) -> Option<String> {
     event
         .pointer("/response/id")
         .and_then(Value::as_str)
-        .map(str::to_owned)
+        .and_then(|value| sanitize_response_id(value, api_key))
 }
 
-fn response_id_from_headers(headers: &HeaderMap) -> Option<String> {
+fn response_id_from_headers(headers: &HeaderMap, api_key: &str) -> Option<String> {
     headers
         .get("x-request-id")
         .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
+        .and_then(|value| sanitize_response_id(value, api_key))
+}
+
+fn sanitize_response_id(value: &str, api_key: &str) -> Option<String> {
+    if value.contains(api_key) {
+        None
+    } else {
+        Some(value.to_owned())
+    }
 }
 
 fn is_event_stream(headers: &HeaderMap) -> bool {
@@ -633,5 +727,185 @@ impl SequenceMapper {
             .checked_add(1)
             .ok_or(ProtocolError::OutputLimitExceeded)?;
         Ok(sequence)
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::{
+        collections::BTreeSet,
+        sync::{mpsc, Arc},
+        thread,
+        time::Duration,
+    };
+
+    use local_agent_terminal_agent_protocol::{
+        ConnectionBinding, InboundDisposition, PeerEventSink, ProtocolCapabilities, ProtocolFrame,
+        ProtocolTrustTier, RunExecutionBinding,
+    };
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use url::Url;
+
+    use super::*;
+
+    #[test]
+    fn shutdown_waits_until_start_registers_its_worker() {
+        let adapter = Arc::new(test_adapter());
+        let (entered, wait_for_entry) = mpsc::channel();
+        let (release, wait_for_release) = mpsc::channel();
+        install_start_registration_gate(entered, wait_for_release);
+
+        let start_adapter = Arc::clone(&adapter);
+        let start = thread::spawn(move || {
+            start_adapter.start(test_run_start("racing"), Box::new(NoopSink))
+        });
+        wait_for_entry.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let shutdown_adapter = Arc::clone(&adapter);
+        let (shutdown_done, wait_for_shutdown) = mpsc::channel();
+        let shutdown = thread::spawn(move || {
+            shutdown_done.send(shutdown_adapter.shutdown()).unwrap();
+        });
+        let early_shutdown = wait_for_shutdown
+            .recv_timeout(Duration::from_millis(100))
+            .ok();
+
+        release.send(()).unwrap();
+        let start_result = start.join().unwrap();
+        let shutdown_result = early_shutdown.unwrap_or_else(|| {
+            wait_for_shutdown
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+        });
+        shutdown.join().unwrap();
+        let after_shutdown = adapter.start(test_run_start("after"), Box::new(NoopSink));
+        let cleanup = adapter.shutdown();
+
+        assert!(
+            early_shutdown.is_none(),
+            "shutdown drained before start registered its worker"
+        );
+        assert!(start_result.is_ok());
+        assert_eq!(shutdown_result, Ok(()));
+        assert_eq!(after_shutdown, Err(ProtocolError::InvalidRequest));
+        assert_eq!(cleanup, Ok(()));
+    }
+
+    fn install_start_registration_gate(entered: mpsc::Sender<()>, release: mpsc::Receiver<()>) {
+        let mut gate = START_REGISTRATION_GATE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap();
+        assert!(gate.is_none());
+        *gate = Some(StartRegistrationGate { entered, release });
+    }
+
+    fn test_adapter() -> OpenAiResponsesAdapter {
+        OpenAiResponsesAdapter::new(
+            OpenAiProviderConfig::for_loopback_test(
+                Url::parse("http://127.0.0.1:9/v1/responses").unwrap(),
+                crate::OpenAiApiKey::new("sk-unit-test").unwrap(),
+                Duration::from_secs(1),
+                Duration::from_millis(20),
+            )
+            .unwrap(),
+            PeerDescriptor {
+                binding: ConnectionBinding {
+                    connection_id: "connection-unit".to_owned(),
+                    agent_id: "agent-unit".to_owned(),
+                    manifest_digest:
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_owned(),
+                    executable_digest:
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .to_owned(),
+                    trust_tier: ProtocolTrustTier::CoreAdapter,
+                },
+                protocol_version: "1.0".to_owned(),
+                capabilities: ProtocolCapabilities {
+                    roles: BTreeSet::from(["critic".to_owned()]),
+                    skills: BTreeSet::from(["testing".to_owned()]),
+                    streaming: true,
+                    context_query: false,
+                    tool_requests: false,
+                    specialist_requests: false,
+                    max_concurrent_runs: 1,
+                    max_context_tokens: 1_024,
+                },
+            },
+        )
+        .unwrap()
+    }
+
+    fn test_run_start(run_id: &str) -> RunStart {
+        let context = b"unit prompt";
+        let generation_parameters = br#"{}"#;
+        let context_digest = format!("sha256:{:x}", Sha256::digest(context));
+        let generation_parameters_digest =
+            format!("sha256:{:x}", Sha256::digest(generation_parameters));
+        let frame = NdjsonCodec::default()
+            .decode(
+                &serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("core:start-{run_id}"),
+                    "method": "agent.run.start",
+                    "params": {
+                        "runId": run_id,
+                        "idempotencyKey": format!("key-{run_id}"),
+                        "taskId": "task-1",
+                        "role": "critic",
+                        "objective": "Test lifecycle serialization",
+                        "contextPackage": {
+                            "packageId": "context-1",
+                            "contentDigest": context_digest,
+                            "manifestRef": "artifact:context-1"
+                        },
+                        "permissions": { "contextQuery": false, "toolRequest": false, "writeFiles": false },
+                        "responseSchema": "agent-message.v1",
+                        "limits": {
+                            "deadline": "2026-07-23T13:30:00Z",
+                            "maxOutputTokens": 17,
+                            "maxToolRequests": 0
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        RunStart::new(
+            frame,
+            RunExecutionBinding {
+                provider_id: "openai".to_owned(),
+                model_id: "gpt-test-model".to_owned(),
+                generation_parameters: generation_parameters.to_vec(),
+                generation_parameters_digest,
+                effective_context: context.to_vec(),
+                effective_context_artifact_id: "artifact-context-1".to_owned(),
+                effective_context_digest: context_digest,
+                supersedes_run_id: None,
+            },
+        )
+        .unwrap()
+    }
+
+    struct NoopSink;
+
+    impl PeerEventSink for NoopSink {
+        fn receive(&self, frame: ProtocolFrame) -> Result<InboundDisposition, ProtocolError> {
+            Ok(InboundDisposition::Notification(frame))
+        }
+
+        fn request(&self, _frame: ProtocolFrame) -> Result<ProtocolFrame, ProtocolError> {
+            Err(ProtocolError::InternalAgentFailure)
+        }
+
+        fn receive_raw(&self, _bytes: &[u8]) -> Result<InboundDisposition, ProtocolError> {
+            Err(ProtocolError::InvalidRequest)
+        }
+
+        fn connection_lost(&self) -> Result<(), ProtocolError> {
+            Ok(())
+        }
     }
 }

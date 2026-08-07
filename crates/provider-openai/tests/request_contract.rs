@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::Duration,
 };
@@ -118,6 +118,53 @@ fn rejects_oversized_prompt_and_hosted_tools_before_contacting_the_provider() {
         ),
         Err(ProtocolError::InvalidRequest)
     );
+}
+
+#[test]
+fn rejects_redirects_without_contacting_the_redirect_target() {
+    for status in [307, 308] {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_url = Url::parse(&format!(
+            "http://{}/redirected",
+            target.local_addr().unwrap()
+        ))
+        .unwrap();
+        let server = RedirectServer::new(status, target_url);
+        let adapter = OpenAiResponsesAdapter::new(
+            OpenAiProviderConfig::for_loopback_test(
+                server.endpoint(),
+                OpenAiApiKey::new(API_KEY_CANARY).unwrap(),
+                Duration::from_secs(1),
+                Duration::from_millis(50),
+            )
+            .unwrap(),
+            descriptor(),
+        )
+        .unwrap();
+
+        adapter
+            .start(
+                run_start("gpt-test-model", b"redirect test", br#"{}"#),
+                Box::new(RecordingSink::default()),
+            )
+            .unwrap();
+        let configured_request = server.capture();
+        adapter.shutdown().unwrap();
+
+        assert_eq!(
+            configured_request.header("authorization"),
+            Some("Bearer sk-canary-must-never-escape-the-wire")
+        );
+        assert!(matches!(
+            target.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(
+            adapter.diagnostics()[0].error,
+            Some(ProtocolError::ProviderUnavailable)
+        );
+    }
 }
 
 fn loopback_config(endpoint: Url) -> OpenAiProviderConfig {
@@ -284,6 +331,49 @@ impl LoopbackServer {
             )
             .unwrap();
             stream.write_all(&body).unwrap();
+        });
+        Self {
+            endpoint,
+            captured,
+            worker: Some(worker),
+        }
+    }
+
+    fn endpoint(&self) -> Url {
+        self.endpoint.clone()
+    }
+
+    fn capture(self) -> CapturedRequest {
+        let request = self.captured.recv_timeout(Duration::from_secs(1)).unwrap();
+        self.worker.unwrap().join().unwrap();
+        request
+    }
+}
+
+struct RedirectServer {
+    endpoint: Url,
+    captured: mpsc::Receiver<CapturedRequest>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl RedirectServer {
+    fn new(status: u16, target: Url) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = Url::parse(&format!(
+            "http://{}/v1/responses",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let (sender, captured) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&stream);
+            sender.send(request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 {status} Redirect\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
         });
         Self {
             endpoint,
