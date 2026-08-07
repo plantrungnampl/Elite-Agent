@@ -59,23 +59,40 @@ struct ConnectionSlots {
 
 #[derive(Default)]
 struct ConnectionSlotState {
-    runs: BTreeMap<String, BTreeSet<String>>,
-    digests: BTreeMap<String, String>,
-    handshakes: BTreeMap<String, Arc<Mutex<()>>>,
-    poisoned_digests: BTreeSet<String>,
-    retired_connection_ids: BTreeSet<String>,
+    connections: BTreeMap<String, ConnectionLifecycle>,
 }
 
-impl ConnectionSlotState {
-    fn is_retired(&self, connection_digest: &str) -> bool {
-        self.digests.iter().any(|(connection_id, digest)| {
-            digest == connection_digest && self.retired_connection_ids.contains(connection_id)
-        })
-    }
+struct ConnectionLifecycle {
+    binding_digest: Option<String>,
+    handshake: Arc<Mutex<()>>,
+    generation: u64,
+    phase: ConnectionPhase,
+    capacity: u64,
+    reservations: BTreeSet<String>,
+}
 
-    fn is_unavailable(&self, connection_digest: &str) -> bool {
-        self.poisoned_digests.contains(connection_digest) || self.is_retired(connection_digest)
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionPhase {
+    Healthy,
+    Poisoned { token: u64 },
+    Retired,
+}
+
+#[derive(Clone)]
+struct ConnectionPoison {
+    connection_id: String,
+    binding_digest: String,
+    generation: u64,
+    token: u64,
+}
+
+enum ConnectionCleanup {
+    Poisoned(ConnectionPoison),
+    Retired {
+        connection_id: String,
+        binding_digest: String,
+        generation: u64,
+    },
 }
 
 impl ConnectionSlots {
@@ -87,85 +104,135 @@ impl ConnectionSlots {
         capacity: u64,
     ) -> Result<RunSlot, PortError> {
         let mut state = self.state.lock().map_err(|_| internal_failure())?;
-        if state.retired_connection_ids.contains(connection_id)
-            || state.poisoned_digests.contains(connection_digest)
-            || state
-                .digests
-                .get(connection_id)
-                .is_some_and(|digest| digest != connection_digest)
-        {
-            return Err(conflict());
+        if !state.connections.contains_key(connection_id) {
+            state.connections.insert(
+                connection_id.to_owned(),
+                ConnectionLifecycle {
+                    binding_digest: Some(connection_digest.to_owned()),
+                    handshake: Arc::new(Mutex::new(())),
+                    generation: 0,
+                    phase: ConnectionPhase::Healthy,
+                    capacity,
+                    reservations: BTreeSet::new(),
+                },
+            );
         }
-        state
-            .digests
-            .insert(connection_id.to_owned(), connection_digest.to_owned());
-        state
-            .handshakes
-            .entry(connection_id.to_owned())
-            .or_insert_with(|| Arc::new(Mutex::new(())));
-        let runs = state.runs.entry(connection_digest.to_owned()).or_default();
-        if u64::try_from(runs.len()).map_err(|_| internal_failure())? >= capacity
-            || !runs.insert(run_id.as_str().to_owned())
+        let lifecycle = state
+            .connections
+            .get_mut(connection_id)
+            .ok_or_else(internal_failure)?;
+        if lifecycle.phase != ConnectionPhase::Healthy
+            || lifecycle.binding_digest.as_deref() != Some(connection_digest)
+            || lifecycle.capacity != capacity
+            || u64::try_from(lifecycle.reservations.len()).map_err(|_| internal_failure())?
+                >= lifecycle.capacity
+            || !lifecycle.reservations.insert(run_id.as_str().to_owned())
         {
             return Err(conflict());
         }
         Ok(RunSlot(Arc::new(RunSlotInner {
             slots: Arc::clone(self),
+            connection_id: connection_id.to_owned(),
             connection_digest: connection_digest.to_owned(),
+            generation: lifecycle.generation,
             run_id: run_id.as_str().to_owned(),
             released: AtomicBool::new(false),
         })))
     }
 
-    fn release(&self, connection_digest: &str, run_id: &str) {
+    fn release(&self, slot: &RunSlotInner) {
         if let Ok(mut state) = self.state.lock() {
-            if state.is_unavailable(connection_digest) {
-                return;
-            }
-            if let Some(runs) = state.runs.get_mut(connection_digest) {
-                runs.remove(run_id);
-                if runs.is_empty() {
-                    state.runs.remove(connection_digest);
+            if let Some(lifecycle) = state.connections.get_mut(&slot.connection_id) {
+                if lifecycle.binding_digest.as_deref() == Some(&slot.connection_digest)
+                    && lifecycle.generation == slot.generation
+                    && lifecycle.phase == ConnectionPhase::Healthy
+                {
+                    lifecycle.reservations.remove(&slot.run_id);
                 }
             }
         }
     }
 
-    fn cleanup_connection(&self, connection_digest: &str) -> Result<(), PortError> {
+    fn complete_cleanup(&self, poison: &ConnectionPoison) -> Result<(), PortError> {
         let mut state = self.state.lock().map_err(|_| internal_failure())?;
-        state.runs.remove(connection_digest);
-        if !state.is_retired(connection_digest) {
-            state.poisoned_digests.remove(connection_digest);
+        let Some(lifecycle) = state.connections.get_mut(&poison.connection_id) else {
+            return Ok(());
+        };
+        if lifecycle.binding_digest.as_deref() == Some(&poison.binding_digest)
+            && lifecycle.generation == poison.generation
+            && lifecycle.phase
+                == (ConnectionPhase::Poisoned {
+                    token: poison.token,
+                })
+        {
+            lifecycle.generation = next_generation(lifecycle.generation)?;
+            lifecycle.phase = ConnectionPhase::Healthy;
+            lifecycle.reservations.clear();
         }
         Ok(())
     }
 
-    fn poison_connection(&self, connection_digest: &str) -> Result<(), PortError> {
+    fn poison_connection(&self, connection_digest: &str) -> Result<ConnectionPoison, PortError> {
         let handshake = self.handshake_for_digest(connection_digest)?;
         let _handshake = handshake.lock().map_err(|_| internal_failure())?;
         self.mark_poisoned(connection_digest)
     }
 
-    fn mark_poisoned(&self, connection_digest: &str) -> Result<(), PortError> {
+    fn mark_poisoned(&self, connection_digest: &str) -> Result<ConnectionPoison, PortError> {
         let mut state = self.state.lock().map_err(|_| internal_failure())?;
-        if !state.is_retired(connection_digest) {
-            state.poisoned_digests.insert(connection_digest.to_owned());
+        let (connection_id, lifecycle) = state
+            .connections
+            .iter_mut()
+            .find(|(_, lifecycle)| lifecycle.binding_digest.as_deref() == Some(connection_digest))
+            .ok_or_else(internal_failure)?;
+        match lifecycle.phase {
+            ConnectionPhase::Healthy => {
+                lifecycle.generation = next_generation(lifecycle.generation)?;
+                lifecycle.phase = ConnectionPhase::Poisoned {
+                    token: lifecycle.generation,
+                };
+                lifecycle.reservations.clear();
+            }
+            ConnectionPhase::Poisoned { .. } => {}
+            ConnectionPhase::Retired => return Err(conflict()),
         }
-        Ok(())
+        let ConnectionPhase::Poisoned { token } = lifecycle.phase else {
+            return Err(internal_failure());
+        };
+        Ok(ConnectionPoison {
+            connection_id: connection_id.clone(),
+            binding_digest: connection_digest.to_owned(),
+            generation: lifecycle.generation,
+            token,
+        })
     }
 
     fn retire_connection(&self, connection_id: &str) -> Result<(), PortError> {
         let handshake = {
             let mut state = self.state.lock().map_err(|_| internal_failure())?;
-            state
-                .retired_connection_ids
-                .insert(connection_id.to_owned());
-            Arc::clone(
-                state
-                    .handshakes
-                    .entry(connection_id.to_owned())
-                    .or_insert_with(|| Arc::new(Mutex::new(()))),
-            )
+            if !state.connections.contains_key(connection_id) {
+                state.connections.insert(
+                    connection_id.to_owned(),
+                    ConnectionLifecycle {
+                        binding_digest: None,
+                        handshake: Arc::new(Mutex::new(())),
+                        generation: 1,
+                        phase: ConnectionPhase::Retired,
+                        capacity: 0,
+                        reservations: BTreeSet::new(),
+                    },
+                );
+            }
+            let lifecycle = state
+                .connections
+                .get_mut(connection_id)
+                .ok_or_else(internal_failure)?;
+            if lifecycle.phase != ConnectionPhase::Retired {
+                lifecycle.generation = next_generation(lifecycle.generation)?;
+                lifecycle.phase = ConnectionPhase::Retired;
+                lifecycle.reservations.clear();
+            }
+            Arc::clone(&lifecycle.handshake)
         };
         drop(handshake.lock().map_err(|_| internal_failure())?);
         Ok(())
@@ -173,43 +240,142 @@ impl ConnectionSlots {
 
     fn start_handshake<T>(
         &self,
-        connection_id: &str,
-        connection_digest: &str,
+        slot: &RunSlot,
         start: impl FnOnce() -> T,
     ) -> Result<T, PortError> {
         let handshake = {
             let state = self.state.lock().map_err(|_| internal_failure())?;
-            if state.retired_connection_ids.contains(connection_id)
-                || state.poisoned_digests.contains(connection_digest)
-            {
+            let lifecycle = state
+                .connections
+                .get(&slot.0.connection_id)
+                .ok_or_else(internal_failure)?;
+            if !slot_matches(lifecycle, &slot.0) {
                 return Err(conflict());
             }
-            state
-                .handshakes
-                .get(connection_id)
-                .cloned()
-                .ok_or_else(internal_failure)?
+            Arc::clone(&lifecycle.handshake)
         };
         let _handshake = handshake.lock().map_err(|_| internal_failure())?;
         {
             let state = self.state.lock().map_err(|_| internal_failure())?;
-            if state.retired_connection_ids.contains(connection_id)
-                || state.poisoned_digests.contains(connection_digest)
-            {
+            let lifecycle = state
+                .connections
+                .get(&slot.0.connection_id)
+                .ok_or_else(internal_failure)?;
+            if !slot_matches(lifecycle, &slot.0) {
                 return Err(conflict());
             }
         }
         Ok(start())
     }
 
+    fn interrupt<T>(
+        &self,
+        connection_digest: &str,
+        action: impl FnOnce(&ConnectionCleanup) -> Result<T, PortError>,
+    ) -> Result<T, PortError> {
+        let handshake = self.handshake_for_digest(connection_digest)?;
+        let _handshake = handshake.lock().map_err(|_| internal_failure())?;
+        let cleanup = self.cleanup_token(connection_digest)?;
+        action(&cleanup)
+    }
+
+    fn retry_poison<T>(
+        &self,
+        poison: &ConnectionPoison,
+        action: impl FnOnce() -> Result<T, PortError>,
+    ) -> Result<Option<T>, PortError> {
+        let handshake = {
+            let state = self.state.lock().map_err(|_| internal_failure())?;
+            let Some(lifecycle) = state.connections.get(&poison.connection_id) else {
+                return Ok(None);
+            };
+            Arc::clone(&lifecycle.handshake)
+        };
+        let _handshake = handshake.lock().map_err(|_| internal_failure())?;
+        {
+            let state = self.state.lock().map_err(|_| internal_failure())?;
+            let Some(lifecycle) = state.connections.get(&poison.connection_id) else {
+                return Ok(None);
+            };
+            if lifecycle.binding_digest.as_deref() != Some(&poison.binding_digest)
+                || lifecycle.generation != poison.generation
+                || lifecycle.phase
+                    != (ConnectionPhase::Poisoned {
+                        token: poison.token,
+                    })
+            {
+                return Ok(None);
+            }
+        }
+        action().map(Some)
+    }
+
+    fn cleanup_token(&self, connection_digest: &str) -> Result<ConnectionCleanup, PortError> {
+        let mut state = self.state.lock().map_err(|_| internal_failure())?;
+        let (connection_id, lifecycle) = state
+            .connections
+            .iter_mut()
+            .find(|(_, lifecycle)| lifecycle.binding_digest.as_deref() == Some(connection_digest))
+            .ok_or_else(internal_failure)?;
+        match lifecycle.phase {
+            ConnectionPhase::Healthy => {
+                lifecycle.generation = next_generation(lifecycle.generation)?;
+                lifecycle.phase = ConnectionPhase::Poisoned {
+                    token: lifecycle.generation,
+                };
+                lifecycle.reservations.clear();
+                Ok(ConnectionCleanup::Poisoned(ConnectionPoison {
+                    connection_id: connection_id.clone(),
+                    binding_digest: connection_digest.to_owned(),
+                    generation: lifecycle.generation,
+                    token: lifecycle.generation,
+                }))
+            }
+            ConnectionPhase::Poisoned { token } => {
+                Ok(ConnectionCleanup::Poisoned(ConnectionPoison {
+                    connection_id: connection_id.clone(),
+                    binding_digest: connection_digest.to_owned(),
+                    generation: lifecycle.generation,
+                    token,
+                }))
+            }
+            ConnectionPhase::Retired => Ok(ConnectionCleanup::Retired {
+                connection_id: connection_id.clone(),
+                binding_digest: connection_digest.to_owned(),
+                generation: lifecycle.generation,
+            }),
+        }
+    }
+
+    fn complete_interruption(&self, cleanup: &ConnectionCleanup) -> Result<(), PortError> {
+        match cleanup {
+            ConnectionCleanup::Poisoned(poison) => self.complete_cleanup(poison),
+            ConnectionCleanup::Retired {
+                connection_id,
+                binding_digest,
+                generation,
+            } => {
+                let mut state = self.state.lock().map_err(|_| internal_failure())?;
+                if let Some(lifecycle) = state.connections.get_mut(connection_id) {
+                    if lifecycle.binding_digest.as_deref() == Some(binding_digest)
+                        && lifecycle.generation == *generation
+                        && lifecycle.phase == ConnectionPhase::Retired
+                    {
+                        lifecycle.reservations.clear();
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn handshake_for_digest(&self, connection_digest: &str) -> Result<Arc<Mutex<()>>, PortError> {
         let state = self.state.lock().map_err(|_| internal_failure())?;
         state
-            .digests
-            .iter()
-            .find(|(_, digest)| digest.as_str() == connection_digest)
-            .and_then(|(connection_id, _)| state.handshakes.get(connection_id))
-            .cloned()
+            .connections
+            .values()
+            .find(|lifecycle| lifecycle.binding_digest.as_deref() == Some(connection_digest))
+            .map(|lifecycle| Arc::clone(&lifecycle.handshake))
             .ok_or_else(internal_failure)
     }
 
@@ -218,20 +384,41 @@ impl ConnectionSlots {
             .state
             .lock()
             .map_err(|_| internal_failure())?
-            .digests
+            .connections
             .values()
-            .cloned()
+            .filter_map(|lifecycle| lifecycle.binding_digest.clone())
             .collect())
     }
 
-    fn poisoned_digests(&self) -> Result<BTreeSet<String>, PortError> {
-        Ok(self
-            .state
-            .lock()
-            .map_err(|_| internal_failure())?
-            .poisoned_digests
-            .clone())
+    fn poisoned_connections(&self) -> Result<Vec<ConnectionPoison>, PortError> {
+        let state = self.state.lock().map_err(|_| internal_failure())?;
+        Ok(state
+            .connections
+            .iter()
+            .filter_map(|(connection_id, lifecycle)| {
+                let ConnectionPhase::Poisoned { token } = lifecycle.phase else {
+                    return None;
+                };
+                Some(ConnectionPoison {
+                    connection_id: connection_id.clone(),
+                    binding_digest: lifecycle.binding_digest.clone()?,
+                    generation: lifecycle.generation,
+                    token,
+                })
+            })
+            .collect())
     }
+}
+
+fn next_generation(generation: u64) -> Result<u64, PortError> {
+    generation.checked_add(1).ok_or_else(internal_failure)
+}
+
+fn slot_matches(lifecycle: &ConnectionLifecycle, slot: &RunSlotInner) -> bool {
+    lifecycle.binding_digest.as_deref() == Some(&slot.connection_digest)
+        && lifecycle.generation == slot.generation
+        && lifecycle.phase == ConnectionPhase::Healthy
+        && lifecycle.reservations.contains(&slot.run_id)
 }
 
 #[derive(Clone)]
@@ -239,7 +426,9 @@ struct RunSlot(Arc<RunSlotInner>);
 
 struct RunSlotInner {
     slots: Arc<ConnectionSlots>,
+    connection_id: String,
     connection_digest: String,
+    generation: u64,
     run_id: String,
     released: AtomicBool,
 }
@@ -247,9 +436,7 @@ struct RunSlotInner {
 impl RunSlot {
     fn release(&self) {
         if !self.0.released.swap(true, Ordering::AcqRel) {
-            self.0
-                .slots
-                .release(&self.0.connection_digest, &self.0.run_id);
+            self.0.slots.release(&self.0);
         }
     }
 }
@@ -257,7 +444,7 @@ impl RunSlot {
 impl Drop for RunSlotInner {
     fn drop(&mut self) {
         if !self.released.load(Ordering::Acquire) {
-            self.slots.release(&self.connection_digest, &self.run_id);
+            self.slots.release(self);
         }
     }
 }
@@ -366,6 +553,7 @@ impl ProtocolAgentRuntime {
     }
 
     pub fn check_timeouts(&self) -> Result<Vec<RunId>, PortError> {
+        let poisoned = self.slots.poisoned_connections()?;
         let now = match self.now() {
             Ok(now) => now,
             Err(error) => {
@@ -384,8 +572,8 @@ impl ProtocolAgentRuntime {
         };
         let mut resolved = Vec::new();
         let mut retry_error = None;
-        for digest in self.slots.poisoned_digests()? {
-            match self.interrupt_connection(&digest, &now.text) {
+        for poison in poisoned {
+            match self.retry_interruption(&poison, &now.text) {
                 Ok(interrupted) => resolved.extend(interrupted),
                 Err(error) => {
                     retry_error.get_or_insert(error);
@@ -567,11 +755,9 @@ impl ProtocolAgentRuntime {
             },
         )
         .map_err(protocol_port_error)?;
-        let started = self.slots.start_handshake(
-            &request.connection.connection_id,
-            request.connection.binding_digest.as_str(),
-            || peer.start(run_start, Box::new(sink)),
-        );
+        let started = self
+            .slots
+            .start_handshake(&slot, || peer.start(run_start, Box::new(sink)));
         let acceptance = match started {
             Err(error) => {
                 gate.fail();
@@ -833,8 +1019,12 @@ impl ProtocolAgentRuntime {
 
     fn cleanup_unstarted_run(&self, request: &BoundAgentRunRequest) -> Result<(), PortError> {
         let now = self.now()?;
-        self.interrupt_connection(request.connection.binding_digest.as_str(), &now.text)?;
-        Ok(())
+        self.persist_runtime_terminal(
+            request,
+            AgentRunStatus::Interrupted,
+            "stale connection generation",
+            now.timestamp,
+        )
     }
 
     fn interrupt_connection(&self, digest: &str, at: &str) -> Result<Vec<RunId>, PortError> {
@@ -845,6 +1035,23 @@ impl ProtocolAgentRuntime {
             self.slots.as_ref(),
             digest,
             at,
+            None,
+        )
+    }
+
+    fn retry_interruption(
+        &self,
+        poison: &ConnectionPoison,
+        at: &str,
+    ) -> Result<Vec<RunId>, PortError> {
+        interrupt_connection_state(
+            self.store.as_ref(),
+            self.active_runs.as_ref(),
+            self.sessions.as_ref(),
+            self.slots.as_ref(),
+            &poison.binding_digest,
+            at,
+            Some(poison),
         )
     }
 
@@ -1012,6 +1219,7 @@ impl RuntimeSink {
             self.slots.as_ref(),
             digest,
             &now.text,
+            None,
         )
         .map(|_| ())
         .map_err(|_| ProtocolError::InternalAgentFailure)
@@ -1025,21 +1233,29 @@ fn interrupt_connection_state(
     slots: &ConnectionSlots,
     digest: &str,
     at: &str,
+    expected_poison: Option<&ConnectionPoison>,
 ) -> Result<Vec<RunId>, PortError> {
-    let handshake = slots.handshake_for_digest(digest)?;
-    let _handshake = handshake.lock().map_err(|_| internal_failure())?;
-    slots.mark_poisoned(digest)?;
-    let interrupted = store.interrupt_connection(digest, at)?;
-    active_runs
-        .lock()
-        .map_err(|_| internal_failure())?
-        .retain(|_, run| run.request.connection.binding_digest.as_str() != digest);
-    sessions
-        .lock()
-        .map_err(|_| internal_failure())?
-        .remove(digest);
-    slots.cleanup_connection(digest)?;
-    Ok(interrupted)
+    let cleanup = |cleanup: &ConnectionCleanup| {
+        let interrupted = store.interrupt_connection(digest, at)?;
+        active_runs
+            .lock()
+            .map_err(|_| internal_failure())?
+            .retain(|_, run| run.request.connection.binding_digest.as_str() != digest);
+        sessions
+            .lock()
+            .map_err(|_| internal_failure())?
+            .remove(digest);
+        slots.complete_interruption(cleanup)?;
+        Ok(interrupted)
+    };
+    if let Some(poison) = expected_poison {
+        return Ok(slots
+            .retry_poison(poison, || {
+                cleanup(&ConnectionCleanup::Poisoned(poison.clone()))
+            })?
+            .unwrap_or_default());
+    }
+    slots.interrupt(digest, cleanup)
 }
 
 impl PeerEventSink for RuntimeSink {
@@ -1068,6 +1284,7 @@ impl PeerEventSink for RuntimeSink {
             Err(_) => {
                 self.slots
                     .poison_connection(self.request.connection.binding_digest.as_str())
+                    .map(|_| ())
                     .map_err(|_| ProtocolError::InternalAgentFailure)?;
                 return Err(ProtocolError::InternalAgentFailure);
             }
@@ -1614,7 +1831,7 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
-    fn retirement_keeps_a_reservation_until_durable_cleanup() {
+    fn retirement_invalidates_old_reservations_and_remains_permanent() {
         let slots = Arc::new(ConnectionSlots::default());
         let run_id = RunId::new("run-1").unwrap();
         let slot = slots
@@ -1624,15 +1841,25 @@ mod tests {
 
         drop(slot);
 
+        let state = slots.state.lock().unwrap();
+        let lifecycle = state.connections.get("connection-1").unwrap();
+        assert_eq!(lifecycle.phase, ConnectionPhase::Retired);
+        assert!(lifecycle.reservations.is_empty());
+        drop(state);
         assert!(slots
-            .state
-            .lock()
-            .unwrap()
-            .runs
-            .get("digest-1")
-            .is_some_and(|runs| runs.contains("run-1")));
-        slots.cleanup_connection("digest-1").unwrap();
-        assert!(!slots.state.lock().unwrap().runs.contains_key("digest-1"));
+            .reserve("connection-1", "digest-1", &RunId::new("run-2").unwrap(), 1,)
+            .is_err());
+    }
+
+    #[test]
+    fn retirement_before_a_first_reservation_remains_permanent() {
+        let slots = Arc::new(ConnectionSlots::default());
+
+        slots.retire_connection("connection-1").unwrap();
+
+        assert!(slots
+            .reserve("connection-1", "digest-1", &RunId::new("run-1").unwrap(), 1,)
+            .is_err());
     }
 
     #[test]
@@ -1644,8 +1871,9 @@ mod tests {
         let (start_entered, start_entered_rx) = mpsc::channel();
         let (release_start, release_start_rx) = mpsc::channel();
         let starting_slots = Arc::clone(&slots);
+        let starting_slot = slot.clone();
         let starting = thread::spawn(move || {
-            starting_slots.start_handshake("connection-1", "digest-1", || {
+            starting_slots.start_handshake(&starting_slot, || {
                 start_entered.send(()).unwrap();
                 release_start_rx.recv().unwrap();
             })
@@ -1665,20 +1893,71 @@ mod tests {
         if matches!(poisoned_during_start, Err(mpsc::RecvTimeoutError::Timeout)) {
             poisoned_rx.recv().unwrap();
         }
-        poisoning.join().unwrap().unwrap();
+        let poison = poisoning.join().unwrap().unwrap();
 
         assert!(matches!(
             poisoned_during_start,
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
         drop(slot);
-        assert!(slots
-            .state
-            .lock()
-            .unwrap()
-            .runs
-            .get("digest-1")
-            .is_some_and(|runs| runs.contains("run-1")));
-        slots.cleanup_connection("digest-1").unwrap();
+        slots.complete_cleanup(&poison).unwrap();
+        slots
+            .reserve("connection-1", "digest-1", &RunId::new("run-2").unwrap(), 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn stale_poison_retry_does_not_mutate_a_new_generation() {
+        let slots = Arc::new(ConnectionSlots::default());
+        let stale_slot = slots
+            .reserve("connection-1", "digest-1", &RunId::new("run-1").unwrap(), 1)
+            .unwrap();
+        let poison_a = slots.poison_connection("digest-1").unwrap();
+        let poison_b = poison_a.clone();
+        let store_calls = Arc::new(AtomicU64::new(0));
+        let (cleanup_entered, cleanup_entered_rx) = mpsc::channel();
+        let (release_cleanup, release_cleanup_rx) = mpsc::channel();
+        let cleanup_slots = Arc::clone(&slots);
+        let cleanup_store_calls = Arc::clone(&store_calls);
+        let cleanup = thread::spawn(move || {
+            cleanup_slots.retry_poison(&poison_a, || {
+                cleanup_entered.send(()).unwrap();
+                release_cleanup_rx.recv().unwrap();
+                cleanup_store_calls.fetch_add(1, Ordering::Relaxed);
+                cleanup_slots.complete_cleanup(&poison_a)
+            })
+        });
+        cleanup_entered_rx.recv().unwrap();
+        release_cleanup.send(()).unwrap();
+        assert_eq!(cleanup.join().unwrap().unwrap(), Some(()));
+
+        let current_slot = slots
+            .reserve("connection-1", "digest-1", &RunId::new("run-2").unwrap(), 1)
+            .unwrap();
+        assert_eq!(
+            slots
+                .retry_poison(&poison_b, || {
+                    store_calls.fetch_add(1, Ordering::Relaxed);
+                    slots.complete_cleanup(&poison_b)
+                })
+                .unwrap(),
+            None
+        );
+        assert_eq!(store_calls.load(Ordering::Relaxed), 1);
+
+        drop(stale_slot);
+        let capacity_error =
+            match slots.reserve("connection-1", "digest-1", &RunId::new("run-3").unwrap(), 1) {
+                Ok(_) => panic!("current generation must keep its reservation"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            capacity_error.safe_classification(),
+            SafeErrorClassification::Conflict
+        );
+        drop(current_slot);
+        slots
+            .reserve("connection-1", "digest-1", &RunId::new("run-3").unwrap(), 1)
+            .unwrap();
     }
 }

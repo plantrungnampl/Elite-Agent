@@ -412,6 +412,45 @@ fn retirement_prevents_a_reserved_start_from_reaching_the_shutdown_peer() {
 }
 
 #[test]
+fn poison_cleanup_invalidates_a_start_blocked_before_durable_create() {
+    let store = Arc::new(RecordingStore::default());
+    let creation_gate = store.block_creation("run-stale");
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let runtime = Arc::new(runtime_with_protocol_peer(
+        store.clone(),
+        Arc::new(ManualClock::new(1_800_000_000)),
+        peer.clone(),
+    ));
+    runtime.start_run(run_request("run-active", None)).unwrap();
+    let stale_runtime = Arc::clone(&runtime);
+    let stale_start =
+        thread::spawn(move || stale_runtime.start_run(run_request("run-stale", None)));
+    creation_gate.wait_until_entered();
+
+    peer.connection_lost(0).unwrap();
+    runtime.start_run(run_request("run-current", None)).unwrap();
+    creation_gate.release();
+
+    assert_eq!(
+        stale_start
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(store.status("run-stale"), Some(AgentRunStatus::Interrupted));
+    assert_eq!(store.status("run-current"), Some(AgentRunStatus::Running));
+    assert_eq!(peer.start_count(), 2);
+    runtime
+        .start_run(run_request("run-current-2", None))
+        .unwrap();
+    assert_start_conflict_without_row(&runtime, &store, "run-over-capacity");
+}
+
+#[test]
 fn compensation_shutdown_retires_connection_after_durable_cleanup() {
     let store = Arc::new(RecordingStore::default());
     let peer = Arc::new(MultiRunPeer::new(peer_descriptor()));
@@ -833,6 +872,63 @@ fn clock_recovery_retries_poison_without_waiting_for_a_session_timeout() {
 }
 
 #[test]
+fn two_retries_for_one_poison_do_not_interrupt_post_recovery_work() {
+    let store = Arc::new(RecordingStore::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let runtime = Arc::new(runtime_with_protocol_peer(
+        store.clone(),
+        clock.clone(),
+        peer.clone(),
+    ));
+    runtime.start_run(run_request("run-1", None)).unwrap();
+    clock.fail();
+    runtime.check_timeouts().unwrap_err();
+    clock.recover();
+
+    let interrupt_gate = store.block_interrupt();
+    let (retry_a_done, retry_a_done_rx) = mpsc::channel();
+    let retry_a_runtime = Arc::clone(&runtime);
+    let retry_a = thread::spawn(move || {
+        retry_a_done.send(retry_a_runtime.check_timeouts()).unwrap();
+    });
+    interrupt_gate.wait_until_entered();
+    let retry_b_clock_gate = clock.block_next_call();
+    let (retry_b_done, retry_b_done_rx) = mpsc::channel();
+    let retry_b_runtime = Arc::clone(&runtime);
+    let retry_b = thread::spawn(move || {
+        retry_b_done.send(retry_b_runtime.check_timeouts()).unwrap();
+    });
+    retry_b_clock_gate.wait_until_entered();
+
+    interrupt_gate.release();
+    assert_eq!(
+        retry_a_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retry A must finish after durable cleanup")
+            .unwrap(),
+        vec![run_id("run-1")]
+    );
+    retry_a.join().unwrap();
+    runtime.start_run(run_request("run-2", None)).unwrap();
+    retry_b_clock_gate.release();
+
+    assert!(retry_b_done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("stale retry B must no-op")
+        .unwrap()
+        .is_empty());
+    retry_b.join().unwrap();
+    assert_eq!(store.interrupt_count(), 1);
+    assert_eq!(store.status("run-2"), Some(AgentRunStatus::Running));
+    assert_eq!(peer.start_count(), 2);
+    runtime.start_run(run_request("run-3", None)).unwrap();
+    assert_eq!(peer.start_count(), 3);
+}
+
+#[test]
 fn connection_loss_store_failure_is_retried_by_check_timeouts() {
     let store = Arc::new(RecordingStore::default());
     let interrupt_gate = store.block_interrupt();
@@ -860,7 +956,7 @@ fn connection_loss_store_failure_is_retried_by_check_timeouts() {
 }
 
 #[test]
-fn rejected_handshake_cleanup_failure_preserves_conflict_and_poisoned_capacity() {
+fn rejected_handshake_preserves_conflict_and_poisoned_capacity() {
     let store = Arc::new(RecordingStore::default());
     let creation_gate = store.block_creation("run-2");
     let clock = Arc::new(ManualClock::new(1_800_000_000));
@@ -890,14 +986,11 @@ fn rejected_handshake_cleanup_failure_preserves_conflict_and_poisoned_capacity()
         SafeErrorClassification::Conflict
     );
     assert_eq!(peer.start_count(), 1);
-    assert_eq!(store.status("run-2"), Some(AgentRunStatus::Created));
+    assert_eq!(store.status("run-2"), Some(AgentRunStatus::Interrupted));
     assert_start_conflict_without_row(&runtime, &store, "run-3");
 
     store.allow_interrupt();
-    assert_eq!(
-        runtime.check_timeouts().unwrap(),
-        vec![run_id("run-1"), run_id("run-2")]
-    );
+    assert_eq!(runtime.check_timeouts().unwrap(), vec![run_id("run-1")]);
     runtime.start_run(run_request("run-4", None)).unwrap();
     assert_eq!(peer.start_count(), 2);
 }
@@ -1587,6 +1680,7 @@ struct RecordingStore {
     fail_terminal: Mutex<bool>,
     fail_start: Mutex<Option<StartStoreFailure>>,
     fail_interrupt: Mutex<bool>,
+    interrupt_calls: Mutex<usize>,
     interrupt_gate: Mutex<Option<Arc<AcceptanceGate>>>,
     creation_gate: Mutex<Option<(String, Arc<AcceptanceGate>)>>,
     acceptance_gate: Mutex<Option<Arc<AcceptanceGate>>>,
@@ -1694,6 +1788,10 @@ impl RecordingStore {
         *self.fail_interrupt.lock().unwrap() = false;
     }
 
+    fn interrupt_count(&self) -> usize {
+        *self.interrupt_calls.lock().unwrap()
+    }
+
     fn block_interrupt(&self) -> Arc<AcceptanceGate> {
         let gate = Arc::new(AcceptanceGate::new());
         *self.interrupt_gate.lock().unwrap() = Some(Arc::clone(&gate));
@@ -1722,11 +1820,6 @@ impl AgentRunStore for RecordingStore {
         &self,
         request: &BoundAgentRunRequest,
     ) -> Result<AgentRunSnapshot, PortError> {
-        let snapshot = AgentRunSnapshot::created(request.clone()).map_err(|_| invalid_input())?;
-        self.runs
-            .lock()
-            .unwrap()
-            .insert(request.run_id.as_str().to_owned(), snapshot.clone());
         let creation_gate = self
             .creation_gate
             .lock()
@@ -1737,6 +1830,11 @@ impl AgentRunStore for RecordingStore {
         if let Some((_, gate)) = creation_gate {
             gate.block();
         }
+        let snapshot = AgentRunSnapshot::created(request.clone()).map_err(|_| invalid_input())?;
+        self.runs
+            .lock()
+            .unwrap()
+            .insert(request.run_id.as_str().to_owned(), snapshot.clone());
         Ok(snapshot)
     }
 
@@ -1781,6 +1879,7 @@ impl AgentRunStore for RecordingStore {
         connection_digest: &str,
         at: &str,
     ) -> Result<Vec<RunId>, PortError> {
+        *self.interrupt_calls.lock().unwrap() += 1;
         if let Some(gate) = self.interrupt_gate.lock().unwrap().clone() {
             gate.block();
         }
@@ -1809,6 +1908,7 @@ impl AgentRunStore for RecordingStore {
 struct ManualClock {
     seconds: Mutex<i64>,
     fail: Mutex<bool>,
+    next_call_gate: Mutex<Option<Arc<AcceptanceGate>>>,
 }
 
 impl ManualClock {
@@ -1816,6 +1916,7 @@ impl ManualClock {
         Self {
             seconds: Mutex::new(seconds),
             fail: Mutex::new(false),
+            next_call_gate: Mutex::new(None),
         }
     }
 
@@ -1830,10 +1931,20 @@ impl ManualClock {
     fn recover(&self) {
         *self.fail.lock().unwrap() = false;
     }
+
+    fn block_next_call(&self) -> Arc<AcceptanceGate> {
+        let gate = Arc::new(AcceptanceGate::new());
+        *self.next_call_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
 }
 
 impl Clock for ManualClock {
     fn now_utc(&self) -> Result<String, PortError> {
+        let gate = self.next_call_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.block();
+        }
         if *self.fail.lock().unwrap() {
             return Err(internal_failure());
         }

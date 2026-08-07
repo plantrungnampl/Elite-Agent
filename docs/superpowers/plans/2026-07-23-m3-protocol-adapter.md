@@ -347,6 +347,49 @@ git add Cargo.toml Cargo.lock crates/agent-runtime
 git commit -m "feat: add conformant agent runtime"
 ```
 
+## Task 6A: Version the agent connection lifecycle
+
+**Files:**
+
+- Modify: `crates/agent-runtime/src/runtime.rs`
+- Modify: `crates/agent-runtime/tests/runtime_contract.rs`
+
+**Lifecycle contract:**
+
+Every reserved start and every poisoned-retry snapshot carries the connection
+lifecycle generation that created it. Poison, durable cleanup, and retirement
+advance or invalidate that generation. A stale reservation cannot dispatch
+after cleanup, and a stale retry cannot re-poison or interrupt post-recovery
+work.
+
+- [x] **Step 1 - Write failing generation-race tests**
+
+Use deterministic barriers for: a start reserved before poison but blocked in
+durable creation; and two retries that snapshot one poison while the first
+retry cleans up and a new run is admitted before the second proceeds.
+
+- [x] **Step 2 - Implement one generation-tagged lifecycle state**
+
+Keep capacity, healthy/poisoned/retired phase, poison token, and reservation
+generation under the existing connection-state lock. Revalidate the captured
+generation under the start handshake immediately before peer dispatch. Retry
+only the exact poison generation observed by the caller. Slot release must be
+generation-aware so stale drops cannot decrement current capacity.
+
+- [x] **Step 3 - Verify, review, and commit**
+
+```powershell
+cargo test -p local-agent-terminal-agent-runtime --test runtime_contract --test fake_conformance
+cargo test -p local-agent-terminal-agent-protocol --test conformance
+cargo test -p local-agent-terminal-storage-sqlite --test agent_store
+cargo fmt --all -- --check
+cargo clippy -p local-agent-terminal-agent-runtime --all-targets --all-features -- -D warnings
+cargo check --workspace --all-targets
+node scripts/check-architecture.mjs
+git add crates/agent-runtime docs/superpowers/plans/2026-07-23-m3-protocol-adapter.md
+git commit -m "fix: version agent connection lifecycle"
+```
+
 ## Task 7: Add the OpenAI Responses API core adapter
 
 **Files:**
