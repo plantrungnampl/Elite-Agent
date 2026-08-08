@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use local_agent_terminal_domain::{
@@ -886,16 +888,6 @@ fn generated_terminal_states_never_leave_terminality_without_a_declared_recovery
 #[test]
 fn domain_crate_declares_only_pure_data_dependencies() {
     const MANIFEST: &str = include_str!("../Cargo.toml");
-    const SOURCES: [&str; 8] = [
-        include_str!("../src/agent.rs"),
-        include_str!("../src/lib.rs"),
-        include_str!("../src/event.rs"),
-        include_str!("../src/identity.rs"),
-        include_str!("../src/policy.rs"),
-        include_str!("../src/tool.rs"),
-        include_str!("../src/workflow.rs"),
-        include_str!("../src/workspace.rs"),
-    ];
 
     let dependency_section = MANIFEST
         .split_once("[dependencies]")
@@ -915,7 +907,10 @@ fn domain_crate_declares_only_pure_data_dependencies() {
         BTreeSet::from(["serde", "serde_json", "serde_json_canonicalizer", "sha2"])
     );
 
-    for source in SOURCES {
+    for source_path in domain_source_paths() {
+        let source = fs::read_to_string(&source_path).unwrap_or_else(|error| {
+            panic!("read domain source {}: {error}", source_path.display())
+        });
         let lowercase = source.to_ascii_lowercase();
         for forbidden in [
             "tauri",
@@ -934,4 +929,64 @@ fn domain_crate_declares_only_pure_data_dependencies() {
             );
         }
     }
+}
+
+fn domain_source_paths() -> Vec<PathBuf> {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut paths = Vec::new();
+    collect_domain_source_paths(&source_root, &mut paths).unwrap_or_else(|error| {
+        panic!("discover domain sources {}: {error}", source_root.display())
+    });
+    paths.sort();
+    paths
+}
+
+fn collect_domain_source_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(directory)?;
+    assert_supported_source_entry(directory, &metadata);
+    assert!(
+        metadata.is_dir(),
+        "domain source root is not a directory: {}",
+        directory.display()
+    );
+
+    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        assert_supported_source_entry(&path, &metadata);
+        if metadata.is_dir() {
+            collect_domain_source_paths(&path, paths)?;
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn assert_supported_source_entry(path: &Path, metadata: &fs::Metadata) {
+    assert!(
+        !metadata.file_type().is_symlink() && !is_reparse_point(metadata),
+        "domain source tree contains a symlink or reparse point: {}",
+        path.display()
+    );
+    assert!(
+        metadata.is_dir() || metadata.is_file(),
+        "domain source tree contains an unsupported entry: {}",
+        path.display()
+    );
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
 }
