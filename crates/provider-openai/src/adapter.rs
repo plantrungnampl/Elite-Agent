@@ -689,7 +689,11 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("text/event-stream"))
+        .is_some_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("text/event-stream")
+            })
+        })
 }
 
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
@@ -802,6 +806,41 @@ mod lifecycle_tests {
     use url::Url;
 
     use super::*;
+
+    #[test]
+    fn recognizes_only_the_event_stream_media_type() {
+        for content_type in [
+            "text/event-stream",
+            "TEXT/EVENT-STREAM; charset=utf-8",
+            " text/event-stream ; charset=utf-8 ",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                content_type.parse().expect("valid header value"),
+            );
+            assert!(
+                is_event_stream(&headers),
+                "expected {content_type} to match"
+            );
+        }
+
+        for content_type in [
+            "text/event-streaming",
+            "application/text/event-stream",
+            "text/event-streamish; charset=utf-8",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                content_type.parse().expect("valid header value"),
+            );
+            assert!(
+                !is_event_stream(&headers),
+                "expected {content_type} to reject"
+            );
+        }
+    }
 
     #[test]
     fn shutdown_waits_until_start_registers_its_worker() {

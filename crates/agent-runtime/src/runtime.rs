@@ -1541,7 +1541,7 @@ fn initialized_frame(descriptor: &PeerDescriptor) -> Result<ProtocolFrame, PortE
         "method": "initialized",
         "params": {
             "connectionId": descriptor.binding.connection_id,
-            "effectiveCapabilitiesDigest": descriptor.binding.manifest_digest
+            "effectiveCapabilitiesDigest": effective_capabilities_digest(&descriptor.capabilities)
         }
     }))
 }
@@ -1661,6 +1661,12 @@ fn capabilities_json(capabilities: &ProtocolCapabilities) -> Value {
         "maxConcurrentRuns": capabilities.max_concurrent_runs,
         "maxContextTokens": capabilities.max_context_tokens
     })
+}
+
+fn effective_capabilities_digest(capabilities: &ProtocolCapabilities) -> String {
+    let bytes = serde_json::to_vec(&capabilities_json(capabilities))
+        .expect("capabilities JSON must be serializable");
+    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 fn terminal_from_frame(
@@ -1953,7 +1959,49 @@ fn internal_failure() -> PortError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use local_agent_terminal_agent_protocol::ConnectionBinding;
     use std::sync::mpsc;
+
+    #[test]
+    fn initialized_frame_uses_the_fixed_effective_capabilities_digest() {
+        let descriptor = PeerDescriptor {
+            protocol_version: "1.0".to_owned(),
+            binding: ConnectionBinding {
+                agent_id: "worker-1".to_owned(),
+                connection_id: "connection-1".to_owned(),
+                manifest_digest:
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_owned(),
+                executable_digest:
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_owned(),
+                trust_tier: ProtocolTrustTier::CoreAdapter,
+            },
+            capabilities: ProtocolCapabilities {
+                roles: BTreeSet::from(["reviewer".to_owned()]),
+                skills: BTreeSet::from(["testing".to_owned()]),
+                streaming: true,
+                context_query: false,
+                tool_requests: false,
+                specialist_requests: false,
+                max_concurrent_runs: 1,
+                max_context_tokens: 1024,
+            },
+        };
+
+        let frame = initialized_frame(&descriptor).expect("initialized frame must encode");
+        let frame_value = frame_value(&frame).expect("initialized frame must decode");
+        let digest = frame_value
+            .pointer("/params/effectiveCapabilitiesDigest")
+            .and_then(Value::as_str)
+            .expect("initialized frame must include a capabilities digest");
+
+        assert_eq!(
+            digest,
+            "sha256:607f4ad4a579f35b688ea51f65b4adee3a15cd967e551864791fe042e2c3a29f"
+        );
+        assert_ne!(digest, descriptor.binding.manifest_digest);
+    }
 
     #[test]
     fn retirement_invalidates_old_reservations_and_remains_permanent() {

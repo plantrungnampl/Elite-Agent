@@ -41,7 +41,10 @@ impl OpenAiProviderConfig {
         connect_timeout: Duration,
         read_timeout: Duration,
     ) -> Result<Self, ProtocolError> {
-        if endpoint.scheme() != "https" || endpoint.host().is_none() {
+        if endpoint.scheme() != "https"
+            || endpoint.host().is_none()
+            || has_forbidden_url_components(&endpoint)
+        {
             return Err(ProtocolError::InvalidRequest);
         }
         Self::with_timeouts(endpoint, api_key, connect_timeout, read_timeout)
@@ -54,7 +57,10 @@ impl OpenAiProviderConfig {
         connect_timeout: Duration,
         read_timeout: Duration,
     ) -> Result<Self, ProtocolError> {
-        if endpoint.scheme() != "http" || !is_literal_loopback(&endpoint) {
+        if endpoint.scheme() != "http"
+            || !is_literal_loopback(&endpoint)
+            || has_forbidden_url_components(&endpoint)
+        {
             return Err(ProtocolError::InvalidRequest);
         }
         Self::with_timeouts(endpoint, api_key, connect_timeout, read_timeout)
@@ -112,4 +118,22 @@ fn is_literal_loopback(endpoint: &Url) -> bool {
         Some(Host::Ipv6(address)) => address.is_loopback(),
         Some(Host::Domain(_)) | None => false,
     }
+}
+
+fn has_forbidden_url_components(endpoint: &Url) -> bool {
+    if !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return true;
+    }
+
+    let Some((_, authority_and_path)) = endpoint.as_str().split_once("://") else {
+        return true;
+    };
+    let authority_end = authority_and_path
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_path.len());
+    authority_and_path[..authority_end].contains('@')
 }

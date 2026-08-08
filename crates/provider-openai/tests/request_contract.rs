@@ -95,6 +95,56 @@ fn rejects_non_https_or_non_loopback_http_endpoints_without_leaking_the_key() {
 }
 
 #[test]
+fn rejects_url_userinfo_query_and_fragment_for_production_and_loopback_endpoints() {
+    let key = OpenAiApiKey::new(API_KEY_CANARY).unwrap();
+    let timeout = Duration::from_secs(1);
+
+    for endpoint_text in [
+        "https://user@example.com/v1/responses",
+        "https://:password@example.com/v1/responses",
+        "https://example.com/v1/responses?query=1",
+        "https://example.com/v1/responses#fragment",
+    ] {
+        let endpoint = Url::parse(endpoint_text).unwrap();
+        assert_eq!(
+            OpenAiProviderConfig::new(endpoint, key.clone(), timeout, timeout).unwrap_err(),
+            ProtocolError::InvalidRequest,
+            "production endpoint must reject {endpoint_text}"
+        );
+    }
+
+    for endpoint_text in [
+        "http://user@127.0.0.1:1234/v1/responses",
+        "http://:password@127.0.0.1:1234/v1/responses",
+        "http://127.0.0.1:1234/v1/responses?query=1",
+        "http://127.0.0.1:1234/v1/responses#fragment",
+    ] {
+        let endpoint = Url::parse(endpoint_text).unwrap();
+        assert_eq!(
+            OpenAiProviderConfig::for_loopback_test(endpoint, key.clone(), timeout, timeout)
+                .unwrap_err(),
+            ProtocolError::InvalidRequest,
+            "loopback endpoint must reject {endpoint_text}"
+        );
+    }
+
+    assert!(OpenAiProviderConfig::new(
+        Url::parse("https://api.example.com/v1/responses").unwrap(),
+        key.clone(),
+        timeout,
+        timeout,
+    )
+    .is_ok());
+    assert!(OpenAiProviderConfig::for_loopback_test(
+        Url::parse("http://127.0.0.1:1234/v1/responses").unwrap(),
+        key,
+        timeout,
+        timeout,
+    )
+    .is_ok());
+}
+
+#[test]
 fn rejects_oversized_prompt_and_hosted_tools_before_contacting_the_provider() {
     let server = LoopbackServer::sse(Vec::new());
     let adapter =

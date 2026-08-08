@@ -121,7 +121,8 @@ fn append_bounded(
 }
 
 fn parse_event(bytes: &[u8]) -> Result<Value, ProtocolError> {
-    serde_json::from_slice(bytes).map_err(|_| ProtocolError::InvalidJson)
+    let text = std::str::from_utf8(bytes).map_err(|_| ProtocolError::InvalidUtf8)?;
+    serde_json::from_str(text).map_err(|_| ProtocolError::InvalidJson)
 }
 
 fn io_error(error: io::Error) -> ProtocolError {
@@ -140,5 +141,32 @@ fn io_error(error: io::Error) -> ProtocolError {
         ProtocolError::Timeout
     } else {
         ProtocolError::ProviderUnavailable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::Cursor, sync::atomic::AtomicBool};
+
+    use super::*;
+
+    #[test]
+    fn invalid_utf8_in_data_is_reported_as_invalid_utf8() {
+        let mut reader = SseReader::new(Cursor::new(b"data: \xff\n\n"), MAX_SSE_EVENT_BYTES);
+
+        assert_eq!(
+            reader.next_event(&AtomicBool::new(false)),
+            Err(ProtocolError::InvalidUtf8)
+        );
+    }
+
+    #[test]
+    fn valid_utf8_malformed_json_is_reported_as_invalid_json() {
+        let mut reader = SseReader::new(Cursor::new(b"data: {not-json}\n\n"), MAX_SSE_EVENT_BYTES);
+
+        assert_eq!(
+            reader.next_event(&AtomicBool::new(false)),
+            Err(ProtocolError::InvalidJson)
+        );
     }
 }
