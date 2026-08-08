@@ -27,10 +27,19 @@ test("architecture checker requires all M3 crates only for the final gate", () =
     ),
     /architecture contracts: ok/,
   );
-  assert.throws(
-    () => run("scripts/check-architecture.mjs", "--require-m3"),
-    /M3 workspace members are required/,
+  const metadata = JSON.parse(readFileSync(fixture("m3-valid-metadata.json"), "utf8"));
+  metadata.packages = metadata.packages.filter(
+    (pkg) => pkg.name !== "local-agent-terminal-provider-openai",
   );
+  metadata.workspace_members = metadata.workspace_members.filter(
+    (member) => member !== "local-agent-terminal-provider-openai",
+  );
+  withM3Metadata(metadata, (metadataPath) => {
+    assert.throws(
+      () => run("scripts/check-architecture.mjs", "--require-m3", "--metadata", metadataPath),
+      /M3 workspace members are required/,
+    );
+  });
 });
 
 test("architecture checker rejects outward M3 crate dependencies", () => {
@@ -387,6 +396,17 @@ function withM3Source(files, callback) {
       writeFileSync(target, source, "utf8");
     }
     callback(directory);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function withM3Metadata(metadata, callback) {
+  const directory = mkdtempSync(join(tmpdir(), "m3-metadata-"));
+  const path = join(directory, "metadata.json");
+  try {
+    writeFileSync(path, `${JSON.stringify(metadata, null, 2)}\n`);
+    callback(path);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

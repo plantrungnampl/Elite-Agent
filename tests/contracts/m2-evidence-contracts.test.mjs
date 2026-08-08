@@ -17,7 +17,7 @@ const run = (...args) =>
   execFileSync(process.execPath, args, { cwd: process.cwd(), encoding: "utf8" });
 
 test("M2 evidence is complete and internally consistent", () => {
-  assert.match(run("scripts/verify-m2-evidence.mjs"), /M2 evidence: ok/u);
+  assert.match(run("scripts/verify-m2-evidence.mjs", "--historical"), /M2 evidence: ok/u);
 });
 
 test("Windows CI runs containment before fresh M2 evidence verification", () => {
@@ -54,12 +54,36 @@ test("M2 verifier rejects stale and non-ancestor source commits", () => {
   withEvidenceCopy((directory, manifest) => {
     manifest.sourceCommit = gitOutput("rev-parse", "HEAD^");
     writeManifest(directory, manifest);
-    assertVerifierFails(directory, /stale for the current code/u);
+    assertVerifierFails(directory, /stale for the current code/u, []);
   });
   withEvidenceCopy((directory, manifest) => {
     manifest.sourceCommit = "0".repeat(40);
     writeManifest(directory, manifest);
+    assertVerifierFails(directory, /not an ancestor|unable to run/u, []);
+  });
+});
+
+test("M2 historical mode still requires ancestry and allows later source commits", () => {
+  withEvidenceCopy((directory, manifest) => {
+    manifest.sourceCommit = "0".repeat(40);
+    writeManifest(directory, manifest);
     assertVerifierFails(directory, /not an ancestor|unable to run/u);
+  });
+  withEvidenceCopy((directory, manifest) => {
+    manifest.sourceCommit = gitOutput("rev-parse", "HEAD^");
+    writeManifest(directory, manifest);
+    const result = spawnSync(
+      process.execPath,
+      [
+        "scripts/verify-m2-evidence.mjs",
+        "--historical",
+        "--manifest",
+        join(directory, "manifest.json"),
+      ],
+      { cwd: process.cwd(), encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+    assert.match(`${result.stdout}${result.stderr}`, /M2 evidence: ok/u);
   });
 });
 
@@ -125,6 +149,7 @@ test("final M2 verification rejects a pending independent review", () => {
     manifest.artifactSha256["review.md"] = hash(readFileSync(reviewPath));
     writeManifest(directory, manifest);
     assertVerifierFails(directory, /independent approval is pending/u, [
+      "--historical",
       "--require-approved",
     ]);
   });
@@ -138,6 +163,7 @@ test("final M2 verification binds every verdict to the reviewed source", () => {
       reviewFixture(manifest.sourceCommit, "PASS", "PENDING", "PASS"),
     );
     assertVerifierFails(directory, /spec compliance is pending/u, [
+      "--historical",
       "--require-approved",
     ]);
   });
@@ -148,6 +174,7 @@ test("final M2 verification binds every verdict to the reviewed source", () => {
       reviewFixture("0".repeat(40), "PASS", "PASS", "PASS"),
     );
     assertVerifierFails(directory, /reviewed source commit mismatch/u, [
+      "--historical",
       "--require-approved",
     ]);
   });
@@ -285,7 +312,7 @@ function reviewFixture(sourceCommit, independent, spec, code) {
 `;
 }
 
-function assertVerifierFails(directory, pattern, extraArguments = []) {
+function assertVerifierFails(directory, pattern, extraArguments = ["--historical"]) {
   const result = spawnSync(
     process.execPath,
     [

@@ -16,6 +16,7 @@ const manifestPath =
     : resolve(root, process.argv[manifestArgument + 1]);
 const artifactRoot = dirname(manifestPath);
 const requiredCommands = new Map(requiredCommandEntries);
+const historical = process.argv.includes("--historical");
 const requireApproved = process.argv.includes("--require-approved");
 
 try {
@@ -23,7 +24,7 @@ try {
   assert(manifest.schemaVersion === 1, "unsupported manifest schema");
   assert(manifest.finalized === true, "manifest is not finalized");
   assert(/^([0-9a-f]{40}|[0-9a-f]{64})$/u.test(manifest.sourceCommit), "invalid source commit");
-  verifyCommitBinding(manifest.sourceCommit);
+  verifyCommitBinding(manifest.sourceCommit, historical);
   assert(manifest.platform === `${process.platform}-${process.arch}`, "platform mismatch");
   assertDeepEqual(manifest.toolVersions, currentToolVersions(), "toolchain mismatch");
 
@@ -105,8 +106,8 @@ try {
   process.exitCode = 1;
 }
 
-function verifyCommitBinding(sourceCommit) {
-  assertEvidenceOnlyChanges(root);
+function verifyCommitBinding(sourceCommit, allowHistorical) {
+  if (!allowHistorical) assertEvidenceOnlyChanges(root);
   const head = commandOutput("git rev-parse HEAD");
   if (head === sourceCommit) return;
   const ancestor = spawnSync("git", ["merge-base", "--is-ancestor", sourceCommit, head], {
@@ -114,6 +115,7 @@ function verifyCommitBinding(sourceCommit) {
     windowsHide: true,
   });
   assert(ancestor.status === 0, "evidence source commit is not an ancestor of HEAD");
+  if (allowHistorical) return;
   const changed = commandOutput(`git diff --name-only ${sourceCommit}..${head}`)
     .split(/\r?\n/u)
     .filter(Boolean);
