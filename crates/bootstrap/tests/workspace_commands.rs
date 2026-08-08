@@ -21,6 +21,7 @@ fn typed_workspace_commands_create_an_isolated_worktree_without_serializing_path
         app_data_dir: root.path().join("app-data"),
         trusted_workspace_root: root.path().join("managed-workspaces"),
         secret_values: Vec::new(),
+        openai: None,
     });
     let runtime = bootstrap.workspace_runtime().unwrap();
 
@@ -74,6 +75,7 @@ fn task_creation_rechecks_repository_health_before_persisting_a_task() {
         app_data_dir: root.path().join("app-data"),
         trusted_workspace_root: root.path().join("managed-workspaces"),
         secret_values: Vec::new(),
+        openai: None,
     });
     let runtime = bootstrap.workspace_runtime().unwrap();
     runtime
@@ -119,6 +121,7 @@ fn exact_retry_resumes_after_the_task_record_but_before_the_worktree_intent() {
         app_data_dir: root.path().join("app-data"),
         trusted_workspace_root: root.path().join("managed-workspaces"),
         secret_values: Vec::new(),
+        openai: None,
     });
     let runtime = bootstrap.workspace_runtime().unwrap();
     let project = runtime
@@ -184,6 +187,7 @@ fn failed_git_creation_is_recoverable_and_revokes_the_executor() {
         app_data_dir: root.path().join("app-data"),
         trusted_workspace_root: root.path().join("managed-workspaces"),
         secret_values: Vec::new(),
+        openai: None,
     });
     let runtime = bootstrap.workspace_runtime().unwrap();
     runtime
@@ -242,6 +246,7 @@ fn dashboard_poll_detects_a_real_out_of_band_workspace_mutation() {
         app_data_dir: root.path().join("app-data"),
         trusted_workspace_root: root.path().join("managed-workspaces"),
         secret_values: Vec::new(),
+        openai: None,
     });
     let runtime = bootstrap.workspace_runtime().unwrap();
     runtime

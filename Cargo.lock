@@ -1964,17 +1964,22 @@ name = "local-agent-terminal-bootstrap"
 version = "0.1.0"
 dependencies = [
  "git2",
+ "local-agent-terminal-agent-runtime",
  "local-agent-terminal-application",
  "local-agent-terminal-domain",
  "local-agent-terminal-platform-windows",
  "local-agent-terminal-policy-engine",
+ "local-agent-terminal-provider-openai",
  "local-agent-terminal-repository-git",
  "local-agent-terminal-storage-files",
  "local-agent-terminal-storage-sqlite",
  "local-agent-terminal-tool-runtime",
  "rusqlite",
  "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
  "tempfile",
+ "url",
 ]
 
 [[package]]

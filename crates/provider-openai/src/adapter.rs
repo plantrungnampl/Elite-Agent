@@ -23,6 +23,7 @@ use reqwest::{
     StatusCode,
 };
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::{
     config::OpenAiProviderConfig,
@@ -614,7 +615,7 @@ fn terminal(
     params.insert(
         "message".to_owned(),
         json!({
-            "messageId": format!("openai-message-{terminal_id}"),
+            "messageId": terminal_message_id(run_id, terminal_id),
             "type": "answer",
             "content": content,
             "claims": []
@@ -639,6 +640,15 @@ fn terminal(
         .map_err(|_| ProtocolError::Encode)?,
     )?;
     sink.request(frame).map(|_| ())
+}
+
+fn terminal_message_id(run_id: &str, terminal_id: u64) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"openai-terminal-message.v1\0");
+    digest.update(run_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(terminal_id.to_be_bytes());
+    format!("openai-message-{:x}", digest.finalize())
 }
 
 fn usage(event: &Value) -> Option<Usage> {

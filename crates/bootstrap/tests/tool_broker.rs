@@ -69,6 +69,7 @@ fn configured_runtime_routes_typed_requests_through_execute_tool() {
             app_data_dir: fixture.app_data.clone(),
             trusted_workspace_root: fixture.workspace_root.clone(),
             secret_values: Vec::new(),
+            openai: None,
         },
         ToolBrokerConfig::new(
             DENY_PROCESS_POLICY,
@@ -101,6 +102,7 @@ fn production_runtime_resolves_the_authoritative_task_before_default_deny() {
         app_data_dir: fixture.app_data.clone(),
         trusted_workspace_root: fixture.workspace_root.clone(),
         secret_values: Vec::new(),
+        openai: None,
     });
 
     assert_eq!(
@@ -155,6 +157,7 @@ fn production_runtime_rejects_forged_policy_and_task_context_before_evaluation()
         app_data_dir: fixture.app_data.clone(),
         trusted_workspace_root: fixture.workspace_root.clone(),
         secret_values: Vec::new(),
+        openai: None,
     });
     let runtime = bootstrap.tool_runtime().unwrap();
 
@@ -191,6 +194,7 @@ fn production_runtime_exposes_read_tools_and_fails_closed_for_hostile_git() {
         app_data_dir: fixture.app_data.clone(),
         trusted_workspace_root: fixture.workspace_root.clone(),
         secret_values: Vec::new(),
+        openai: None,
     });
     let runtime = bootstrap.tool_runtime().unwrap();
     let task_id = TaskId::new("task-1").unwrap();
@@ -238,6 +242,7 @@ fn production_runtime_reports_clean_git_status_and_diff() {
         app_data_dir: fixture.app_data.clone(),
         trusted_workspace_root: fixture.workspace_root.clone(),
         secret_values: Vec::new(),
+        openai: None,
     });
     let runtime = bootstrap.tool_runtime().unwrap();
     let task_id = TaskId::new("task-1").unwrap();
@@ -276,6 +281,7 @@ fn production_runtime_writes_with_durable_recovery_evidence() {
         app_data_dir: fixture.app_data.clone(),
         trusted_workspace_root: fixture.workspace_root.clone(),
         secret_values: Vec::new(),
+        openai: None,
     });
     let task_id = TaskId::new("task-1").unwrap();
     let lease = bootstrap
@@ -473,6 +479,7 @@ fn production_bootstrap(fixture: &WorkspaceFixture) -> Bootstrap {
         app_data_dir: fixture.app_data.clone(),
         trusted_workspace_root: fixture.workspace_root.clone(),
         secret_values: Vec::new(),
+        openai: None,
     })
 }
 
@@ -652,6 +659,7 @@ fn degraded_read_only_never_reaches_the_process_executor() {
             app_data_dir: fixture.app_data.clone(),
             trusted_workspace_root: fixture.workspace_root.clone(),
             secret_values: Vec::new(),
+            openai: None,
         },
         ToolBrokerConfig::new(
             ALLOW_PROCESS_POLICY,
@@ -696,6 +704,7 @@ fn completed_process_publishes_scanned_stream_artifacts_before_terminal_audit() 
             app_data_dir: fixture.app_data.clone(),
             trusted_workspace_root: fixture.workspace_root.clone(),
             secret_values: Vec::new(),
+            openai: None,
         },
         ToolBrokerConfig::new(
             ALLOW_PROCESS_POLICY,
@@ -748,6 +757,7 @@ fn stop_all_cancels_and_joins_a_runtime_owned_execution() {
             app_data_dir: fixture.app_data.clone(),
             trusted_workspace_root: fixture.workspace_root.clone(),
             secret_values: Vec::new(),
+            openai: None,
         },
         ToolBrokerConfig::new(
             ALLOW_PROCESS_POLICY,
@@ -793,6 +803,7 @@ fn reconfigure_stops_and_joins_the_previous_runtime_before_replacement() {
         app_data_dir: fixture.app_data.clone(),
         trusted_workspace_root: fixture.workspace_root.clone(),
         secret_values: Vec::new(),
+        openai: None,
     };
     let mut bootstrap = Bootstrap::with_tool_broker(
         config(),
@@ -835,6 +846,7 @@ fn stop_all_cancels_started_workers_while_an_earlier_worker_is_still_registering
             app_data_dir: fixture.app_data.clone(),
             trusted_workspace_root: fixture.workspace_root.clone(),
             secret_values: Vec::new(),
+            openai: None,
         },
         ToolBrokerConfig::new(ALLOW_PROCESS_POLICY, authority.clone(), executor.clone()),
     );
@@ -877,6 +889,7 @@ fn configured_runtime_resumes_an_approved_request_through_execute_tool() {
             app_data_dir: fixture.app_data.clone(),
             trusted_workspace_root: fixture.workspace_root.clone(),
             secret_values: Vec::new(),
+            openai: None,
         },
         ToolBrokerConfig::new(
             APPROVE_PROCESS_POLICY,
@@ -926,6 +939,7 @@ fn configured_runtime_projects_exact_approval_context_and_rejects_a_stale_digest
             app_data_dir: fixture.app_data.clone(),
             trusted_workspace_root: fixture.workspace_root.clone(),
             secret_values: Vec::new(),
+            openai: None,
         },
         ToolBrokerConfig::new(
             APPROVE_PROCESS_POLICY,
@@ -1004,6 +1018,7 @@ fn approval_display_redacts_secrets_without_losing_argument_boundaries() {
             app_data_dir: fixture.app_data.clone(),
             trusted_workspace_root: fixture.workspace_root.clone(),
             secret_values: Vec::new(),
+            openai: None,
         },
         ToolBrokerConfig::new(
             APPROVE_PROCESS_POLICY,
@@ -1046,6 +1061,7 @@ fn denying_a_projected_approval_never_calls_the_executor() {
             app_data_dir: fixture.app_data.clone(),
             trusted_workspace_root: fixture.workspace_root.clone(),
             secret_values: Vec::new(),
+            openai: None,
         },
         ToolBrokerConfig::new(
             APPROVE_PROCESS_POLICY,
@@ -1087,6 +1103,7 @@ fn worker_panic_after_process_binding_closes_production_dispatch() {
             app_data_dir: fixture.app_data.clone(),
             trusted_workspace_root: fixture.workspace_root.clone(),
             secret_values: Vec::new(),
+            openai: None,
         },
         ToolBrokerConfig::new(
             ALLOW_PROCESS_POLICY,

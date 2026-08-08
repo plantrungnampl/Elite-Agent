@@ -120,6 +120,7 @@ impl WorkspaceFixture {
             app_data_dir: self.app_data.clone(),
             trusted_workspace_root: self.workspace_root.clone(),
             secret_values: Vec::new(),
+            openai: None,
         })
     }
 

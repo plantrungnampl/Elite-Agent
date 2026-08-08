@@ -141,6 +141,7 @@ fn schema_failure_has_stable_safe_recovery_and_sanitized_diagnostics() {
         trusted_workspace_root: app_data.join("workspaces"),
         app_data_dir: app_data,
         secret_values: vec!["sha256:".to_owned()],
+        openai: None,
     });
 
     assert_eq!(
@@ -359,6 +360,7 @@ fn config(app_data_dir: &Path) -> StartupConfig {
         app_data_dir: app_data_dir.to_owned(),
         trusted_workspace_root: app_data_dir.join("workspaces"),
         secret_values: Vec::new(),
+        openai: None,
     }
 }
 

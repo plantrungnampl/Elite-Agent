@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use local_agent_terminal_application::{
-    ApprovalExpiryStore, Clock, DiagnosticSeverityDto, LocalDiagnosticDto, ObservationClassDto,
-    PortError, RetainedProcessController, SafeErrorClassification, StartupIssueDto,
-    StartupRecoveryActionDto, StartupStateDto, StartupStatusDto, ToolExecutionStore, TrustLabelDto,
+    AgentRuntime, ApprovalExpiryStore, Clock, DiagnosticSeverityDto, LocalDiagnosticDto,
+    ObservationClassDto, PortError, RetainedProcessController, SafeErrorClassification,
+    StartupIssueDto, StartupRecoveryActionDto, StartupStateDto, StartupStatusDto,
+    ToolExecutionStore, TrustLabelDto,
 };
 #[cfg(windows)]
 use local_agent_terminal_platform_windows::WindowsProcessLauncher;
@@ -15,6 +16,7 @@ use local_agent_terminal_storage_files::{
 };
 use local_agent_terminal_storage_sqlite::{DatabaseHealth, DatabaseIssue, OpenError, SqliteStore};
 
+use crate::agent_runtime::{compose_openai_runtime, ComposedAgentRuntime, OpenAiBootstrapConfig};
 use crate::logging::LocalLog;
 #[cfg(windows)]
 use crate::production_tools::production_tool_broker;
@@ -29,6 +31,7 @@ pub struct StartupConfig {
     pub app_data_dir: PathBuf,
     pub trusted_workspace_root: PathBuf,
     pub secret_values: Vec<String>,
+    pub openai: Option<OpenAiBootstrapConfig>,
 }
 
 pub struct Bootstrap {
@@ -36,6 +39,7 @@ pub struct Bootstrap {
     status: StartupStatusDto,
     diagnostics: Vec<LocalDiagnosticDto>,
     runtime: Option<WorkspaceRuntime>,
+    agent_runtime: Option<Arc<ComposedAgentRuntime>>,
     tool_runtime: Option<Arc<ToolRuntime>>,
     tool_broker: Option<ToolBrokerConfig>,
     retained_processes: Arc<dyn RetainedProcessController>,
@@ -43,6 +47,7 @@ pub struct Bootstrap {
 
 struct StartupRuntimes {
     workspace: WorkspaceRuntime,
+    agent_runtime: Option<Arc<ComposedAgentRuntime>>,
     tools: ToolRuntime,
 }
 
@@ -113,6 +118,7 @@ impl Bootstrap {
             },
             diagnostics: Vec::new(),
             runtime: None,
+            agent_runtime: None,
             tool_runtime: None,
             tool_broker,
             retained_processes: default_retained_process_controller(),
@@ -174,6 +180,14 @@ impl Bootstrap {
             return &self.status;
         };
         let mut log = LocalLog::new(secret_values);
+        if let Some(runtime) = self.agent_runtime.as_ref() {
+            if let Err(error) = runtime.shutdown() {
+                self.record_failure(&mut log, agent_runtime_shutdown_failure(error));
+                self.diagnostics = log.into_records();
+                return &self.status;
+            }
+        }
+        self.agent_runtime = None;
         self.runtime = None;
         if let Some(runtime) = self.tool_runtime.take() {
             if let Err(error) = runtime.stop_all() {
@@ -197,6 +211,7 @@ impl Bootstrap {
                     issues: Vec::new(),
                 };
                 self.runtime = Some(runtimes.workspace);
+                self.agent_runtime = runtimes.agent_runtime;
                 self.tool_runtime = Some(Arc::new(runtimes.tools));
                 log.push(record(
                     "startup.ready",
@@ -235,6 +250,18 @@ impl Bootstrap {
         self.runtime.as_ref()
     }
 
+    pub fn agent_runtime(&self) -> Option<&dyn AgentRuntime> {
+        self.agent_runtime
+            .as_deref()
+            .map(|runtime| runtime as &dyn AgentRuntime)
+    }
+
+    pub fn agent_runtime_handle(&self) -> Option<Arc<dyn AgentRuntime>> {
+        self.agent_runtime
+            .as_ref()
+            .map(|runtime| Arc::clone(runtime) as Arc<dyn AgentRuntime>)
+    }
+
     pub fn tool_runtime(&self) -> Option<&ToolRuntime> {
         self.tool_runtime.as_deref()
     }
@@ -259,7 +286,11 @@ impl Bootstrap {
                 recovery_actions: recovery_actions(failure.recovery),
             }],
         };
+        if let Some(runtime) = self.agent_runtime.as_ref() {
+            let _ = runtime.shutdown();
+        }
         self.runtime = None;
+        self.agent_runtime = None;
         self.tool_runtime = None;
     }
 
@@ -284,9 +315,18 @@ impl Bootstrap {
             },
             diagnostics: log.into_records(),
             runtime: None,
+            agent_runtime: None,
             tool_runtime: None,
             tool_broker: None,
             retained_processes: default_retained_process_controller(),
+        }
+    }
+}
+
+impl Drop for Bootstrap {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.agent_runtime.as_ref() {
+            let _ = runtime.shutdown();
         }
     }
 }
@@ -334,8 +374,10 @@ fn start(
         "Database schema and integrity checks passed.",
     ));
 
-    let artifacts = ContentAddressedArtifactStore::open(config.app_data_dir.join("artifacts"))
-        .map_err(|error| artifact_failure("startup.artifact_storage_unavailable", error))?;
+    let artifacts = Arc::new(
+        ContentAddressedArtifactStore::open(config.app_data_dir.join("artifacts"))
+            .map_err(|error| artifact_failure("startup.artifact_storage_unavailable", error))?,
+    );
     artifacts
         .validate_health()
         .map_err(|error| artifact_failure("startup.artifact_storage_unavailable", error))?;
@@ -347,8 +389,8 @@ fn start(
         "Artifact storage passed capability-relative read/write validation.",
     ));
 
-    let report =
-        reconcile_artifacts(&artifacts, &database, &database).map_err(reconciliation_failure)?;
+    let report = reconcile_artifacts(artifacts.as_ref(), &database, &database)
+        .map_err(reconciliation_failure)?;
     log.push(record(
         "startup.artifacts.reconciled",
         "storage-files",
@@ -416,8 +458,9 @@ fn start(
     let artifact_root = config.app_data_dir.join("artifacts");
     let repositories = GitRepositoryGateway::open(&config.trusted_workspace_root, &[artifact_root])
         .map_err(workspace_reconciliation_failure)?;
-    let workspace_report = reconcile_workspace_after_fencing(&database, &artifacts, &repositories)
-        .map_err(workspace_reconciliation_failure)?;
+    let workspace_report =
+        reconcile_workspace_after_fencing(&database, artifacts.as_ref(), &repositories)
+            .map_err(workspace_reconciliation_failure)?;
     log.push(record(
         "startup.repositories.reconciled",
         "repository-git",
@@ -495,6 +538,22 @@ fn start(
         ),
     ));
 
+    let agent_runtime = config
+        .openai
+        .as_ref()
+        .map(|openai| compose_openai_runtime(database.clone(), Arc::clone(&artifacts), openai))
+        .transpose()
+        .map_err(agent_runtime_failure)?;
+    if agent_runtime.is_some() {
+        log.push(record(
+            "startup.agent_runtime.composed",
+            "bootstrap",
+            DiagnosticSeverityDto::Info,
+            None,
+            "Configured trusted agent runtime was composed.",
+        ));
+    }
+
     Ok(StartupRuntimes {
         workspace: WorkspaceRuntime::new(
             database,
@@ -503,6 +562,7 @@ fn start(
             workspace_report.recovery_candidates,
             workspace_writes,
         ),
+        agent_runtime,
         tools,
     })
 }
@@ -557,6 +617,36 @@ fn tool_recovery_failure(error: PortError) -> StartupFailure {
         category: classification_name(error.safe_classification()),
         detail: format!(
             "Tool recovery failed ({:?}, {:?}).",
+            error.safe_classification(),
+            error.retryability()
+        ),
+        recovery: RecoveryMode::Retry,
+    }
+}
+
+fn agent_runtime_failure(error: PortError) -> StartupFailure {
+    StartupFailure {
+        state: StartupStateDto::RecoverableFailure,
+        code: "startup.agent_runtime_unavailable",
+        message: "The configured agent runtime could not be composed.",
+        category: classification_name(error.safe_classification()),
+        detail: format!(
+            "Configured agent runtime composition failed ({:?}, {:?}).",
+            error.safe_classification(),
+            error.retryability()
+        ),
+        recovery: RecoveryMode::Retry,
+    }
+}
+
+fn agent_runtime_shutdown_failure(error: PortError) -> StartupFailure {
+    StartupFailure {
+        state: StartupStateDto::RecoverableFailure,
+        code: "startup.agent_runtime_shutdown_failed",
+        message: "The configured agent runtime could not be shut down safely.",
+        category: classification_name(error.safe_classification()),
+        detail: format!(
+            "Configured agent runtime shutdown failed ({:?}, {:?}).",
             error.safe_classification(),
             error.retryability()
         ),

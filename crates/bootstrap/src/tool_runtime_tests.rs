@@ -548,6 +548,7 @@ fn startup_config(root: &TempDir) -> StartupConfig {
         app_data_dir: root.path().join("app-data"),
         trusted_workspace_root: root.path().join("workspaces"),
         secret_values: Vec::new(),
+        openai: None,
     }
 }
 

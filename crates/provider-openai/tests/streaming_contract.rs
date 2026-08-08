@@ -78,6 +78,51 @@ fn parses_fragmented_crlf_multiline_sse_and_maps_deltas_usage_and_response_id() 
 }
 
 #[test]
+fn terminal_message_ids_are_distinct_after_adapter_recreation() {
+    let first_server = LoopbackServer::responding(sse_fragments(&[
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+    ]));
+    let first_adapter = adapter(first_server.endpoint(), Duration::from_secs(1));
+    let first_sink = RecordingSink::default();
+    first_adapter
+        .start(
+            run_start("run-before-restart"),
+            Box::new(first_sink.clone()),
+        )
+        .expect("first accepted run");
+    let first_terminal = first_sink.wait_for_terminal();
+    first_adapter.shutdown().expect("first adapter shutdown");
+    first_server.join();
+
+    let second_server = LoopbackServer::responding(sse_fragments(&[
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+    ]));
+    let second_adapter = adapter(second_server.endpoint(), Duration::from_secs(1));
+    let second_sink = RecordingSink::default();
+    second_adapter
+        .start(
+            run_start("run-after-restart"),
+            Box::new(second_sink.clone()),
+        )
+        .expect("second accepted run");
+    let second_terminal = second_sink.wait_for_terminal();
+    second_adapter.shutdown().expect("second adapter shutdown");
+    second_server.join();
+
+    let first_message_id = first_terminal
+        .pointer("/params/message/messageId")
+        .and_then(Value::as_str)
+        .expect("first message ID");
+    let second_message_id = second_terminal
+        .pointer("/params/message/messageId")
+        .and_then(Value::as_str)
+        .expect("second message ID");
+    assert_ne!(first_message_id, second_message_id);
+    assert!(first_message_id.len() <= 256);
+    assert!(second_message_id.len() <= 256);
+}
+
+#[test]
 fn maps_failed_incomplete_and_error_events_to_one_failed_terminal() {
     for (run_id, event, response_id) in [
         (

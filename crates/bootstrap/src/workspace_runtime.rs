@@ -28,7 +28,7 @@ use crate::workspace_monitor::{
 
 pub struct WorkspaceRuntime {
     database: SqliteStore,
-    artifacts: ContentAddressedArtifactStore,
+    artifacts: Arc<ContentAddressedArtifactStore>,
     repositories: GitRepositoryGateway,
     writes: Arc<WorkspaceWriteCoordinator>,
     monitor: WorkspaceMonitor,
@@ -44,7 +44,7 @@ pub(crate) struct WorkspaceRecoveryReport {
 impl WorkspaceRuntime {
     pub(crate) fn new(
         database: SqliteStore,
-        artifacts: ContentAddressedArtifactStore,
+        artifacts: Arc<ContentAddressedArtifactStore>,
         repositories: GitRepositoryGateway,
         recovery_candidates: Vec<RecoveryCandidate>,
         writes: Arc<WorkspaceWriteCoordinator>,

@@ -49,6 +49,7 @@ fn startup_exposes_workspace_runtime_only_after_ordered_recovery() {
         app_data_dir: app_data,
         trusted_workspace_root,
         secret_values: Vec::new(),
+        openai: None,
     });
 
     assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
@@ -931,6 +932,7 @@ impl OnboardingFixture {
             app_data_dir: self.app_data.clone(),
             trusted_workspace_root: self.workspace_root.clone(),
             secret_values: Vec::new(),
+            openai: None,
         })
     }
 
@@ -1087,6 +1089,7 @@ impl WorkspaceFixture {
             app_data_dir: self.app_data.clone(),
             trusted_workspace_root: self.workspace_root.clone(),
             secret_values: Vec::new(),
+            openai: None,
         })
     }
 

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod agent_runtime;
 mod logging;
 #[cfg(windows)]
 mod production_tools;
@@ -8,6 +9,7 @@ mod tool_runtime;
 mod workspace_monitor;
 mod workspace_runtime;
 
+pub use agent_runtime::{OpenAiApiKey, OpenAiBootstrapConfig};
 pub use local_agent_terminal_application::{
     ApprovalId, CancelToolExecutionRequestDto, CommandErrorDto, ConfirmDiscardWorkspaceRequestDto,
     CreateTaskWorkspaceRequestDto, GetApprovalRequestDto, LocalDiagnosticDto,

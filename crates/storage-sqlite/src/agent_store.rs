@@ -21,6 +21,7 @@ const CONTEXT_ARTIFACT_KIND: &str = "content";
 const RUN_CONFIG_ARTIFACT_KIND: &str = "run-config";
 const MESSAGE_ARTIFACT_KIND: &str = "agent-message";
 const RUN_CONFIG_SCHEMA: &str = "agent-run-config.v1";
+const TRUSTED_CORE_ADAPTER_ID: &str = "core_adapter";
 
 pub fn canonical_agent_run_config_artifact(
     request: &BoundAgentRunRequest,
@@ -69,6 +70,96 @@ pub fn canonical_agent_run_config_artifact(
         },
     });
     serde_json_canonicalizer::to_vec(&value).map_err(|_| internal_failure())
+}
+
+impl SqliteStore {
+    pub fn reconcile_trusted_core_adapter(
+        &self,
+        descriptor: &AgentDescriptor,
+        at: &str,
+    ) -> Result<Vec<RunId>, PortError> {
+        descriptor.validate().map_err(|_| invalid_input())?;
+        if descriptor.agent_id != TRUSTED_CORE_ADAPTER_ID
+            || descriptor.trust_tier != TrustTier::CoreAdapter
+            || !descriptor.enabled
+            || !descriptor.containment_verified
+        {
+            return Err(invalid_input());
+        }
+        let executable_digest = descriptor
+            .executable_digest
+            .as_ref()
+            .ok_or_else(invalid_input)?;
+        let manifest = canonical_manifest(&descriptor.manifest_json)?;
+        let completed_at = {
+            let connection = self.connection().map_err(open_error_to_port)?;
+            validated_timestamp(&connection, at)?
+        };
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error_to_port)?;
+        let registered: Option<RegisteredDescriptor> = transaction
+            .query_row(
+                "SELECT transport_type, trust_tier, manifest_json, manifest_digest,
+                            executable_digest, enabled, containment_verified
+                     FROM agent_descriptors WHERE id = ?1",
+                [TRUSTED_CORE_ADAPTER_ID],
+                |row| {
+                    Ok(RegisteredDescriptor {
+                        transport: row.get(0)?,
+                        trust_tier: row.get(1)?,
+                        manifest: row.get(2)?,
+                        manifest_digest: row.get(3)?,
+                        executable_digest: row.get(4)?,
+                        enabled: row.get(5)?,
+                        containment_verified: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?;
+        let Some(registered) = registered else {
+            if active_run_count(&transaction, ActiveRunScope::Agent(TRUSTED_CORE_ADAPTER_ID))? != 0
+            {
+                return Err(conflict());
+            }
+            transaction.commit().map_err(sqlite_error_to_port)?;
+            return Ok(Vec::new());
+        };
+        if registered.transport != transport_type(TrustTier::CoreAdapter)
+            || registered.trust_tier != TrustTier::CoreAdapter.as_str()
+            || registered.manifest != manifest
+            || registered.manifest_digest != descriptor.manifest_digest.as_str()
+            || !registered.enabled
+            || !registered.containment_verified
+        {
+            return Err(conflict());
+        }
+        let registered_executable_digest = registered.executable_digest.ok_or_else(conflict)?;
+        Sha256Digest::new(&registered_executable_digest).map_err(|_| integrity_failure())?;
+        let interrupted = interrupt_active_runs(
+            &transaction,
+            ActiveRunScope::Agent(TRUSTED_CORE_ADAPTER_ID),
+            completed_at,
+            at,
+        )?;
+        if registered_executable_digest != executable_digest.as_str() {
+            let updated = transaction
+                .execute(
+                    "UPDATE agent_descriptors
+                     SET executable_digest = ?1, updated_at = ?2
+                     WHERE id = ?3",
+                    params![executable_digest.as_str(), at, TRUSTED_CORE_ADAPTER_ID],
+                )
+                .map_err(sqlite_error_to_port)?;
+            if updated != 1 {
+                return Err(conflict());
+            }
+        }
+        transaction.commit().map_err(sqlite_error_to_port)?;
+        Ok(interrupted)
+    }
 }
 
 impl AgentRunStore for SqliteStore {
@@ -382,59 +473,12 @@ impl AgentRunStore for SqliteStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
-        let active_runs = {
-            let mut statement = transaction
-                .prepare(
-                    "SELECT id, status, started_at, completed_at FROM agent_runs
-                     WHERE connection_binding_digest = ?1
-                       AND status IN ('created', 'accepted', 'running')
-                     ORDER BY id",
-                )
-                .map_err(sqlite_error_to_port)?;
-            let rows = statement
-                .query_map([connection_digest], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                    ))
-                })
-                .map_err(sqlite_error_to_port)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(sqlite_error_to_port)?;
-            rows
-        };
-        let mut interrupted = Vec::with_capacity(active_runs.len());
-        for (value, status, started_at, existing_completed_at) in active_runs {
-            let run_id = RunId::new(value).map_err(|_| integrity_failure())?;
-            validate_interruption_lifecycle(
-                &transaction,
-                &run_id,
-                &status,
-                started_at.as_deref(),
-                existing_completed_at.as_deref(),
-                completed_at,
-            )?;
-            let updated = transaction
-                .execute(
-                    "UPDATE agent_runs SET status = 'interrupted', completed_at = ?1
-                     WHERE id = ?2 AND status = ?3 AND completed_at IS NULL",
-                    params![at, run_id.as_str(), status],
-                )
-                .map_err(sqlite_error_to_port)?;
-            if updated != 1 {
-                return Err(conflict());
-            }
-            append_run_event(
-                &transaction,
-                &run_id,
-                "agent.run.completed",
-                at,
-                json!({"runId": run_id.as_str(), "status": "interrupted"}),
-            )?;
-            interrupted.push(run_id);
-        }
+        let interrupted = interrupt_active_runs(
+            &transaction,
+            ActiveRunScope::Connection(connection_digest),
+            completed_at,
+            at,
+        )?;
         transaction.commit().map_err(sqlite_error_to_port)?;
         Ok(interrupted)
     }
@@ -442,6 +486,119 @@ impl AgentRunStore for SqliteStore {
     fn load_run(&self, run_id: &RunId) -> Result<Option<AgentRunSnapshot>, PortError> {
         let connection = self.connection().map_err(open_error_to_port)?;
         load_run_on_connection(&connection, run_id)
+    }
+}
+
+enum ActiveRunScope<'a> {
+    Connection(&'a str),
+    Agent(&'a str),
+}
+
+struct RegisteredDescriptor {
+    transport: String,
+    trust_tier: String,
+    manifest: String,
+    manifest_digest: String,
+    executable_digest: Option<String>,
+    enabled: bool,
+    containment_verified: bool,
+}
+
+struct ActiveRun {
+    id: String,
+    status: String,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+}
+
+fn active_run_count(
+    transaction: &Transaction<'_>,
+    scope: ActiveRunScope<'_>,
+) -> Result<u64, PortError> {
+    let (column, value) = active_run_scope(scope);
+    transaction
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM agent_runs
+                 WHERE {column} = ?1 AND status IN ('created', 'accepted', 'running')"
+            ),
+            [value],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error_to_port)
+}
+
+fn interrupt_active_runs(
+    transaction: &Transaction<'_>,
+    scope: ActiveRunScope<'_>,
+    completed_at: Timestamp,
+    at: &str,
+) -> Result<Vec<RunId>, PortError> {
+    let active_runs = load_active_runs(transaction, scope)?;
+    let mut interrupted = Vec::with_capacity(active_runs.len());
+    for active_run in active_runs {
+        let run_id = RunId::new(active_run.id).map_err(|_| integrity_failure())?;
+        validate_interruption_lifecycle(
+            transaction,
+            &run_id,
+            &active_run.status,
+            active_run.started_at.as_deref(),
+            active_run.completed_at.as_deref(),
+            completed_at,
+        )?;
+        let updated = transaction
+            .execute(
+                "UPDATE agent_runs SET status = 'interrupted', completed_at = ?1
+                 WHERE id = ?2 AND status = ?3 AND completed_at IS NULL",
+                params![at, run_id.as_str(), active_run.status],
+            )
+            .map_err(sqlite_error_to_port)?;
+        if updated != 1 {
+            return Err(conflict());
+        }
+        append_run_event(
+            transaction,
+            &run_id,
+            "agent.run.completed",
+            at,
+            json!({"runId": run_id.as_str(), "status": "interrupted"}),
+        )?;
+        interrupted.push(run_id);
+    }
+    Ok(interrupted)
+}
+
+fn load_active_runs(
+    transaction: &Transaction<'_>,
+    scope: ActiveRunScope<'_>,
+) -> Result<Vec<ActiveRun>, PortError> {
+    let (column, value) = active_run_scope(scope);
+    let mut statement = transaction
+        .prepare(&format!(
+            "SELECT id, status, started_at, completed_at FROM agent_runs
+             WHERE {column} = ?1 AND status IN ('created', 'accepted', 'running')
+             ORDER BY id"
+        ))
+        .map_err(sqlite_error_to_port)?;
+    let runs = statement
+        .query_map([value], |row| {
+            Ok(ActiveRun {
+                id: row.get(0)?,
+                status: row.get(1)?,
+                started_at: row.get(2)?,
+                completed_at: row.get(3)?,
+            })
+        })
+        .map_err(sqlite_error_to_port)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error_to_port)?;
+    Ok(runs)
+}
+
+fn active_run_scope(scope: ActiveRunScope<'_>) -> (&'static str, &str) {
+    match scope {
+        ActiveRunScope::Connection(digest) => ("connection_binding_digest", digest),
+        ActiveRunScope::Agent(agent_id) => ("agent_id", agent_id),
     }
 }
 
@@ -575,7 +732,6 @@ fn snapshot_from_raw(connection: &Connection, raw: RawRun) -> Result<AgentRunSna
             .transpose()
             .map_err(|_| integrity_failure())?,
     };
-    let manifest = verify_descriptor(connection, &request)?;
     let manifest_artifact = load_available_artifact(
         connection,
         &request.context.manifest_artifact_id,
@@ -583,9 +739,7 @@ fn snapshot_from_raw(connection: &Connection, raw: RawRun) -> Result<AgentRunSna
         MANIFEST_ARTIFACT_KIND,
         Some(request.run_config.manifest_digest.as_str()),
     )?;
-    if manifest_artifact.bytes != manifest {
-        return Err(integrity_failure());
-    }
+    verify_historical_run_binding(&request, &manifest_artifact.bytes)?;
     load_available_artifact(
         connection,
         &request.context.effective_context_artifact_id,
@@ -673,6 +827,18 @@ fn verify_descriptor(
         return Err(integrity_failure());
     }
     Ok(manifest.into_bytes())
+}
+
+fn verify_historical_run_binding(
+    request: &BoundAgentRunRequest,
+    manifest_bytes: &[u8],
+) -> Result<(), PortError> {
+    request.validate().map_err(|_| integrity_failure())?;
+    let manifest = canonical_manifest(manifest_bytes).map_err(|_| integrity_failure())?;
+    if digest_bytes(manifest.as_bytes()) != request.run_config.manifest_digest {
+        return Err(integrity_failure());
+    }
+    Ok(())
 }
 
 fn verify_supersession(

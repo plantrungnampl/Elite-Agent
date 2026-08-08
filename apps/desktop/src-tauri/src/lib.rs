@@ -230,6 +230,7 @@ fn config(app_data_dir: PathBuf) -> StartupConfig {
         trusted_workspace_root: app_data_dir.join("workspaces"),
         app_data_dir,
         secret_values: Vec::new(),
+        openai: None,
     }
 }
 
