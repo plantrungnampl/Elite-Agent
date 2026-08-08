@@ -210,6 +210,90 @@ fn stop_all_replays_a_failed_shutdown_result() {
 }
 
 #[test]
+fn stop_all_before_startup_recovery_makes_runtime_terminal() {
+    let runtime = unrecovered_test_tool_runtime();
+
+    let first = runtime.stop_all();
+    let recovery = runtime.recover_startup();
+    let release = runtime.release_dispatch();
+    let authority = cancellation_authority("execution-terminal-before-recovery");
+    let (worker_done_tx, worker_done_rx) = mpsc::channel();
+    let dispatch = runtime.dispatch_test_worker(authority.execution_id().clone(), move || {
+        worker_done_tx.send(()).unwrap();
+        Ok(terminated_receipt(authority))
+    });
+    if dispatch.is_ok() {
+        worker_done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+    let availability = runtime.availability();
+    let repeated = runtime.stop_all();
+
+    assert_eq!(first, Ok(Vec::new()));
+    assert_eq!(
+        recovery.err().map(|error| error.safe_classification()),
+        Some(SafeErrorClassification::Conflict),
+    );
+    assert_eq!(
+        release.err().map(|error| error.safe_classification()),
+        Some(SafeErrorClassification::Conflict),
+    );
+    assert_eq!(
+        availability,
+        Ok(super::ToolRuntimeAvailability::Unavailable)
+    );
+    assert_eq!(
+        dispatch.err().map(|error| error.safe_classification()),
+        Some(SafeErrorClassification::Conflict),
+    );
+    assert_eq!(repeated, first);
+}
+
+#[test]
+fn shutdown_after_survivor_inspection_blocks_recovery_and_dispatch() {
+    let runtime = unrecovered_test_tool_runtime();
+
+    runtime.inspect_survivors().unwrap();
+    let first = runtime.stop_all();
+    let file_writes = runtime.recover_file_writes();
+    let reconciliation = runtime.reconcile_intents();
+    let release = runtime.release_dispatch();
+    let authority = cancellation_authority("execution-terminal-after-inspection");
+    let (worker_done_tx, worker_done_rx) = mpsc::channel();
+    let dispatch = runtime.dispatch_test_worker(authority.execution_id().clone(), move || {
+        worker_done_tx.send(()).unwrap();
+        Ok(terminated_receipt(authority))
+    });
+    if dispatch.is_ok() {
+        worker_done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+    let availability = runtime.availability();
+
+    assert_eq!(first, Ok(Vec::new()));
+    assert_eq!(
+        file_writes.err().map(|error| error.safe_classification()),
+        Some(SafeErrorClassification::Conflict),
+    );
+    assert_eq!(
+        reconciliation
+            .err()
+            .map(|error| error.safe_classification()),
+        Some(SafeErrorClassification::Conflict),
+    );
+    assert_eq!(
+        release.err().map(|error| error.safe_classification()),
+        Some(SafeErrorClassification::Conflict),
+    );
+    assert_eq!(
+        availability,
+        Ok(super::ToolRuntimeAvailability::Unavailable)
+    );
+    assert_eq!(
+        dispatch.err().map(|error| error.safe_classification()),
+        Some(SafeErrorClassification::Conflict),
+    );
+}
+
+#[test]
 fn retry_retains_failed_tool_runtime_without_an_agent_runtime() {
     let root = TempDir::new().unwrap();
     let tool_runtime = released_test_tool_runtime();
@@ -707,7 +791,7 @@ fn startup_config(root: &TempDir) -> StartupConfig {
     }
 }
 
-fn released_test_tool_runtime() -> Arc<ToolRuntime> {
+fn unrecovered_test_tool_runtime() -> Arc<ToolRuntime> {
     let events = Arc::new(Mutex::new(Vec::new()));
     let executions = Arc::new(RecordingExecutionStore::running(
         Vec::new(),
@@ -716,7 +800,11 @@ fn released_test_tool_runtime() -> Arc<ToolRuntime> {
     let executor = Arc::new(BlockingCancellationExecutor::new(events));
     let execution_port: Arc<dyn ToolExecutionStore> = executions;
     let executor_port: Arc<dyn SelfTestingToolExecutor> = executor;
-    let runtime = Arc::new(ToolRuntime::new(execution_port, executor_port));
+    Arc::new(ToolRuntime::new(execution_port, executor_port))
+}
+
+fn released_test_tool_runtime() -> Arc<ToolRuntime> {
+    let runtime = unrecovered_test_tool_runtime();
     runtime.recover_startup().unwrap();
     runtime.release_dispatch().unwrap();
     runtime

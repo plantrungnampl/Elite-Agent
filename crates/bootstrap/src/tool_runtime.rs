@@ -529,15 +529,17 @@ impl ToolRuntime {
     }
 
     pub fn recover_startup(&self) -> Result<ToolStartupRecoveryReport, PortError> {
-        self.inspect_survivors()?;
-        self.reconcile_intents()
+        let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
+        self.inspect_survivors_locked()?;
+        self.reconcile_intents_locked()
     }
 
     pub(crate) fn recover_file_writes(&self) -> Result<Vec<FileWriteRecoverySnapshot>, PortError> {
         let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
         {
             let state = self.state.lock().map_err(|_| internal_failure())?;
-            if state.dispatch_open
+            if state.shutdown_result.is_some()
+                || state.dispatch_open
                 || !state.workers.is_empty()
                 || state.startup_inspection.is_none()
                 || state.recovery_report.is_some()
@@ -564,9 +566,13 @@ impl ToolRuntime {
 
     pub fn inspect_survivors(&self) -> Result<ToolStartupRecoveryReport, PortError> {
         let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
+        self.inspect_survivors_locked()
+    }
+
+    fn inspect_survivors_locked(&self) -> Result<ToolStartupRecoveryReport, PortError> {
         {
             let state = self.state.lock().map_err(|_| internal_failure())?;
-            if state.dispatch_open || !state.workers.is_empty() {
+            if state.shutdown_result.is_some() || state.dispatch_open || !state.workers.is_empty() {
                 return Err(conflict());
             }
             if let Some(report) = &state.recovery_report {
@@ -664,7 +670,8 @@ impl ToolRuntime {
         }
 
         let mut state = self.state.lock().map_err(|_| internal_failure())?;
-        if state.dispatch_open
+        if state.shutdown_result.is_some()
+            || state.dispatch_open
             || !state.workers.is_empty()
             || state.startup_inspection.is_some()
             || state.recovery_report.is_some()
@@ -681,9 +688,13 @@ impl ToolRuntime {
 
     pub fn reconcile_intents(&self) -> Result<ToolStartupRecoveryReport, PortError> {
         let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
+        self.reconcile_intents_locked()
+    }
+
+    fn reconcile_intents_locked(&self) -> Result<ToolStartupRecoveryReport, PortError> {
         let inspection = {
             let state = self.state.lock().map_err(|_| internal_failure())?;
-            if state.dispatch_open || !state.workers.is_empty() {
+            if state.shutdown_result.is_some() || state.dispatch_open || !state.workers.is_empty() {
                 return Err(conflict());
             }
             if let Some(report) = &state.recovery_report {
@@ -701,7 +712,11 @@ impl ToolRuntime {
         }
 
         let mut state = self.state.lock().map_err(|_| internal_failure())?;
-        if state.dispatch_open || !state.workers.is_empty() || state.recovery_report.is_some() {
+        if state.shutdown_result.is_some()
+            || state.dispatch_open
+            || !state.workers.is_empty()
+            || state.recovery_report.is_some()
+        {
             return Err(conflict());
         }
         state.availability = inspection.availability;
@@ -711,7 +726,11 @@ impl ToolRuntime {
     }
 
     pub fn release_dispatch(&self) -> Result<(), PortError> {
+        let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
         let mut state = self.state.lock().map_err(|_| internal_failure())?;
+        if state.shutdown_result.is_some() {
+            return Err(conflict());
+        }
         if state.recovery_report.is_none()
             || !matches!(
                 state.availability,
@@ -918,7 +937,8 @@ impl ToolRuntime {
         worker: impl FnOnce() -> ToolWorkerResult + Send + 'static,
     ) -> Result<Arc<ToolWorkerCompletion>, PortError> {
         let mut state = self.state.lock().map_err(|_| internal_failure())?;
-        if !state.dispatch_open
+        if state.shutdown_result.is_some()
+            || !state.dispatch_open
             || !matches!(
                 state.availability,
                 ToolRuntimeAvailability::Ready | ToolRuntimeAvailability::DegradedReadOnly
