@@ -38,6 +38,38 @@ test("M3 evidence is complete and internally consistent", () => {
   assert.match(`${result.stdout}${result.stderr}`, /M3 evidence: ok/u);
 });
 
+test("retained verification logs and toolchains are checked out with LF endings", () => {
+  const retainedPaths = gitOutput(
+    "ls-files",
+    "--cached",
+    "--others",
+    "--exclude-standard",
+    "--",
+    "artifacts/verification",
+  )
+    .split(/\r?\n/u)
+    .filter((path) => path.endsWith(".log") || path.endsWith("toolchain.txt"));
+  const m3Generation = retainedPaths.find((path) =>
+    path.startsWith("artifacts/verification/m3/.generations/") &&
+    path.endsWith("/outputs/protocol-schema-conformance.log"),
+  );
+  const paths = [
+    "artifacts/verification/m1/toolchain.txt",
+    "artifacts/verification/m1/outputs/architecture.log",
+    "artifacts/verification/m1/post-final-contracts.log",
+    "artifacts/verification/m2/toolchain.txt",
+    m3Generation ??
+      "artifacts/verification/m3/.generations/fixture/outputs/protocol-schema-conformance.log",
+    m3Generation?.replace(/\/outputs\/[^/]+\.log$/u, "/toolchain.txt") ??
+      "artifacts/verification/m3/.generations/fixture/toolchain.txt",
+    ...retainedPaths,
+  ];
+
+  for (const path of new Set(paths)) {
+    assert.equal(effectiveGitAttribute(path, "eol"), "lf", path);
+  }
+});
+
 test("M3 verifier rejects an absent manifest", () => {
   const directory = mkdtempSync(join(tmpdir(), "m3-missing-manifest-"));
   try {
@@ -697,6 +729,19 @@ function gitOutput(...arguments_) {
   });
   assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
   return result.stdout.trim();
+}
+
+function effectiveGitAttribute(path, attribute) {
+  const result = spawnSync("git", ["check-attr", attribute, "--", path], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+  const expectedPrefix = `${path}: ${attribute}: `;
+  const output = result.stdout.trim();
+  assert.equal(output.startsWith(expectedPrefix), true, output);
+  return output.slice(expectedPrefix.length);
 }
 
 function hash(value) {
