@@ -472,15 +472,15 @@ pub struct StartupConfig {
 
 If no explicit provider config is supplied, startup succeeds with no OpenAI agent registered. If supplied, bootstrap constructs the concrete adapter/runtime, registers one disabled-until-bound or enabled `core_adapter` descriptor as appropriate, and exposes the provider-neutral `Arc<dyn AgentRuntime>` to later orchestration. It never reads `OPENAI_API_KEY` itself.
 
-- [ ] **Step 1 - Write failing bootstrap tests**
+- [x] **Step 1 - Write failing bootstrap tests**
 
 Prove optional configuration, exact descriptor/manifest/core-release binding, deterministic fake-provider run, real OpenAI adapter against loopback SSE, immediate start receipt, stream/terminal storage, cancellation, provider outage, process/app restart interruption, and exact reconstruction of effective context plus run config after reopening SQLite. Assert task workflow state/sequence is unchanged by every provider failure.
 
-- [ ] **Step 2 - Implement bootstrap-only construction**
+- [x] **Step 2 - Implement bootstrap-only construction**
 
 Reuse the existing SQLite and content-addressed artifact instances. Canonicalize and publish effective context and run configuration before dispatch. Store only provider ID/model/generation parameters and digests; never the API key or endpoint credentials.
 
-- [ ] **Step 3 - Verify and commit**
+- [x] **Step 3 - Verify and commit**
 
 ```powershell
 cargo test -p local-agent-terminal-bootstrap --test agent_runtime_e2e --test agent_recovery
