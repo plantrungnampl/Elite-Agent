@@ -109,6 +109,26 @@ impl Bootstrap {
         Self::configured(config, Some(tool_broker))
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_agent_runtime_for_test(
+        config: StartupConfig,
+        agent_runtime: Arc<ComposedAgentRuntime>,
+    ) -> Self {
+        Self {
+            config: Some(config),
+            status: StartupStatusDto {
+                state: StartupStateDto::Ready,
+                issues: Vec::new(),
+            },
+            diagnostics: Vec::new(),
+            runtime: None,
+            agent_runtime: Some(agent_runtime),
+            tool_runtime: None,
+            tool_broker: None,
+            retained_processes: default_retained_process_controller(),
+        }
+    }
+
     fn configured(config: StartupConfig, tool_broker: Option<ToolBrokerConfig>) -> Self {
         let mut bootstrap = Self {
             config: Some(config),
@@ -180,14 +200,11 @@ impl Bootstrap {
             return &self.status;
         };
         let mut log = LocalLog::new(secret_values);
-        if let Some(runtime) = self.agent_runtime.as_ref() {
-            if let Err(error) = runtime.shutdown() {
-                self.record_failure(&mut log, agent_runtime_shutdown_failure(error));
-                self.diagnostics = log.into_records();
-                return &self.status;
-            }
+        if let Err(error) = self.shutdown_agent_runtime() {
+            self.record_failure(&mut log, agent_runtime_shutdown_failure(error));
+            self.diagnostics = log.into_records();
+            return &self.status;
         }
-        self.agent_runtime = None;
         self.runtime = None;
         if let Some(runtime) = self.tool_runtime.take() {
             if let Err(error) = runtime.stop_all() {
@@ -233,7 +250,13 @@ impl Bootstrap {
                         "Tool dispatch released after startup recovery completed.",
                     )),
                     Ok(false) => {}
-                    Err(error) => self.record_failure(&mut log, tool_recovery_failure(error)),
+                    Err(error) => match self.shutdown_agent_runtime() {
+                        Ok(()) => self.record_failure(&mut log, tool_recovery_failure(error)),
+                        Err(shutdown_error) => self.record_failure(
+                            &mut log,
+                            agent_runtime_shutdown_failure(shutdown_error),
+                        ),
+                    },
                 }
             }
             Err(failure) => self.record_failure(&mut log, failure),
@@ -286,12 +309,17 @@ impl Bootstrap {
                 recovery_actions: recovery_actions(failure.recovery),
             }],
         };
-        if let Some(runtime) = self.agent_runtime.as_ref() {
-            let _ = runtime.shutdown();
-        }
         self.runtime = None;
-        self.agent_runtime = None;
         self.tool_runtime = None;
+    }
+
+    fn shutdown_agent_runtime(&mut self) -> Result<(), PortError> {
+        let Some(runtime) = self.agent_runtime.as_ref() else {
+            return Ok(());
+        };
+        runtime.shutdown()?;
+        self.agent_runtime = None;
+        Ok(())
     }
 
     fn failed(failure: StartupFailure) -> Self {

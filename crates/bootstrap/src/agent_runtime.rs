@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeSet,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -127,7 +127,7 @@ fn compose_runtime(
         connection,
         durable_artifacts,
         runtime,
-        lifecycle: Mutex::new(ComposedRuntimeLifecycle::Open),
+        lifecycle: RuntimeLifecycle::new(),
     }))
 }
 
@@ -137,23 +137,62 @@ pub(crate) struct ComposedAgentRuntime {
     connection: BoundAgentConnection,
     durable_artifacts: Arc<DurableAgentArtifacts>,
     runtime: Arc<ProtocolAgentRuntime>,
-    lifecycle: Mutex<ComposedRuntimeLifecycle>,
+    lifecycle: RuntimeLifecycle,
 }
 
 enum ComposedRuntimeLifecycle {
     Open,
-    Closed,
+    Closing,
+    Closed(Result<(), PortError>),
+}
+
+struct RuntimeLifecycle {
+    state: Mutex<ComposedRuntimeLifecycle>,
+    shutdown_complete: Condvar,
+}
+
+impl RuntimeLifecycle {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ComposedRuntimeLifecycle::Open),
+            shutdown_complete: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, ComposedRuntimeLifecycle>, PortError> {
+        self.state.lock().map_err(|_| integrity_failure())
+    }
+
+    fn shutdown(&self, cleanup: impl FnOnce() -> Result<(), PortError>) -> Result<(), PortError> {
+        let mut state = self.lock()?;
+        loop {
+            match &*state {
+                ComposedRuntimeLifecycle::Open => {
+                    *state = ComposedRuntimeLifecycle::Closing;
+                    break;
+                }
+                ComposedRuntimeLifecycle::Closing => {
+                    state = self
+                        .shutdown_complete
+                        .wait(state)
+                        .map_err(|_| integrity_failure())?;
+                }
+                ComposedRuntimeLifecycle::Closed(result) => return result.clone(),
+            }
+        }
+        drop(state);
+
+        let result = cleanup();
+        let mut state = self.lock()?;
+        *state = ComposedRuntimeLifecycle::Closed(result.clone());
+        self.shutdown_complete.notify_all();
+        result
+    }
 }
 
 impl ComposedAgentRuntime {
     pub(crate) fn shutdown(&self) -> Result<(), PortError> {
-        let mut lifecycle = self.lifecycle.lock().map_err(|_| integrity_failure())?;
-        if matches!(*lifecycle, ComposedRuntimeLifecycle::Closed) {
-            return Ok(());
-        }
-        *lifecycle = ComposedRuntimeLifecycle::Closed;
-        drop(lifecycle);
-        self.runtime.shutdown()
+        self.lifecycle.shutdown(|| self.runtime.shutdown())
     }
 
     fn prepare_run(&self, request: &BoundAgentRunRequest) -> Result<(), PortError> {
@@ -238,8 +277,8 @@ impl AgentRuntime for ComposedAgentRuntime {
     }
 
     fn start_run(&self, request: BoundAgentRunRequest) -> Result<AgentRunReceipt, PortError> {
-        let lifecycle = self.lifecycle.lock().map_err(|_| integrity_failure())?;
-        if matches!(*lifecycle, ComposedRuntimeLifecycle::Closed) {
+        let lifecycle = self.lifecycle.lock()?;
+        if !matches!(*lifecycle, ComposedRuntimeLifecycle::Open) {
             return Err(conflict());
         }
         self.prepare_run(&request)?;
@@ -249,8 +288,8 @@ impl AgentRuntime for ComposedAgentRuntime {
     }
 
     fn cancel(&self, request: CancelAgentRun) -> Result<AgentCancellationReceipt, PortError> {
-        let lifecycle = self.lifecycle.lock().map_err(|_| integrity_failure())?;
-        if matches!(*lifecycle, ComposedRuntimeLifecycle::Closed) {
+        let lifecycle = self.lifecycle.lock()?;
+        if !matches!(*lifecycle, ComposedRuntimeLifecycle::Open) {
             return Err(not_found());
         }
         let receipt = self.runtime.cancel(request);
@@ -455,4 +494,257 @@ fn conflict() -> PortError {
         SafeErrorClassification::Conflict,
         Retryability::NonRetryable,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::Path,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc, Arc, Mutex,
+        },
+        thread,
+        time::Duration,
+    };
+
+    use local_agent_terminal_agent_runtime::{ProtocolAgentRuntime, Script, ScriptedPeer};
+    use local_agent_terminal_application::StartupStateDto;
+    use tempfile::TempDir;
+
+    use crate::{Bootstrap, StartupConfig};
+
+    use super::*;
+
+    #[test]
+    fn shutdown_preserves_failed_cleanup_result_for_repeated_calls() {
+        let temporary = TempDir::new().expect("temporary state directory");
+        let clock = Arc::new(FailingShutdownClock::default());
+        let runtime = runtime_with_clock(temporary.path(), Arc::clone(&clock));
+
+        let first = runtime.shutdown();
+        let repeated = runtime.shutdown();
+
+        assert_shutdown_failure(first);
+        assert_shutdown_failure(repeated);
+        assert_eq!(clock.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn shutdown_serializes_concurrent_cleanup_and_shares_the_failure() {
+        let temporary = TempDir::new().expect("temporary state directory");
+        let (cleanup_entered, wait_for_cleanup) = mpsc::channel();
+        let (release_cleanup, release) = mpsc::channel();
+        let clock = Arc::new(GatedFailureClock::new(cleanup_entered, release));
+        let runtime = Arc::new(runtime_with_clock(temporary.path(), Arc::clone(&clock)));
+        let (first_done, wait_for_first) = mpsc::channel();
+        let first_runtime = Arc::clone(&runtime);
+        let first = thread::spawn(move || {
+            let _ = first_done.send(first_runtime.shutdown());
+        });
+
+        wait_for_cleanup
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first shutdown entered cleanup");
+        let (second_done, wait_for_second) = mpsc::channel();
+        let second_runtime = Arc::clone(&runtime);
+        let second = thread::spawn(move || {
+            let _ = second_done.send(second_runtime.shutdown());
+        });
+
+        assert!(
+            wait_for_second
+                .recv_timeout(Duration::from_millis(30))
+                .is_err(),
+            "concurrent shutdown returned before authoritative cleanup completed"
+        );
+        release_cleanup.send(()).expect("release cleanup");
+
+        assert_shutdown_failure(
+            wait_for_first
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first shutdown result"),
+        );
+        assert_shutdown_failure(
+            wait_for_second
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second shutdown result"),
+        );
+        first.join().expect("first shutdown thread");
+        second.join().expect("second shutdown thread");
+        assert_eq!(clock.cleanup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn bootstrap_retry_retains_a_runtime_with_a_failed_shutdown_result() {
+        let temporary = TempDir::new().expect("temporary state directory");
+        let clock = Arc::new(FailingShutdownClock::default());
+        let runtime = Arc::new(runtime_with_clock(temporary.path(), Arc::clone(&clock)));
+        let mut bootstrap = Bootstrap::with_agent_runtime_for_test(
+            StartupConfig {
+                app_data_dir: temporary.path().join("app-data"),
+                trusted_workspace_root: temporary.path().join("workspaces"),
+                secret_values: Vec::new(),
+                openai: None,
+            },
+            runtime,
+        );
+
+        assert_eq!(
+            bootstrap.retry_startup_validation().state,
+            StartupStateDto::RecoverableFailure
+        );
+        assert_eq!(
+            bootstrap.status().issues[0].code,
+            "startup.agent_runtime_shutdown_failed"
+        );
+        assert!(bootstrap.agent_runtime_handle().is_some());
+        assert_eq!(
+            bootstrap.retry_startup_validation().state,
+            StartupStateDto::RecoverableFailure
+        );
+        assert_eq!(
+            bootstrap.status().issues[0].code,
+            "startup.agent_runtime_shutdown_failed"
+        );
+        assert!(bootstrap.agent_runtime_handle().is_some());
+        assert_eq!(clock.calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn runtime_with_clock<C>(path: &Path, clock: Arc<C>) -> ComposedAgentRuntime
+    where
+        C: Clock + 'static,
+    {
+        let database = SqliteStore::open(path.join("state.sqlite3")).expect("database");
+        let artifacts = Arc::new(
+            ContentAddressedArtifactStore::open(path.join("artifacts")).expect("artifact store"),
+        );
+        let config = OpenAiBootstrapConfig {
+            endpoint: "http://127.0.0.1:9/v1/responses".to_owned(),
+            api_key: OpenAiApiKey::new("sk-test-key").expect("API key"),
+            manifest_digest: digest_bytes(CORE_MANIFEST),
+            core_release_digest: digest_bytes(b"test-release"),
+            adapter_version: "test-adapter-v1".to_owned(),
+        };
+        let descriptor = core_adapter_descriptor(&config).expect("descriptor");
+        let connection = core_adapter_connection(&config).expect("connection");
+        let peer: Arc<dyn ProtocolPeer> = Arc::new(ScriptedPeer::new(
+            Script::Slow,
+            peer_descriptor(&connection),
+        ));
+        let durable_artifacts = Arc::new(DurableAgentArtifacts {
+            database: database.clone(),
+            artifacts,
+        });
+        let runtime = Arc::new(
+            ProtocolAgentRuntime::new(
+                Arc::new(database.clone()) as Arc<dyn AgentRunStore>,
+                durable_artifacts.clone() as Arc<dyn AgentArtifactStore>,
+                clock as Arc<dyn Clock>,
+                vec![(descriptor.clone(), connection.binding_digest.clone(), peer)],
+            )
+            .expect("protocol runtime"),
+        );
+
+        ComposedAgentRuntime {
+            database,
+            descriptor,
+            connection,
+            durable_artifacts,
+            runtime,
+            lifecycle: RuntimeLifecycle::new(),
+        }
+    }
+
+    fn peer_descriptor(connection: &BoundAgentConnection) -> PeerDescriptor {
+        PeerDescriptor {
+            binding: ConnectionBinding {
+                connection_id: connection.connection_id.clone(),
+                agent_id: connection.agent_id.clone(),
+                manifest_digest: connection.manifest_digest.as_str().to_owned(),
+                executable_digest: connection
+                    .executable_digest
+                    .as_ref()
+                    .expect("core connection executable digest")
+                    .as_str()
+                    .to_owned(),
+                trust_tier: ProtocolTrustTier::CoreAdapter,
+            },
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            capabilities: ProtocolCapabilities {
+                roles: BTreeSet::from([
+                    "proposer".to_owned(),
+                    "critic".to_owned(),
+                    "reviewer".to_owned(),
+                    "verifier".to_owned(),
+                ]),
+                skills: BTreeSet::new(),
+                streaming: true,
+                context_query: false,
+                tool_requests: false,
+                specialist_requests: false,
+                max_concurrent_runs: 1,
+                max_context_tokens: 16_384,
+            },
+        }
+    }
+
+    fn assert_shutdown_failure(result: Result<(), PortError>) {
+        let error = result.expect_err("shutdown must preserve the cleanup failure");
+        assert_eq!(
+            error.safe_classification(),
+            SafeErrorClassification::Internal
+        );
+        assert_eq!(error.retryability(), Retryability::NonRetryable);
+    }
+
+    #[derive(Default)]
+    struct FailingShutdownClock {
+        calls: AtomicUsize,
+    }
+
+    impl Clock for FailingShutdownClock {
+        fn now_utc(&self) -> Result<String, PortError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok("2026-07-23T13:30:00Z".to_owned());
+            }
+            Err(PortError::failure(
+                SafeErrorClassification::Internal,
+                Retryability::NonRetryable,
+            ))
+        }
+    }
+
+    struct GatedFailureClock {
+        calls: AtomicUsize,
+        cleanup_calls: AtomicUsize,
+        cleanup_entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl GatedFailureClock {
+        fn new(cleanup_entered: mpsc::Sender<()>, release: mpsc::Receiver<()>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                cleanup_calls: AtomicUsize::new(0),
+                cleanup_entered,
+                release: Mutex::new(release),
+            }
+        }
+    }
+
+    impl Clock for GatedFailureClock {
+        fn now_utc(&self) -> Result<String, PortError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok("2026-07-23T13:30:00Z".to_owned());
+            }
+            self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = self.cleanup_entered.send(());
+            let _ = self.release.lock().map_err(|_| integrity_failure())?.recv();
+            Err(PortError::failure(
+                SafeErrorClassification::Internal,
+                Retryability::NonRetryable,
+            ))
+        }
+    }
 }

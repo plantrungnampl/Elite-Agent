@@ -642,12 +642,10 @@ fn terminal(
     sink.request(frame).map(|_| ())
 }
 
-fn terminal_message_id(run_id: &str, terminal_id: u64) -> String {
+fn terminal_message_id(run_id: &str, _terminal_id: u64) -> String {
     let mut digest = Sha256::new();
     digest.update(b"openai-terminal-message.v1\0");
     digest.update(run_id.as_bytes());
-    digest.update(b"\0");
-    digest.update(terminal_id.to_be_bytes());
     format!("openai-message-{:x}", digest.finalize())
 }
 
@@ -892,6 +890,24 @@ mod lifecycle_tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn terminal_message_id_uses_only_the_durable_run_identity() {
+        let first_adapter = test_adapter();
+        let first = terminal_message_id("durable-run", first_adapter.next_terminal_id());
+
+        let warmed_adapter = test_adapter();
+        let _ = warmed_adapter.next_terminal_id();
+        let _ = warmed_adapter.next_terminal_id();
+        let after_warmup = terminal_message_id("durable-run", warmed_adapter.next_terminal_id());
+        let different_run =
+            terminal_message_id("different-durable-run", warmed_adapter.next_terminal_id());
+
+        assert_eq!(first, after_warmup);
+        assert_ne!(first, different_run);
+        assert!(first.len() <= 256);
+        assert!(different_run.len() <= 256);
     }
 
     fn test_run_start(run_id: &str) -> RunStart {
