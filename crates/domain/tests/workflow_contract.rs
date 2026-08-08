@@ -886,11 +886,15 @@ fn generated_terminal_states_never_leave_terminality_without_a_declared_recovery
 #[test]
 fn domain_crate_declares_only_pure_data_dependencies() {
     const MANIFEST: &str = include_str!("../Cargo.toml");
-    const SOURCES: [&str; 4] = [
+    const SOURCES: [&str; 8] = [
+        include_str!("../src/agent.rs"),
         include_str!("../src/lib.rs"),
         include_str!("../src/event.rs"),
         include_str!("../src/identity.rs"),
+        include_str!("../src/policy.rs"),
+        include_str!("../src/tool.rs"),
         include_str!("../src/workflow.rs"),
+        include_str!("../src/workspace.rs"),
     ];
 
     let dependency_section = MANIFEST
@@ -906,7 +910,10 @@ fn domain_crate_declares_only_pure_data_dependencies() {
         .filter(|name| !name.is_empty())
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(direct_dependencies, BTreeSet::from(["serde", "serde_json"]));
+    assert_eq!(
+        direct_dependencies,
+        BTreeSet::from(["serde", "serde_json", "serde_json_canonicalizer", "sha2"])
+    );
 
     for source in SOURCES {
         let lowercase = source.to_ascii_lowercase();
