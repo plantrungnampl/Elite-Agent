@@ -340,6 +340,35 @@ fn long_paths_are_opened_relative_to_retained_directory_handles() {
 }
 
 #[test]
+fn registered_root_under_oversized_parent_resolves_and_reads() {
+    let parent = TempDir::new().unwrap();
+    let root_dir = parent.path().join("authorized-root");
+    fs::create_dir(&root_dir).unwrap();
+    fs::write(root_dir.join("inside.txt"), b"inside").unwrap();
+    for index in 0..=MAX_DIRECTORY_ENTRIES {
+        fs::write(parent.path().join(format!("sibling-{index:04}.txt")), b"x").unwrap();
+    }
+    let task = task("task-1");
+    let adapter = WindowsCapabilityAdapter::new(vec![CapabilityRegistration::source(
+        root("oversized-parent-root"),
+        task.clone(),
+        "revision-1",
+        &root_dir,
+    )
+    .unwrap()])
+    .unwrap();
+
+    assert_eq!(
+        resolve_and_read(
+            &adapter,
+            &task,
+            CapabilityRef::source("revision-1", "inside.txt").unwrap(),
+        ),
+        b"inside"
+    );
+}
+
+#[test]
 fn reads_and_directory_enumeration_are_bounded() {
     let bytes_root = TempDir::new().unwrap();
     fs::write(

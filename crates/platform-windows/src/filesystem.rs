@@ -24,12 +24,14 @@ use local_agent_terminal_domain::{ArtifactId, CapabilityRef, Sha256Digest, TaskI
 use sha2::{Digest, Sha256};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE, FILE_DIRECTORY_FILE,
+    FileDirectoryInformation, FileRenameInformation, NtCreateFile, NtQueryDirectoryFile,
+    NtSetInformationFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DIRECTORY_INFORMATION,
     FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
     FILE_SYNCHRONOUS_IO_NONALERT,
 };
 use windows_sys::Win32::Foundation::{
-    HANDLE, OBJ_CASE_INSENSITIVE, STATUS_OBJECT_NAME_COLLISION, STATUS_SUCCESS, UNICODE_STRING,
+    HANDLE, OBJ_CASE_INSENSITIVE, STATUS_BUFFER_OVERFLOW, STATUS_NO_MORE_FILES,
+    STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_COLLISION, STATUS_SUCCESS, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FileDispositionInfoEx, FileIdInfo, GetFileInformationByHandleEx, SetFileInformationByHandle,
@@ -43,6 +45,7 @@ use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 const MAX_READ_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 4_096;
 const MAX_TEMP_CREATE_ATTEMPTS: u32 = 16;
+const MAX_EXACT_NAME_QUERY_BYTES: usize = 64 * 1024 + size_of::<FILE_DIRECTORY_INFORMATION>();
 
 #[derive(Debug)]
 pub struct CapabilityRegistration {
@@ -502,7 +505,7 @@ impl RegisteredCapability {
         {
             return Err(denied());
         }
-        require_exact_name(&self.root_parent, &self.root_name).map_err(read_io_error)?;
+        require_exact_registered_name(&self.root_parent, &self.root_name).map_err(read_io_error)?;
         let reopened = self
             .root_parent
             .open_dir_nofollow(&self.root_name)
@@ -860,16 +863,21 @@ impl WindowsFileWriteSession {
 
     fn revalidate_parent(&self) -> Result<Dir, PortError> {
         let mut parent = self.root_parent.try_clone().map_err(read_io_error)?;
-        for ((name, retained), expected_identity) in self
+        for (index, ((name, retained), expected_identity)) in self
             .directory_names
             .iter()
             .zip(&self.directories)
             .zip(&self.directory_identities)
+            .enumerate()
         {
             if file_identity(retained).map_err(read_io_error)? != *expected_identity {
                 return Err(denied());
             }
-            require_exact_name(&parent, name).map_err(read_io_error)?;
+            if index == 0 {
+                require_exact_registered_name(&parent, name).map_err(read_io_error)?;
+            } else {
+                require_exact_name(&parent, name).map_err(read_io_error)?;
+            }
             let reopened = parent.open_dir_nofollow(name).map_err(read_io_error)?;
             reject_reparse_directory(&reopened).map_err(read_io_error)?;
             if file_identity(&reopened).map_err(read_io_error)? != *expected_identity {
@@ -1003,7 +1011,7 @@ fn retain_expected_target(
 ) -> Result<RetainedTarget, PortError> {
     match expected {
         ExpectedTarget::Absent => {
-            if exact_name_exists(parent, OsStr::new(name)).map_err(read_io_error)? {
+            if bounded_exact_name_exists(parent, OsStr::new(name)).map_err(read_io_error)? {
                 return Err(denied());
             }
             Ok(RetainedTarget::Absent)
@@ -1104,13 +1112,13 @@ fn open_registered_root(path: &Path) -> Result<(Dir, OsString, Dir), PortError> 
     let mut parent =
         Dir::open_ambient_dir(anchor, ambient_authority()).map_err(configuration_io_error)?;
     for component in components {
-        require_exact_name(&parent, &component).map_err(configuration_io_error)?;
+        require_exact_registered_name(&parent, &component).map_err(configuration_io_error)?;
         parent = parent
             .open_dir_nofollow(&component)
             .map_err(configuration_io_error)?;
         reject_reparse_directory(&parent).map_err(configuration_io_error)?;
     }
-    require_exact_name(&parent, &root_name).map_err(configuration_io_error)?;
+    require_exact_registered_name(&parent, &root_name).map_err(configuration_io_error)?;
     let root = parent
         .open_dir_nofollow(&root_name)
         .map_err(configuration_io_error)?;
@@ -1178,7 +1186,7 @@ fn open_optional_file_from_root(
 
 fn open_optional_file_nofollow(parent: &Dir, name: &str) -> Result<Option<File>, PortError> {
     validate_windows_component(name)?;
-    if !exact_name_exists(parent, OsStr::new(name)).map_err(read_io_error)? {
+    if !bounded_exact_name_exists(parent, OsStr::new(name)).map_err(read_io_error)? {
         return Ok(None);
     }
     let mut options = OpenOptions::new();
@@ -1263,7 +1271,7 @@ fn read_bounded(file: &mut (impl Read + Seek)) -> Result<Vec<u8>, PortError> {
     Ok(bytes)
 }
 
-fn require_exact_name(directory: &Dir, expected: &OsStr) -> std::io::Result<()> {
+fn require_exact_registered_name(directory: &Dir, expected: &OsStr) -> std::io::Result<()> {
     if exact_name_exists(directory, expected)? {
         Ok(())
     } else {
@@ -1271,7 +1279,70 @@ fn require_exact_name(directory: &Dir, expected: &OsStr) -> std::io::Result<()> 
     }
 }
 
+fn require_exact_name(directory: &Dir, expected: &OsStr) -> std::io::Result<()> {
+    if bounded_exact_name_exists(directory, expected)? {
+        Ok(())
+    } else {
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+    }
+}
+
 fn exact_name_exists(directory: &Dir, expected: &OsStr) -> std::io::Result<bool> {
+    let mut expected_name = expected.encode_wide().collect::<Vec<_>>();
+    if !is_queryable_exact_name(&expected_name) {
+        return Ok(false);
+    }
+    let byte_length = expected_name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(invalid_directory_query)?;
+    let unicode_name = UNICODE_STRING {
+        Length: byte_length,
+        MaximumLength: byte_length,
+        Buffer: expected_name.as_mut_ptr(),
+    };
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .maybe_dir(true)
+        .follow(FollowSymlinks::No);
+    // Directory queries retain their first filter on a file object. Open a
+    // fresh nofollow handle relative to the retained capability directory so
+    // this lookup cannot affect later exact-name queries.
+    let query_directory = directory.open_with(".", &options)?;
+    let mut buffer = vec![0_u8; MAX_EXACT_NAME_QUERY_BYTES];
+    let buffer_length = u32::try_from(buffer.len()).map_err(|_| invalid_directory_query())?;
+    let mut io_status = IO_STATUS_BLOCK::default();
+    // SAFETY: `query_directory` is a live directory handle opened relative to
+    // `directory`; `unicode_name` points to the nonempty, bounded UTF-16
+    // storage in `expected_name`; and `io_status` plus `buffer` are writable
+    // for the synchronous call and remain alive until it returns.
+    let status = unsafe {
+        NtQueryDirectoryFile(
+            query_directory.as_raw_handle() as HANDLE,
+            ptr::null_mut(),
+            None,
+            ptr::null(),
+            &mut io_status,
+            buffer.as_mut_ptr().cast(),
+            buffer_length,
+            FileDirectoryInformation,
+            true,
+            &unicode_name,
+            true,
+        )
+    };
+    if status == STATUS_NO_SUCH_FILE || status == STATUS_NO_MORE_FILES {
+        return Ok(false);
+    }
+    if status != STATUS_SUCCESS && status != STATUS_BUFFER_OVERFLOW {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    exact_name_from_directory_query(&buffer, io_status.Information, &expected_name)
+}
+
+fn bounded_exact_name_exists(directory: &Dir, expected: &OsStr) -> std::io::Result<bool> {
     let expected_folded = expected.to_string_lossy().to_lowercase();
     let mut exact = false;
     let mut count = 0_usize;
@@ -1293,6 +1364,95 @@ fn exact_name_exists(directory: &Dir, expected: &OsStr) -> std::io::Result<bool>
         }
     }
     Ok(exact)
+}
+
+fn is_queryable_exact_name(name: &[u16]) -> bool {
+    !name.is_empty()
+        && !name
+            .iter()
+            .any(|unit| *unit == u16::from(b'*') || *unit == u16::from(b'?'))
+        && !matches!(
+            name.last(),
+            Some(unit) if *unit == u16::from(b'.') || *unit == u16::from(b' ')
+        )
+}
+
+fn exact_name_from_directory_query(
+    buffer: &[u8],
+    returned: usize,
+    expected: &[u16],
+) -> std::io::Result<bool> {
+    let name_offset = std::mem::offset_of!(FILE_DIRECTORY_INFORMATION, FileName);
+    if returned < name_offset || returned > buffer.len() || name_offset % size_of::<u16>() != 0 {
+        return Err(invalid_directory_query());
+    }
+
+    let mut offset = 0_usize;
+    while offset < returned {
+        let entry = buffer
+            .get(offset..returned)
+            .ok_or_else(invalid_directory_query)?;
+        if entry.len() < name_offset {
+            return Err(invalid_directory_query());
+        }
+        let next_offset = usize::try_from(directory_query_u32(
+            entry,
+            std::mem::offset_of!(FILE_DIRECTORY_INFORMATION, NextEntryOffset),
+        )?)
+        .map_err(|_| invalid_directory_query())?;
+        let name_bytes = usize::try_from(directory_query_u32(
+            entry,
+            std::mem::offset_of!(FILE_DIRECTORY_INFORMATION, FileNameLength),
+        )?)
+        .map_err(|_| invalid_directory_query())?;
+        let name_end = name_offset
+            .checked_add(name_bytes)
+            .ok_or_else(invalid_directory_query)?;
+        if name_bytes == 0 || name_bytes % size_of::<u16>() != 0 || name_end > entry.len() {
+            return Err(invalid_directory_query());
+        }
+        if !matches_exact_utf16_name(&entry[name_offset..name_end], expected) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "case mismatch",
+            ));
+        }
+        if next_offset == 0 {
+            return Ok(true);
+        }
+        if next_offset < name_end
+            || next_offset % size_of::<u16>() != 0
+            || next_offset > entry.len()
+        {
+            return Err(invalid_directory_query());
+        }
+        offset = offset
+            .checked_add(next_offset)
+            .ok_or_else(invalid_directory_query)?;
+    }
+    Err(invalid_directory_query())
+}
+
+fn directory_query_u32(entry: &[u8], offset: usize) -> std::io::Result<u32> {
+    let end = offset
+        .checked_add(size_of::<u32>())
+        .ok_or_else(invalid_directory_query)?;
+    let bytes: [u8; size_of::<u32>()] = entry
+        .get(offset..end)
+        .ok_or_else(invalid_directory_query)?
+        .try_into()
+        .map_err(|_| invalid_directory_query())?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn matches_exact_utf16_name(name: &[u8], expected: &[u16]) -> bool {
+    name.chunks_exact(size_of::<u16>())
+        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+        .eq(expected.iter().copied())
+}
+
+fn invalid_directory_query() -> std::io::Error {
+    std::io::Error::from(std::io::ErrorKind::InvalidData)
 }
 
 fn reject_reparse_directory(directory: &Dir) -> std::io::Result<()> {
