@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
+  lstatSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   statSync,
 } from "node:fs";
 import os from "node:os";
@@ -66,15 +68,20 @@ function verifyManifest(manifest) {
 }
 
 function resolveActiveArtifactRoot(manifest) {
-  if (manifest.evidenceRoot === undefined) return artifactRoot;
   assert(
-    typeof manifest.evidenceRoot === "string" && manifest.evidenceRoot.length > 0,
+    typeof manifest.evidenceRoot === "string" &&
+      /^\.generations\/\d{13}-[0-9a-f]{24}$/u.test(manifest.evidenceRoot),
     "invalid active evidence root",
   );
   const candidate = resolve(artifactRoot, manifest.evidenceRoot);
   assert(
     isContainedPath(artifactRoot, candidate),
     "active evidence root escapes artifact root",
+  );
+  assert(!lstatSync(candidate).isSymbolicLink(), "active evidence root is a symlink or junction");
+  assert(
+    isContainedPath(realpathSync(artifactRoot), realpathSync(candidate)),
+    "active evidence root escapes artifact root through a symlink",
   );
   assert(statSync(candidate).isDirectory(), "active evidence root is not a directory");
   return candidate;
@@ -124,13 +131,22 @@ function verifyCommands(manifest) {
     .sort();
   const outputDirectory = resolveArtifactPath("outputs");
   assert(statSync(outputDirectory).isDirectory(), "active output root is not a directory");
-  const actualOutputs = collectFiles(outputDirectory)
+  const actualOutputs = collectEvidenceFiles(outputDirectory)
     .map((path) => relativeArtifactPath(path))
     .sort();
   assertDeepEqual(
     actualOutputs,
     expectedOutputs,
     "unexpected retained output set",
+  );
+  const expectedGenerationFiles = ["toolchain.txt", ...expectedOutputs].sort();
+  const actualGenerationFiles = collectEvidenceFiles(activeArtifactRoot)
+    .map((path) => relative(activeArtifactRoot, path).replaceAll("\\", "/"))
+    .sort();
+  assertDeepEqual(
+    actualGenerationFiles,
+    expectedGenerationFiles,
+    "active generation file set mismatch",
   );
 }
 
@@ -175,7 +191,9 @@ function verifyArtifacts(manifest) {
   );
 
   for (const file of ["review.md", "known-limitations.md", "toolchain.txt"]) {
-    const path = resolveArtifactPath(file);
+    const path = file === "toolchain.txt"
+      ? resolveArtifactPath(file)
+      : resolveRootArtifactPath(file);
     const contents = readFileSync(path);
     assert(artifactHashes[file] === hash(contents), `artifact hash mismatch: ${file}`);
   }
@@ -186,13 +204,13 @@ function verifyArtifacts(manifest) {
     "toolchain serialization is not canonical",
   );
 
-  const limitations = readFileSync(resolveArtifactPath("known-limitations.md"), "utf8");
+  const limitations = readFileSync(resolveRootArtifactPath("known-limitations.md"), "utf8");
   assert(limitations.trim().length > 0, "known limitations are absent");
   assert(readFileSync(resolveArtifactPath("toolchain.txt"), "utf8").trim().length > 0, "toolchain artifact is absent");
 }
 
 function verifyReview(manifest) {
-  const review = readFileSync(resolveArtifactPath("review.md"), "utf8");
+  const review = readFileSync(resolveRootArtifactPath("review.md"), "utf8");
   assert(review.startsWith("# M3 independent review\n\n"), "invalid review heading");
   const reviewedSource = reviewHeading(
     review,
@@ -238,10 +256,10 @@ function reviewHeading(review, heading, valuePattern) {
 
 function rejectCredentialCanaryLeaks(manifest) {
   const markerPattern = new RegExp(`${escapeRegExp(credentialCanary.markerPrefix)}[A-Za-z0-9][A-Za-z0-9_-]*`, "u");
-  const files = collectFiles(activeArtifactRoot);
+  const files = collectEvidenceFiles(artifactRoot);
   for (const file of files) {
     const contents = readFileSync(file, "utf8");
-    assert(!markerPattern.test(contents), `credential canary leaked in ${relativeArtifactPath(file)}`);
+    assert(!markerPattern.test(contents), `credential canary leaked in ${relativeRootArtifactPath(file)}`);
   }
 
   const serializedManifest = JSON.stringify(manifest);
@@ -335,21 +353,53 @@ function resolveArtifactPath(relativePath) {
     isContainedPath(activeArtifactRoot, path),
     `invalid artifact path: ${relativePath}`,
   );
+  assert(
+    isContainedPath(realpathSync(activeArtifactRoot), realpathSync(path)),
+    `artifact path escapes active evidence root: ${relativePath}`,
+  );
   return path;
 }
 
-function collectFiles(directory) {
+function resolveRootArtifactPath(relativePath) {
+  const normalized = relativePath.replaceAll("\\", "/");
+  const path = resolve(artifactRoot, normalized);
+  assert(
+    isContainedPath(artifactRoot, path),
+    `invalid root artifact path: ${relativePath}`,
+  );
+  assert(
+    isContainedPath(realpathSync(artifactRoot), realpathSync(path)),
+    `root artifact path escapes artifact root: ${relativePath}`,
+  );
+  return path;
+}
+
+function collectEvidenceFiles(directory) {
   const files = [];
+  const directoryMetadata = lstatSync(directory);
+  if (directoryMetadata.isSymbolicLink()) {
+    throw new Error(`evidence tree contains a symlink or junction: ${relativeRootArtifactPath(directory)}`);
+  }
+  assert(directoryMetadata.isDirectory(), `evidence tree root is not a directory: ${relativeRootArtifactPath(directory)}`);
   for (const entry of readdirSync(directory)) {
     const path = join(directory, entry);
-    if (statSync(path).isDirectory()) files.push(...collectFiles(path));
-    else if (statSync(path).isFile()) files.push(path);
+    const metadata = lstatSync(path);
+    if (metadata.isSymbolicLink()) {
+      throw new Error(`evidence tree contains a symlink or junction: ${relativeRootArtifactPath(path)}`);
+    }
+    if (metadata.isDirectory()) files.push(...collectEvidenceFiles(path));
+    else if (metadata.isFile()) files.push(path);
+    else throw new Error(`unsupported evidence tree entry: ${relativeRootArtifactPath(path)}`);
   }
   return files;
 }
 
 function relativeArtifactPath(path) {
   return relative(activeArtifactRoot, path).replaceAll("\\", "/");
+}
+
+function relativeRootArtifactPath(path) {
+  return relative(artifactRoot, path).replaceAll("\\", "/");
 }
 
 function isContainedPath(parent, candidate) {

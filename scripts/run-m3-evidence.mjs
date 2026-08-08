@@ -5,11 +5,11 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  lstatSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -225,10 +225,9 @@ function verifyMatrices(commandEvidence, stagedOutputRoot) {
 
 function verifyRetainedEvidence(stagedRoot, canaryPattern) {
   const retainedFiles = [
-    ...collectFiles(join(stagedRoot, "outputs")),
+    ...collectEvidenceFiles(artifactRoot),
+    ...collectEvidenceFiles(join(stagedRoot, "outputs")),
     join(stagedRoot, "toolchain.txt"),
-    join(artifactRoot, "review.md"),
-    join(artifactRoot, "known-limitations.md"),
   ];
   for (const file of retainedFiles) {
     const contents = readFileSync(file, "utf8");
@@ -244,18 +243,13 @@ function publishArtifacts(stagedRoot, manifest) {
   const generationPath = join(artifactRoot, generationName);
   pendingGenerationPath = generationPath;
   mkdirSync(join(generationPath, "outputs"), { recursive: true });
-  for (const file of collectFiles(join(stagedRoot, "outputs"))) {
+  for (const file of collectEvidenceFiles(join(stagedRoot, "outputs"))) {
     copyFileSync(
       file,
       join(generationPath, "outputs", file.slice(join(stagedRoot, "outputs").length + 1)),
     );
   }
   copyFileSync(join(stagedRoot, "toolchain.txt"), join(generationPath, "toolchain.txt"));
-  copyFileSync(join(artifactRoot, "review.md"), join(generationPath, "review.md"));
-  copyFileSync(
-    join(artifactRoot, "known-limitations.md"),
-    join(generationPath, "known-limitations.md"),
-  );
 
   if (process.env.M3_EVIDENCE_INJECT_PUBLISH_FAILURE === "after-generation") {
     throw new Error("injected publication failure after generation staging");
@@ -336,13 +330,25 @@ function normalizeOutput(output) {
   );
 }
 
-function collectFiles(directory) {
+function collectEvidenceFiles(directory) {
   const files = [];
   if (!existsSync(directory)) return files;
+  const directoryMetadata = lstatSync(directory);
+  if (directoryMetadata.isSymbolicLink()) {
+    throw new Error(`evidence tree contains a symlink or junction: ${relativePath(directory)}`);
+  }
+  if (!directoryMetadata.isDirectory()) {
+    throw new Error(`evidence tree root is not a directory: ${relativePath(directory)}`);
+  }
   for (const entry of readdirSync(directory)) {
     const path = join(directory, entry);
-    if (statSync(path).isDirectory()) files.push(...collectFiles(path));
-    else if (statSync(path).isFile()) files.push(path);
+    const metadata = lstatSync(path);
+    if (metadata.isSymbolicLink()) {
+      throw new Error(`evidence tree contains a symlink or junction: ${relativePath(path)}`);
+    }
+    if (metadata.isDirectory()) files.push(...collectEvidenceFiles(path));
+    else if (metadata.isFile()) files.push(path);
+    else throw new Error(`unsupported evidence tree entry: ${relativePath(path)}`);
   }
   return files;
 }
