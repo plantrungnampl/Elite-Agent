@@ -18,6 +18,7 @@ use local_agent_terminal_application::{
 use local_agent_terminal_domain::{ArtifactId, RunId, Sha256Digest};
 use tempfile::TempDir;
 
+use crate::agent_runtime::failing_runtime_for_test;
 use crate::startup::{Bootstrap, StartupConfig};
 
 use super::{SelfTestingToolExecutor, ToolBrokerConfig, ToolRuntime};
@@ -88,6 +89,92 @@ fn configured_startup_keeps_unavailable_dispatch_closed_without_failing_startup(
         .local_diagnostics()
         .iter()
         .any(|record| record.code == "startup.tools.dispatch_released"));
+}
+
+#[test]
+fn retry_closes_retained_tool_dispatch_after_agent_shutdown_failure() {
+    let root = TempDir::new().unwrap();
+    let tool_runtime = released_test_tool_runtime();
+    let mut bootstrap = Bootstrap::with_runtimes_for_test(
+        startup_config(&root),
+        failing_runtime_for_test(root.path()),
+        Some(Arc::clone(&tool_runtime)),
+    );
+    let stale_tool_runtime = bootstrap.tool_runtime_handle().unwrap();
+
+    assert_eq!(
+        bootstrap.retry_startup_validation().state,
+        StartupStateDto::RecoverableFailure
+    );
+    assert_eq!(
+        bootstrap.status().issues[0].code,
+        "startup.agent_runtime_shutdown_failed"
+    );
+
+    assert_stale_dispatch_is_closed(&stale_tool_runtime, "execution-retry-agent-failure-gate");
+    assert!(bootstrap.agent_runtime_handle().is_some());
+    assert!(bootstrap.tool_runtime_handle().is_none());
+    assert_eq!(
+        bootstrap.retry_startup_validation().state,
+        StartupStateDto::RecoverableFailure
+    );
+    assert_eq!(
+        bootstrap.status().issues[0].code,
+        "startup.agent_runtime_shutdown_failed"
+    );
+    assert!(bootstrap.agent_runtime_handle().is_some());
+}
+
+#[test]
+fn retry_retains_failed_tool_runtime_after_agent_shutdown_failure() {
+    let root = TempDir::new().unwrap();
+    let tool_runtime = released_test_tool_runtime();
+    let execution_id = ToolExecutionId::new("execution-retry-tool-failure").unwrap();
+    let (worker_started_tx, worker_started_rx) = mpsc::channel();
+    tool_runtime
+        .dispatch_test_worker(execution_id, move || {
+            worker_started_tx.send(()).unwrap();
+            Err(unavailable())
+        })
+        .unwrap();
+    worker_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    let mut bootstrap = Bootstrap::with_runtimes_for_test(
+        startup_config(&root),
+        failing_runtime_for_test(root.path()),
+        Some(Arc::clone(&tool_runtime)),
+    );
+    let stale_tool_runtime = bootstrap.tool_runtime_handle().unwrap();
+
+    assert_eq!(
+        bootstrap.retry_startup_validation().state,
+        StartupStateDto::RecoverableFailure
+    );
+    assert_eq!(
+        bootstrap.status().issues[0].code,
+        "startup.agent_runtime_shutdown_failed"
+    );
+    assert!(bootstrap.agent_runtime_handle().is_some());
+    assert!(bootstrap.tool_runtime_handle().is_some());
+
+    assert_stale_dispatch_is_closed(&stale_tool_runtime, "execution-retry-tool-failure-gate");
+}
+
+#[test]
+fn drop_closes_tool_dispatch_after_agent_shutdown_failure() {
+    let root = TempDir::new().unwrap();
+    let tool_runtime = released_test_tool_runtime();
+    let stale_tool_runtime = Arc::clone(&tool_runtime);
+
+    drop(Bootstrap::with_runtimes_for_test(
+        startup_config(&root),
+        failing_runtime_for_test(root.path()),
+        Some(tool_runtime),
+    ));
+
+    assert_stale_dispatch_is_closed(&stale_tool_runtime, "execution-drop-agent-failure");
 }
 
 #[test]
@@ -550,6 +637,32 @@ fn startup_config(root: &TempDir) -> StartupConfig {
         secret_values: Vec::new(),
         openai: None,
     }
+}
+
+fn released_test_tool_runtime() -> Arc<ToolRuntime> {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let executions = Arc::new(RecordingExecutionStore::running(
+        Vec::new(),
+        Arc::clone(&events),
+    ));
+    let executor = Arc::new(BlockingCancellationExecutor::new(events));
+    let execution_port: Arc<dyn ToolExecutionStore> = executions;
+    let executor_port: Arc<dyn SelfTestingToolExecutor> = executor;
+    let runtime = Arc::new(ToolRuntime::new(execution_port, executor_port));
+    runtime.recover_startup().unwrap();
+    runtime.release_dispatch().unwrap();
+    runtime
+}
+
+fn assert_stale_dispatch_is_closed(runtime: &ToolRuntime, execution_id: &str) {
+    let authority = cancellation_authority(execution_id);
+    let dispatch = runtime.dispatch_test_worker(authority.execution_id().clone(), move || {
+        Ok(terminated_receipt(authority))
+    });
+    if dispatch.is_ok() {
+        let _ = runtime.stop_all();
+    }
+    assert!(dispatch.is_err(), "stale tool dispatch must be closed");
 }
 
 fn digest(marker: char) -> Sha256Digest {

@@ -114,6 +114,15 @@ impl Bootstrap {
         config: StartupConfig,
         agent_runtime: Arc<ComposedAgentRuntime>,
     ) -> Self {
+        Self::with_runtimes_for_test(config, agent_runtime, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_runtimes_for_test(
+        config: StartupConfig,
+        agent_runtime: Arc<ComposedAgentRuntime>,
+        tool_runtime: Option<Arc<ToolRuntime>>,
+    ) -> Self {
         Self {
             config: Some(config),
             status: StartupStatusDto {
@@ -123,7 +132,7 @@ impl Bootstrap {
             diagnostics: Vec::new(),
             runtime: None,
             agent_runtime: Some(agent_runtime),
-            tool_runtime: None,
+            tool_runtime,
             tool_broker: None,
             retained_processes: default_retained_process_controller(),
         }
@@ -200,18 +209,10 @@ impl Bootstrap {
             return &self.status;
         };
         let mut log = LocalLog::new(secret_values);
-        if let Err(error) = self.shutdown_agent_runtime() {
-            self.record_failure(&mut log, agent_runtime_shutdown_failure(error));
+        if let Err(failure) = self.shutdown_owned_runtimes() {
+            self.record_failure(&mut log, failure);
             self.diagnostics = log.into_records();
             return &self.status;
-        }
-        self.runtime = None;
-        if let Some(runtime) = self.tool_runtime.take() {
-            if let Err(error) = runtime.stop_all() {
-                self.record_failure(&mut log, tool_recovery_failure(error));
-                self.diagnostics = log.into_records();
-                return &self.status;
-            }
         }
         let result = start(
             self.config
@@ -250,12 +251,9 @@ impl Bootstrap {
                         "Tool dispatch released after startup recovery completed.",
                     )),
                     Ok(false) => {}
-                    Err(error) => match self.shutdown_agent_runtime() {
+                    Err(error) => match self.shutdown_owned_runtimes() {
                         Ok(()) => self.record_failure(&mut log, tool_recovery_failure(error)),
-                        Err(shutdown_error) => self.record_failure(
-                            &mut log,
-                            agent_runtime_shutdown_failure(shutdown_error),
-                        ),
+                        Err(shutdown_failure) => self.record_failure(&mut log, shutdown_failure),
                     },
                 }
             }
@@ -310,7 +308,20 @@ impl Bootstrap {
             }],
         };
         self.runtime = None;
-        self.tool_runtime = None;
+    }
+
+    fn shutdown_owned_runtimes(&mut self) -> Result<(), StartupFailure> {
+        let agent_error = self.shutdown_agent_runtime().err();
+        let tool_error = self.shutdown_tool_runtime().err();
+        self.runtime = None;
+
+        if let Some(error) = agent_error {
+            return Err(agent_runtime_shutdown_failure(error));
+        }
+        if let Some(error) = tool_error {
+            return Err(tool_recovery_failure(error));
+        }
+        Ok(())
     }
 
     fn shutdown_agent_runtime(&mut self) -> Result<(), PortError> {
@@ -319,6 +330,15 @@ impl Bootstrap {
         };
         runtime.shutdown()?;
         self.agent_runtime = None;
+        Ok(())
+    }
+
+    fn shutdown_tool_runtime(&mut self) -> Result<(), PortError> {
+        let Some(runtime) = self.tool_runtime.as_ref() else {
+            return Ok(());
+        };
+        runtime.stop_all()?;
+        self.tool_runtime = None;
         Ok(())
     }
 
@@ -353,9 +373,7 @@ impl Bootstrap {
 
 impl Drop for Bootstrap {
     fn drop(&mut self) {
-        if let Some(runtime) = self.agent_runtime.as_ref() {
-            let _ = runtime.shutdown();
-        }
+        let _ = self.shutdown_owned_runtimes();
     }
 }
 

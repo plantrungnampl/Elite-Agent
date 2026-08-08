@@ -497,6 +497,11 @@ fn conflict() -> PortError {
 }
 
 #[cfg(test)]
+pub(crate) fn failing_runtime_for_test(path: &std::path::Path) -> Arc<ComposedAgentRuntime> {
+    tests::failing_runtime_for_test(path)
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         path::Path,
@@ -609,6 +614,11 @@ mod tests {
         );
         assert!(bootstrap.agent_runtime_handle().is_some());
         assert_eq!(clock.calls.load(Ordering::SeqCst), 2);
+    }
+
+    pub(super) fn failing_runtime_for_test(path: &Path) -> Arc<ComposedAgentRuntime> {
+        let clock = Arc::new(FailingShutdownClock::default());
+        Arc::new(runtime_with_clock(path, clock))
     }
 
     fn runtime_with_clock<C>(path: &Path, clock: Arc<C>) -> ComposedAgentRuntime
