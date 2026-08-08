@@ -74,6 +74,36 @@ test("retained verification logs and toolchains are checked out with LF endings"
   }
 });
 
+test("retained evidence traversal fails closed for links and unsupported roots", () => {
+  const directory = mkdtempSync(join(tmpdir(), "m3-evidence-traversal-"));
+  const root = join(directory, "verification");
+  const outside = mkdtempSync(join(tmpdir(), "m3-evidence-outside-"));
+  try {
+    mkdirSync(root, { recursive: true });
+    writeFileSync(join(root, "retained.log"), "retained\n");
+    writeFileSync(join(root, "unrelated.txt"), "unrelated\n");
+    assert.ok(
+      enumerateRetainedVerificationPaths(root).some((path) => path.endsWith("/retained.log")),
+    );
+
+    symlinkSync(outside, join(root, "nested-link"), "junction");
+    assert.throws(
+      () => enumerateRetainedVerificationPaths(root),
+      /symlink|reparse/u,
+    );
+
+    const rootLink = join(directory, "verification-link");
+    symlinkSync(root, rootLink, "junction");
+    assert.throws(
+      () => enumerateRetainedVerificationPaths(rootLink),
+      /symlink|reparse/u,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 test("M3 verifier rejects an absent manifest", () => {
   const directory = mkdtempSync(join(tmpdir(), "m3-missing-manifest-"));
   try {
@@ -748,8 +778,16 @@ function effectiveGitAttribute(path, attribute) {
   return output.slice(expectedPrefix.length);
 }
 
-function enumerateRetainedVerificationPaths() {
-  const root = join(process.cwd(), "artifacts", "verification");
+function enumerateRetainedVerificationPaths(
+  root = join(process.cwd(), "artifacts", "verification"),
+) {
+  const rootMetadata = lstatSync(root);
+  if (rootMetadata.isSymbolicLink()) {
+    throw new Error(`verification root is a symlink or reparse point: ${root}`);
+  }
+  if (!rootMetadata.isDirectory()) {
+    throw new Error(`verification root is not a real directory: ${root}`);
+  }
   const paths = [];
   visitVerificationDirectory(root, paths);
   return paths;
@@ -786,11 +824,12 @@ function visitVerificationDirectory(directory, paths) {
     }
     if (metadata.isDirectory()) {
       visitVerificationDirectory(absolutePath, paths);
-    } else if (
-      metadata.isFile() &&
-      (entry.name.endsWith(".log") || entry.name === "toolchain.txt")
-    ) {
-      paths.push(relativePath(process.cwd(), absolutePath).replaceAll("\\", "/"));
+    } else if (metadata.isFile()) {
+      if (entry.name.endsWith(".log") || entry.name === "toolchain.txt") {
+        paths.push(relativePath(process.cwd(), absolutePath).replaceAll("\\", "/"));
+      }
+    } else {
+      throw new Error(`verification tree contains an unsupported entry: ${absolutePath}`);
     }
   }
 }
