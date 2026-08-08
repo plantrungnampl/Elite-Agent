@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
   copyFileSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -14,7 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import os, { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative as relativePath } from "node:path";
 import test from "node:test";
 
 import {
@@ -39,17 +40,20 @@ test("M3 evidence is complete and internally consistent", () => {
 });
 
 test("retained verification logs and toolchains are checked out with LF endings", () => {
-  const retainedPaths = gitOutput(
-    "ls-files",
-    "--cached",
-    "--others",
-    "--exclude-standard",
-    "--",
-    "artifacts/verification",
-  )
-    .split(/\r?\n/u)
-    .filter((path) => path.endsWith(".log") || path.endsWith("toolchain.txt"));
-  const m3Generation = retainedPaths.find((path) =>
+  const retainedPaths = enumerateRetainedVerificationPaths();
+  assert.ok(retainedPaths.length > 0, "verification tree has no retained logs or toolchains");
+  const activeM3Root = activeM3EvidenceRoot();
+  const activeM3Output = activeM3Root
+    ? `artifacts/verification/m3/${activeM3Root}/outputs/protocol-schema-conformance.log`
+    : undefined;
+  const activeM3Toolchain = activeM3Root
+    ? `artifacts/verification/m3/${activeM3Root}/toolchain.txt`
+    : undefined;
+  if (activeM3Output && activeM3Toolchain) {
+    assert.equal(retainedPaths.includes(activeM3Output), true, activeM3Output);
+    assert.equal(retainedPaths.includes(activeM3Toolchain), true, activeM3Toolchain);
+  }
+  const m3Generation = activeM3Output ?? retainedPaths.find((path) =>
     path.startsWith("artifacts/verification/m3/.generations/") &&
     path.endsWith("/outputs/protocol-schema-conformance.log"),
   );
@@ -742,6 +746,53 @@ function effectiveGitAttribute(path, attribute) {
   const output = result.stdout.trim();
   assert.equal(output.startsWith(expectedPrefix), true, output);
   return output.slice(expectedPrefix.length);
+}
+
+function enumerateRetainedVerificationPaths() {
+  const root = join(process.cwd(), "artifacts", "verification");
+  const paths = [];
+  visitVerificationDirectory(root, paths);
+  return paths;
+}
+
+function activeM3EvidenceRoot() {
+  try {
+    const manifest = JSON.parse(
+      readFileSync(
+        join(process.cwd(), "artifacts", "verification", "m3", "manifest.json"),
+        "utf8",
+      ),
+    );
+    assert.equal(
+      typeof manifest.evidenceRoot,
+      "string",
+      "M3 manifest evidenceRoot is required",
+    );
+    return manifest.evidenceRoot.replaceAll("\\", "/");
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function visitVerificationDirectory(directory, paths) {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const absolutePath = join(directory, entry.name);
+    const metadata = lstatSync(absolutePath);
+    if (entry.isSymbolicLink() || metadata.isSymbolicLink()) {
+      throw new Error(
+        `verification tree contains a symlink or reparse point: ${absolutePath}`,
+      );
+    }
+    if (metadata.isDirectory()) {
+      visitVerificationDirectory(absolutePath, paths);
+    } else if (
+      metadata.isFile() &&
+      (entry.name.endsWith(".log") || entry.name === "toolchain.txt")
+    ) {
+      paths.push(relativePath(process.cwd(), absolutePath).replaceAll("\\", "/"));
+    }
+  }
 }
 
 function hash(value) {
