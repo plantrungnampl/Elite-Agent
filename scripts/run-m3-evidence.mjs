@@ -24,7 +24,6 @@ import {
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const artifactRoot = join(root, "artifacts", "verification", "m3");
-const outputRoot = join(artifactRoot, "outputs");
 const manifestPath = join(artifactRoot, "manifest.json");
 const temporaryManifestPath = `${manifestPath}.tmp`;
 const allowedGeneratedPath = /^artifacts\/verification\/m3(?:\/|$)/u;
@@ -34,6 +33,8 @@ const allowedPlanPath =
 let stagingRoot;
 let isolatedTempRoot;
 let temporaryManifestCreated = false;
+let pendingGenerationPath;
+let activeManifestCommitted = false;
 let originalTemp;
 let originalTmp;
 let originalTmpdir;
@@ -119,6 +120,9 @@ try {
 } catch (error) {
   if (temporaryManifestCreated) {
     rmSync(temporaryManifestPath, { force: true });
+  }
+  if (pendingGenerationPath !== undefined && !activeManifestCommitted) {
+    rmSync(pendingGenerationPath, { recursive: true, force: true });
   }
   console.error(`M3 evidence generation failed: ${error.message}`);
   process.exitCode = 1;
@@ -236,18 +240,35 @@ function verifyRetainedEvidence(stagedRoot, canaryPattern) {
 }
 
 function publishArtifacts(stagedRoot, manifest) {
-  mkdirSync(artifactRoot, { recursive: true });
-  rmSync(outputRoot, { recursive: true, force: true });
-  mkdirSync(outputRoot, { recursive: true });
+  const generationName = `.generations/${Date.now()}-${randomBytes(12).toString("hex")}`;
+  const generationPath = join(artifactRoot, generationName);
+  pendingGenerationPath = generationPath;
+  mkdirSync(join(generationPath, "outputs"), { recursive: true });
   for (const file of collectFiles(join(stagedRoot, "outputs"))) {
-    copyFileSync(file, join(outputRoot, file.slice(join(stagedRoot, "outputs").length + 1)));
+    copyFileSync(
+      file,
+      join(generationPath, "outputs", file.slice(join(stagedRoot, "outputs").length + 1)),
+    );
   }
-  copyFileSync(join(stagedRoot, "toolchain.txt"), join(artifactRoot, "toolchain.txt"));
+  copyFileSync(join(stagedRoot, "toolchain.txt"), join(generationPath, "toolchain.txt"));
+  copyFileSync(join(artifactRoot, "review.md"), join(generationPath, "review.md"));
+  copyFileSync(
+    join(artifactRoot, "known-limitations.md"),
+    join(generationPath, "known-limitations.md"),
+  );
+
+  if (process.env.M3_EVIDENCE_INJECT_PUBLISH_FAILURE === "after-generation") {
+    throw new Error("injected publication failure after generation staging");
+  }
 
   temporaryManifestCreated = true;
-  writeFileSync(temporaryManifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  writeFileSync(
+    temporaryManifestPath,
+    `${JSON.stringify({ ...manifest, evidenceRoot: generationName }, null, 2)}\n`,
+  );
   renameSync(temporaryManifestPath, manifestPath);
   temporaryManifestCreated = false;
+  activeManifestCommitted = true;
 }
 
 function assertEvidenceOnlyChanges() {

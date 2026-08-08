@@ -3,10 +3,13 @@ import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
+  copyFileSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import os, { tmpdir } from "node:os";
@@ -60,6 +63,16 @@ test("M3 verifier rejects unsupported or non-finalized manifests", () => {
   });
 });
 
+test("M3 verifier rejects historical final approval mode", () => {
+  withEvidenceCopy((directory) => {
+    assertVerifierFails(
+      directory,
+      /historical.*require-approved|require-approved.*historical|cannot be combined/u,
+      ["--historical", "--require-approved"],
+    );
+  });
+});
+
 test("M3 verifier rejects modified captured output and retained artifacts", () => {
   withEvidenceCopy((directory, manifest) => {
     appendFileSync(join(directory, manifest.commands[0].outputFile), "tampered\n");
@@ -73,44 +86,50 @@ test("M3 verifier rejects modified captured output and retained artifacts", () =
   }
 });
 
-test(
-  "M3 verifier rejects missing, duplicate, failed, and reordered commands; runner preserves prior evidence on failure",
-  () => {
-    const runner = readFileSync("scripts/run-m3-evidence.mjs", "utf8");
-    const failurePath = runner.match(/\}\s*catch \(error\) \{([\s\S]*?)\n\}\s*finally/u)?.[1];
-    assert.ok(failurePath, "runner failure path is missing");
-    assert.doesNotMatch(
-      failurePath,
-      /artifactRoot|outputRoot|copyFileSync|renameSync|writeFileSync/u,
-      "failed evidence runs must not replace finalized artifacts",
-    );
+test("M3 verifier rejects retained outputs outside the active command set", () => {
+  withEvidenceCopy((directory, manifest) => {
+    writeFileSync(join(directory, "outputs", "unexpected.log"), "unattested output\n");
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /unexpected retained output|output set|unexpected output/u);
+  });
+});
 
-    withEvidenceCopy((directory, manifest) => {
-      manifest.commands.pop();
-      writeManifest(directory, manifest);
-      assertVerifierFails(directory, /unexpected command evidence count|missing command/u);
-    });
-    withEvidenceCopy((directory, manifest) => {
-      assert.ok(manifest.commands.length > 1, "M3 evidence must retain multiple commands");
-      manifest.commands[1].name = manifest.commands[0].name;
-      writeManifest(directory, manifest);
-      assertVerifierFails(directory, /duplicate command evidence/u);
-    });
-    withEvidenceCopy((directory, manifest) => {
-      manifest.commands[0].exitCode = 1;
-      writeManifest(directory, manifest);
-      assertVerifierFails(directory, /command did not pass/u);
-    });
-    withEvidenceCopy((directory, manifest) => {
-      const first = manifest.commands[0];
-      const second = manifest.commands[1];
-      manifest.commands[0] = second;
-      manifest.commands[1] = first;
-      writeManifest(directory, manifest);
-      assertVerifierFails(directory, /command order|unexpected command|command mismatch/u);
-    });
-  },
-);
+test("M3 verifier rejects noncanonical toolchain serialization", () => {
+  withEvidenceCopy((directory, manifest) => {
+    const toolchainPath = join(directory, "toolchain.txt");
+    writeFileSync(toolchainPath, `${JSON.stringify(manifest.toolVersions)}\n`);
+    manifest.artifactSha256["toolchain.txt"] = hash(readFileSync(toolchainPath));
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /canonical toolchain|toolchain serialization|toolchain artifact/u);
+  });
+});
+
+test("M3 verifier rejects missing, duplicate, failed, and reordered commands", () => {
+  withEvidenceCopy((directory, manifest) => {
+    manifest.commands.pop();
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /unexpected command evidence count|missing command/u);
+  });
+  withEvidenceCopy((directory, manifest) => {
+    assert.ok(manifest.commands.length > 1, "M3 evidence must retain multiple commands");
+    manifest.commands[1].name = manifest.commands[0].name;
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /duplicate command evidence/u);
+  });
+  withEvidenceCopy((directory, manifest) => {
+    manifest.commands[0].exitCode = 1;
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /command did not pass/u);
+  });
+  withEvidenceCopy((directory, manifest) => {
+    const first = manifest.commands[0];
+    const second = manifest.commands[1];
+    manifest.commands[0] = second;
+    manifest.commands[1] = first;
+    writeManifest(directory, manifest);
+    assertVerifierFails(directory, /command order|unexpected command|command mismatch/u);
+  });
+});
 
 test("M3 verifier rejects native skipped-test summaries", () => {
   for (const summary of [
@@ -184,39 +203,90 @@ test("M3 verifier rejects a captured credential-canary marker", () => {
 
 test("final M3 verification rejects pending independent, spec, and code verdicts", () => {
   for (const heading of ["Independent approval", "Spec compliance", "Code quality"]) {
-    withEvidenceCopy((directory, manifest) => {
-      const reviewPath = join(directory, "review.md");
+    withApprovedRunnerEvidence((directory, manifest, activeRoot, manifestPath) => {
+      const reviewPath = join(activeRoot, "review.md");
       const review = readFileSync(reviewPath, "utf8").replace(
         new RegExp(`(^## ${heading}: )PASS$`, "mu"),
         "$1PENDING",
       );
       writeFileSync(reviewPath, review);
       manifest.artifactSha256["review.md"] = hash(readFileSync(reviewPath));
-      writeManifest(directory, manifest);
-      assertVerifierFails(
+      writeManifest(join(directory, "artifacts", "verification", "m3"), manifest);
+      runGit(directory, ["add", "artifacts/verification/m3"]);
+      runGit(directory, ["commit", "-m", `pending ${heading}`]);
+      assertTempVerifierFails(
         directory,
+        manifestPath,
         new RegExp(`${heading}.*pending|pending`, "iu"),
-        ["--historical", "--require-approved"],
+        ["--require-approved"],
       );
     });
   }
 });
 
 test("final M3 verification binds every verdict to the reviewed source", () => {
-  withEvidenceCopy((directory, manifest) => {
-    const reviewPath = join(directory, "review.md");
+  withApprovedRunnerEvidence((directory, manifest, activeRoot, manifestPath) => {
+    const reviewPath = join(activeRoot, "review.md");
     const review = readFileSync(reviewPath, "utf8").replace(
       /^## Reviewed source commit: .+$/mu,
       `## Reviewed source commit: ${"0".repeat(40)}`,
     );
     writeFileSync(reviewPath, review);
     manifest.artifactSha256["review.md"] = hash(readFileSync(reviewPath));
-    writeManifest(directory, manifest);
-    assertVerifierFails(directory, /reviewed source commit mismatch/u, [
-      "--historical",
+    writeManifest(join(directory, "artifacts", "verification", "m3"), manifest);
+    runGit(directory, ["add", "artifacts/verification/m3"]);
+    runGit(directory, ["commit", "-m", "mismatched reviewed source"]);
+    assertTempVerifierFails(directory, manifestPath, /reviewed source commit mismatch/u, [
       "--require-approved",
     ]);
   });
+});
+
+test("final M3 verification requires empty Critical and Important findings", () => {
+  for (const heading of ["Critical findings", "Important findings"]) {
+    withApprovedRunnerEvidence((directory, manifest, activeRoot, manifestPath) => {
+      const reviewPath = join(activeRoot, "review.md");
+      const review = readFileSync(reviewPath, "utf8").replace(
+        new RegExp(`(^## ${heading}\\n\\n)None\\.$`, "mu"),
+        "$1Finding remains.",
+      );
+      writeFileSync(reviewPath, review);
+      manifest.artifactSha256["review.md"] = hash(readFileSync(reviewPath));
+      writeManifest(join(directory, "artifacts", "verification", "m3"), manifest);
+      runGit(directory, ["add", "artifacts/verification/m3"]);
+      runGit(directory, ["commit", "-m", `mutate ${heading}`]);
+      assertTempVerifierFails(
+        directory,
+        manifestPath,
+        new RegExp(`${heading}.*None|findings|approval`, "iu"),
+        ["--require-approved"],
+      );
+    });
+  }
+});
+
+test("runner keeps the active evidence generation when publication fails", () => {
+  const directory = mkdtempSync(join(tmpdir(), "m3-runner-transaction-"));
+  try {
+    createRunnerFixture(directory);
+    const before = readActiveRunnerEvidence(directory);
+    const result = spawnSync(process.execPath, [join(directory, "scripts", "run-m3-evidence.mjs")], {
+      cwd: directory,
+      encoding: "utf8",
+      env: { ...process.env, M3_EVIDENCE_INJECT_PUBLISH_FAILURE: "after-generation" },
+    });
+    assert.notEqual(result.status, 0, `${result.stdout}${result.stderr}`);
+    assert.deepEqual(readActiveRunnerEvidence(directory), before);
+    assert.equal(
+      readdirSync(join(directory, "artifacts", "verification", "m3", ".generations"), {
+        withFileTypes: true,
+      }).length,
+      0,
+      "failed publication must remove the uncommitted generation",
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("M3 verifier rejects stale and non-ancestor source commits in strict mode", () => {
@@ -301,7 +371,7 @@ function createEvidenceFixture(directory) {
     join(directory, "known-limitations.md"),
     "Fixture-only M3 evidence for verifier contract mutation tests.\n",
   );
-  writeFileSync(join(directory, "toolchain.txt"), `${JSON.stringify(toolVersions, null, 2)}\n`);
+  writeFileSync(join(directory, "toolchain.txt"), canonicalToolchain(toolVersions));
 
   const canaryDigest = hash(Buffer.from("fixture-only-canary-digest"));
   const manifest = {
@@ -333,12 +403,118 @@ function writeManifest(directory, manifest) {
   writeFileSync(join(directory, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
+function createRunnerFixture(directory) {
+  mkdirSync(join(directory, "scripts"), { recursive: true });
+  mkdirSync(join(directory, "docs", "superpowers", "plans"), { recursive: true });
+  mkdirSync(join(directory, "artifacts", "verification", "m3", "outputs"), { recursive: true });
+  mkdirSync(join(directory, "artifacts", "verification", "m3", ".generations"), { recursive: true });
+  copyFileSync("scripts/run-m3-evidence.mjs", join(directory, "scripts", "run-m3-evidence.mjs"));
+  writeFileSync(
+    join(directory, "scripts", "m3-evidence-spec.mjs"),
+    `export const commands = [["probe", "node -e \\\"process.stdout.write('runner-probe\\\\n')\\\""]];\nexport const verificationMatrices = [{ name: "probe", evidence: [{ command: "probe", needle: "runner-probe" }] }];\nexport const credentialCanary = { markerPrefix: "M3_CREDENTIAL_CANARY_" };\n`,
+  );
+  writeFileSync(
+    join(directory, "docs", "superpowers", "plans", "2026-07-23-m3-protocol-adapter.md"),
+    "fixture plan\n",
+  );
+  writeFileSync(
+    join(directory, "artifacts", "verification", "m3", "review.md"),
+    "# M3 independent review\n\n## Reviewed source commit: PENDING\n\n## Independent approval: PENDING\n\n## Spec compliance: PENDING\n\n## Code quality: PENDING\n\n## Critical findings\n\nNone.\n\n## Important findings\n\nNone.\n",
+  );
+  writeFileSync(
+    join(directory, "artifacts", "verification", "m3", "known-limitations.md"),
+    "Fixture runner limitations.\n",
+  );
+  writeFileSync(
+    join(directory, "artifacts", "verification", "m3", "manifest.json"),
+    "active-old-manifest\n",
+  );
+  writeFileSync(
+    join(directory, "artifacts", "verification", "m3", "outputs", "old.log"),
+    "active-old-output\n",
+  );
+  writeFileSync(
+    join(directory, "artifacts", "verification", "m3", "toolchain.txt"),
+    "active-old-toolchain\n",
+  );
+
+  runGit(directory, ["init"]);
+  runGit(directory, ["config", "user.email", "m3-fixture@example.invalid"]);
+  runGit(directory, ["config", "user.name", "M3 fixture"]);
+  runGit(directory, ["add", "scripts", "docs", "artifacts/verification/m3/manifest.json", "artifacts/verification/m3/review.md", "artifacts/verification/m3/known-limitations.md", "artifacts/verification/m3/toolchain.txt"]);
+  runGit(directory, ["commit", "-m", "fixture"]);
+}
+
+function withApprovedRunnerEvidence(callback) {
+  const directory = mkdtempSync(join(tmpdir(), "m3-approved-runner-"));
+  try {
+    createRunnerFixture(directory);
+    copyFileSync("scripts/verify-m3-evidence.mjs", join(directory, "scripts", "verify-m3-evidence.mjs"));
+    runGit(directory, ["add", "scripts/verify-m3-evidence.mjs"]);
+    runGit(directory, ["commit", "-m", "fixture verifier"]);
+    const generated = spawnSync(
+      process.execPath,
+      [join(directory, "scripts", "run-m3-evidence.mjs")],
+      { cwd: directory, encoding: "utf8", env: process.env },
+    );
+    assert.equal(generated.status, 0, `${generated.stdout}${generated.stderr}`);
+    const manifestPath = join(directory, "artifacts", "verification", "m3", "manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const activeRoot = join(directory, "artifacts", "verification", "m3", manifest.evidenceRoot);
+    const reviewPath = join(activeRoot, "review.md");
+    const approvedReview = readFileSync(reviewPath, "utf8")
+      .replace("Reviewed source commit: PENDING", `Reviewed source commit: ${manifest.sourceCommit}`)
+      .replace("Independent approval: PENDING", "Independent approval: PASS")
+      .replace("Spec compliance: PENDING", "Spec compliance: PASS")
+      .replace("Code quality: PENDING", "Code quality: PASS");
+    writeFileSync(reviewPath, approvedReview);
+    manifest.artifactSha256["review.md"] = hash(readFileSync(reviewPath));
+    writeManifest(join(directory, "artifacts", "verification", "m3"), manifest);
+    callback(directory, manifest, activeRoot, manifestPath);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function readActiveRunnerEvidence(directory) {
+  const evidenceRoot = join(directory, "artifacts", "verification", "m3");
+  const files = [
+    "manifest.json",
+    "toolchain.txt",
+    join("outputs", "old.log"),
+  ];
+  return files.map((file) => {
+    const path = join(evidenceRoot, file);
+    assert.equal(statSync(path).isFile(), true, `fixture evidence file missing: ${file}`);
+    return [file, readFileSync(path)];
+  });
+}
+
+function runGit(directory, arguments_) {
+  const result = spawnSync("git", arguments_, {
+    cwd: directory,
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+}
+
 function assertVerifierFails(directory, pattern, extraArguments = ["--historical"]) {
   assertVerifierFailsAt(join(directory, "manifest.json"), pattern, extraArguments);
 }
 
 function assertVerifierFailsAt(manifestPath, pattern, extraArguments) {
   const result = runVerifier(...extraArguments, "--manifest", manifestPath);
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stdout}${result.stderr}`, pattern);
+}
+
+function assertTempVerifierFails(directory, manifestPath, pattern, extraArguments = []) {
+  const result = spawnSync(
+    process.execPath,
+    ["scripts/verify-m3-evidence.mjs", ...extraArguments, "--manifest", manifestPath],
+    { cwd: directory, encoding: "utf8" },
+  );
   assert.notEqual(result.status, 0);
   assert.match(`${result.stdout}${result.stderr}`, pattern);
 }
@@ -365,6 +541,12 @@ function gitOutput(...arguments_) {
 
 function hash(value) {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function canonicalToolchain(toolVersions) {
+  return `${Object.entries(toolVersions)
+    .map(([name, value]) => `${name}=${value}`)
+    .join("\n")}\n`;
 }
 
 function currentToolVersions() {

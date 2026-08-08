@@ -6,7 +6,7 @@ import {
   statSync,
 } from "node:fs";
 import os from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -24,12 +24,17 @@ const manifestPath =
     ? join(root, "artifacts", "verification", "m3", "manifest.json")
     : resolve(root, process.argv[manifestArgument + 1]);
 const artifactRoot = dirname(manifestPath);
+let activeArtifactRoot = artifactRoot;
 const allowedGeneratedPath =
   /^artifacts\/verification\/m3(?:\/|$)/u;
 const allowedPlanPath =
   "docs/superpowers/plans/2026-07-23-m3-protocol-adapter.md";
 
 try {
+  assert(
+    !(historical && requireApproved),
+    "--historical cannot be combined with --require-approved",
+  );
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   verifyManifest(manifest);
   console.log("M3 evidence: ok");
@@ -42,6 +47,7 @@ function verifyManifest(manifest) {
   assert(manifest && typeof manifest === "object" && !Array.isArray(manifest), "manifest must be an object");
   assert(manifest.schemaVersion === 1, "unsupported manifest schema");
   assert(manifest.finalized === true, "manifest is not finalized");
+  activeArtifactRoot = resolveActiveArtifactRoot(manifest);
   assert(/^([0-9a-f]{40}|[0-9a-f]{64})$/u.test(manifest.sourceCommit), "invalid source commit");
   verifyCommitBinding(manifest.sourceCommit);
   assert(manifest.platform === `${process.platform}-${process.arch}`, "platform mismatch");
@@ -57,6 +63,21 @@ function verifyManifest(manifest) {
   verifyArtifacts(manifest);
   verifyReview(manifest);
   rejectCredentialCanaryLeaks(manifest);
+}
+
+function resolveActiveArtifactRoot(manifest) {
+  if (manifest.evidenceRoot === undefined) return artifactRoot;
+  assert(
+    typeof manifest.evidenceRoot === "string" && manifest.evidenceRoot.length > 0,
+    "invalid active evidence root",
+  );
+  const candidate = resolve(artifactRoot, manifest.evidenceRoot);
+  assert(
+    isContainedPath(artifactRoot, candidate),
+    "active evidence root escapes artifact root",
+  );
+  assert(statSync(candidate).isDirectory(), "active evidence root is not a directory");
+  return candidate;
 }
 
 function verifyCommands(manifest) {
@@ -97,6 +118,20 @@ function verifyCommands(manifest) {
     assert(entry.outputSha256 === hash(output), `output hash mismatch: ${entry.name}`);
     assert(!hasSkippedTests(output.toString("utf8")), `command skipped a case: ${entry.name}`);
   });
+
+  const expectedOutputs = manifest.commands
+    .map((entry) => entry.outputFile)
+    .sort();
+  const outputDirectory = resolveArtifactPath("outputs");
+  assert(statSync(outputDirectory).isDirectory(), "active output root is not a directory");
+  const actualOutputs = collectFiles(outputDirectory)
+    .map((path) => relativeArtifactPath(path))
+    .sort();
+  assertDeepEqual(
+    actualOutputs,
+    expectedOutputs,
+    "unexpected retained output set",
+  );
 }
 
 function verifyMatrices(manifest) {
@@ -145,6 +180,12 @@ function verifyArtifacts(manifest) {
     assert(artifactHashes[file] === hash(contents), `artifact hash mismatch: ${file}`);
   }
 
+  assert(
+    readFileSync(resolveArtifactPath("toolchain.txt"), "utf8") ===
+      canonicalToolchain(manifest.toolVersions),
+    "toolchain serialization is not canonical",
+  );
+
   const limitations = readFileSync(resolveArtifactPath("known-limitations.md"), "utf8");
   assert(limitations.trim().length > 0, "known limitations are absent");
   assert(readFileSync(resolveArtifactPath("toolchain.txt"), "utf8").trim().length > 0, "toolchain artifact is absent");
@@ -169,7 +210,19 @@ function verifyReview(manifest) {
     assert(specVerdict === "PASS", "spec compliance is pending");
     assert(codeVerdict === "PASS", "code quality is pending");
     assert(reviewedSource === manifest.sourceCommit, "reviewed source commit mismatch");
+    assertReviewSectionIsEmpty(review, "Critical findings");
+    assertReviewSectionIsEmpty(review, "Important findings");
   }
+}
+
+function assertReviewSectionIsEmpty(review, heading) {
+  const lines = review.split(/\r?\n/u);
+  const headingLine = `## ${heading}`;
+  const start = lines.indexOf(headingLine);
+  assert(start !== -1, `missing ${heading.toLowerCase()} heading`);
+  const end = lines.findIndex((line, index) => index > start && line.startsWith("## "));
+  const body = lines.slice(start + 1, end === -1 ? lines.length : end).join("\n").trim();
+  assert(/^None\.?$/u.test(body), `${heading} must be None for approval`);
 }
 
 function reviewHeading(review, heading, valuePattern) {
@@ -182,7 +235,7 @@ function reviewHeading(review, heading, valuePattern) {
 
 function rejectCredentialCanaryLeaks(manifest) {
   const markerPattern = new RegExp(`${escapeRegExp(credentialCanary.markerPrefix)}[A-Za-z0-9][A-Za-z0-9_-]*`, "u");
-  const files = collectFiles(artifactRoot);
+  const files = collectFiles(activeArtifactRoot);
   for (const file of files) {
     const contents = readFileSync(file, "utf8");
     assert(!markerPattern.test(contents), `credential canary leaked in ${relativeArtifactPath(file)}`);
@@ -274,8 +327,11 @@ function parseTimestamp(value, description) {
 
 function resolveArtifactPath(relativePath) {
   const normalized = relativePath.replaceAll("\\", "/");
-  const path = resolve(artifactRoot, normalized);
-  assert(path === resolve(artifactRoot, relativePath), `invalid artifact path: ${relativePath}`);
+  const path = resolve(activeArtifactRoot, normalized);
+  assert(
+    isContainedPath(activeArtifactRoot, path),
+    `invalid artifact path: ${relativePath}`,
+  );
   return path;
 }
 
@@ -290,7 +346,12 @@ function collectFiles(directory) {
 }
 
 function relativeArtifactPath(path) {
-  return path.slice(artifactRoot.length + 1).replaceAll("\\", "/");
+  return relative(activeArtifactRoot, path).replaceAll("\\", "/");
+}
+
+function isContainedPath(parent, candidate) {
+  const relation = relative(parent, candidate);
+  return relation.length === 0 || (!relation.startsWith("..") && !isAbsolute(relation));
 }
 
 function hasSkippedTests(output) {
@@ -307,6 +368,12 @@ function escapeRegExp(value) {
 
 function hash(value) {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function canonicalToolchain(toolVersions) {
+  return `${Object.entries(toolVersions)
+    .map(([name, value]) => `${name}=${value}`)
+    .join("\n")}\n`;
 }
 
 function assertDeepEqual(actual, expected, message) {
