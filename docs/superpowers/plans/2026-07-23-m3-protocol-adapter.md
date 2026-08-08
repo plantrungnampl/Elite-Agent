@@ -504,7 +504,7 @@ git commit -m "feat: compose trusted agent adapter"
 - Generate: `artifacts/verification/m3/outputs/*.log`
 - Modify: `docs/superpowers/plans/2026-07-23-m3-protocol-adapter.md`
 
-- [ ] **Step 1 - Write failing evidence contracts**
+- [x] **Step 1 - Write failing evidence contracts**
 
 Require a source-commit-bound manifest, tool versions, hashes for every retained output, no skipped approval-critical test, immutable design proof, full Rust/Node/frontend regressions, protocol/schema/conformance matrices, fake-agent matrix, OpenAI loopback matrix, persistence/recovery tests, and an explicit credential canary absence check.
 
