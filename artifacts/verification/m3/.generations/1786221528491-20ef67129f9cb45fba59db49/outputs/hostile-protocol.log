@@ -1,0 +1,31 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running tests\conformance.rs (target\debug\deps\conformance-9f9335a7cbc527cc.exe)
+
+running 6 tests
+test run_start_rejects_noncanonical_generation_parameters ... ok
+test run_start_carries_provider_neutral_execution_bytes_outside_the_wire_frame ... ok
+test run_start_rejects_generation_or_context_digest_mismatch ... ok
+test shared_harness_rejects_events_emitted_before_start_acceptance ... ok
+test shared_harness_drives_every_case_through_a_deferred_peer ... ok
+test shared_harness_rejects_a_peer_that_never_emits_a_terminal_result ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests\session_contract.rs (target\debug\deps\session_contract-cd15d120425a6c45.exe)
+
+running 13 tests
+test rejects_heartbeat_regressions_and_times_out_stalled_connections ... ok
+test rejects_unoffered_protocol_versions_and_capability_escalation ... ok
+test rejects_launch_and_agent_binding_mismatches ... ok
+test opaque_run_requests_only_wrap_their_schema_method ... ok
+test rejects_features_the_agent_did_not_select_during_handshake ... ok
+test connection_loss_only_interrupts_runs_accepted_by_the_agent ... ok
+test enforces_method_ownership_and_never_responds_to_notifications ... ok
+test enforces_connection_unique_request_ids_and_response_provenance ... ok
+test rejects_terminal_usage_that_exceeds_the_run_output_token_limit ... ok
+test rejects_terminal_frames_before_start_and_after_the_one_terminal_result ... ok
+test fails_runs_when_output_or_tool_limits_are_exceeded ... ok
+test applies_run_and_cancellation_deadlines_and_interrupts_connection_runs ... ok
+test rejects_foreign_runs_and_terminalizes_runs_after_stream_sequence_violations ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s

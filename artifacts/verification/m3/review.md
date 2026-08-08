@@ -1,23 +1,27 @@
 # M3 independent review
 
-## Reviewed source commit: PENDING
+## Reviewed source commit: 1ac6ad63675af514201d67a0a2719fa03fb44dd3
 
-## Independent approval: PENDING
+## Independent approval: PASS
 
-Independent review is pending for the source commit bound to the finalized M3 evidence.
+The finalized manifest is bound exactly to the reviewed source commit. The sole active generation contains exactly 20 hashed command outputs plus its canonical toolchain. The verifier and all 24 M3 evidence-contract tests pass.
 
-## Spec compliance: PENDING
+## Spec compliance: PASS
 
-Spec compliance review is pending for the source commit bound to the finalized M3 evidence.
+All 20 required commands passed without skipped cases. Six required verification matrices contain 26 observed evidence needles. Normative design documents remain unchanged from `321734f`. Credential-canary and high-confidence secret scans found no leaks. Known limitations accurately constrain the evidence claims.
 
-## Code quality: PENDING
+## Code quality: PASS
 
-Code-quality review is pending for the source commit bound to the finalized M3 evidence.
+Captured formatting, checking, Clippy, Rust test, documentation, frontend, desktop-build, architecture, and contract gates all passed. Every output hash matches, retained outputs are LF-normalized, and fresh-checkout probes remain LF with `core.autocrlf=true`.
 
 ## Critical findings
 
-Pending independent review.
+None.
 
 ## Important findings
 
-Pending independent review.
+None.
+
+## Minor findings
+
+None.

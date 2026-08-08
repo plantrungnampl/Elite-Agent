@@ -1,0 +1,27 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running tests\agent_recovery.rs (target\debug\deps\agent_recovery-251b46f9221e0ed5.exe)
+
+running 4 tests
+test reopening_without_provider_configuration_keeps_agent_runtime_absent ... ok
+test adapter_version_rotation_interrupts_incomplete_core_adapter_runs ... ok
+test restart_interrupts_an_incomplete_openai_run_and_reconstructs_its_durable_inputs ... ok
+test core_release_rotation_interrupts_incomplete_runs_and_reconstructs_completed_history ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+
+     Running tests\agent_runtime_e2e.rs (target\debug\deps\agent_runtime_e2e-a78b17a2eceb2302.exe)
+
+running 11 tests
+test startup_without_openai_is_ready_without_an_agent_runtime ... ok
+test configured_openai_registers_the_exact_trusted_core_adapter_descriptor ... ok
+test non_openai_provider_is_rejected_before_publication_or_loopback_dispatch ... ok
+test accepted_cancellation_terminalizes_cleanly_without_changing_the_task_workflow ... ok
+test openai_outage_terminalizes_the_agent_run_without_changing_the_task_workflow ... ok
+test dropping_bootstrap_waits_for_active_openai_worker_and_permanently_closes_cloned_handle ... ok
+test loopback_sse_persists_a_terminal_run_and_reconstructs_its_bound_inputs_after_reopen ... ok
+test retry_waits_for_active_openai_worker_and_permanently_closes_cloned_handle ... ok
+test reconfigure_waits_for_active_openai_worker_and_permanently_closes_cloned_handle ... ok
+test missing_or_mismatched_context_fails_before_openai_loopback_dispatch ... ok
+test successful_runs_before_and_after_bootstrap_restart_persist_distinct_messages ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.17s

@@ -508,7 +508,7 @@ git commit -m "feat: compose trusted agent adapter"
 
 Require a source-commit-bound manifest, tool versions, hashes for every retained output, no skipped approval-critical test, immutable design proof, full Rust/Node/frontend regressions, protocol/schema/conformance matrices, fake-agent matrix, OpenAI loopback matrix, persistence/recovery tests, and an explicit credential canary absence check.
 
-- [ ] **Step 2 - Run the complete M3 gate**
+- [x] **Step 2 - Run the complete M3 gate**
 
 ```powershell
 node --test tests/contracts/*.test.mjs
@@ -528,11 +528,11 @@ node scripts/run-m3-evidence.mjs
 node scripts/verify-m3-evidence.mjs
 ```
 
-- [ ] **Step 3 - Perform final M3 review**
+- [x] **Step 3 - Perform final M3 review**
 
 Review baseline-to-HEAD for Critical/Important findings, specifically malformed/oversize allocation, request-ID confusion, response-to-notification, capability escalation, binding substitution, stream gap/conflict, double terminal, terminal-before-persist, unsafe retry/resume, credential disclosure, provider DTO leakage, provider-name orchestration, cancellation races, detached workers, SQLite partial commit, outage workflow mutation, and stale/non-reconstructible context or run config. Fix and rerun evidence until none remain.
 
-- [ ] **Step 4 - Mark every completed step and commit evidence**
+- [x] **Step 4 - Mark every completed step and commit evidence**
 
 Update `[ ]` to `[x]` immediately for every genuinely completed step. Do not mark deferred/failed steps. Bind final evidence to the implementation source commit, run post-final verification, then commit only plan/evidence files.
 

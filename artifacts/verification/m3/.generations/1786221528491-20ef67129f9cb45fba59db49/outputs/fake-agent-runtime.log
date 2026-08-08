@@ -1,0 +1,60 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running tests\fake_conformance.rs (target\debug\deps\fake_conformance-69d4a7250ceda8e4.exe)
+
+running 1 test
+test every_script_passes_the_shared_protocol_conformance_matrix ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\runtime_contract.rs (target\debug\deps\runtime_contract-06994113dd0d649f.exe)
+
+running 47 tests
+test duplicate_peer_connection_ids_are_rejected_at_construction ... ok
+test disabled_descriptor_is_listed_but_never_dispatched ... ok
+test dispatch_rejects_a_binding_digest_not_authorized_at_registration ... ok
+test compensation_uses_a_fresh_monotonic_timestamp_after_running_store_failure ... ok
+test compensation_shutdown_retires_connection_after_durable_cleanup ... ok
+test capacity_one_reserves_an_in_flight_start_before_durable_create ... ok
+test compensation_failure_preserves_the_original_start_failure ... ok
+test connection_loss_store_failure_is_retried_by_check_timeouts ... ok
+test interruption_poison_blocks_a_concurrent_start_before_the_store_call_finishes ... ok
+test compensation_clock_failure_retires_connection_until_later_cleanup ... ok
+test concurrent_cleanup_retries_claim_once_and_reuse_published_artifact ... ok
+test cooperative_cancellation_is_terminal_before_the_receipt_returns ... ok
+test background_callback_entering_before_peer_start_returns_waits_for_durable_readiness ... ok
+test compensation_shutdown_interrupts_and_removes_sibling_connection_runs ... ok
+test every_agent_originated_request_receives_one_typed_response ... ok
+test heartbeat_timeout_and_crash_interrupt_active_runs ... ok
+test clock_recovery_retries_poison_without_waiting_for_a_session_timeout ... ok
+test interruption_store_failure_retains_active_state_and_capacity_until_retry_succeeds ... ok
+test peer_receives_every_bound_execution_field_and_wire_limit_exactly ... ok
+test startup_clock_failure_is_returned_before_runtime_is_available ... ok
+test startup_recovery_deduplicates_authoritative_connection_digests ... ok
+test startup_store_recovery_failure_is_returned_before_runtime_is_available ... ok
+test failed_stale_terminal_cleanup_retries_without_poisoning_current_work ... ok
+test failed_stale_artifact_cleanup_retries_without_poisoning_current_work ... ok
+test cancellation_and_run_deadlines_are_classified_as_terminated ... ok
+test runtime_shutdown_retires_connection_after_durable_cleanup ... ok
+test retirement_prevents_a_reserved_start_from_reaching_the_shutdown_peer ... ok
+test shutdown_interrupts_active_runs_before_reporting_completion ... ok
+test duplicate_and_conflicting_terminal_requests_commit_one_result ... ok
+test stale_cleanup_survives_clock_failure_before_its_first_attempt ... ok
+test synchronous_callbacks_during_peer_start_are_rejected ... ok
+test retry_uses_a_new_run_and_exact_supersession_binding ... ok
+test rejected_handshake_preserves_conflict_and_poisoned_capacity ... ok
+test output_limit_persists_failure_and_triggers_peer_cancellation ... ok
+test post_start_store_failures_cancel_shutdown_and_persist_interruption ... ok
+test terminal_store_failure_is_never_acknowledged ... ok
+test terminal_artifact_publication_failure_is_never_persisted_or_acknowledged ... ok
+test runtime_recreation_recovers_memory_lost_stale_cleanup ... ok
+test poison_cleanup_invalidates_a_start_blocked_before_durable_create ... ok
+test start_returns_after_durable_acceptance_and_scripted_output_is_deterministic ... ok
+test terminal_completion_releases_capacity_for_the_next_run ... ok
+test stale_start_never_registers_in_the_current_generation_session ... ok
+test every_hostile_peer_failure_terminates_the_run ... ok
+test two_retries_for_one_poison_do_not_interrupt_post_recovery_work ... ok
+test proposer_critic_and_verifier_outputs_are_stable_for_the_same_bound_input ... ok
+test threaded_delta_waits_for_durable_run_readiness ... ok
+test threaded_terminal_ack_waits_for_durable_run_readiness_and_commit ... ok
+
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s

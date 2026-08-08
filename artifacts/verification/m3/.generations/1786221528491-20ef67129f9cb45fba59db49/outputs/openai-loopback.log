@@ -1,0 +1,7 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running tests\conformance.rs (target\debug\deps\conformance-90401dc5434aeb28.exe)
+
+running 1 test
+test openai_adapter_passes_shared_conformance_against_loopback_sse_fixtures ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s

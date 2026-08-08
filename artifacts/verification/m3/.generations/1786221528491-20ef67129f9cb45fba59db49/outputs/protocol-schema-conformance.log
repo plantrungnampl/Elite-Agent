@@ -1,0 +1,25 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running tests\codec.rs (target\debug\deps\codec-0261289f5e10a7d3.exe)
+
+running 12 tests
+test rejects_malformed_utf8_json_and_line_boundaries ... ok
+test decodes_one_utf8_json_object_line ... ok
+test enforces_configured_limits_before_deserialization ... ok
+test errors_never_include_frame_content ... ok
+test rejects_unsigned_values_that_exceed_i64_for_bounded_integer_constraints ... ok
+test encoding_respects_the_configured_limit ... ok
+test encoding_is_one_lf_terminated_utf8_object ... ok
+test rejects_invalid_frame_shapes_and_ids ... ok
+test consumes_hostile_ndjson_fixtures ... ok
+test enforces_every_numeric_schema_boundary ... ok
+test rejects_array_cardinality_uniqueness_and_property_constraints ... ok
+test encoding_rechecks_representable_schema_constraints ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests\schema_types.rs (target\debug\deps\schema_types-c36ae0df8c3e341a.exe)
+
+running 1 test
+test every_protocol_example_round_trips_through_generated_types ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

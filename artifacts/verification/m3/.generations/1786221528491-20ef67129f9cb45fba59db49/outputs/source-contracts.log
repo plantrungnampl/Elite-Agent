@@ -1,0 +1,176 @@
+architecture contracts: Tauri invoke is allowed only in src/api/: feature.ts
+architecture contracts: local-agent-terminal-application has an outward internal dependency
+architecture contracts: domain may not depend on workspace packages
+architecture contracts: generic Tauri command is forbidden: run_command
+architecture contracts: generic Tauri command is forbidden: commit
+architecture contracts: generic Tauri command is forbidden: create_commit
+architecture contracts: generic Tauri command is forbidden: finalize_commit
+architecture contracts: repository adapter may not spawn a process: lib.rs
+architecture contracts: repository adapter may not inspect PATH: lib.rs
+✔ architecture checker accepts the production workspace (582.7113ms)
+✔ architecture checker permits staged M3 crate introduction (453.111ms)
+✔ architecture checker rejects a frontend Tauri invoke outside its API boundary (84.8798ms)
+✔ architecture checker rejects an outward application dependency (41.3489ms)
+✔ architecture checker rejects even dev-only domain dependencies on adapters (42.5488ms)
+✔ architecture checker allows external domain test dependencies (430.2385ms)
+✔ architecture checker rejects a generic Tauri execution command (105.4755ms)
+✔ architecture checker rejects M5 commit and finalization command variants (374.631ms)
+✔ architecture checker rejects grouped and aliased process imports (100.6961ms)
+✔ architecture checker rejects grouped and aliased PATH access (102.3192ms)
+design contracts: checksum manifest is not exact
+design contracts: workflow global event target is not a phase
+✔ design verifier accepts the checked-in immutable design artifacts (81.1202ms)
+✔ design verifier rejects incomplete checksum manifests (75.1343ms)
+✔ design verifier rejects global events with an unknown target phase (83.9418ms)
+architecture contracts: local-agent-terminal-repository-git has an outward internal dependency on local-agent-terminal-desktop
+architecture contracts: generic Tauri command is forbidden: run_command
+architecture contracts: repository adapter may not spawn a process: lib.rs
+architecture contracts: repository adapter may not inspect PATH: lib.rs
+✔ immutable design checks still pass (81.7415ms)
+✔ repository adapter cannot depend on an outer desktop adapter (67.8252ms)
+✔ generic Tauri execution commands are rejected (138.7465ms)
+✔ repository adapter rejects process execution (118.6612ms)
+✔ repository adapter rejects PATH lookup (113.3858ms)
+✔ M1 evidence is complete and internally consistent (1663.3072ms)
+✔ the historical M1 runner retains its complete verification gate (0.5462ms)
+✔ M1 verifier rejects modified captured output (1451.5441ms)
+✔ M1 verifier rejects a stale source commit (152.7846ms)
+✔ M1 verifier rejects self-asserted fixture classifications (1376.9335ms)
+✔ M1 verifier rejects fixture evidence absent from captured output (1378.4183ms)
+✔ M1 verifier rejects dirty tracked source even when HEAD matches sourceCommit (150.7396ms)
+✔ M1 evidence generation preflight rejects dirty tracked source (156.8418ms)
+✔ unknown non-repeatable operations are indeterminate and non-replayable (1.1893ms)
+architecture contracts: application may depend only on domain or general-purpose libraries
+architecture contracts: local-agent-terminal-policy-engine has an outward internal dependency on local-agent-terminal-platform-windows
+architecture contracts: local-agent-terminal-tool-runtime has an outward internal dependency on local-agent-terminal-repository-git
+architecture contracts: tool-runtime may not construct or discover processes
+architecture contracts: Windows process and filesystem APIs are allowed only in platform-windows
+architecture contracts: process construction is allowed only in platform-windows
+architecture contracts: Windows process and filesystem APIs are allowed only in platform-windows
+architecture contracts: process construction is allowed only in platform-windows
+architecture contracts: Windows process and filesystem APIs are allowed only in platform-windows
+architecture contracts: process construction is allowed only in platform-windows
+architecture contracts: process construction is allowed only in platform-windows
+architecture contracts: process construction is allowed only in platform-windows
+architecture contracts: process construction is allowed only in platform-windows
+architecture contracts: process construction is allowed only in platform-windows
+architecture contracts: process construction is allowed only in platform-windows
+architecture contracts: process construction is allowed only in platform-windows
+architecture contracts: process construction is allowed only in platform-windows
+architecture contracts: concrete M2 adapters must be constructed only in bootstrap
+architecture contracts: concrete M2 adapters must be constructed only in bootstrap
+architecture contracts: concrete M2 adapters must be constructed only in bootstrap
+architecture contracts: raw path-bearing frontend DTOs are forbidden
+architecture contracts: M3 protocol or provider packages are out of scope for M2
+✔ architecture checker accepts the workspace while M2 packages are absent (574.1221ms)
+✔ application exposes one canonical tool execution entry point (0.9796ms)
+✔ architecture checker rejects application dependencies outside its exact allowlist (60.8738ms)
+✔ architecture checker rejects outward M2 adapter dependencies (116.0924ms)
+✔ architecture checker rejects tool-runtime process construction (119.9576ms)
+✔ architecture checker requires tool-runtime to receive application ports (117.0759ms)
+✔ architecture checker reserves Windows process and filesystem APIs for platform-windows (102.2388ms)
+✔ architecture checker rejects process and Windows APIs outside platform-windows (424.6954ms)
+✔ architecture checker scans production code after an inline test module (113.2168ms)
+✔ architecture checker ignores fake test-module markers in comments and raw strings (244.079ms)
+✔ architecture checker fails closed for unterminated lexical forms (446.0757ms)
+✔ architecture checker balances raw strings and nested comments in inline test modules (96.2805ms)
+✔ architecture checker ignores process construction inside an inline test module (97.839ms)
+✔ architecture checker allows platform-windows process and Windows APIs (109.756ms)
+✔ architecture checker reserves concrete M2 adapter construction for bootstrap (100.3383ms)
+✔ architecture checker rejects Tauri construction of concrete M2 adapters (103.7535ms)
+✔ architecture checker scans Tauri construction after an inline test module (89.9334ms)
+✔ architecture checker allows bootstrap to compose M2 adapters (94.9987ms)
+✔ architecture checker allows bootstrap dependencies on M2 adapters (392.5648ms)
+✔ architecture checker rejects raw frontend paths (107.6688ms)
+✔ the approval fixture satisfies the loaded normative tool schema (1.5288ms)
+✔ default structured tool requests deny raw shell and command strings (0.8827ms)
+✔ architecture checker rejects M3 protocol and provider packages (104.9949ms)
+✔ the normative design directory remains unchanged (28.7834ms)
+✔ M2 evidence is complete and internally consistent (1713.9291ms)
+✔ Windows CI runs containment before fresh M2 evidence verification (0.3554ms)
+✔ M2 evidence-only path predicate allows exact M2/M3 evidence and the execution plan (0.3468ms)
+✔ M2 evidence-only path predicate rejects broad artifacts, unsafe generations, and source paths (0.2348ms)
+✔ M2 verifier rejects modified captured output (1500.6022ms)
+✔ M2 verifier rejects stale and non-ancestor source commits (642.2422ms)
+✔ M2 historical mode still requires ancestry and allows later source commits (1560.3209ms)
+✔ M2 verifier rejects missing, failed, and skipped commands (3940.6314ms)
+✔ M2 verifier rejects omitted containment cases (1267.493ms)
+✔ M2 verifier rejects platform and toolchain drift (1443.989ms)
+✔ M2 verifier rejects tampered review and limitations artifacts (2646.17ms)
+✔ final M2 verification rejects a pending independent review (1306.4723ms)
+✔ final M2 verification binds every verdict to the reviewed source (2637.9952ms)
+✔ M2 verifier rejects native skipped-test summaries (3915.2821ms)
+✔ M2 verifier rejects dirty source and immutable design changes (283.0203ms)
+✔ M2 evidence generation preflight rejects dirty source (163.4273ms)
+✔ M2 post-final verifier rejects an absent log (43.3904ms)
+✔ M2 post-final verifier requires every approval-critical contract (82.1504ms)
+architecture contracts: M3 workspace members are required: local-agent-terminal-provider-openai
+architecture contracts: local-agent-terminal-agent-protocol has an outward internal dependency on local-agent-terminal-domain
+architecture contracts: local-agent-terminal-agent-runtime has an outward internal dependency on local-agent-terminal-provider-openai
+architecture contracts: local-agent-terminal-provider-openai has an outward internal dependency on local-agent-terminal-application
+architecture contracts: concrete M3 adapters must be constructed only in bootstrap
+architecture contracts: provider names are forbidden in domain, application, and orchestration policy
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: Authorization values may not be logged
+architecture contracts: provider HTTP and raw TCP/TLS are allowed only in provider-openai
+architecture contracts: provider HTTP and raw TCP/TLS are allowed only in provider-openai
+architecture contracts: process construction is allowed only in platform-windows
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider credentials may not be read from environment
+architecture contracts: provider HTTP and raw TCP/TLS are allowed only in provider-openai
+architecture contracts: provider names are forbidden in domain, application, and orchestration policy
+architecture contracts: concrete M3 adapters must be constructed only in bootstrap
+architecture contracts: concrete M3 adapters must be constructed only in bootstrap
+✔ architecture checker accepts the complete M3 inward dependency graph (530.0896ms)
+✔ architecture checker requires all M3 crates only for the final gate (510.0446ms)
+✔ architecture checker rejects outward M3 crate dependencies (132.7798ms)
+✔ architecture checker confines M3 provider and runtime boundaries (813.3876ms)
+✔ architecture checker rejects provider credentials through environment aliases (318.5358ms)
+✔ architecture checker rejects environment references before invocation (602.0687ms)
+✔ architecture checker rejects environment macro aliases (401.0189ms)
+✔ architecture checker mutation-checks every forbidden environment accessor (515.4202ms)
+✔ architecture checker rejects variable-indirected environment lookups (194.072ms)
+✔ architecture checker rejects runtime environment enumeration (193.2828ms)
+✔ architecture checker rejects compile-time credential environment macros (196.1829ms)
+✔ architecture checker allows narrowly justified environment access (292.8354ms)
+✔ architecture checker confines justified environment access to exact calls (395.377ms)
+✔ architecture checker confines provider HTTP across every production crate (101.879ms)
+✔ architecture checker normalizes provider names in orchestration policy (99.8544ms)
+✔ architecture checker forbids runtime type references outside bootstrap (104.0621ms)
+✔ architecture checker forbids provider type references outside bootstrap (108.3432ms)
+✔ architecture checker allows bootstrap composition and provider HTTP (104.6414ms)
+✔ normative M3 schema pins frame variants, IDs, strict frames, and the 8 MiB default (1.1636ms)
+✔ M3 hostile fixtures encode rejection cases for the future conformance binary (17.0585ms)
+ℹ tests 89
+ℹ suites 0
+ℹ pass 89
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 23254.8125

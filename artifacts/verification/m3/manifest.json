@@ -1,0 +1,347 @@
+{
+  "schemaVersion": 1,
+  "finalized": true,
+  "generatedAtUtc": "2026-08-08T20:38:48.491Z",
+  "sourceCommit": "1ac6ad63675af514201d67a0a2719fa03fb44dd3",
+  "platform": "win32-x64",
+  "outputCapture": "combined stdout/stderr bytes normalized to LF",
+  "toolVersions": {
+    "os": "Windows_NT 10.0.26200 x64",
+    "node": "v24.16.0",
+    "pnpm": "11.7.0",
+    "git": "git version 2.54.0.windows.1",
+    "rustup": "rustup 1.29.0 (28d1352db 2026-03-05)",
+    "rustToolchain": "1.97.1-x86_64-pc-windows-msvc (overridden by 'D:\\multiagent\\rust-toolchain.toml')",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)"
+  },
+  "commands": [
+    {
+      "name": "source-contracts",
+      "command": "node --test tests/contracts/architecture.test.mjs tests/contracts/design-contracts.test.mjs tests/contracts/m1-contracts.test.mjs tests/contracts/m2-contracts.test.mjs tests/contracts/m2-evidence-contracts.test.mjs tests/contracts/m3-contracts.test.mjs",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:35:23.036Z",
+      "durationMs": 23321,
+      "outputFile": "outputs/source-contracts.log",
+      "outputSha256": "sha256:7e8f4e18cd45642d9eae0c1bf529c6ca160b506de9e4fbf6a092251fb9356f53"
+    },
+    {
+      "name": "design-contracts",
+      "command": "node scripts/verify-design-contracts.mjs",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:35:46.359Z",
+      "durationMs": 81,
+      "outputFile": "outputs/design-contracts.log",
+      "outputSha256": "sha256:b5cd721cbd79d0db596529962f463442bca6fe3f46067cf82a20b2a85d150852"
+    },
+    {
+      "name": "architecture",
+      "command": "node scripts/check-architecture.mjs --require-m3",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:35:46.442Z",
+      "durationMs": 447,
+      "outputFile": "outputs/architecture.log",
+      "outputSha256": "sha256:dc03b01395fd9c81198a04278ff2d04986443b2d7f71d20a6b77e1ef7f53c30f"
+    },
+    {
+      "name": "rust-format",
+      "command": "cargo fmt --all -- --check",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:35:46.891Z",
+      "durationMs": 1044,
+      "outputFile": "outputs/rust-format.log",
+      "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "rust-check",
+      "command": "cargo check --workspace --all-targets",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:35:47.935Z",
+      "durationMs": 515,
+      "outputFile": "outputs/rust-check.log",
+      "outputSha256": "sha256:92bec25ad54c650450560360480d5f94d3d8ad203f81a2c724e0c641b330bbfb"
+    },
+    {
+      "name": "rust-clippy",
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:35:48.451Z",
+      "durationMs": 580,
+      "outputFile": "outputs/rust-clippy.log",
+      "outputSha256": "sha256:29162d76fb109d9c6005d8544d63a4a438d15235d4f9b8e73d51adc9ba6e95d7"
+    },
+    {
+      "name": "rust-tests",
+      "command": "cargo test --workspace --all-targets",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:35:49.032Z",
+      "durationMs": 74312,
+      "outputFile": "outputs/rust-tests.log",
+      "outputSha256": "sha256:014509e4e4093badb603d92a1be2692d38bbd981f5f886ee4abe6f90b43bc005"
+    },
+    {
+      "name": "rust-all-features",
+      "command": "cargo test --workspace --all-features",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:37:03.347Z",
+      "durationMs": 78144,
+      "outputFile": "outputs/rust-all-features.log",
+      "outputSha256": "sha256:8905a9d4ecf7997e735111d3e56614b191bd890f9dbfc60f2ec2ac6e528fdd53"
+    },
+    {
+      "name": "rust-doc",
+      "command": "cargo test --workspace --doc",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:38:21.493Z",
+      "durationMs": 6242,
+      "outputFile": "outputs/rust-doc.log",
+      "outputSha256": "sha256:238dc9038feafc5da903ee12530dcf6ab029be9334e31f78e9749f7054cbba89"
+    },
+    {
+      "name": "protocol-schema-conformance",
+      "command": "cargo test -p local-agent-terminal-agent-protocol --test schema_types --test codec",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:38:27.737Z",
+      "durationMs": 253,
+      "outputFile": "outputs/protocol-schema-conformance.log",
+      "outputSha256": "sha256:c4e05c84a85aa38e51a2b17fdcf6c67235cf7107139f870cba67a2bc3d8103e1"
+    },
+    {
+      "name": "hostile-protocol",
+      "command": "cargo test -p local-agent-terminal-agent-protocol --test session_contract --test conformance",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:38:27.991Z",
+      "durationMs": 341,
+      "outputFile": "outputs/hostile-protocol.log",
+      "outputSha256": "sha256:803048fe3257f9477c1528248abb4bbaab1745531abf29c06115500ded7bfaac"
+    },
+    {
+      "name": "fake-agent-runtime",
+      "command": "cargo test -p local-agent-terminal-agent-runtime --test runtime_contract --test fake_conformance",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:38:28.333Z",
+      "durationMs": 303,
+      "outputFile": "outputs/fake-agent-runtime.log",
+      "outputSha256": "sha256:a9c1e737aa52d3cf8de68c226b27c3a47705c29d397456a9d63e1ff8a4078dfc"
+    },
+    {
+      "name": "openai-loopback",
+      "command": "cargo test -p local-agent-terminal-provider-openai --test conformance",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:38:28.638Z",
+      "durationMs": 305,
+      "outputFile": "outputs/openai-loopback.log",
+      "outputSha256": "sha256:8197d9fccf86c9685fe187b8296d80bafb870a2962f4dddc69b85b01a7477a42"
+    },
+    {
+      "name": "provider-neutral-credentials",
+      "command": "cargo test -p local-agent-terminal-provider-openai --test request_contract --test streaming_contract",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:38:28.943Z",
+      "durationMs": 635,
+      "outputFile": "outputs/provider-neutral-credentials.log",
+      "outputSha256": "sha256:d1bdaf13cdb1fcf85b2c7a846d6eecfcb1aca11ca2660c8caf43759bd0335b4c"
+    },
+    {
+      "name": "persistence-recovery",
+      "command": "cargo test -p local-agent-terminal-bootstrap --test agent_runtime_e2e --test agent_recovery",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:38:29.580Z",
+      "durationMs": 4292,
+      "outputFile": "outputs/persistence-recovery.log",
+      "outputSha256": "sha256:8286fa516f73484764bf6eb02912a152892dadb4989c5441977a068f98a54103"
+    },
+    {
+      "name": "frontend-tests",
+      "command": "pnpm --dir apps/desktop test --run",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:38:33.872Z",
+      "durationMs": 3783,
+      "outputFile": "outputs/frontend-tests.log",
+      "outputSha256": "sha256:7f4c6ac756fe72694c0bf1e1af3b32e47ddc2e2d2a13dd02768f2189d5ea7957"
+    },
+    {
+      "name": "frontend-build",
+      "command": "pnpm --dir apps/desktop build",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:38:37.657Z",
+      "durationMs": 2945,
+      "outputFile": "outputs/frontend-build.log",
+      "outputSha256": "sha256:7d6f1ab7f95ac179e7b1263b2f03b8b3417381aa88e97225526060f2c2d90d82"
+    },
+    {
+      "name": "desktop-debug-build",
+      "command": "cargo build -p local-agent-terminal-desktop",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:38:40.603Z",
+      "durationMs": 7762,
+      "outputFile": "outputs/desktop-debug-build.log",
+      "outputSha256": "sha256:ffa4d2801a297b69cfe4fa832484eb3cd896030262ddf0d0ed6941b2462f4ba4"
+    },
+    {
+      "name": "diff-check",
+      "command": "git diff --check",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:38:48.366Z",
+      "durationMs": 55,
+      "outputFile": "outputs/diff-check.log",
+      "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "design-docs-unchanged",
+      "command": "git diff --exit-code 321734f -- docs/multi-agent-terminal-design",
+      "exitCode": 0,
+      "startedAtUtc": "2026-08-08T20:38:48.422Z",
+      "durationMs": 43,
+      "outputFile": "outputs/design-docs-unchanged.log",
+      "outputSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "verificationMatrices": [
+    {
+      "name": "protocol-schema-conformance",
+      "evidence": [
+        {
+          "command": "protocol-schema-conformance",
+          "needle": "every_protocol_example_round_trips_through_generated_types"
+        },
+        {
+          "command": "protocol-schema-conformance",
+          "needle": "consumes_hostile_ndjson_fixtures"
+        }
+      ]
+    },
+    {
+      "name": "hostile-protocol",
+      "evidence": [
+        {
+          "command": "protocol-schema-conformance",
+          "needle": "enforces_configured_limits_before_deserialization"
+        },
+        {
+          "command": "hostile-protocol",
+          "needle": "enforces_connection_unique_request_ids_and_response_provenance"
+        },
+        {
+          "command": "hostile-protocol",
+          "needle": "enforces_method_ownership_and_never_responds_to_notifications"
+        },
+        {
+          "command": "hostile-protocol",
+          "needle": "rejects_foreign_runs_and_terminalizes_runs_after_stream_sequence_violations"
+        },
+        {
+          "command": "hostile-protocol",
+          "needle": "rejects_terminal_frames_before_start_and_after_the_one_terminal_result"
+        }
+      ]
+    },
+    {
+      "name": "fake-agent-runtime",
+      "evidence": [
+        {
+          "command": "fake-agent-runtime",
+          "needle": "proposer_critic_and_verifier_outputs_are_stable_for_the_same_bound_input"
+        },
+        {
+          "command": "fake-agent-runtime",
+          "needle": "duplicate_and_conflicting_terminal_requests_commit_one_result"
+        },
+        {
+          "command": "fake-agent-runtime",
+          "needle": "heartbeat_timeout_and_crash_interrupt_active_runs"
+        },
+        {
+          "command": "fake-agent-runtime",
+          "needle": "cancellation_and_run_deadlines_are_classified_as_terminated"
+        },
+        {
+          "command": "fake-agent-runtime",
+          "needle": "every_hostile_peer_failure_terminates_the_run"
+        },
+        {
+          "command": "fake-agent-runtime",
+          "needle": "every_script_passes_the_shared_protocol_conformance_matrix"
+        }
+      ]
+    },
+    {
+      "name": "openai-loopback",
+      "evidence": [
+        {
+          "command": "openai-loopback",
+          "needle": "openai_adapter_passes_shared_conformance_against_loopback_sse_fixtures"
+        },
+        {
+          "command": "provider-neutral-credentials",
+          "needle": "rejects_invalid_oversized_and_premature_sse_streams"
+        },
+        {
+          "command": "provider-neutral-credentials",
+          "needle": "rejects_oversized_prompt_and_hosted_tools_before_contacting_the_provider"
+        },
+        {
+          "command": "provider-neutral-credentials",
+          "needle": "classifies_http_failures_and_preserves_valid_retry_after_without_retrying"
+        }
+      ]
+    },
+    {
+      "name": "persistence-recovery",
+      "evidence": [
+        {
+          "command": "persistence-recovery",
+          "needle": "loopback_sse_persists_a_terminal_run_and_reconstructs_its_bound_inputs_after_reopen"
+        },
+        {
+          "command": "persistence-recovery",
+          "needle": "accepted_cancellation_terminalizes_cleanly_without_changing_the_task_workflow"
+        },
+        {
+          "command": "persistence-recovery",
+          "needle": "openai_outage_terminalizes_the_agent_run_without_changing_the_task_workflow"
+        },
+        {
+          "command": "persistence-recovery",
+          "needle": "restart_interrupts_an_incomplete_openai_run_and_reconstructs_its_durable_inputs"
+        },
+        {
+          "command": "persistence-recovery",
+          "needle": "successful_runs_before_and_after_bootstrap_restart_persist_distinct_messages"
+        }
+      ]
+    },
+    {
+      "name": "provider-neutral-credentials",
+      "evidence": [
+        {
+          "command": "provider-neutral-credentials",
+          "needle": "posts_bound_request_and_keeps_api_key_off_everything_except_wire"
+        },
+        {
+          "command": "provider-neutral-credentials",
+          "needle": "sanitizes_api_key_reflected_by_provider_response_ids"
+        },
+        {
+          "command": "provider-neutral-credentials",
+          "needle": "rejects_non_https_or_non_loopback_http_endpoints_without_leaking_the_key"
+        },
+        {
+          "command": "persistence-recovery",
+          "needle": "non_openai_provider_is_rejected_before_publication_or_loopback_dispatch"
+        }
+      ]
+    }
+  ],
+  "credentialCanary": {
+    "markerPrefix": "M3_CREDENTIAL_CANARY_",
+    "sha256": "sha256:a308d83a969f249d2e9c0fe27eae5fd5d30c404e345a3ec78bd5352d040ac1c5",
+    "absentFromCapturedEvidence": true
+  },
+  "artifactSha256": {
+    "review.md": "sha256:1863be737a2b7ea15bd81aa0001b624f12737c4ed57eb8a1fae07e4ec7c2f81b",
+    "known-limitations.md": "sha256:01d9d43fc4fc8246f2d92448003e38c7c11b6f18a29a51d98906257aec777262",
+    "toolchain.txt": "sha256:25c26e9c10fc4e9724da9c34ea6e874e9a0cc8832a09009fe9952b91ea79d396"
+  },
+  "evidenceRoot": ".generations/1786221528491-20ef67129f9cb45fba59db49"
+}
