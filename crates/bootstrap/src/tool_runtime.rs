@@ -133,6 +133,7 @@ struct ToolRuntimeState {
     startup_inspection: Option<ToolStartupInspection>,
     recovery_report: Option<ToolStartupRecoveryReport>,
     workers: BTreeMap<ToolExecutionId, ToolWorker>,
+    shutdown_result: Option<Result<Vec<DurableToolExecutionReceipt>, PortError>>,
 }
 
 #[derive(Clone)]
@@ -513,6 +514,7 @@ impl ToolRuntime {
                 startup_inspection: None,
                 recovery_report: None,
                 workers: BTreeMap::new(),
+                shutdown_result: None,
             })),
             shutdown: Mutex::new(()),
             degraded_read_only,
@@ -974,15 +976,22 @@ impl ToolRuntime {
             let mut state = self.state.lock().map_err(|_| internal_failure())?;
             state.dispatch_open = false;
             state.availability = ToolRuntimeAvailability::Unavailable;
+            if let Some(result) = &state.shutdown_result {
+                return result.clone();
+            }
             std::mem::take(&mut state.workers)
         };
-        if workers.is_empty() {
-            return Ok(Vec::new());
-        }
-        match self.broker.as_ref() {
-            Some(broker) => self.stop_all_broker(workers, broker),
-            None => self.stop_all_legacy(workers),
-        }
+        let result = if workers.is_empty() {
+            Ok(Vec::new())
+        } else {
+            match self.broker.as_ref() {
+                Some(broker) => self.stop_all_broker(workers, broker),
+                None => self.stop_all_legacy(workers),
+            }
+        };
+        let mut state = self.state.lock().map_err(|_| internal_failure())?;
+        state.shutdown_result = Some(result.clone());
+        result
     }
 
     fn stop_all_broker(

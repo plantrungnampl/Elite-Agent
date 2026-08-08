@@ -114,13 +114,13 @@ impl Bootstrap {
         config: StartupConfig,
         agent_runtime: Arc<ComposedAgentRuntime>,
     ) -> Self {
-        Self::with_runtimes_for_test(config, agent_runtime, None)
+        Self::with_runtimes_for_test(config, Some(agent_runtime), None)
     }
 
     #[cfg(test)]
     pub(crate) fn with_runtimes_for_test(
         config: StartupConfig,
-        agent_runtime: Arc<ComposedAgentRuntime>,
+        agent_runtime: Option<Arc<ComposedAgentRuntime>>,
         tool_runtime: Option<Arc<ToolRuntime>>,
     ) -> Self {
         Self {
@@ -131,7 +131,7 @@ impl Bootstrap {
             },
             diagnostics: Vec::new(),
             runtime: None,
-            agent_runtime: Some(agent_runtime),
+            agent_runtime,
             tool_runtime,
             tool_broker: None,
             retained_processes: default_retained_process_controller(),

@@ -97,7 +97,7 @@ fn retry_closes_retained_tool_dispatch_after_agent_shutdown_failure() {
     let tool_runtime = released_test_tool_runtime();
     let mut bootstrap = Bootstrap::with_runtimes_for_test(
         startup_config(&root),
-        failing_runtime_for_test(root.path()),
+        Some(failing_runtime_for_test(root.path())),
         Some(Arc::clone(&tool_runtime)),
     );
     let stale_tool_runtime = bootstrap.tool_runtime_handle().unwrap();
@@ -143,7 +143,7 @@ fn retry_retains_failed_tool_runtime_after_agent_shutdown_failure() {
 
     let mut bootstrap = Bootstrap::with_runtimes_for_test(
         startup_config(&root),
-        failing_runtime_for_test(root.path()),
+        Some(failing_runtime_for_test(root.path())),
         Some(Arc::clone(&tool_runtime)),
     );
     let stale_tool_runtime = bootstrap.tool_runtime_handle().unwrap();
@@ -160,6 +160,17 @@ fn retry_retains_failed_tool_runtime_after_agent_shutdown_failure() {
     assert!(bootstrap.tool_runtime_handle().is_some());
 
     assert_stale_dispatch_is_closed(&stale_tool_runtime, "execution-retry-tool-failure-gate");
+    assert_eq!(
+        bootstrap.retry_startup_validation().state,
+        StartupStateDto::RecoverableFailure
+    );
+    assert_eq!(
+        bootstrap.status().issues[0].code,
+        "startup.agent_runtime_shutdown_failed"
+    );
+    assert!(bootstrap.agent_runtime_handle().is_some());
+    assert!(bootstrap.tool_runtime_handle().is_some());
+    assert_eq!(stale_tool_runtime.stop_all(), Err(not_found()));
 }
 
 #[test]
@@ -170,11 +181,70 @@ fn drop_closes_tool_dispatch_after_agent_shutdown_failure() {
 
     drop(Bootstrap::with_runtimes_for_test(
         startup_config(&root),
-        failing_runtime_for_test(root.path()),
+        Some(failing_runtime_for_test(root.path())),
         Some(tool_runtime),
     ));
 
     assert_stale_dispatch_is_closed(&stale_tool_runtime, "execution-drop-agent-failure");
+}
+
+#[test]
+fn stop_all_replays_a_failed_shutdown_result() {
+    let runtime = released_test_tool_runtime();
+    let execution_id = ToolExecutionId::new("execution-stop-repeat-failure").unwrap();
+    let (worker_started_tx, worker_started_rx) = mpsc::channel();
+    runtime
+        .dispatch_test_worker(execution_id, move || {
+            worker_started_tx.send(()).unwrap();
+            Err(unavailable())
+        })
+        .unwrap();
+    worker_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    let first = runtime.stop_all();
+
+    assert_eq!(first, Err(not_found()));
+    assert_eq!(runtime.stop_all(), first);
+}
+
+#[test]
+fn retry_retains_failed_tool_runtime_without_an_agent_runtime() {
+    let root = TempDir::new().unwrap();
+    let tool_runtime = released_test_tool_runtime();
+    let execution_id = ToolExecutionId::new("execution-retry-tool-only-failure").unwrap();
+    let (worker_started_tx, worker_started_rx) = mpsc::channel();
+    tool_runtime
+        .dispatch_test_worker(execution_id, move || {
+            worker_started_tx.send(()).unwrap();
+            Err(unavailable())
+        })
+        .unwrap();
+    worker_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    let mut bootstrap = Bootstrap::with_runtimes_for_test(
+        startup_config(&root),
+        None,
+        Some(Arc::clone(&tool_runtime)),
+    );
+    let stale_tool_runtime = bootstrap.tool_runtime_handle().unwrap();
+
+    for _ in 0..2 {
+        assert_eq!(
+            bootstrap.retry_startup_validation().state,
+            StartupStateDto::Indeterminate
+        );
+        assert_eq!(
+            bootstrap.status().issues[0].code,
+            "startup.tool_recovery_failed"
+        );
+        assert!(bootstrap.agent_runtime_handle().is_none());
+        assert!(bootstrap.tool_runtime_handle().is_some());
+    }
+    assert_eq!(stale_tool_runtime.stop_all(), Err(not_found()));
 }
 
 #[test]
@@ -233,7 +303,7 @@ fn stop_all_closes_dispatch_cancels_each_running_execution_once_and_joins_worker
             || unreachable!("closed dispatch must not start a worker"),
         )
         .is_err());
-    assert!(runtime.stop_all().unwrap().is_empty());
+    assert_eq!(runtime.stop_all().unwrap(), receipts);
     assert!(authorities
         .iter()
         .all(|authority| executor.cancel_count(authority.execution_id()) == 1));
@@ -321,12 +391,10 @@ fn concurrent_stop_all_callers_wait_for_the_same_worker_join() {
         Err(mpsc::RecvTimeoutError::Timeout)
     ));
     release_tx.send(()).unwrap();
-    assert_eq!(first.join().unwrap().unwrap().len(), 1);
-    assert!(second_rx
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap()
-        .is_empty());
+    let first_result = first.join().unwrap();
+    let second_result = second_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(first_result, second_result);
+    assert_eq!(first_result.unwrap().len(), 1);
     second.join().unwrap();
     assert_eq!(executor.cancel_count(authority.execution_id()), 1);
 }
