@@ -218,8 +218,11 @@ function verifyReview(manifest) {
 function assertReviewSectionIsEmpty(review, heading) {
   const lines = review.split(/\r?\n/u);
   const headingLine = `## ${heading}`;
-  const start = lines.indexOf(headingLine);
-  assert(start !== -1, `missing ${heading.toLowerCase()} heading`);
+  const headingIndexes = lines
+    .map((line, index) => (line === headingLine ? index : -1))
+    .filter((index) => index !== -1);
+  assert(headingIndexes.length === 1, `invalid ${heading.toLowerCase()} heading`);
+  const start = headingIndexes[0];
   const end = lines.findIndex((line, index) => index > start && line.startsWith("## "));
   const body = lines.slice(start + 1, end === -1 ? lines.length : end).join("\n").trim();
   assert(/^None\.?$/u.test(body), `${heading} must be None for approval`);
