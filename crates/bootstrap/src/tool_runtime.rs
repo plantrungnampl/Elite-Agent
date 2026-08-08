@@ -153,6 +153,8 @@ pub struct ToolRuntime {
     shutdown: Mutex<()>,
     #[cfg(test)]
     approval_resolution_test_hook: Mutex<Option<Arc<ApprovalResolutionTestHook>>>,
+    #[cfg(test)]
+    approval_worker_start_failure: Mutex<Option<PortError>>,
     degraded_read_only: bool,
 }
 
@@ -182,6 +184,53 @@ struct ToolWorker {
 struct ToolWorkerCompletion {
     result: Mutex<Option<ToolWorkerResult>>,
     ready: Condvar,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApprovalWorkerDecision {
+    Resume,
+    Abort,
+}
+
+#[derive(Default)]
+struct PendingApprovalWorker {
+    decision: Mutex<Option<ApprovalWorkerDecision>>,
+    changed: Condvar,
+}
+
+impl PendingApprovalWorker {
+    fn activate(&self) {
+        self.decide(ApprovalWorkerDecision::Resume);
+    }
+
+    fn abort(&self) {
+        self.decide(ApprovalWorkerDecision::Abort);
+    }
+
+    fn wait_for_decision(&self) -> ApprovalWorkerDecision {
+        let mut decision = self
+            .decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(decision) = *decision {
+                return decision;
+            }
+            decision = self
+                .changed
+                .wait(decision)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn decide(&self, decision: ApprovalWorkerDecision) {
+        let mut pending = self
+            .decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pending = Some(decision);
+        self.changed.notify_all();
+    }
 }
 
 #[cfg(test)]
@@ -531,6 +580,8 @@ impl ToolRuntime {
             shutdown: Mutex::new(()),
             #[cfg(test)]
             approval_resolution_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            approval_worker_start_failure: Mutex::new(None),
             degraded_read_only,
         }
     }
@@ -861,21 +912,38 @@ impl ToolRuntime {
         let completion = {
             let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
             self.ensure_approval_dispatch()?;
-            broker.resolve_approval(approval_id.clone(), approved)?;
-            let completion = approved
-                .then(|| {
-                    let worker_broker = Arc::clone(&broker);
-                    let worker_approval_id = approval_id.clone();
-                    self.start_worker(execution_id.clone(), move || {
-                        worker_broker.resume_approved(worker_approval_id)
-                    })
-                })
-                .transpose()?;
-            #[cfg(test)]
-            if completion.is_some() {
-                self.approval_resolution_checkpoint(ApprovalResolutionCheckpoint::WorkerRegistered);
+            if !approved {
+                broker.resolve_approval(approval_id.clone(), false)?;
+                None
+            } else {
+                let pending_worker = Arc::new(PendingApprovalWorker::default());
+                let completion = self.start_approved_worker(
+                    execution_id.clone(),
+                    Arc::clone(&broker),
+                    approval_id.clone(),
+                    Arc::clone(&pending_worker),
+                )?;
+                match broker.resolve_approval(approval_id.clone(), true) {
+                    Ok(()) => {
+                        pending_worker.activate();
+                        #[cfg(test)]
+                        self.approval_resolution_checkpoint(
+                            ApprovalResolutionCheckpoint::WorkerRegistered,
+                        );
+                        Some(completion)
+                    }
+                    Err(error) => {
+                        pending_worker.abort();
+                        let worker = self
+                            .take_worker(&execution_id)?
+                            .ok_or_else(internal_failure)?;
+                        // This worker can only be waiting for the decision above, so joining it
+                        // here cannot wait on broker or executor work while shutdown is held.
+                        Self::join_worker(worker)?;
+                        return Err(error);
+                    }
+                }
             }
-            completion
         };
         let status = match completion {
             Some(completion) => {
@@ -949,16 +1017,24 @@ impl ToolRuntime {
         completion: Arc<ToolWorkerCompletion>,
     ) -> ToolWorkerResult {
         let result = completion.wait();
-        let owned_worker = self
+        let owned_worker = self.take_worker(&execution_id)?;
+        if let Some(worker) = owned_worker {
+            Self::join_worker(worker)?;
+        }
+        result
+    }
+
+    fn take_worker(&self, execution_id: &ToolExecutionId) -> Result<Option<ToolWorker>, PortError> {
+        Ok(self
             .state
             .lock()
             .map_err(|_| internal_failure())?
             .workers
-            .remove(&execution_id);
-        if let Some(worker) = owned_worker {
-            worker.handle.join().map_err(|_| internal_failure())?;
-        }
-        result
+            .remove(execution_id))
+    }
+
+    fn join_worker(worker: ToolWorker) -> Result<(), PortError> {
+        worker.handle.join().map_err(|_| internal_failure())
     }
 
     fn ensure_approval_dispatch(&self) -> Result<(), PortError> {
@@ -1032,6 +1108,24 @@ impl ToolRuntime {
         Ok(completion)
     }
 
+    fn start_approved_worker(
+        &self,
+        execution_id: ToolExecutionId,
+        broker: Arc<ToolBroker>,
+        approval_id: ApprovalId,
+        pending_worker: Arc<PendingApprovalWorker>,
+    ) -> Result<Arc<ToolWorkerCompletion>, PortError> {
+        #[cfg(test)]
+        self.approval_worker_start_failure()?;
+        self.start_worker(execution_id, move || {
+            if pending_worker.wait_for_decision() == ApprovalWorkerDecision::Resume {
+                broker.resume_approved(approval_id)
+            } else {
+                Err(conflict())
+            }
+        })
+    }
+
     #[cfg(test)]
     fn dispatch_test_worker(
         &self,
@@ -1049,6 +1143,20 @@ impl ToolRuntime {
     #[cfg(test)]
     fn set_approval_resolution_checkpoint(&self, hook: Arc<ApprovalResolutionTestHook>) {
         *self.approval_resolution_test_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn fail_next_approved_worker_start(&self, error: PortError) {
+        *self.approval_worker_start_failure.lock().unwrap() = Some(error);
+    }
+
+    #[cfg(test)]
+    fn approval_worker_start_failure(&self) -> Result<(), PortError> {
+        self.approval_worker_start_failure
+            .lock()
+            .unwrap()
+            .take()
+            .map_or(Ok(()), Err)
     }
 
     #[cfg(test)]

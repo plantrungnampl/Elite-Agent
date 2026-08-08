@@ -557,6 +557,48 @@ fn shutdown_wins_approval_resolution_without_mutating_the_pending_approval() {
 }
 
 #[test]
+fn failed_approval_worker_admission_preserves_pending_approval() {
+    let fixture = support::WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let executor = Arc::new(BlockingApprovalExecutor::new(
+        SqliteStore::open(&fixture.database_path).unwrap(),
+    ));
+    let bootstrap = approval_test_bootstrap(&fixture, Arc::clone(&executor));
+    let runtime = bootstrap.tool_runtime_handle().unwrap();
+    let policy = VersionedPolicyEngine::from_json(APPROVE_PROCESS_POLICY).unwrap();
+    let execution_id = ToolExecutionId::new("execution-approval-admission-failure").unwrap();
+    let local_agent_terminal_application::ToolOutcome::ApprovalRequired(approval) = runtime
+        .execute(approval_test_request(
+            execution_id.as_str(),
+            policy.snapshot_digest().clone(),
+        ))
+        .unwrap()
+    else {
+        panic!("approval policy must publish a pending approval");
+    };
+    runtime.fail_next_approved_worker_start(unavailable());
+
+    let error = runtime
+        .resolve_approval(ResolveToolApprovalRequestDto {
+            approval_id: approval.approval_id,
+            expected_operation_digest: approval.operation_digest,
+            decision: ToolApprovalDecisionDto::Approve,
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Unavailable
+    );
+    assert_eq!(
+        runtime.activity().unwrap().entries[0].status,
+        ToolActivityStatusDto::ApprovalRequired
+    );
+    assert!(runtime.state.lock().unwrap().workers.is_empty());
+    assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn approval_wins_registers_its_worker_before_shutdown_can_cancel_and_join_it() {
     let fixture = support::WorkspaceFixture::new();
     fixture.seed_present_workspace();
@@ -600,31 +642,24 @@ fn approval_wins_registers_its_worker_before_shutdown_can_cancel_and_join_it() {
         .workers
         .contains_key(&execution_id));
     executor.wait_until_started();
+    assert!(matches!(
+        runtime.shutdown.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ));
     let stopping_runtime = Arc::clone(&runtime);
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     let shutdown = std::thread::spawn(move || {
         shutdown_tx.send(stopping_runtime.stop_all()).unwrap();
     });
-    let shutdown_before_registration_is_released =
-        shutdown_rx.recv_timeout(Duration::from_millis(100));
-    let shutdown_finished_while_registration_is_paused =
-        shutdown_before_registration_is_released.is_ok();
 
     barrier.release();
-    let receipts = match shutdown_before_registration_is_released {
-        Ok(result) => result.unwrap(),
-        Err(mpsc::RecvTimeoutError::Timeout) => shutdown_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap(),
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            panic!("shutdown must return a result")
-        }
-    };
+    let receipts = shutdown_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
     let resolved = resolution.join().unwrap().unwrap();
     shutdown.join().unwrap();
 
-    assert!(!shutdown_finished_while_registration_is_paused);
     assert_eq!(receipts.len(), 1);
     assert_eq!(resolved.status, ToolActivityStatusDto::Indeterminate);
     assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 1);
