@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { isEvidenceOnlyPath } from "../../scripts/m2-evidence-worktree.mjs";
+
 const run = (...args) =>
   execFileSync(process.execPath, args, { cwd: process.cwd(), encoding: "utf8" });
 
@@ -41,6 +43,49 @@ test("Windows CI runs containment before fresh M2 evidence verification", () => 
       upload > verifyPostFinal,
   );
   assert.match(workflow, /artifacts\/verification\/m2/u);
+});
+
+test("M2 evidence-only path predicate allows exact M2/M3 evidence and the execution plan", () => {
+  for (const path of [
+    "artifacts/verification/m2/manifest.json",
+    "artifacts/verification/m2/review.md",
+    "artifacts/verification/m2/known-limitations.md",
+    "artifacts/verification/m2/toolchain.txt",
+    "artifacts/verification/m2/post-final-contracts.log",
+    "artifacts/verification/m2/outputs/source-contracts.log",
+    "artifacts/verification/m3/manifest.json",
+    "artifacts/verification/m3/review.md",
+    "artifacts/verification/m3/known-limitations.md",
+    "artifacts/verification/m3/.generations/1786215905484-1cd0d36850022258537b24f3/toolchain.txt",
+    "artifacts/verification/m3/.generations/1786215905484-1cd0d36850022258537b24f3/outputs/protocol-schema-conformance.log",
+    "docs/superpowers/plans/2026-07-23-m3-protocol-adapter.md",
+  ]) {
+    assert.equal(isEvidenceOnlyPath(path), true, path);
+  }
+  assert.equal(
+    isEvidenceOnlyPath("artifacts\\verification\\m3\\manifest.json"),
+    true,
+  );
+});
+
+test("M2 evidence-only path predicate rejects broad artifacts, unsafe generations, and source paths", () => {
+  for (const path of [
+    "artifacts/verification/m3/task9a4-runner-report.log",
+    "artifacts/verification/m3/known-limitations.txt",
+    "artifacts/verification/m3/.generations/178621590548-1cd0d36850022258537b24f3/toolchain.txt",
+    "artifacts/verification/m3/.generations/1786215905484-1cd0d36850022258537b24f/outputs/protocol-schema-conformance.log",
+    "artifacts/verification/m3/.generations/1786215905484-1cd0d36850022258537b24f3/manifest.json",
+    "artifacts/verification/m3/.generations/1786215905484-1cd0d36850022258537b24f3/outputs/Protocol.log",
+    "artifacts/verification/m3/.generations/1786215905484-1cd0d36850022258537b24f3/outputs/../toolchain.txt",
+    "artifacts/verification/m3/../m2/manifest.json",
+    "artifacts/verification/m3/raw/manifest.json",
+    "docs/superpowers/plans/2026-07-23-m3-protocol-adapter-copy.md",
+    "docs/multi-agent-terminal-design/03-agent-protocol.md",
+    "scripts/verify-m2-evidence.mjs",
+    "tests/contracts/m2-evidence-contracts.test.mjs",
+  ]) {
+    assert.equal(isEvidenceOnlyPath(path), false, path);
+  }
 });
 
 test("M2 verifier rejects modified captured output", () => {
