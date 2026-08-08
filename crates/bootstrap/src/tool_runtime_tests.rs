@@ -1,30 +1,51 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use local_agent_terminal_application::{
+    ApprovedExecutableIdentity, ApprovedProcessRequest, AuthoritativeProcessBinding,
     AuthorizedToolExecutionClaim, AuthorizedToolRequest, CancellationReceipt, DeniedToolExecution,
     DisclosureOutcome, DurableToolExecutionArtifact, DurableToolExecutionArtifacts,
     DurableToolExecutionReceipt, FileReadRequest, FileWriteRequest, GitDiffRequest, GitDiffResult,
     GitStatusRequest, GitStatusResult, ImmutableToolRequest, IncompleteToolExecution,
     NewToolExecution, NewToolIntent, OperationIntentSnapshot, PolicyBoundBytes, PortError,
-    ProcessStatus, Retryability, SafeErrorClassification, StartupStateDto, StructuredToolExecutor,
-    ToolAuthorityResolver, ToolAuthoritySnapshot, ToolControlSelfTest,
-    ToolExecutionCancellationClaim, ToolExecutionClaim, ToolExecutionClaimAuthority,
-    ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput, ToolExecutionResolution,
-    ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal, ToolExecutionTerminalKind,
-    ToolRequest, VerifiedWrite,
+    ProcessExecutionBindingStore, ProcessStatus, ResolveToolApprovalRequestDto, ResolvedExecutable,
+    Retryability, SafeErrorClassification, StartupStateDto, StructuredToolExecutor,
+    ToolActivityStatusDto, ToolApprovalDecisionDto, ToolAuthorityResolver, ToolAuthoritySnapshot,
+    ToolControlSelfTest, ToolExecutionCancellationClaim, ToolExecutionClaim,
+    ToolExecutionClaimAuthority, ToolExecutionDenialRequest, ToolExecutionId, ToolExecutionOutput,
+    ToolExecutionResolution, ToolExecutionResult, ToolExecutionStore, ToolExecutionTerminal,
+    ToolExecutionTerminalKind, ToolPolicyContext, ToolRequest, VerifiedWrite,
 };
-use local_agent_terminal_domain::{ArtifactId, RunId, Sha256Digest};
+use local_agent_terminal_domain::{
+    ActorLocality, ArtifactId, CapabilityRef, EnvironmentProfile, NetworkProfile, Phase,
+    PlanStepId, PolicyAction, PolicyActor, PolicyResource, ProcessBinding, ProcessInvocation,
+    ProcessToolRequest, ProcessTrustTier, ResourceClass, RunId, Sha256Digest, TaskId, TaskRisk,
+    TrustTier, WorkspaceVersion,
+};
+use local_agent_terminal_policy_engine::VersionedPolicyEngine;
+use local_agent_terminal_storage_sqlite::SqliteStore;
 use tempfile::TempDir;
 
 use crate::agent_runtime::failing_runtime_for_test;
 use crate::startup::{Bootstrap, StartupConfig};
 
-use super::{SelfTestingToolExecutor, ToolBrokerConfig, ToolRuntime};
+#[allow(dead_code)]
+mod support {
+    use crate as local_agent_terminal_bootstrap;
+
+    include!("../tests/support/mod.rs");
+}
+
+use super::{ApprovalResolutionCheckpoint, SelfTestingToolExecutor, ToolBrokerConfig, ToolRuntime};
 
 const ALLOW_PROCESS_POLICY: &str =
     r#"{"version":1,"rules":[{"id":"allow-process","effect":"allow","action":"process.exec"}]}"#;
+const APPROVE_PROCESS_POLICY: &str = r#"{"version":1,"rules":[{"id":"approve-process","effect":"require_approval","action":"process.exec"},{"id":"redact-tool-display","effect":"allow_with_redaction","action":"tool.approval.display","redactions":["secret_scanner"]}]}"#;
+const EMPTY_BYTES_HASH: &str =
+    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 #[test]
 fn configured_startup_exposes_ready_before_releasing_dispatch() {
@@ -481,6 +502,400 @@ fn concurrent_stop_all_callers_wait_for_the_same_worker_join() {
     assert_eq!(first_result.unwrap().len(), 1);
     second.join().unwrap();
     assert_eq!(executor.cancel_count(authority.execution_id()), 1);
+}
+
+#[test]
+fn shutdown_wins_approval_resolution_without_mutating_the_pending_approval() {
+    let fixture = support::WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let executor = Arc::new(BlockingApprovalExecutor::new(
+        SqliteStore::open(&fixture.database_path).unwrap(),
+    ));
+    let bootstrap = approval_test_bootstrap(&fixture, Arc::clone(&executor));
+    let runtime = bootstrap.tool_runtime_handle().unwrap();
+    let policy = VersionedPolicyEngine::from_json(APPROVE_PROCESS_POLICY).unwrap();
+    let local_agent_terminal_application::ToolOutcome::ApprovalRequired(approval) = runtime
+        .execute(approval_test_request(
+            "execution-approval-shutdown-wins",
+            policy.snapshot_digest().clone(),
+        ))
+        .unwrap()
+    else {
+        panic!("approval policy must publish a pending approval");
+    };
+    let barrier = Arc::new(ApprovalResolutionBarrier::new(
+        ApprovalResolutionCheckpoint::BeforeAdmission,
+    ));
+    let hook_barrier = Arc::clone(&barrier);
+    runtime.set_approval_resolution_checkpoint(Arc::new(move |checkpoint| {
+        hook_barrier.reach(checkpoint);
+    }));
+    let resolution_request = ResolveToolApprovalRequestDto {
+        approval_id: approval.approval_id.clone(),
+        expected_operation_digest: approval.operation_digest,
+        decision: ToolApprovalDecisionDto::Approve,
+    };
+    let resolving_runtime = Arc::clone(&runtime);
+    let resolution =
+        std::thread::spawn(move || resolving_runtime.resolve_approval(resolution_request));
+
+    barrier.wait_until(ApprovalResolutionCheckpoint::BeforeAdmission);
+    let shutdown = runtime.stop_all().unwrap();
+    barrier.release();
+    let error = resolution.join().unwrap().unwrap_err();
+
+    assert!(shutdown.is_empty());
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(
+        runtime.activity().unwrap().entries[0].status,
+        ToolActivityStatusDto::ApprovalRequired
+    );
+    assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn approval_wins_registers_its_worker_before_shutdown_can_cancel_and_join_it() {
+    let fixture = support::WorkspaceFixture::new();
+    fixture.seed_present_workspace();
+    let executor = Arc::new(BlockingApprovalExecutor::new(
+        SqliteStore::open(&fixture.database_path).unwrap(),
+    ));
+    let bootstrap = approval_test_bootstrap(&fixture, Arc::clone(&executor));
+    let runtime = bootstrap.tool_runtime_handle().unwrap();
+    let policy = VersionedPolicyEngine::from_json(APPROVE_PROCESS_POLICY).unwrap();
+    let execution_id = ToolExecutionId::new("execution-approval-wins").unwrap();
+    let local_agent_terminal_application::ToolOutcome::ApprovalRequired(approval) = runtime
+        .execute(approval_test_request(
+            execution_id.as_str(),
+            policy.snapshot_digest().clone(),
+        ))
+        .unwrap()
+    else {
+        panic!("approval policy must publish a pending approval");
+    };
+    let barrier = Arc::new(ApprovalResolutionBarrier::new(
+        ApprovalResolutionCheckpoint::WorkerRegistered,
+    ));
+    let hook_barrier = Arc::clone(&barrier);
+    runtime.set_approval_resolution_checkpoint(Arc::new(move |checkpoint| {
+        hook_barrier.reach(checkpoint);
+    }));
+    let resolution_request = ResolveToolApprovalRequestDto {
+        approval_id: approval.approval_id,
+        expected_operation_digest: approval.operation_digest,
+        decision: ToolApprovalDecisionDto::Approve,
+    };
+    let resolving_runtime = Arc::clone(&runtime);
+    let resolution =
+        std::thread::spawn(move || resolving_runtime.resolve_approval(resolution_request));
+
+    barrier.wait_until(ApprovalResolutionCheckpoint::WorkerRegistered);
+    assert!(runtime
+        .state
+        .lock()
+        .unwrap()
+        .workers
+        .contains_key(&execution_id));
+    executor.wait_until_started();
+    let stopping_runtime = Arc::clone(&runtime);
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    let shutdown = std::thread::spawn(move || {
+        shutdown_tx.send(stopping_runtime.stop_all()).unwrap();
+    });
+    let shutdown_before_registration_is_released =
+        shutdown_rx.recv_timeout(Duration::from_millis(100));
+    let shutdown_finished_while_registration_is_paused =
+        shutdown_before_registration_is_released.is_ok();
+
+    barrier.release();
+    let receipts = match shutdown_before_registration_is_released {
+        Ok(result) => result.unwrap(),
+        Err(mpsc::RecvTimeoutError::Timeout) => shutdown_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("shutdown must return a result")
+        }
+    };
+    let resolved = resolution.join().unwrap().unwrap();
+    shutdown.join().unwrap();
+
+    assert!(!shutdown_finished_while_registration_is_paused);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(resolved.status, ToolActivityStatusDto::Indeterminate);
+    assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(executor.cancel_calls.load(Ordering::SeqCst), 1);
+}
+
+struct ApprovalResolutionBarrier {
+    blocking_checkpoint: ApprovalResolutionCheckpoint,
+    state: Mutex<ApprovalResolutionBarrierState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct ApprovalResolutionBarrierState {
+    before_admission: bool,
+    worker_registered: bool,
+    released: bool,
+}
+
+impl ApprovalResolutionBarrier {
+    fn new(blocking_checkpoint: ApprovalResolutionCheckpoint) -> Self {
+        Self {
+            blocking_checkpoint,
+            state: Mutex::new(ApprovalResolutionBarrierState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn reach(&self, checkpoint: ApprovalResolutionCheckpoint) {
+        let mut state = self.state.lock().unwrap();
+        match checkpoint {
+            ApprovalResolutionCheckpoint::BeforeAdmission => state.before_admission = true,
+            ApprovalResolutionCheckpoint::WorkerRegistered => state.worker_registered = true,
+        }
+        self.changed.notify_all();
+        if checkpoint == self.blocking_checkpoint {
+            while !state.released {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+    }
+
+    fn wait_until(&self, checkpoint: ApprovalResolutionCheckpoint) {
+        let state = self.state.lock().unwrap();
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| match checkpoint {
+                ApprovalResolutionCheckpoint::BeforeAdmission => !state.before_admission,
+                ApprovalResolutionCheckpoint::WorkerRegistered => !state.worker_registered,
+            })
+            .unwrap();
+        assert!(!timeout.timed_out());
+        match checkpoint {
+            ApprovalResolutionCheckpoint::BeforeAdmission => assert!(state.before_admission),
+            ApprovalResolutionCheckpoint::WorkerRegistered => assert!(state.worker_registered),
+        }
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().released = true;
+        self.changed.notify_all();
+    }
+}
+
+struct ApprovalTestAuthority;
+
+impl ToolAuthorityResolver for ApprovalTestAuthority {
+    fn resolve(&self, request: &ToolRequest) -> Result<ToolAuthoritySnapshot, PortError> {
+        ToolAuthoritySnapshot::new(request.clone(), b"", None)
+    }
+}
+
+struct BlockingApprovalExecutor {
+    database: SqliteStore,
+    execute_calls: AtomicUsize,
+    cancel_calls: AtomicUsize,
+    state: Mutex<BlockingApprovalExecutorState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct BlockingApprovalExecutorState {
+    started: bool,
+    released: bool,
+}
+
+impl BlockingApprovalExecutor {
+    fn new(database: SqliteStore) -> Self {
+        Self {
+            database,
+            execute_calls: AtomicUsize::new(0),
+            cancel_calls: AtomicUsize::new(0),
+            state: Mutex::new(BlockingApprovalExecutorState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait_until_started(&self) {
+        let state = self.state.lock().unwrap();
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.started)
+            .unwrap();
+        assert!(state.started && !timeout.timed_out());
+    }
+}
+
+impl ToolControlSelfTest for BlockingApprovalExecutor {
+    fn verify_controls(&self) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
+impl StructuredToolExecutor for BlockingApprovalExecutor {
+    fn execute(&self, request: AuthorizedToolRequest) -> Result<ToolExecutionResult, PortError> {
+        self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        let authority = self
+            .database
+            .load_claimed_authority(&request.execution_id)?;
+        self.database
+            .record_process_binding(AuthoritativeProcessBinding::new(
+                authority,
+                1,
+                "approval-shutdown-test-job",
+            )?)?;
+        let mut state = self.state.lock().unwrap();
+        state.started = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+        Err(PortError::failure(
+            SafeErrorClassification::Unavailable,
+            Retryability::NonRetryable,
+        ))
+    }
+
+    fn cancel(&self, execution_id: &ToolExecutionId) -> Result<CancellationReceipt, PortError> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        self.state.lock().unwrap().released = true;
+        self.changed.notify_all();
+        Ok(CancellationReceipt {
+            execution_id: execution_id.clone(),
+            status: ProcessStatus::Terminated,
+            job_receipt: None,
+            cancelled: true,
+        })
+    }
+
+    fn file_read(
+        &self,
+        _: FileReadRequest,
+    ) -> Result<DisclosureOutcome<PolicyBoundBytes>, PortError> {
+        unreachable!("approval shutdown tests exercise process execution only")
+    }
+
+    fn file_write(&self, _: FileWriteRequest) -> Result<VerifiedWrite, PortError> {
+        unreachable!("approval shutdown tests exercise process execution only")
+    }
+
+    fn git_status(
+        &self,
+        _: GitStatusRequest,
+    ) -> Result<DisclosureOutcome<GitStatusResult>, PortError> {
+        unreachable!("approval shutdown tests exercise process execution only")
+    }
+
+    fn git_diff(&self, _: GitDiffRequest) -> Result<DisclosureOutcome<GitDiffResult>, PortError> {
+        unreachable!("approval shutdown tests exercise process execution only")
+    }
+}
+
+fn approval_test_bootstrap(
+    fixture: &support::WorkspaceFixture,
+    executor: Arc<BlockingApprovalExecutor>,
+) -> Bootstrap {
+    Bootstrap::with_tool_broker(
+        StartupConfig {
+            app_data_dir: fixture.app_data.clone(),
+            trusted_workspace_root: fixture.workspace_root.clone(),
+            secret_values: Vec::new(),
+            openai: None,
+        },
+        ToolBrokerConfig::new(
+            APPROVE_PROCESS_POLICY,
+            Arc::new(ApprovalTestAuthority),
+            executor,
+        ),
+    )
+}
+
+fn approval_test_request(execution_id: &str, policy_snapshot_digest: Sha256Digest) -> ToolRequest {
+    let task_id = TaskId::new("task-1").unwrap();
+    let process = ProcessToolRequest::new(
+        ProcessBinding::new(
+            task_id.clone(),
+            RunId::new("run-lease-1").unwrap(),
+            PlanStepId::new("step-1").unwrap(),
+            Phase::Implementation,
+            WorkspaceVersion::new(1),
+            EnvironmentProfile::new("rust", digest('e')).unwrap(),
+            1,
+        )
+        .unwrap(),
+        ProcessInvocation::new(
+            CapabilityRef::toolchain("cargo").unwrap(),
+            vec!["test".to_owned()],
+            CapabilityRef::worktree(task_id.clone(), ".").unwrap(),
+            ProcessTrustTier::IsolatedWorker,
+            NetworkProfile::Denied,
+            Vec::new(),
+            None,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let approved = ApprovedProcessRequest::new(
+        ApprovedExecutableIdentity::new(
+            ResolvedExecutable {
+                canonical_path: approved_executable_path(),
+                sha256: digest('d'),
+                file_identity: local_agent_terminal_application::ExecutableFileIdentity::new(
+                    "cargo-file",
+                )
+                .unwrap(),
+                toolchain_id: "cargo".to_owned(),
+            },
+            "1.97.1",
+        )
+        .unwrap(),
+        process,
+        Vec::new(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let policy = ToolPolicyContext::new(
+        PolicyActor {
+            connection_id: "connection-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            trust_tier: TrustTier::IsolatedWorker,
+            locality: ActorLocality::Local,
+        },
+        PolicyAction::new("process.exec").unwrap(),
+        PolicyResource {
+            capability: CapabilityRef::worktree(task_id, ".").unwrap(),
+            content_digest: Sha256Digest::new(EMPTY_BYTES_HASH).unwrap(),
+            resource_class: ResourceClass::InternalCode,
+        },
+        TaskRisk::High,
+        "run focused tests",
+        policy_snapshot_digest,
+    )
+    .unwrap();
+    ToolRequest::new(
+        ToolExecutionId::new(execution_id).unwrap(),
+        approved,
+        policy,
+    )
+    .unwrap()
+}
+
+#[cfg(windows)]
+fn approved_executable_path() -> PathBuf {
+    PathBuf::from(r"\\?\C:\approved\cargo.exe")
+}
+
+#[cfg(not(windows))]
+fn approved_executable_path() -> PathBuf {
+    PathBuf::from("/approved/cargo")
 }
 
 struct UnusedAuthority;

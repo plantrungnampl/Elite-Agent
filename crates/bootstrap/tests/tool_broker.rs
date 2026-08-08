@@ -767,7 +767,7 @@ fn stop_all_cancels_and_joins_a_runtime_owned_execution() {
     );
     let runtime = bootstrap.tool_runtime().unwrap();
 
-    std::thread::scope(|scope| {
+    let first_receipts = std::thread::scope(|scope| {
         let execution = scope.spawn(|| runtime.execute(request));
         executor.wait_until_started();
         let stopped = runtime.stop_all();
@@ -783,8 +783,9 @@ fn stop_all_cancels_and_joins_a_runtime_owned_execution() {
         ));
         assert_eq!(receipts.len(), 1);
         assert_eq!(executor.cancel_calls.load(Ordering::SeqCst), 1);
+        receipts
     });
-    assert!(runtime.stop_all().unwrap().is_empty());
+    assert_eq!(runtime.stop_all().unwrap(), first_receipts);
 }
 
 #[test]

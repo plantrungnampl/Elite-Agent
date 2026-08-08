@@ -151,6 +151,8 @@ pub struct ToolRuntime {
     file_write_recovery: Option<Arc<StartupFileWriteRecovery>>,
     state: Arc<Mutex<ToolRuntimeState>>,
     shutdown: Mutex<()>,
+    #[cfg(test)]
+    approval_resolution_test_hook: Mutex<Option<Arc<ApprovalResolutionTestHook>>>,
     degraded_read_only: bool,
 }
 
@@ -181,6 +183,16 @@ struct ToolWorkerCompletion {
     result: Mutex<Option<ToolWorkerResult>>,
     ready: Condvar,
 }
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApprovalResolutionCheckpoint {
+    BeforeAdmission,
+    WorkerRegistered,
+}
+
+#[cfg(test)]
+type ApprovalResolutionTestHook = dyn Fn(ApprovalResolutionCheckpoint) + Send + Sync;
 
 struct RuntimeIdGenerator;
 
@@ -517,6 +529,8 @@ impl ToolRuntime {
                 shutdown_result: None,
             })),
             shutdown: Mutex::new(()),
+            #[cfg(test)]
+            approval_resolution_test_hook: Mutex::new(None),
             degraded_read_only,
         }
     }
@@ -839,13 +853,35 @@ impl ToolRuntime {
         if detail.operation_digest != request.expected_operation_digest {
             return Err(conflict());
         }
+        let execution_id = ToolExecutionId::new(detail.execution_id.clone())?;
         let broker = Arc::clone(self.broker.as_ref().ok_or_else(unavailable)?);
         let approved = request.decision == ToolApprovalDecisionDto::Approve;
-        broker.resolve_approval(approval_id.clone(), approved)?;
-        let status = if approved {
-            tool_outcome_status(&self.resume_approved(approval_id.clone())?)
-        } else {
-            ToolActivityStatusDto::Denied
+        #[cfg(test)]
+        self.approval_resolution_checkpoint(ApprovalResolutionCheckpoint::BeforeAdmission);
+        let completion = {
+            let _shutdown = self.shutdown.lock().map_err(|_| internal_failure())?;
+            self.ensure_approval_dispatch()?;
+            broker.resolve_approval(approval_id.clone(), approved)?;
+            let completion = approved
+                .then(|| {
+                    let worker_broker = Arc::clone(&broker);
+                    let worker_approval_id = approval_id.clone();
+                    self.start_worker(execution_id.clone(), move || {
+                        worker_broker.resume_approved(worker_approval_id)
+                    })
+                })
+                .transpose()?;
+            #[cfg(test)]
+            if completion.is_some() {
+                self.approval_resolution_checkpoint(ApprovalResolutionCheckpoint::WorkerRegistered);
+            }
+            completion
+        };
+        let status = match completion {
+            Some(completion) => {
+                tool_outcome_status(&self.wait_for_worker(execution_id, completion)?)
+            }
+            None => ToolActivityStatusDto::Denied,
         };
         Ok(ToolApprovalResolutionDto {
             approval_id: approval_id.as_str().to_owned(),
@@ -904,6 +940,14 @@ impl ToolRuntime {
         worker: impl FnOnce() -> ToolWorkerResult + Send + 'static,
     ) -> ToolWorkerResult {
         let completion = self.start_worker(execution_id.clone(), worker)?;
+        self.wait_for_worker(execution_id, completion)
+    }
+
+    fn wait_for_worker(
+        &self,
+        execution_id: ToolExecutionId,
+        completion: Arc<ToolWorkerCompletion>,
+    ) -> ToolWorkerResult {
         let result = completion.wait();
         let owned_worker = self
             .state
@@ -915,6 +959,18 @@ impl ToolRuntime {
             worker.handle.join().map_err(|_| internal_failure())?;
         }
         result
+    }
+
+    fn ensure_approval_dispatch(&self) -> Result<(), PortError> {
+        let state = self.state.lock().map_err(|_| internal_failure())?;
+        if state.shutdown_result.is_some() || !state.dispatch_open {
+            return Err(conflict());
+        }
+        if state.availability == ToolRuntimeAvailability::Ready {
+            Ok(())
+        } else {
+            Err(unavailable())
+        }
     }
 
     fn ensure_structured_dispatch(&self, allow_degraded: bool) -> Result<(), PortError> {
@@ -988,6 +1044,19 @@ impl ToolRuntime {
             })
         })?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_approval_resolution_checkpoint(&self, hook: Arc<ApprovalResolutionTestHook>) {
+        *self.approval_resolution_test_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn approval_resolution_checkpoint(&self, checkpoint: ApprovalResolutionCheckpoint) {
+        let hook = self.approval_resolution_test_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(checkpoint);
+        }
     }
 
     pub fn stop_all(&self) -> Result<Vec<DurableToolExecutionReceipt>, PortError> {
