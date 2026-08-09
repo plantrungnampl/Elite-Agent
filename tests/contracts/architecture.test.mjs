@@ -44,6 +44,44 @@ test("architecture checker permits staged M3 crate introduction", () => {
   }
 });
 
+test("architecture checker permits staged M4 crate introduction", () => {
+  const directory = mkdtempSync(join(tmpdir(), "m4-staged-workspace-"));
+  try {
+    const metadata = join(directory, "metadata.json");
+    writeFileSync(
+      metadata,
+      JSON.stringify({
+        packages: [
+          { name: "local-agent-terminal-domain", dependencies: [] },
+          {
+            name: "local-agent-terminal-application",
+            dependencies: [{ name: "local-agent-terminal-domain" }],
+          },
+          {
+            name: "local-agent-terminal-context-engine",
+            dependencies: [
+              { name: "local-agent-terminal-application" },
+              { name: "local-agent-terminal-domain" },
+            ],
+          },
+        ],
+        workspace_members: [
+          "local-agent-terminal-domain",
+          "local-agent-terminal-application",
+          "local-agent-terminal-context-engine",
+        ],
+      }),
+      "utf8",
+    );
+    assert.match(
+      run("scripts/check-architecture.mjs", "--metadata", metadata),
+      /architecture contracts: ok/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("architecture checker rejects a frontend Tauri invoke outside its API boundary", () => {
   assert.throws(
     () =>

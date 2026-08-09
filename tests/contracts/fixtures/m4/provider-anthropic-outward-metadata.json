@@ -1,0 +1,20 @@
+{
+  "packages": [
+    { "name": "local-agent-terminal-domain", "dependencies": [] },
+    {
+      "name": "local-agent-terminal-application",
+      "dependencies": [{ "name": "local-agent-terminal-domain" }]
+    },
+    { "name": "local-agent-terminal-agent-protocol", "dependencies": [] },
+    {
+      "name": "local-agent-terminal-provider-anthropic",
+      "dependencies": [{ "name": "local-agent-terminal-application" }]
+    }
+  ],
+  "workspace_members": [
+    "local-agent-terminal-domain",
+    "local-agent-terminal-application",
+    "local-agent-terminal-agent-protocol",
+    "local-agent-terminal-provider-anthropic"
+  ]
+}

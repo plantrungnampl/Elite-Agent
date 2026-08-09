@@ -1,0 +1,30 @@
+{
+  "packages": [
+    { "name": "local-agent-terminal-domain", "dependencies": [] },
+    {
+      "name": "local-agent-terminal-application",
+      "dependencies": [{ "name": "local-agent-terminal-domain" }]
+    },
+    {
+      "name": "local-agent-terminal-storage-sqlite",
+      "dependencies": [
+        { "name": "local-agent-terminal-application" },
+        { "name": "local-agent-terminal-domain" }
+      ]
+    },
+    {
+      "name": "local-agent-terminal-context-engine",
+      "dependencies": [
+        { "name": "local-agent-terminal-application" },
+        { "name": "local-agent-terminal-domain" },
+        { "name": "local-agent-terminal-storage-sqlite", "kind": "dev" }
+      ]
+    }
+  ],
+  "workspace_members": [
+    "local-agent-terminal-domain",
+    "local-agent-terminal-application",
+    "local-agent-terminal-storage-sqlite",
+    "local-agent-terminal-context-engine"
+  ]
+}

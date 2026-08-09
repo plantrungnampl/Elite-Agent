@@ -58,7 +58,7 @@ application + orchestration + context-engine + providers + adapters <- bootstrap
 bootstrap <- Tauri <- React API modules
 ```
 
-- [ ] **Step 1 - Write failing M4 contract tests**
+- [x] **Step 1 - Write failing M4 contract tests**
 
 Assert the three new crates and exact internal allowlists, no crate cycles, no provider DTO/name/policy logic in inner crates, no HTTP outside provider crates, no provider construction outside bootstrap, no concrete storage/repository/policy construction in `context-engine` or `orchestration`, no direct Tauri invoke outside `apps/desktop/src/api`, and no pre-approval write-capable call path.
 
@@ -70,11 +70,11 @@ node --test tests/contracts/m4-contracts.test.mjs
 
 Expected RED: M4 fixtures, allowlists, and required-crate checks do not exist.
 
-- [ ] **Step 2 - Add only contract checker rules and hostile fixtures**
+- [x] **Step 2 - Add only contract checker rules and hostile fixtures**
 
 Permit partial M4 crate presence while Tasks 2–8 are in progress, but enforce each present crate's exact dependency allowlist. Add `--require-m4` to require all final crates, desktop API routing, zero provider-name branches, and absence of forbidden M5/M6 features.
 
-- [ ] **Step 3 - Verify M0–M4 contracts and immutable design**
+- [x] **Step 3 - Verify M0–M4 contracts and immutable design**
 
 ```powershell
 node --test tests/contracts/m4-contracts.test.mjs tests/contracts/architecture.test.mjs tests/contracts/design-contracts.test.mjs tests/contracts/m3-contracts.test.mjs
@@ -82,7 +82,7 @@ node scripts/check-architecture.mjs
 git diff --exit-code 9b182a3 -- docs/multi-agent-terminal-design
 ```
 
-- [ ] **Step 4 - Commit and record progress**
+- [x] **Step 4 - Commit and record progress**
 
 ```powershell
 git add scripts/check-architecture.mjs tests/contracts .superpowers/sdd/progress.md
