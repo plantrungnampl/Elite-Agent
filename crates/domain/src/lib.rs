@@ -19,8 +19,9 @@ pub use agent::{
 };
 pub use context::{
     ContextBudget, ContextError, ContextPackageArtifact, ContextPackageBinding,
-    ContextPackageDescriptor, ContextPackageMember, ContextVersionSet, Disclosure, DisclosureKind,
-    EvidenceCitation, EvidenceFreshness, LineRange, PolicyDecisionSet, SourceIdentity,
+    ContextPackageDescriptor, ContextPackageIdentity, ContextPackageMember, ContextVersionSet,
+    Disclosure, DisclosureKind, EvidenceCitation, EvidenceFreshness, LineRange, PolicyDecisionSet,
+    SourceIdentity,
 };
 pub use deliberation::{
     AgentFamilyKey, ApprovalAuthority, ApprovalExecution, ApprovalScope, ClaimVerification,

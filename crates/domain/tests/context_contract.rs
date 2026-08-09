@@ -1,8 +1,8 @@
 use local_agent_terminal_domain::{
     ArtifactId, ContextBudget, ContextPackageArtifact, ContextPackageBinding,
-    ContextPackageDescriptor, ContextPackageMember, ContextVersionSet, Disclosure,
-    EvidenceCitation, EvidenceFreshness, LineRange, PolicyDecisionSet, ProjectId, Sha256Digest,
-    SourceIdentity, TaskId,
+    ContextPackageDescriptor, ContextPackageIdentity, ContextPackageMember, ContextVersionSet,
+    Disclosure, EvidenceCitation, EvidenceFreshness, LineRange, PolicyDecisionSet, ProjectId,
+    Sha256Digest, SourceIdentity, TaskId, Timestamp,
 };
 
 #[test]
@@ -12,36 +12,67 @@ fn source_and_package_identity_reject_empty_or_oversized_values() {
     assert!(SourceIdentity::new(project_id(), "revision-1", "x".repeat(257), digest('a')).is_err());
     assert!(Sha256Digest::new("").is_err());
 
-    assert!(ContextPackageDescriptor::new(
+    assert!(ContextPackageIdentity::new(
         "",
         task_id("task-1"),
-        "Review the task.",
-        versions(),
-        budget(),
+        "agent-1",
+        "reviewer",
+        artifact_id("artifact-agent-manifest-1"),
+        artifact_id("artifact-context-1"),
+        Timestamp::from_unix_seconds(1),
     )
     .is_err());
-    assert!(ContextPackageDescriptor::new(
+    assert!(ContextPackageIdentity::new(
         &"x".repeat(257),
         task_id("task-1"),
-        "Review the task.",
-        versions(),
-        budget(),
+        "agent-1",
+        "reviewer",
+        artifact_id("artifact-agent-manifest-1"),
+        artifact_id("artifact-context-1"),
+        Timestamp::from_unix_seconds(1),
     )
     .is_err());
+    assert!(
+        ContextPackageDescriptor::new(package_identity("task-1"), "", versions(), budget(),)
+            .is_err()
+    );
     assert!(ContextPackageDescriptor::new(
-        "package-1",
-        task_id("task-1"),
-        "",
-        versions(),
-        budget(),
-    )
-    .is_err());
-    assert!(ContextPackageDescriptor::new(
-        "package-1",
-        task_id("task-1"),
+        package_identity("task-1"),
         &"x".repeat(65_537),
         versions(),
         budget(),
+    )
+    .is_err());
+}
+
+#[test]
+fn package_descriptor_preserves_complete_storage_identity() {
+    let descriptor = descriptor("task-1");
+
+    assert_eq!(descriptor.agent_id(), "agent-1");
+    assert_eq!(descriptor.role(), "reviewer");
+    assert_eq!(
+        descriptor.agent_manifest_artifact_id().as_str(),
+        "artifact-agent-manifest-1"
+    );
+    assert_eq!(
+        descriptor.effective_content_artifact_id().as_str(),
+        "artifact-context-1"
+    );
+    assert_eq!(descriptor.created_at(), Timestamp::from_unix_seconds(1));
+}
+
+#[test]
+fn package_binding_rejects_an_effective_artifact_identity_mismatch() {
+    let mismatched =
+        ContextPackageArtifact::new(artifact_id("artifact-other"), digest('a'), digest('a'))
+            .unwrap();
+
+    assert!(ContextPackageBinding::new(
+        descriptor("task-1"),
+        policy_decisions(["policy-1"]),
+        mismatched,
+        Vec::new(),
     )
     .is_err());
 }
@@ -209,11 +240,23 @@ fn package_member_deduplication_is_order_independent_and_canonical() {
 
 fn descriptor(task: &str) -> ContextPackageDescriptor {
     ContextPackageDescriptor::new(
-        "package-1",
-        task_id(task),
+        package_identity(task),
         "Review the task.",
         versions(),
         budget(),
+    )
+    .unwrap()
+}
+
+fn package_identity(task: &str) -> ContextPackageIdentity {
+    ContextPackageIdentity::new(
+        "package-1",
+        task_id(task),
+        "agent-1",
+        "reviewer",
+        artifact_id("artifact-agent-manifest-1"),
+        artifact_id("artifact-context-1"),
+        Timestamp::from_unix_seconds(1),
     )
     .unwrap()
 }

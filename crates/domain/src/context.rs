@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{ArtifactId, ProjectId, Sha256Digest, TaskId};
+use crate::{ArtifactId, ProjectId, Sha256Digest, TaskId, Timestamp};
 
 const MAX_IDENTIFIER_LENGTH: usize = 256;
 const MAX_OBJECTIVE_LENGTH: usize = 65_536;
@@ -315,34 +315,43 @@ impl ContextVersionSet {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextPackageDescriptor {
+pub struct ContextPackageIdentity {
     package_id: String,
     task_id: TaskId,
-    objective: String,
-    versions: ContextVersionSet,
-    budget: ContextBudget,
+    agent_id: String,
+    role: String,
+    agent_manifest_artifact_id: ArtifactId,
+    effective_content_artifact_id: ArtifactId,
+    created_at: Timestamp,
 }
 
-impl ContextPackageDescriptor {
+impl ContextPackageIdentity {
     pub fn new(
         package_id: &str,
         task_id: TaskId,
-        objective: &str,
-        versions: ContextVersionSet,
-        budget: ContextBudget,
+        agent_id: &str,
+        role: &str,
+        agent_manifest_artifact_id: ArtifactId,
+        effective_content_artifact_id: ArtifactId,
+        created_at: Timestamp,
     ) -> Result<Self, ContextError> {
         if !valid_identifier(package_id)
             || !valid_identifier(task_id.as_str())
-            || !valid_text(objective, MAX_OBJECTIVE_LENGTH)
+            || !valid_identifier(agent_id)
+            || !valid_identifier(role)
+            || !valid_identifier(agent_manifest_artifact_id.as_str())
+            || !valid_identifier(effective_content_artifact_id.as_str())
         {
             return Err(ContextError::InvalidPackage);
         }
         Ok(Self {
             package_id: package_id.to_owned(),
             task_id,
-            objective: objective.to_owned(),
-            versions,
-            budget,
+            agent_id: agent_id.to_owned(),
+            role: role.to_owned(),
+            agent_manifest_artifact_id,
+            effective_content_artifact_id,
+            created_at,
         })
     }
 
@@ -352,6 +361,81 @@ impl ContextPackageDescriptor {
 
     pub fn task_id(&self) -> &TaskId {
         &self.task_id
+    }
+
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    pub fn agent_manifest_artifact_id(&self) -> &ArtifactId {
+        &self.agent_manifest_artifact_id
+    }
+
+    pub fn effective_content_artifact_id(&self) -> &ArtifactId {
+        &self.effective_content_artifact_id
+    }
+
+    pub const fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextPackageDescriptor {
+    identity: ContextPackageIdentity,
+    objective: String,
+    versions: ContextVersionSet,
+    budget: ContextBudget,
+}
+
+impl ContextPackageDescriptor {
+    pub fn new(
+        identity: ContextPackageIdentity,
+        objective: &str,
+        versions: ContextVersionSet,
+        budget: ContextBudget,
+    ) -> Result<Self, ContextError> {
+        if !valid_text(objective, MAX_OBJECTIVE_LENGTH) {
+            return Err(ContextError::InvalidPackage);
+        }
+        Ok(Self {
+            identity,
+            objective: objective.to_owned(),
+            versions,
+            budget,
+        })
+    }
+
+    pub fn package_id(&self) -> &str {
+        self.identity.package_id()
+    }
+
+    pub fn task_id(&self) -> &TaskId {
+        self.identity.task_id()
+    }
+
+    pub fn agent_id(&self) -> &str {
+        self.identity.agent_id()
+    }
+
+    pub fn role(&self) -> &str {
+        self.identity.role()
+    }
+
+    pub fn agent_manifest_artifact_id(&self) -> &ArtifactId {
+        self.identity.agent_manifest_artifact_id()
+    }
+
+    pub fn effective_content_artifact_id(&self) -> &ArtifactId {
+        self.identity.effective_content_artifact_id()
+    }
+
+    pub const fn created_at(&self) -> Timestamp {
+        self.identity.created_at()
     }
 
     pub fn objective(&self) -> &str {
@@ -491,6 +575,9 @@ impl ContextPackageBinding {
         artifact: ContextPackageArtifact,
         mut members: Vec<ContextPackageMember>,
     ) -> Result<Self, ContextError> {
+        if artifact.artifact_id() != descriptor.effective_content_artifact_id() {
+            return Err(ContextError::InvalidPackage);
+        }
         if members
             .iter()
             .any(|member| member.task_id() != descriptor.task_id())

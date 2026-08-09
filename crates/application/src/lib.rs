@@ -6,11 +6,11 @@ pub use local_agent_terminal_domain::{
     AgentRunStatus, AgentRunTerminal, AgentUsage, ArtifactId, BoundAgentConnection,
     BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig,
     CancelAgentRun, ContextBudget, ContextError, ContextPackageArtifact, ContextPackageBinding,
-    ContextPackageDescriptor, ContextPackageMember, ContextVersionSet, DeliberationError,
-    FencingToken, GitObjectId, LeaseClaim, LineRange, Phase, PolicyAction, PolicyActor,
-    PolicyDecisionSet, PolicyResource, ProjectId, RepositoryId, ResourceClass, RunId, Sequence,
-    Sha256Digest, SourceIdentity, TaskBranch, TaskId, TaskRisk, TrustTier, WorkspaceFingerprint,
-    WorkspaceVersion, WorktreeId, MAX_GENERATION_PARAMETERS_BYTES,
+    ContextPackageDescriptor, ContextPackageIdentity, ContextPackageMember, ContextVersionSet,
+    DeliberationError, FencingToken, GitObjectId, LeaseClaim, LineRange, Phase, PolicyAction,
+    PolicyActor, PolicyDecisionSet, PolicyResource, ProjectId, RepositoryId, ResourceClass, RunId,
+    Sequence, Sha256Digest, SourceIdentity, TaskBranch, TaskId, TaskRisk, TrustTier,
+    WorkspaceFingerprint, WorkspaceVersion, WorktreeId, MAX_GENERATION_PARAMETERS_BYTES,
 };
 
 mod agent;
@@ -55,13 +55,20 @@ pub use authority::{
 pub use canonical_json::{canonical_evidence, CanonicalEvidenceRef, CanonicalJsonRequest};
 pub use context::{
     BuildInitialContext, BuildInitialContextRequest, ContextArtifactKind, ContextArtifactPublisher,
-    ContextBuildPolicy, ContextChunkRecord, ContextPackageDraft, ContextPackagePersistence,
-    ContextPackageRecord, ContextQuery, ContextSourceRecord, ContextStore,
-    ImmutableContextArtifact, QueryContext, QueryContextRequest, RepositoryContextSource,
-    RetrievedContextItem, SourceSnapshot, SourceSnapshotItem, SourceSnapshotRequest,
+    ContextArtifactReader, ContextArtifactRef, ContextBuildPolicy, ContextChunkRecord,
+    ContextClassificationOutcome, ContextIndexProvenance, ContextIndexProvenanceRehydration,
+    ContextLogicalIdentity, ContextPackageDraft, ContextPackagePersistence, ContextPackageRecord,
+    ContextPolicyDecisionRef, ContextQuery, ContextSensitivity, ContextSourceClassification,
+    ContextSourceClassifier, ContextSourceKind, ContextSourceRecord, ContextSourceState,
+    ContextStore, ImmutableContextArtifact, QueryContext, QueryContextRequest,
+    RepositoryContextSource, RetrievedContextItem, SourceClassificationRequest,
+    SourceIndexMetadata, SourceSnapshot, SourceSnapshotItem, SourceSnapshotRequest,
+    SourceStateTransition,
 };
 pub use deliberation::{
-    DeliberationCommandContext, DeliberationCommands, DeliberationSnapshot, DeliberationStore,
+    DeliberationArtifactRef, DeliberationCommandContext, DeliberationCommands,
+    DeliberationPersistenceCommand, DeliberationRecord, DeliberationRunAssignment,
+    DeliberationSnapshot, DeliberationStore,
 };
 pub use dto::{
     present_tool_activity_record, tool_request_context, ApprovalRequestDto,
@@ -88,9 +95,13 @@ pub use orchestration::{
 };
 pub use plan_approval::{
     canonical_plan_approval_payload, parse_canonical_plan_approval_payload, plan_approval_payload,
-    CompareAndResolvePlanApproval, NewPlanApproval, PlanApprovalAction, PlanApprovalBindingInput,
-    PlanApprovalCurrentState, PlanApprovalInvalidation, PlanApprovalResolution, PlanApprovalState,
-    PlanApprovalStore, ResolvePlanApproval, ResolvePlanApprovalInput, StoredPlanApproval,
+    CompareAndExpirePlanApproval, CompareAndInvalidatePlanApproval, CompareAndResolvePlanApproval,
+    InvalidatePlanApproval, InvalidatePlanApprovalInput, NewPlanApproval, PlanApprovalAction,
+    PlanApprovalAuthorityBinding, PlanApprovalBindingInput, PlanApprovalCurrentState,
+    PlanApprovalExpiry, PlanApprovalInvalidation, PlanApprovalRequestArtifact,
+    PlanApprovalResolution, PlanApprovalState, PlanApprovalStore, PlanApprovalTerminal,
+    PreparePlanApprovalRequest, PreparePlanApprovalRequestInput, ResolvePlanApproval,
+    ResolvePlanApprovalInput, StoredPlanApproval, StoredPlanApprovalRehydration,
 };
 pub use policy::{
     bind_disclosure_channel, parse_policy_timestamp, DisclosureChannel, DisclosureContextProvider,
