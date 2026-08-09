@@ -66,6 +66,27 @@ fn proposals_remain_hidden_until_a_valid_quorum_reveals_them() {
 }
 
 #[test]
+fn revealed_quorum_rehydration_enforces_the_same_independence_invariants() {
+    let revealed = IndependentQuorum::new(vec![
+        proposal("run-1", "agent-1", "family-a", "proposal-1"),
+        proposal("run-2", "agent-2", "family-b", "proposal-2"),
+    ])
+    .unwrap()
+    .reveal();
+
+    assert!(IndependentQuorum::from_revealed(revealed.clone()).is_ok());
+    assert!(IndependentQuorum::from_revealed(vec![revealed[0].clone()]).is_err());
+    assert!(
+        IndependentQuorum::from_revealed(vec![revealed[0].clone(), revealed[0].clone(),]).is_err()
+    );
+    assert!(IndependentQuorum::from_revealed(vec![
+        proposal("run-1", "agent-1", "family-a", "proposal-1"),
+        proposal("run-2", "agent-2", "family-b", "proposal-2"),
+    ])
+    .is_err());
+}
+
+#[test]
 fn review_plans_reject_duplicate_edges_and_limit_overruns() {
     let limits = DeliberationLimits::new(2, 2, 2, 1).unwrap();
     let edge = ReviewEdge::new("reviewer-1", artifact_id("proposal-1"), 1).unwrap();

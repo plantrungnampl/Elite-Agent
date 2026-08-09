@@ -1,18 +1,20 @@
 use std::sync::Mutex;
 
+use sha2::{Digest, Sha256};
+
 use local_agent_terminal_application::{
     canonical_approval_payload, canonical_plan_approval_payload,
     parse_canonical_plan_approval_payload, plan_approval_payload, ApprovalDigestPayload,
     ApprovalId, Clock, CompareAndExpirePlanApproval, CompareAndInvalidatePlanApproval,
     CompareAndResolvePlanApproval, ContextPackageDto, DeliberationWorkspaceDto,
-    InvalidatePlanApproval, InvalidatePlanApprovalInput, PlanApprovalAction,
-    PlanApprovalAuthorityBinding, PlanApprovalBindingInput, PlanApprovalCurrentState,
-    PlanApprovalPathScopeV1, PlanApprovalRequestArtifact, PlanApprovalResolution,
-    PlanApprovalState, PlanApprovalStore, PlanApprovalTerminal, PolicyExceptionApprovalOperationV1,
-    PolicyExceptionApprovalPayloadV1, PortError, PreparePlanApprovalRequest,
-    PreparePlanApprovalRequestInput, ResolvePlanApproval, ResolvePlanApprovalInput,
-    ResolvePlanApprovalRequestDto, Retryability, SafeErrorClassification, StoredPlanApproval,
-    StoredPlanApprovalRehydration,
+    InvalidatePlanApproval, InvalidatePlanApprovalInput, NewPlanApproval,
+    NewPlanApprovalRehydration, PlanApprovalAction, PlanApprovalAuthorityBinding,
+    PlanApprovalBindingInput, PlanApprovalCurrentState, PlanApprovalPathScopeV1,
+    PlanApprovalRequestArtifact, PlanApprovalResolution, PlanApprovalState, PlanApprovalStore,
+    PlanApprovalTerminal, PolicyExceptionApprovalOperationV1, PolicyExceptionApprovalPayloadV1,
+    PortError, PreparePlanApprovalRequest, PreparePlanApprovalRequestInput, ResolvePlanApproval,
+    ResolvePlanApprovalInput, ResolvePlanApprovalRequestDto, Retryability, SafeErrorClassification,
+    StoredPlanApproval, StoredPlanApprovalRehydration,
 };
 use local_agent_terminal_domain::{
     ActorId, Condition, FencingToken, OperationState, Phase, Sequence, Sha256Digest, TaskId,
@@ -653,6 +655,63 @@ fn stored_plan_approval_rehydrates_from_both_durable_envelopes_and_rejects_subst
     let mut wrong_approval = record();
     wrong_approval.operation_digest = _typed_digest(digest('b'));
     assert!(StoredPlanApproval::rehydrate(wrong_approval).is_err());
+}
+
+#[test]
+fn new_plan_approval_rehydrates_exact_normative_bytes_and_rejects_substitution() {
+    let authority = PlanApprovalAuthorityBinding::issue(binding()).unwrap();
+    let canonical = canonical_plan_approval_payload(authority.binding()).unwrap();
+    let record = || NewPlanApprovalRehydration {
+        approval_id: ApprovalId::new("approval-plan-recovery-1").unwrap(),
+        canonical_bytes: canonical.canonical_bytes.clone(),
+        operation_digest: canonical.operation_digest.clone(),
+        request_artifact: request_artifact(
+            canonical.operation_digest.clone(),
+            canonical.canonical_bytes.len() as u64,
+        ),
+        authority_binding_bytes: authority.canonical_bytes().to_vec(),
+        authority_binding_digest: authority.content_digest().clone(),
+    };
+
+    let reopened = NewPlanApproval::rehydrate(record()).unwrap();
+    assert_eq!(reopened.approval_id().as_str(), "approval-plan-recovery-1");
+    assert_eq!(reopened.task_id().as_str(), authority.binding().task_id);
+    assert_eq!(reopened.canonical_bytes(), canonical.canonical_bytes);
+    assert_eq!(reopened.operation_digest(), &canonical.operation_digest);
+    assert_eq!(
+        reopened.authority_binding().canonical_bytes(),
+        authority.canonical_bytes()
+    );
+
+    let mut wrong_approval_digest = record();
+    wrong_approval_digest.operation_digest = _typed_digest(digest('a'));
+    assert!(NewPlanApproval::rehydrate(wrong_approval_digest).is_err());
+
+    let mut wrong_request_digest = record();
+    wrong_request_digest.request_artifact.content_digest = _typed_digest(digest('b'));
+    assert!(NewPlanApproval::rehydrate(wrong_request_digest).is_err());
+
+    let mut wrong_authority_digest = record();
+    wrong_authority_digest.authority_binding_digest = _typed_digest(digest('c'));
+    assert!(NewPlanApproval::rehydrate(wrong_authority_digest).is_err());
+
+    let mut substituted_request = record();
+    substituted_request.canonical_bytes[0] ^= 1;
+    assert!(NewPlanApproval::rehydrate(substituted_request).is_err());
+
+    let mut substituted_authority = record();
+    substituted_authority.authority_binding_bytes[0] ^= 1;
+    assert!(NewPlanApproval::rehydrate(substituted_authority).is_err());
+
+    let value: serde_json::Value = serde_json::from_slice(&canonical.canonical_bytes).unwrap();
+    let noncanonical = serde_json::to_vec_pretty(&value).unwrap();
+    let noncanonical_digest = _typed_digest(format!("sha256:{:x}", Sha256::digest(&noncanonical)));
+    let mut noncanonical_request = record();
+    noncanonical_request.canonical_bytes = noncanonical.clone();
+    noncanonical_request.operation_digest = noncanonical_digest.clone();
+    noncanonical_request.request_artifact.content_digest = noncanonical_digest;
+    noncanonical_request.request_artifact.size_bytes = noncanonical.len() as u64;
+    assert!(NewPlanApproval::rehydrate(noncanonical_request).is_err());
 }
 
 #[test]

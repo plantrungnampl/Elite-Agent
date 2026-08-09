@@ -20,6 +20,7 @@ mod authority;
 mod canonical_json;
 mod context;
 mod deliberation;
+mod deliberation_recovery;
 mod dto;
 mod error;
 mod execute_tool;
@@ -66,9 +67,16 @@ pub use context::{
     SourceStateTransition,
 };
 pub use deliberation::{
-    DeliberationArtifactRef, DeliberationCommandContext, DeliberationCommands,
-    DeliberationPersistenceCommand, DeliberationRecord, DeliberationRunAssignment,
-    DeliberationSnapshot, DeliberationStore,
+    ClaimSetSnapshot, DecisionDraftSnapshot, DeliberationArtifactRef, DeliberationCommandContext,
+    DeliberationCommands, DeliberationPersistenceCommand, DeliberationRecord,
+    DeliberationRunAssignment, DeliberationSnapshot, DeliberationStore,
+    ObjectionRoundClosedSnapshot, ObjectionSetSnapshot, PlanApprovalAuthorityProvider,
+    PrivateProposalSnapshot, QuorumPublicationSnapshot, ReviewEdgesSnapshot,
+    SevereObjectionAcceptanceSnapshot, SpecialistRequestSnapshot, SupersessionSnapshot,
+    ThreadSummarySnapshot, VerificationSetSnapshot,
+};
+pub use deliberation_recovery::{
+    recover_deliberation, CanonicalDeliberationFact, DeliberationRecoveryInput,
 };
 pub use dto::{
     present_tool_activity_record, tool_request_context, ApprovalRequestDto,
@@ -96,12 +104,13 @@ pub use orchestration::{
 pub use plan_approval::{
     canonical_plan_approval_payload, parse_canonical_plan_approval_payload, plan_approval_payload,
     CompareAndExpirePlanApproval, CompareAndInvalidatePlanApproval, CompareAndResolvePlanApproval,
-    InvalidatePlanApproval, InvalidatePlanApprovalInput, NewPlanApproval, PlanApprovalAction,
-    PlanApprovalAuthorityBinding, PlanApprovalBindingInput, PlanApprovalCurrentState,
-    PlanApprovalExpiry, PlanApprovalInvalidation, PlanApprovalRequestArtifact,
-    PlanApprovalResolution, PlanApprovalState, PlanApprovalStore, PlanApprovalTerminal,
-    PreparePlanApprovalRequest, PreparePlanApprovalRequestInput, ResolvePlanApproval,
-    ResolvePlanApprovalInput, StoredPlanApproval, StoredPlanApprovalRehydration,
+    InvalidatePlanApproval, InvalidatePlanApprovalInput, NewPlanApproval,
+    NewPlanApprovalRehydration, PlanApprovalAction, PlanApprovalAuthorityBinding,
+    PlanApprovalBindingInput, PlanApprovalCurrentState, PlanApprovalExpiry,
+    PlanApprovalInvalidation, PlanApprovalRequestArtifact, PlanApprovalResolution,
+    PlanApprovalState, PlanApprovalStore, PlanApprovalTerminal, PreparePlanApprovalRequest,
+    PreparePlanApprovalRequestInput, ResolvePlanApproval, ResolvePlanApprovalInput,
+    StoredPlanApproval, StoredPlanApprovalRehydration,
 };
 pub use policy::{
     bind_disclosure_channel, parse_policy_timestamp, DisclosureChannel, DisclosureContextProvider,

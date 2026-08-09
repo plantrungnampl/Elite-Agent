@@ -178,7 +178,36 @@ pub struct NewPlanApproval {
     authority_binding: PlanApprovalAuthorityBinding,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewPlanApprovalRehydration {
+    pub approval_id: ApprovalId,
+    pub canonical_bytes: Vec<u8>,
+    pub operation_digest: Sha256Digest,
+    pub request_artifact: PlanApprovalRequestArtifact,
+    pub authority_binding_bytes: Vec<u8>,
+    pub authority_binding_digest: Sha256Digest,
+}
+
 impl NewPlanApproval {
+    pub fn rehydrate(record: NewPlanApprovalRehydration) -> Result<Self, PortError> {
+        let authority_binding = PlanApprovalAuthorityBinding::rehydrate(
+            record.authority_binding_bytes,
+            record.authority_binding_digest,
+        )?;
+        let task_id =
+            TaskId::new(&authority_binding.binding().task_id).map_err(|_| integrity_failure())?;
+        let approval = Self {
+            approval_id: record.approval_id,
+            task_id,
+            canonical_bytes: record.canonical_bytes,
+            operation_digest: record.operation_digest,
+            request_artifact: record.request_artifact,
+            authority_binding,
+        };
+        approval.validate()?;
+        Ok(approval)
+    }
+
     pub fn approval_id(&self) -> &ApprovalId {
         &self.approval_id
     }

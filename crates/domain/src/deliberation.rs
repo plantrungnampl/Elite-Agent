@@ -160,7 +160,19 @@ pub struct IndependentQuorum {
 }
 
 impl IndependentQuorum {
-    pub fn new(mut proposals: Vec<IndependentProposal>) -> Result<Self, DeliberationError> {
+    pub fn new(proposals: Vec<IndependentProposal>) -> Result<Self, DeliberationError> {
+        Self::from_visibility(proposals, false)
+    }
+
+    /// Rehydrates an already-published quorum while enforcing the same independence rules.
+    pub fn from_revealed(proposals: Vec<IndependentProposal>) -> Result<Self, DeliberationError> {
+        Self::from_visibility(proposals, true)
+    }
+
+    fn from_visibility(
+        mut proposals: Vec<IndependentProposal>,
+        expected_revealed: bool,
+    ) -> Result<Self, DeliberationError> {
         if proposals.len() < 2 || proposals.len() > MAX_AGENTS as usize {
             return Err(DeliberationError::InvalidQuorum);
         }
@@ -178,7 +190,7 @@ impl IndependentQuorum {
             .collect();
         if proposals
             .iter()
-            .any(|proposal| proposal.task_id != task || proposal.is_revealed())
+            .any(|proposal| proposal.task_id != task || proposal.is_revealed() != expected_revealed)
             || runs.len() != proposals.len()
             || agents.len() != proposals.len()
             || families.len() != proposals.len()
