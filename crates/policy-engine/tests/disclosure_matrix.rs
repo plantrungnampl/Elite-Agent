@@ -1,3 +1,7 @@
+use local_agent_terminal_application::{
+    DisclosureChannel as ApplicationDisclosureChannel, DisclosurePolicyEvaluator,
+    DisclosureRequest as ApplicationDisclosureRequest,
+};
 use local_agent_terminal_domain::{
     ActorLocality, CapabilityRef, PolicyAction, PolicyActor, PolicyEffect, PolicyRequest,
     PolicyResource, ResourceClass, Sha256Digest, TaskId, TaskRisk, Timestamp, TrustTier,
@@ -69,6 +73,69 @@ const CHANNEL_CASES: [ChannelCase; 8] = [
         category: "api_token",
     },
 ];
+
+#[test]
+fn application_context_channels_keep_their_identity_and_existing_scan_semantics() {
+    let engine = VersionedPolicyEngine::from_json(POLICY).expect("trusted fixture parses");
+    let cases = [
+        (
+            ApplicationDisclosureChannel::IndexMetadata,
+            b"archive=secrets.zip\n".as_slice(),
+            b"secrets.zip".as_slice(),
+        ),
+        (
+            ApplicationDisclosureChannel::IndexContent,
+            b"-----BEGIN RSA PRIVATE KEY-----\nsecret-fragment\n-----END RSA PRIVATE KEY-----\n"
+                .as_slice(),
+            b"-----BEGIN RSA PRIVATE KEY-----".as_slice(),
+        ),
+        (
+            ApplicationDisclosureChannel::RetrievedItem,
+            b"API_TOKEN=tok_test_7f89ac\r\n".as_slice(),
+            b"tok_test_7f89ac".as_slice(),
+        ),
+        (
+            ApplicationDisclosureChannel::FinalContextPackage,
+            b"{\"token\":\"tok_test_7f89ac\"}".as_slice(),
+            b"tok_test_7f89ac".as_slice(),
+        ),
+    ];
+    let mut bound_digests = Vec::new();
+
+    for (channel, payload, secret) in cases {
+        let result = DisclosurePolicyEvaluator::disclose(
+            &engine,
+            ApplicationDisclosureRequest {
+                policy_request: policy_request(engine.snapshot_digest().clone(), payload),
+                channel,
+                bytes: payload.to_vec(),
+            },
+        )
+        .expect("application context disclosure succeeds");
+
+        assert_eq!(result.channel, channel);
+        assert_eq!(
+            result.decision.draft.effect(),
+            PolicyEffect::AllowWithRedaction
+        );
+        let effective = result
+            .effective_bytes
+            .as_ref()
+            .expect("redacted payload is disclosed");
+        assert!(!effective
+            .windows(secret.len())
+            .any(|window| window == secret));
+        assert!(result
+            .redaction_report_digest
+            .as_str()
+            .starts_with("sha256:"));
+        bound_digests.push(result.decision.operation_digest);
+    }
+
+    bound_digests.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    bound_digests.dedup();
+    assert_eq!(bound_digests.len(), 4);
+}
 
 #[test]
 fn every_disclosure_channel_redacts_bytes_and_binds_approval_to_the_effective_payload() {

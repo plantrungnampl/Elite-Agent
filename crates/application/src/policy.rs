@@ -78,6 +78,10 @@ pub trait PolicyEvaluator: Send + Sync {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisclosureChannel {
+    IndexMetadata,
+    IndexContent,
+    RetrievedItem,
+    FinalContextPackage,
     FileRead,
     ListMetadata,
     GitStatus,
@@ -191,6 +195,10 @@ pub fn bind_disclosure_channel(
 
 const fn disclosure_channel_name(channel: DisclosureChannel) -> &'static str {
     match channel {
+        DisclosureChannel::IndexMetadata => "index_metadata",
+        DisclosureChannel::IndexContent => "index_content",
+        DisclosureChannel::RetrievedItem => "retrieved_item",
+        DisclosureChannel::FinalContextPackage => "final_context_package",
         DisclosureChannel::FileRead => "file_read",
         DisclosureChannel::ListMetadata => "list_metadata",
         DisclosureChannel::GitStatus => "git_status",

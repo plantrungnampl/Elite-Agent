@@ -61,6 +61,46 @@ pub struct ToolApprovalOperationV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanApprovalPayloadV1 {
+    pub schema: String,
+    pub approval_type: String,
+    pub task_id: String,
+    pub operation: PlanApprovalOperationV1,
+    pub policy_snapshot_digest: String,
+    pub workspace_version: u64,
+    pub requested_at: String,
+    pub expires_at: String,
+    pub nonce: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanApprovalOperationV1 {
+    pub plan: PlanApprovalPlanRefV1,
+    pub base_commit: String,
+    pub allowed_paths: Vec<PlanApprovalPathScopeV1>,
+    pub planned_tool_digests: Vec<String>,
+    pub verification_profile_digest: String,
+    pub risk_class: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanApprovalPlanRefV1 {
+    pub id: String,
+    pub version: u64,
+    pub content_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanApprovalPathScopeV1 {
+    pub root_capability: String,
+    pub patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PolicyExceptionApprovalPayloadV1 {
     pub schema: String,
     pub approval_type: String,
@@ -86,6 +126,7 @@ pub struct PolicyExceptionApprovalOperationV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDigestPayload {
+    Plan(PlanApprovalPayloadV1),
     Tool(ToolApprovalPayloadV1),
     PolicyException(PolicyExceptionApprovalPayloadV1),
 }
@@ -96,6 +137,7 @@ impl Serialize for ApprovalDigestPayload {
         S: serde::Serializer,
     {
         match self {
+            Self::Plan(payload) => payload.serialize(serializer),
             Self::Tool(payload) => payload.serialize(serializer),
             Self::PolicyException(payload) => payload.serialize(serializer),
         }
@@ -161,7 +203,7 @@ impl ToolApprovalRequest {
         payload: ToolApprovalPayloadV1,
     ) -> Result<Self, PortError> {
         let canonical_payload = canonical_approval_payload(&ApprovalDigestPayload::Tool(payload))?;
-        let normalized = parse_approval_payload(
+        let normalized = parse_canonical_approval_payload(
             std::str::from_utf8(&canonical_payload.canonical_bytes).map_err(|_| invalid_input())?,
         )?;
         let ApprovalDigestPayload::Tool(payload) = normalized else {
@@ -332,6 +374,9 @@ pub fn parse_approval_payload(raw: &str) -> Result<ApprovalDigestPayload, PortEr
         .and_then(Value::as_str)
         .ok_or_else(invalid_input)?;
     let payload = match approval_type {
+        "plan" => {
+            ApprovalDigestPayload::Plan(serde_json::from_value(value).map_err(|_| invalid_input())?)
+        }
         "tool" => {
             ApprovalDigestPayload::Tool(serde_json::from_value(value).map_err(|_| invalid_input())?)
         }
@@ -342,6 +387,15 @@ pub fn parse_approval_payload(raw: &str) -> Result<ApprovalDigestPayload, PortEr
     };
     validate_payload(&payload)?;
     normalize_payload_timestamps(payload)
+}
+
+pub fn parse_canonical_approval_payload(raw: &str) -> Result<ApprovalDigestPayload, PortError> {
+    let payload = parse_approval_payload(raw)?;
+    let canonical = canonical_approval_payload(&payload)?;
+    if canonical.canonical_bytes != raw.as_bytes() {
+        return Err(invalid_input());
+    }
+    Ok(payload)
 }
 
 pub fn canonical_approval_payload(
@@ -391,6 +445,45 @@ pub fn build_approval_request(
 
 fn validate_payload(payload: &ApprovalDigestPayload) -> Result<(), PortError> {
     match payload {
+        ApprovalDigestPayload::Plan(value) => {
+            validate_common(
+                &value.schema,
+                &value.approval_type,
+                &value.task_id,
+                &value.policy_snapshot_digest,
+                value.workspace_version,
+                &value.requested_at,
+                &value.expires_at,
+                &value.nonce,
+            )?;
+            let operation = &value.operation;
+            if value.approval_type != "plan"
+                || !valid_identifier(&operation.plan.id)
+                || operation.plan.version == 0
+                || operation.plan.version > MAX_SAFE_INTEGER
+                || !valid_digest(&operation.plan.content_digest)
+                || !valid_git_object_id(&operation.base_commit)
+                || !valid_path_scopes(&operation.allowed_paths)
+                || operation.planned_tool_digests.len() > 1024
+                || operation
+                    .planned_tool_digests
+                    .iter()
+                    .any(|digest| !valid_digest(digest))
+                || operation
+                    .planned_tool_digests
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != operation.planned_tool_digests.len()
+                || !valid_digest(&operation.verification_profile_digest)
+                || !matches!(
+                    operation.risk_class.as_str(),
+                    "low" | "medium" | "high" | "critical"
+                )
+            {
+                return Err(invalid_input());
+            }
+        }
         ApprovalDigestPayload::Tool(value) => {
             validate_common(
                 &value.schema,
@@ -480,7 +573,7 @@ fn validate_common(
     nonce: &str,
 ) -> Result<(), PortError> {
     if schema != SCHEMA
-        || !matches!(approval_type, "tool" | "policy_exception")
+        || !matches!(approval_type, "plan" | "tool" | "policy_exception")
         || !valid_identifier(task_id)
         || !valid_digest(policy_snapshot_digest)
         || !valid_approval_nonce(nonce)
@@ -510,6 +603,11 @@ fn normalize_payload_timestamps(
     payload: ApprovalDigestPayload,
 ) -> Result<ApprovalDigestPayload, PortError> {
     match payload {
+        ApprovalDigestPayload::Plan(mut value) => {
+            value.requested_at = normalize_timestamp(&value.requested_at)?;
+            value.expires_at = normalize_timestamp(&value.expires_at)?;
+            Ok(ApprovalDigestPayload::Plan(value))
+        }
         ApprovalDigestPayload::Tool(mut value) => {
             value.requested_at = normalize_timestamp(&value.requested_at)?;
             value.expires_at = normalize_timestamp(&value.expires_at)?;
@@ -536,6 +634,7 @@ fn parse_timestamp(value: &str) -> Result<OffsetDateTime, PortError> {
 
 fn payload_task_id(payload: &ApprovalDigestPayload) -> &str {
     match payload {
+        ApprovalDigestPayload::Plan(payload) => &payload.task_id,
         ApprovalDigestPayload::Tool(payload) => &payload.task_id,
         ApprovalDigestPayload::PolicyException(payload) => &payload.task_id,
     }
@@ -558,6 +657,39 @@ fn valid_digest(value: &str) -> bool {
         && value[7..]
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_path_scopes(scopes: &[PlanApprovalPathScopeV1]) -> bool {
+    !scopes.is_empty()
+        && scopes.len() <= 1024
+        && scopes.iter().all(|scope| {
+            valid_identifier(&scope.root_capability)
+                && !scope.patterns.is_empty()
+                && scope.patterns.len() <= 1024
+                && scope
+                    .patterns
+                    .iter()
+                    .all(|pattern| !pattern.is_empty() && pattern.len() <= 4096)
+                && scope.patterns.iter().collect::<BTreeSet<_>>().len() == scope.patterns.len()
+        })
+}
+
+pub(crate) fn approval_time_contains(
+    requested_at: &str,
+    expires_at: &str,
+    observed_at: &str,
+) -> Result<bool, PortError> {
+    let requested_at = parse_timestamp(requested_at)?;
+    let expires_at = parse_timestamp(expires_at)?;
+    let observed_at = parse_timestamp(observed_at)?;
+    Ok(observed_at >= requested_at && observed_at < expires_at)
 }
 
 pub(crate) fn valid_approval_nonce(value: &str) -> bool {

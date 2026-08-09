@@ -1369,6 +1369,7 @@ fn snapshot_from_new(approval: NewApproval, state: ApprovalState) -> ApprovalSna
 
 fn payload_type(payload: &ApprovalDigestPayload) -> &'static str {
     match payload {
+        ApprovalDigestPayload::Plan(_) => "plan",
         ApprovalDigestPayload::Tool(_) => "tool",
         ApprovalDigestPayload::PolicyException(_) => "policy_exception",
     }
@@ -1376,6 +1377,7 @@ fn payload_type(payload: &ApprovalDigestPayload) -> &'static str {
 
 fn payload_task_id(payload: &ApprovalDigestPayload) -> &str {
     match payload {
+        ApprovalDigestPayload::Plan(value) => &value.task_id,
         ApprovalDigestPayload::Tool(value) => &value.task_id,
         ApprovalDigestPayload::PolicyException(value) => &value.task_id,
     }
@@ -1383,6 +1385,7 @@ fn payload_task_id(payload: &ApprovalDigestPayload) -> &str {
 
 fn payload_workspace_version(payload: &ApprovalDigestPayload) -> u64 {
     match payload {
+        ApprovalDigestPayload::Plan(value) => value.workspace_version,
         ApprovalDigestPayload::Tool(value) => value.workspace_version,
         ApprovalDigestPayload::PolicyException(value) => value.workspace_version,
     }
@@ -1390,6 +1393,7 @@ fn payload_workspace_version(payload: &ApprovalDigestPayload) -> u64 {
 
 fn payload_policy_digest(payload: &ApprovalDigestPayload) -> &str {
     match payload {
+        ApprovalDigestPayload::Plan(value) => &value.policy_snapshot_digest,
         ApprovalDigestPayload::Tool(value) => &value.policy_snapshot_digest,
         ApprovalDigestPayload::PolicyException(value) => &value.policy_snapshot_digest,
     }
@@ -1397,6 +1401,7 @@ fn payload_policy_digest(payload: &ApprovalDigestPayload) -> &str {
 
 fn payload_fencing_token(payload: &ApprovalDigestPayload) -> Option<u64> {
     match payload {
+        ApprovalDigestPayload::Plan(_) => None,
         ApprovalDigestPayload::Tool(value) => value.operation.executor_fencing_token,
         ApprovalDigestPayload::PolicyException(_) => None,
     }
@@ -1404,6 +1409,7 @@ fn payload_fencing_token(payload: &ApprovalDigestPayload) -> Option<u64> {
 
 fn payload_requested_at(payload: &ApprovalDigestPayload) -> &str {
     match payload {
+        ApprovalDigestPayload::Plan(value) => &value.requested_at,
         ApprovalDigestPayload::Tool(value) => &value.requested_at,
         ApprovalDigestPayload::PolicyException(value) => &value.requested_at,
     }
@@ -1411,6 +1417,7 @@ fn payload_requested_at(payload: &ApprovalDigestPayload) -> &str {
 
 fn payload_expires_at(payload: &ApprovalDigestPayload) -> &str {
     match payload {
+        ApprovalDigestPayload::Plan(value) => &value.expires_at,
         ApprovalDigestPayload::Tool(value) => &value.expires_at,
         ApprovalDigestPayload::PolicyException(value) => &value.expires_at,
     }
@@ -1418,6 +1425,7 @@ fn payload_expires_at(payload: &ApprovalDigestPayload) -> &str {
 
 fn payload_nonce(payload: &ApprovalDigestPayload) -> &str {
     match payload {
+        ApprovalDigestPayload::Plan(value) => &value.nonce,
         ApprovalDigestPayload::Tool(value) => &value.nonce,
         ApprovalDigestPayload::PolicyException(value) => &value.nonce,
     }

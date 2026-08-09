@@ -183,13 +183,13 @@ pub struct DeliberationCommands { /* deterministic commands */ }
 pub struct ResolvePlanApproval { /* canonical reload and compare */ }
 ```
 
-- [ ] **Step 1 - Write failing object-safety and use-case tests**
+- [x] **Step 1 - Write failing object-safety and use-case tests**
 
 Use recording ports to prove coherent source identity is preserved, policy is called before any persistence port, denied content never reaches the artifact/index port, final serialized disclosure happens before package publish, and every package includes all decision relations.
 
 Prove deliberation commands reject wrong phase/version/task/actor, cannot publish a proposal before quorum, cannot synthesize incomplete claim sets, cannot close an accepted severe objection, and cannot approve a stale plan.
 
-- [ ] **Step 2 - Write failing canonical plan-approval tests**
+- [x] **Step 2 - Write failing canonical plan-approval tests**
 
 Define `PlanApprovalPayloadV1` with plan artifact/digest/version, base commit, repository fingerprint, policy snapshot, task scope, writable scope, tools, verification profile, actor, fencing epoch, requested-at, and expiry. Make every scalar, list member, ordering, and Unicode form affect canonical bytes/digest one leaf at a time. Reject duplicate JSON keys and noncanonical persisted payloads.
 
@@ -199,11 +199,11 @@ Approve input contains only approval ID, displayed digest, expected task version
 cargo test -p local-agent-terminal-application --test context_ports --test deliberation_ports --test plan_approval_digest --test agent_ports
 ```
 
-- [ ] **Step 3 - Implement minimum ports, use cases, DTOs, and safe errors**
+- [x] **Step 3 - Implement minimum ports, use cases, DTOs, and safe errors**
 
 Add explicit policy channels for index metadata, index content, retrieved item, and final context package. Do not leak physical paths, source bytes, provider payloads, or secret match detail through DTOs/errors. Reuse the existing event, artifact, approval, policy, workflow reducer, and canonical JSON utilities.
 
-- [ ] **Step 4 - Verify and commit**
+- [x] **Step 4 - Verify and commit**
 
 ```powershell
 cargo fmt --all -- --check

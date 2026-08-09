@@ -1,6 +1,7 @@
 use local_agent_terminal_domain::{
     AgentCancellationReceipt, AgentDescriptor, AgentRunReceipt, AgentRunSnapshot, AgentRunTerminal,
-    ArtifactId, BoundAgentRunRequest, BoundEffectiveContext, CancelAgentRun, RunId, TaskId,
+    ArtifactId, BoundAgentRunRequest, BoundEffectiveContext, CancelAgentRun, RunId, Sha256Digest,
+    TaskId,
 };
 
 use crate::PortError;
@@ -43,4 +44,54 @@ pub trait AgentRunStore: Send + Sync {
         at: &str,
     ) -> Result<Vec<RunId>, PortError>;
     fn load_run(&self, run_id: &RunId) -> Result<Option<AgentRunSnapshot>, PortError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentContextQueryRequest {
+    pub run_id: RunId,
+    pub task_id: TaskId,
+    pub query_id: String,
+    pub query: String,
+    pub scopes: Vec<String>,
+    pub max_items: u32,
+    pub max_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentContextQueryResponse {
+    pub query_id: String,
+    pub supplement_id: String,
+    pub content_digest: Sha256Digest,
+    pub item_ids: Vec<String>,
+    pub policy_decision_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSpecialistRequest {
+    pub run_id: RunId,
+    pub task_id: TaskId,
+    pub request_id: String,
+    pub capability: String,
+    pub reason: String,
+    pub required_context_ids: Vec<String>,
+    pub max_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSpecialistResponse {
+    pub request_id: String,
+    pub accepted: bool,
+    pub reason_code: String,
+}
+
+pub trait AgentRequestHandler: Send + Sync {
+    fn query_context(
+        &self,
+        request: AgentContextQueryRequest,
+    ) -> Result<AgentContextQueryResponse, PortError>;
+
+    fn request_specialist(
+        &self,
+        request: AgentSpecialistRequest,
+    ) -> Result<AgentSpecialistResponse, PortError>;
 }

@@ -167,6 +167,18 @@ impl DisclosurePolicyEvaluator for VersionedPolicyEngine {
             DisclosureRequest::new(
                 request.policy_request,
                 match request.channel {
+                    local_agent_terminal_application::DisclosureChannel::IndexMetadata => {
+                        DisclosureChannel::ListMetadata
+                    }
+                    local_agent_terminal_application::DisclosureChannel::IndexContent => {
+                        DisclosureChannel::Artifact
+                    }
+                    local_agent_terminal_application::DisclosureChannel::RetrievedItem => {
+                        DisclosureChannel::DirectRead
+                    }
+                    local_agent_terminal_application::DisclosureChannel::FinalContextPackage => {
+                        DisclosureChannel::FinalSerializedPayload
+                    }
                     local_agent_terminal_application::DisclosureChannel::FileRead => {
                         DisclosureChannel::DirectRead
                     }

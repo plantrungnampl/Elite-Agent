@@ -6,11 +6,47 @@ use serde::{Deserialize, Serialize, Serializer};
 
 use crate::{
     canonical_json::sha256_digest, tool::logical_capability, DisclosureChannel,
-    DisclosurePolicyEvaluator, DisclosureRequest, ExpectedPresence, PolicyDecisionId,
-    PolicyDecisionStore, PortError, ProjectSnapshot, RecordedPolicyDecision, RecoveryAction,
-    RecoveryCandidate, RecoveryReason, RepositorySnapshot, Retryability, SafeErrorClassification,
-    TaskLeaseState, TaskSnapshot, ToolRequest, WorktreeSnapshot, WorktreeState,
+    DisclosurePolicyEvaluator, DisclosureRequest, ExpectedPresence, PlanApprovalAction,
+    PolicyDecisionId, PolicyDecisionStore, PortError, ProjectSnapshot, RecordedPolicyDecision,
+    RecoveryAction, RecoveryCandidate, RecoveryReason, RepositorySnapshot, Retryability,
+    SafeErrorClassification, TaskLeaseState, TaskSnapshot, ToolRequest, WorktreeSnapshot,
+    WorktreeState,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolvePlanApprovalRequestDto {
+    pub approval_id: String,
+    pub displayed_digest: String,
+    pub expected_task_version: u64,
+    pub actor_id: String,
+    pub action: PlanApprovalAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPackageDto {
+    pub package_id: String,
+    pub task_id: String,
+    pub agent_id: String,
+    pub role: String,
+    pub artifact_id: String,
+    pub content_digest: String,
+    pub policy_snapshot_digest: String,
+    pub policy_decision_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliberationWorkspaceDto {
+    pub task_id: String,
+    pub phase: String,
+    pub task_version: u64,
+    pub private_proposal_count: usize,
+    pub published_proposal_ids: Vec<String>,
+    pub decision_artifact_id: Option<String>,
+    pub unresolved_objection_ids: Vec<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -1,8 +1,9 @@
 use local_agent_terminal_application::{
-    AgentArtifactStore, AgentCancellationReceipt, AgentDescriptor, AgentMessageArtifact,
+    AgentArtifactStore, AgentCancellationReceipt, AgentContextQueryRequest,
+    AgentContextQueryResponse, AgentDescriptor, AgentMessageArtifact, AgentRequestHandler,
     AgentRunReceipt, AgentRunSnapshot, AgentRunStatus, AgentRunStore, AgentRunTerminal,
-    AgentRuntime, ArtifactId, BoundAgentRunRequest, BoundEffectiveContext, CancelAgentRun,
-    PortError, RunId,
+    AgentRuntime, AgentSpecialistRequest, AgentSpecialistResponse, ArtifactId,
+    BoundAgentRunRequest, BoundEffectiveContext, CancelAgentRun, PortError, RunId,
 };
 use local_agent_terminal_domain::Timestamp;
 
@@ -75,15 +76,47 @@ fn agent_ports_are_object_safe_and_keep_only_bound_values_at_the_boundary() {
         }
     }
 
+    impl AgentRequestHandler for Store {
+        fn query_context(
+            &self,
+            request: AgentContextQueryRequest,
+        ) -> Result<AgentContextQueryResponse, PortError> {
+            Ok(AgentContextQueryResponse {
+                query_id: request.query_id,
+                supplement_id: "supplement-1".to_owned(),
+                content_digest: local_agent_terminal_domain::Sha256Digest::new(format!(
+                    "sha256:{}",
+                    "1".repeat(64)
+                ))
+                .unwrap(),
+                item_ids: Vec::new(),
+                policy_decision_ids: Vec::new(),
+            })
+        }
+
+        fn request_specialist(
+            &self,
+            request: AgentSpecialistRequest,
+        ) -> Result<AgentSpecialistResponse, PortError> {
+            Ok(AgentSpecialistResponse {
+                request_id: request.request_id,
+                accepted: false,
+                reason_code: "budget_exhausted".to_owned(),
+            })
+        }
+    }
+
     fn accepts_runtime(_: &dyn AgentRuntime) {}
     fn accepts_store(_: &dyn AgentRunStore) {}
     fn accepts_artifact_store(_: &dyn AgentArtifactStore) {}
+    fn accepts_request_handler(_: &dyn AgentRequestHandler) {}
 
     let runtime = Runtime;
     let store = Store;
     accepts_runtime(&runtime);
     accepts_store(&store);
     accepts_artifact_store(&store);
+    accepts_request_handler(&store);
 
     let _: AgentRunStatus = AgentRunStatus::Created;
 }

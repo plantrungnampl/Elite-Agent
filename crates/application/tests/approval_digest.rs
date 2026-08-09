@@ -1,6 +1,7 @@
 use local_agent_terminal_application::{
     build_approval_request, canonical_approval_payload, parse_approval_payload,
-    ApprovalDigestPayload, ApprovalId, ToolApprovalPayloadV1,
+    parse_canonical_approval_payload, ApprovalDigestPayload, ApprovalId, PlanApprovalOperationV1,
+    PlanApprovalPathScopeV1, PlanApprovalPayloadV1, PlanApprovalPlanRefV1, ToolApprovalPayloadV1,
 };
 use local_agent_terminal_domain::{ArtifactId, ProjectId, TaskId};
 use serde_json::{json, Value};
@@ -33,6 +34,123 @@ const POLICY_EXCEPTION: &str = r#"{
 }"#;
 const OTHER_DIGEST: &str =
     "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+type PlanPayloadMutation = (&'static str, Box<dyn Fn(&mut PlanApprovalPayloadV1)>);
+
+#[test]
+fn shared_parser_round_trips_only_canonical_normative_plan_payloads() {
+    let payload = ApprovalDigestPayload::Plan(plan_payload());
+    let canonical = canonical_approval_payload(&payload).unwrap();
+    let canonical_text = std::str::from_utf8(&canonical.canonical_bytes).unwrap();
+
+    assert_eq!(
+        parse_canonical_approval_payload(canonical_text).unwrap(),
+        payload
+    );
+
+    let duplicate = canonical_text.replacen(
+        "\"taskId\":\"task-1\"",
+        "\"taskId\":\"task-1\",\"taskId\":\"task-2\"",
+        1,
+    );
+    assert!(parse_canonical_approval_payload(&duplicate).is_err());
+
+    let noncanonical =
+        serde_json::to_string_pretty(&serde_json::to_value(&payload).unwrap()).unwrap();
+    assert!(parse_canonical_approval_payload(&noncanonical).is_err());
+}
+
+#[test]
+fn normative_plan_payload_validates_every_schema_shape() {
+    let mutations: Vec<PlanPayloadMutation> = vec![
+        ("schema", Box::new(|value| value.schema = "other".into())),
+        (
+            "approval_type",
+            Box::new(|value| value.approval_type = "tool".into()),
+        ),
+        ("task_id", Box::new(|value| value.task_id.clear())),
+        ("plan_id", Box::new(|value| value.operation.plan.id.clear())),
+        (
+            "plan_version_zero",
+            Box::new(|value| value.operation.plan.version = 0),
+        ),
+        (
+            "plan_version_unsafe",
+            Box::new(|value| value.operation.plan.version = 9_007_199_254_740_992),
+        ),
+        (
+            "plan_digest",
+            Box::new(|value| value.operation.plan.content_digest = "bad".into()),
+        ),
+        (
+            "base_commit",
+            Box::new(|value| value.operation.base_commit = "bad".into()),
+        ),
+        (
+            "allowed_paths",
+            Box::new(|value| value.operation.allowed_paths.clear()),
+        ),
+        (
+            "root_capability",
+            Box::new(|value| value.operation.allowed_paths[0].root_capability.clear()),
+        ),
+        (
+            "patterns_empty",
+            Box::new(|value| value.operation.allowed_paths[0].patterns.clear()),
+        ),
+        (
+            "patterns_duplicate",
+            Box::new(|value| {
+                value.operation.allowed_paths[0].patterns = vec!["src/**".into(), "src/**".into()]
+            }),
+        ),
+        (
+            "planned_tool_digest",
+            Box::new(|value| value.operation.planned_tool_digests[0] = "bad".into()),
+        ),
+        (
+            "planned_tool_duplicate",
+            Box::new(|value| {
+                value.operation.planned_tool_digests =
+                    vec![OTHER_DIGEST.into(), OTHER_DIGEST.into()]
+            }),
+        ),
+        (
+            "verification_profile_digest",
+            Box::new(|value| value.operation.verification_profile_digest = "bad".into()),
+        ),
+        (
+            "risk_class",
+            Box::new(|value| value.operation.risk_class = "unknown".into()),
+        ),
+        (
+            "policy_snapshot_digest",
+            Box::new(|value| value.policy_snapshot_digest = "bad".into()),
+        ),
+        (
+            "workspace_version",
+            Box::new(|value| value.workspace_version = 9_007_199_254_740_992),
+        ),
+        (
+            "requested_at",
+            Box::new(|value| value.requested_at = "bad".into()),
+        ),
+        (
+            "expires_at",
+            Box::new(|value| value.expires_at = value.requested_at.clone()),
+        ),
+        ("nonce", Box::new(|value| value.nonce = "bad".into())),
+    ];
+
+    for (name, mutate) in mutations {
+        let mut invalid = plan_payload();
+        mutate(&mut invalid);
+        assert!(
+            canonical_approval_payload(&ApprovalDigestPayload::Plan(invalid)).is_err(),
+            "{name}"
+        );
+    }
+}
 
 #[test]
 fn authorization_parser_rejects_duplicate_keys_floats_negative_zero_and_unsafe_integers() {
@@ -286,6 +404,21 @@ fn programmatic_payloads_enforce_variant_type_integer_and_task_binding() {
     .is_err());
 }
 
+#[test]
+fn shared_plan_extension_preserves_tool_and_policy_exception_round_trips() {
+    for raw in [TOOL_FIXTURE, POLICY_EXCEPTION] {
+        let payload = parse_approval_payload(raw).unwrap();
+        let canonical = canonical_approval_payload(&payload).unwrap();
+        assert_eq!(
+            parse_canonical_approval_payload(
+                std::str::from_utf8(&canonical.canonical_bytes).unwrap(),
+            )
+            .unwrap(),
+            payload
+        );
+    }
+}
+
 fn parsed_value(raw: &str) -> Value {
     serde_json::to_value(parse_approval_payload(raw).unwrap()).unwrap()
 }
@@ -311,4 +444,32 @@ fn set(value: &mut Value, path: &str, replacement: Value) {
     *value
         .pointer_mut(path)
         .unwrap_or_else(|| panic!("missing fixture path {path}")) = replacement;
+}
+
+fn plan_payload() -> PlanApprovalPayloadV1 {
+    PlanApprovalPayloadV1 {
+        schema: "approval-digest.v1".to_owned(),
+        approval_type: "plan".to_owned(),
+        task_id: "task-1".to_owned(),
+        operation: PlanApprovalOperationV1 {
+            plan: PlanApprovalPlanRefV1 {
+                id: "plan-1".to_owned(),
+                version: 2,
+                content_digest: format!("sha256:{}", "1".repeat(64)),
+            },
+            base_commit: "a".repeat(40),
+            allowed_paths: vec![PlanApprovalPathScopeV1 {
+                root_capability: "worktree:task-1".to_owned(),
+                patterns: vec!["src/**".to_owned()],
+            }],
+            planned_tool_digests: vec![format!("sha256:{}", "2".repeat(64))],
+            verification_profile_digest: format!("sha256:{}", "3".repeat(64)),
+            risk_class: "high".to_owned(),
+        },
+        policy_snapshot_digest: format!("sha256:{}", "4".repeat(64)),
+        workspace_version: 9,
+        requested_at: "2026-07-23T12:00:00Z".to_owned(),
+        expires_at: "2026-07-23T12:15:00Z".to_owned(),
+        nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+    }
 }

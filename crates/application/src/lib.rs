@@ -5,10 +5,12 @@ pub use local_agent_terminal_domain::{
     AgentEvidenceRef, AgentRunLimits, AgentRunMessage, AgentRunReceipt, AgentRunSnapshot,
     AgentRunStatus, AgentRunTerminal, AgentUsage, ArtifactId, BoundAgentConnection,
     BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig,
-    CancelAgentRun, FencingToken, GitObjectId, LeaseClaim, Phase, PolicyAction, PolicyActor,
-    PolicyResource, ProjectId, RepositoryId, ResourceClass, RunId, Sequence, Sha256Digest,
-    TaskBranch, TaskId, TaskRisk, TrustTier, WorkspaceFingerprint, WorkspaceVersion, WorktreeId,
-    MAX_GENERATION_PARAMETERS_BYTES,
+    CancelAgentRun, ContextBudget, ContextError, ContextPackageArtifact, ContextPackageBinding,
+    ContextPackageDescriptor, ContextPackageMember, ContextVersionSet, DeliberationError,
+    FencingToken, GitObjectId, LeaseClaim, LineRange, Phase, PolicyAction, PolicyActor,
+    PolicyDecisionSet, PolicyResource, ProjectId, RepositoryId, ResourceClass, RunId, Sequence,
+    Sha256Digest, SourceIdentity, TaskBranch, TaskId, TaskRisk, TrustTier, WorkspaceFingerprint,
+    WorkspaceVersion, WorktreeId, MAX_GENERATION_PARAMETERS_BYTES,
 };
 
 mod agent;
@@ -16,11 +18,14 @@ mod append_events;
 mod approval;
 mod authority;
 mod canonical_json;
+mod context;
+mod deliberation;
 mod dto;
 mod error;
 mod execute_tool;
 mod lease;
 mod orchestration;
+mod plan_approval;
 mod policy;
 mod ports;
 mod repository;
@@ -28,33 +33,49 @@ mod resume;
 mod tool;
 mod workspace;
 
-pub use agent::{AgentArtifactStore, AgentMessageArtifact, AgentRunStore, AgentRuntime};
+pub use agent::{
+    AgentArtifactStore, AgentContextQueryRequest, AgentContextQueryResponse, AgentMessageArtifact,
+    AgentRequestHandler, AgentRunStore, AgentRuntime, AgentSpecialistRequest,
+    AgentSpecialistResponse,
+};
 pub use append_events::AppendEvents;
 pub use approval::{
-    build_approval_request, canonical_approval_payload, parse_approval_payload, ApprovalCheck,
-    ApprovalClaim, ApprovalDigestPayload, ApprovalExpiryStore, ApprovalId, ApprovalInvalidation,
-    ApprovalRequestBuild, ApprovalResolution, ApprovalSnapshot, ApprovalState, ApprovalStore,
-    CanonicalApprovalPayload, NewApproval, PolicyExceptionApprovalOperationV1,
-    PolicyExceptionApprovalPayloadV1, ToolApprovalOperationV1, ToolApprovalPayloadV1,
-    ToolApprovalPublication, ToolApprovalRequest, ToolApprovalRequestPublisher,
+    build_approval_request, canonical_approval_payload, parse_approval_payload,
+    parse_canonical_approval_payload, ApprovalCheck, ApprovalClaim, ApprovalDigestPayload,
+    ApprovalExpiryStore, ApprovalId, ApprovalInvalidation, ApprovalRequestBuild,
+    ApprovalResolution, ApprovalSnapshot, ApprovalState, ApprovalStore, CanonicalApprovalPayload,
+    NewApproval, PlanApprovalOperationV1, PlanApprovalPathScopeV1, PlanApprovalPayloadV1,
+    PlanApprovalPlanRefV1, PolicyExceptionApprovalOperationV1, PolicyExceptionApprovalPayloadV1,
+    ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolApprovalPublication, ToolApprovalRequest,
+    ToolApprovalRequestPublisher,
 };
 pub use authority::{
     validate_authoritative_tool_request, ToolAuthorityResolver, ToolAuthoritySnapshot,
 };
 pub use canonical_json::{canonical_evidence, CanonicalEvidenceRef, CanonicalJsonRequest};
+pub use context::{
+    BuildInitialContext, BuildInitialContextRequest, ContextArtifactKind, ContextArtifactPublisher,
+    ContextBuildPolicy, ContextChunkRecord, ContextPackageDraft, ContextPackagePersistence,
+    ContextPackageRecord, ContextQuery, ContextSourceRecord, ContextStore,
+    ImmutableContextArtifact, QueryContext, QueryContextRequest, RepositoryContextSource,
+    RetrievedContextItem, SourceSnapshot, SourceSnapshotItem, SourceSnapshotRequest,
+};
+pub use deliberation::{
+    DeliberationCommandContext, DeliberationCommands, DeliberationSnapshot, DeliberationStore,
+};
 pub use dto::{
     present_tool_activity_record, tool_request_context, ApprovalRequestDto,
     ApproveOperationRequestDto, CancelToolExecutionRequestDto, CommandErrorDto,
-    ConfirmDiscardWorkspaceRequestDto, CreateTaskWorkspaceRequestDto, DiagnosticSeverityDto,
-    EvidenceSummaryDto, GetApprovalRequestDto, LocalDiagnosticDto, ObservationClassDto,
-    OnboardRepositoryRequestDto, RecoveryActionCodeDto, RecoveryActionDto,
-    RecoveryCandidateRequestDto, ResolveToolApprovalRequestDto, StartupIssueDto,
-    StartupRecoveryActionDto, StartupStateDto, StartupStatusDto, StopAllToolsReceiptDto,
-    TimelineEntryDto, ToolActivityDto, ToolActivityEntryDto, ToolActivityRecord,
-    ToolActivityStatusDto, ToolApprovalDecisionDto, ToolApprovalRequestDto,
-    ToolApprovalResolutionDto, ToolCancellationReceiptDto, ToolRedactionStateDto,
-    ToolRequestContext, ToolRuntimeAvailabilityDto, TrustLabelDto, WorkspaceDashboardDto,
-    WorkspaceDashboardRequestDto,
+    ConfirmDiscardWorkspaceRequestDto, ContextPackageDto, CreateTaskWorkspaceRequestDto,
+    DeliberationWorkspaceDto, DiagnosticSeverityDto, EvidenceSummaryDto, GetApprovalRequestDto,
+    LocalDiagnosticDto, ObservationClassDto, OnboardRepositoryRequestDto, RecoveryActionCodeDto,
+    RecoveryActionDto, RecoveryCandidateRequestDto, ResolvePlanApprovalRequestDto,
+    ResolveToolApprovalRequestDto, StartupIssueDto, StartupRecoveryActionDto, StartupStateDto,
+    StartupStatusDto, StopAllToolsReceiptDto, TimelineEntryDto, ToolActivityDto,
+    ToolActivityEntryDto, ToolActivityRecord, ToolActivityStatusDto, ToolApprovalDecisionDto,
+    ToolApprovalRequestDto, ToolApprovalResolutionDto, ToolCancellationReceiptDto,
+    ToolRedactionStateDto, ToolRequestContext, ToolRuntimeAvailabilityDto, TrustLabelDto,
+    WorkspaceDashboardDto, WorkspaceDashboardRequestDto,
 };
 pub use error::{PortError, Retryability, SafeErrorClassification};
 pub use execute_tool::{ExecuteTool, ToolOutcome};
@@ -64,6 +85,12 @@ pub use lease::{
 pub use orchestration::{
     policy_request_for_tool, validate_tool_approval_request, PreEffectOutcome, PreEffectReady,
     ToolExecutionOrchestration, ToolRequestPublisher,
+};
+pub use plan_approval::{
+    canonical_plan_approval_payload, parse_canonical_plan_approval_payload, plan_approval_payload,
+    CompareAndResolvePlanApproval, NewPlanApproval, PlanApprovalAction, PlanApprovalBindingInput,
+    PlanApprovalCurrentState, PlanApprovalInvalidation, PlanApprovalResolution, PlanApprovalState,
+    PlanApprovalStore, ResolvePlanApproval, ResolvePlanApprovalInput, StoredPlanApproval,
 };
 pub use policy::{
     bind_disclosure_channel, parse_policy_timestamp, DisclosureChannel, DisclosureContextProvider,
