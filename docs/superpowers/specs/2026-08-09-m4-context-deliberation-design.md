@@ -2,7 +2,7 @@
 
 Date: 2026-08-09
 
-Status: Approved architecture choice; pending written-spec review
+Status: Approved by the user for implementation planning
 
 Milestone: M4 — Context and deliberation
 
