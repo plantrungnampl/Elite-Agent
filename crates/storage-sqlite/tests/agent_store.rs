@@ -33,7 +33,7 @@ const CONTEXT_BYTES: &[u8] = br#"{"context":"bound"}"#;
 const RFC8785_GENERATION_DIGEST: &str =
     "sha256:0ac6c8907856746804e71de596b1ddceed49d53b3c52035da285c42271851863";
 const RFC8785_RUN_CONFIG_DIGEST: &str =
-    "sha256:aaee7e5993f31b532ca87c06d8d1249fc8b1ef2ef438ced1cfae35cac54928b3";
+    "sha256:e730df0d28bc2827af7d559c318357a1e79107661d5f6ace658d8117e4a057f0";
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -132,6 +132,34 @@ impl TestDatabase {
                 ],
             )
             .unwrap();
+    }
+
+    fn replace_artifact_bytes(&self, artifact_id: &ArtifactId, bytes: &[u8]) {
+        let content_hash = digest_bytes(bytes);
+        let reference = ContentAddressedArtifactStore::open(&self.artifact_root)
+            .unwrap()
+            .put(NewArtifact {
+                expected_hash: content_hash.as_str().to_owned(),
+                expected_size: u64::try_from(bytes.len()).unwrap(),
+                content: bytes.to_vec(),
+            })
+            .unwrap();
+        assert_eq!(
+            self.connection()
+                .execute(
+                    "UPDATE artifacts
+                     SET content_hash = ?1, storage_key = ?2, size_bytes = ?3
+                     WHERE id = ?4",
+                    params![
+                        content_hash.as_str(),
+                        reference.storage_key,
+                        i64::try_from(bytes.len()).unwrap(),
+                        artifact_id.as_str(),
+                    ],
+                )
+                .unwrap(),
+            1,
+        );
     }
 }
 
@@ -246,21 +274,99 @@ fn rfc8785_canonical_bytes_and_digests_survive_run_reconstruction() {
 }
 
 #[test]
-fn run_limits_survive_canonical_config_reconstruction() {
+fn canonical_run_config_v2_binds_each_new_limit_to_bytes_and_digest() {
+    let baseline = bound_run("canonical-limits", "canonical-limits-key");
+    let baseline_bytes = canonical_agent_run_config_artifact(&baseline).unwrap();
+    let baseline_digest = digest_bytes(&baseline_bytes);
+    let value: Value = serde_json::from_slice(&baseline_bytes).unwrap();
+    assert_eq!(value["schema"], "agent-run-config.v2");
+
+    let mut context_queries = baseline.clone();
+    context_queries.run_config.limits.max_context_queries = 1;
+    let mut specialist_requests = baseline;
+    specialist_requests
+        .run_config
+        .limits
+        .max_specialist_requests = 1;
+
+    for changed in [context_queries, specialist_requests] {
+        let changed_bytes = canonical_agent_run_config_artifact(&changed).unwrap();
+        assert_ne!(changed_bytes, baseline_bytes);
+        assert_ne!(digest_bytes(&changed_bytes), baseline_digest);
+    }
+}
+
+#[test]
+fn nonzero_run_limits_survive_persistence_and_reopen() {
     let database = TestDatabase::new();
     let store = database.store();
     let descriptor = descriptor();
-    let request = bound_run("limits", "limits-key");
+    let mut request = bound_run("limits", "limits-key");
+    request.run_config.limits.max_context_queries = 7;
+    request.run_config.limits.max_specialist_requests = 9;
+    request.validate().unwrap();
     store.register_descriptor(&descriptor).unwrap();
     seed_default_artifacts(&database, &request, &descriptor);
 
     store.create_bound_run(&request).unwrap();
+    drop(store);
     let reconstructed = database.store().load_run(&request.run_id).unwrap().unwrap();
 
     assert_eq!(
         reconstructed.request.run_config.limits,
         request.run_config.limits
     );
+}
+
+#[test]
+fn legacy_v1_run_config_artifacts_default_new_limits_to_zero() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let descriptor = descriptor();
+    let request = bound_run("legacy-v1", "legacy-v1-key");
+    store.register_descriptor(&descriptor).unwrap();
+    seed_default_artifacts(&database, &request, &descriptor);
+    store.create_bound_run(&request).unwrap();
+    drop(store);
+
+    database.replace_artifact_bytes(
+        &request.run_config.run_config_artifact_id,
+        &legacy_v1_run_config_artifact(&request),
+    );
+
+    let reconstructed = database.store().load_run(&request.run_id).unwrap().unwrap();
+    assert_eq!(
+        reconstructed.request.run_config.limits.max_context_queries,
+        0
+    );
+    assert_eq!(
+        reconstructed
+            .request
+            .run_config
+            .limits
+            .max_specialist_requests,
+        0,
+    );
+}
+
+#[test]
+fn run_config_parser_rejects_nonexact_or_unknown_versioned_shapes() {
+    assert_replaced_run_config_rejected("v1-extra", |value| {
+        value["schema"] = Value::String("agent-run-config.v1".to_owned());
+        let limits = value["runConfig"]["limits"].as_object_mut().unwrap();
+        limits.remove("maxContextQueries");
+        limits.remove("maxSpecialistRequests");
+        limits.insert("maxContextQueries".to_owned(), Value::from(0));
+    });
+    assert_replaced_run_config_rejected("v2-missing", |value| {
+        value["schema"] = Value::String("agent-run-config.v2".to_owned());
+        let limits = value["runConfig"]["limits"].as_object_mut().unwrap();
+        limits.insert("maxContextQueries".to_owned(), Value::from(0));
+        limits.remove("maxSpecialistRequests");
+    });
+    assert_replaced_run_config_rejected("unknown", |value| {
+        value["schema"] = Value::String("agent-run-config.v3".to_owned());
+    });
 }
 
 #[test]
@@ -977,6 +1083,35 @@ fn seed_default_artifacts(
     );
 }
 
+fn legacy_v1_run_config_artifact(request: &BoundAgentRunRequest) -> Vec<u8> {
+    let mut value: Value =
+        serde_json::from_slice(&canonical_agent_run_config_artifact(request).unwrap()).unwrap();
+    value["schema"] = Value::String("agent-run-config.v1".to_owned());
+    let limits = value["runConfig"]["limits"].as_object_mut().unwrap();
+    limits.remove("maxContextQueries");
+    limits.remove("maxSpecialistRequests");
+    serde_json_canonicalizer::to_vec(&value).unwrap()
+}
+
+fn assert_replaced_run_config_rejected(suffix: &str, mutate: impl FnOnce(&mut Value)) {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let descriptor = descriptor();
+    let request = bound_run(suffix, &format!("{suffix}-key"));
+    store.register_descriptor(&descriptor).unwrap();
+    seed_default_artifacts(&database, &request, &descriptor);
+    store.create_bound_run(&request).unwrap();
+    drop(store);
+
+    let mut value: Value =
+        serde_json::from_slice(&canonical_agent_run_config_artifact(&request).unwrap()).unwrap();
+    mutate(&mut value);
+    let bytes = serde_json_canonicalizer::to_vec(&value).unwrap();
+    database.replace_artifact_bytes(&request.run_config.run_config_artifact_id, &bytes);
+
+    assert_integrity_failure(database.store().load_run(&request.run_id));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn seed_bound_artifacts(
     database: &TestDatabase,
@@ -1097,6 +1232,8 @@ fn bound_run(suffix: &str, idempotency_key: &str) -> BoundAgentRunRequest {
                 deadline: Timestamp::from_unix_seconds(1_800_000_300),
                 max_output_tokens: 8_000,
                 max_tool_requests: 8,
+                max_context_queries: 0,
+                max_specialist_requests: 0,
             },
         },
         connection: BoundAgentConnection {

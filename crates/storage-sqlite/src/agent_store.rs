@@ -20,7 +20,50 @@ const MANIFEST_ARTIFACT_KIND: &str = "manifest";
 const CONTEXT_ARTIFACT_KIND: &str = "content";
 const RUN_CONFIG_ARTIFACT_KIND: &str = "run-config";
 const MESSAGE_ARTIFACT_KIND: &str = "agent-message";
-const RUN_CONFIG_SCHEMA: &str = "agent-run-config.v1";
+const RUN_CONFIG_SCHEMA_V1: &str = "agent-run-config.v1";
+const RUN_CONFIG_SCHEMA_V2: &str = "agent-run-config.v2";
+const RUN_CONFIG_ARTIFACT_FIELDS: &[&str] = &["connection", "runConfig", "schema"];
+const RUN_CONFIG_CONNECTION_FIELDS: &[&str] = &[
+    "adapterVersion",
+    "agentId",
+    "bindingDigest",
+    "connectionId",
+    "contractVersion",
+    "executableDigest",
+    "manifestDigest",
+    "trustTier",
+];
+const RUN_CONFIG_FIELDS: &[&str] = &[
+    "adapterVersion",
+    "agentId",
+    "contextPackageId",
+    "contractVersion",
+    "effectiveContextArtifactId",
+    "effectiveContextDigest",
+    "executableDigest",
+    "generationParameters",
+    "generationParametersDigest",
+    "limits",
+    "manifestDigest",
+    "modelId",
+    "policySnapshotDigest",
+    "promptTemplateVersion",
+    "providerId",
+    "responseSchemaVersion",
+    "role",
+    "runConfigArtifactId",
+    "taskId",
+    "trustTier",
+];
+const RUN_CONFIG_LIMIT_FIELDS_V1: &[&str] =
+    &["deadlineUnixSeconds", "maxOutputTokens", "maxToolRequests"];
+const RUN_CONFIG_LIMIT_FIELDS_V2: &[&str] = &[
+    "deadlineUnixSeconds",
+    "maxContextQueries",
+    "maxOutputTokens",
+    "maxSpecialistRequests",
+    "maxToolRequests",
+];
 const TRUSTED_CORE_ADAPTER_ID: &str = "core_adapter";
 
 pub fn canonical_agent_run_config_artifact(
@@ -31,7 +74,7 @@ pub fn canonical_agent_run_config_artifact(
         serde_json::from_slice(&request.run_config.generation_parameters.canonical_json)
             .map_err(|_| invalid_input())?;
     let value = json!({
-        "schema": RUN_CONFIG_SCHEMA,
+        "schema": RUN_CONFIG_SCHEMA_V2,
         "connection": {
             "adapterVersion": request.connection.adapter_version,
             "agentId": request.connection.agent_id,
@@ -54,7 +97,9 @@ pub fn canonical_agent_run_config_artifact(
             "generationParametersDigest": request.run_config.generation_parameters.digest.as_str(),
             "limits": {
                 "deadlineUnixSeconds": request.run_config.limits.deadline.unix_seconds(),
+                "maxContextQueries": request.run_config.limits.max_context_queries,
                 "maxOutputTokens": request.run_config.limits.max_output_tokens,
+                "maxSpecialistRequests": request.run_config.limits.max_specialist_requests,
                 "maxToolRequests": request.run_config.limits.max_tool_requests,
             },
             "manifestDigest": request.run_config.manifest_digest.as_str(),
@@ -1086,17 +1131,33 @@ fn parse_run_config_artifact(
     bytes: &[u8],
 ) -> Result<(BoundRunConfig, BoundAgentConnection), PortError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| integrity_failure())?;
-    if serde_json_canonicalizer::to_vec(&value).map_err(|_| integrity_failure())? != bytes
-        || required_string(&value, "schema")? != RUN_CONFIG_SCHEMA
-    {
+    if serde_json_canonicalizer::to_vec(&value).map_err(|_| integrity_failure())? != bytes {
         return Err(integrity_failure());
     }
+    require_exact_fields(&value, RUN_CONFIG_ARTIFACT_FIELDS)?;
+    let schema = required_string(&value, "schema")?;
     let config = required_object(&value, "runConfig")?;
     let connection = required_object(&value, "connection")?;
+    require_exact_fields(config, RUN_CONFIG_FIELDS)?;
+    require_exact_fields(connection, RUN_CONFIG_CONNECTION_FIELDS)?;
     let generation_parameters = config
         .get("generationParameters")
         .ok_or_else(integrity_failure)?;
     let limits = required_object(config, "limits")?;
+    let (max_context_queries, max_specialist_requests) = match schema {
+        RUN_CONFIG_SCHEMA_V1 => {
+            require_exact_fields(limits, RUN_CONFIG_LIMIT_FIELDS_V1)?;
+            (0, 0)
+        }
+        RUN_CONFIG_SCHEMA_V2 => {
+            require_exact_fields(limits, RUN_CONFIG_LIMIT_FIELDS_V2)?;
+            (
+                required_u64(limits, "maxContextQueries")?,
+                required_u64(limits, "maxSpecialistRequests")?,
+            )
+        }
+        _ => return Err(integrity_failure()),
+    };
     let run_config = BoundRunConfig {
         run_config_artifact_id: artifact_id(config, "runConfigArtifactId")?,
         task_id: task_id(config, "taskId")?,
@@ -1124,6 +1185,8 @@ fn parse_run_config_artifact(
             deadline: Timestamp::from_unix_seconds(required_i64(limits, "deadlineUnixSeconds")?),
             max_output_tokens: required_u64(limits, "maxOutputTokens")?,
             max_tool_requests: required_u64(limits, "maxToolRequests")?,
+            max_context_queries,
+            max_specialist_requests,
         },
     };
     let connection = BoundAgentConnection {
@@ -1146,6 +1209,14 @@ fn required_object<'a>(value: &'a Value, key: &str) -> Result<&'a Value, PortErr
         .get(key)
         .filter(|field| field.is_object())
         .ok_or_else(integrity_failure)
+}
+
+fn require_exact_fields(value: &Value, expected: &[&str]) -> Result<(), PortError> {
+    let fields = value.as_object().ok_or_else(integrity_failure)?;
+    if fields.len() != expected.len() || expected.iter().any(|field| !fields.contains_key(*field)) {
+        return Err(integrity_failure());
+    }
+    Ok(())
 }
 
 fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, PortError> {

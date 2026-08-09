@@ -117,11 +117,11 @@ pub struct FinalObjection { /* severity, impact, evidence */ }
 pub struct PlanApprovalBinding { /* plan/base/policy/scope/tools/actor/expiry */ }
 ```
 
-- [ ] **Step 1 - Write failing context invariant tests**
+- [x] **Step 1 - Write failing context invariant tests**
 
 Reject empty/oversized IDs and objectives, invalid or inverted line ranges, missing revision/hash provenance, cross-task package references, duplicate policy decisions, unversioned prompt/retrieval/tokenizer identity, a package whose exact effective artifact digest differs, stale evidence accepted as current, denied/redacted entries without stable reports, and token budgets that overflow or reserve no response capacity.
 
-- [ ] **Step 2 - Write failing deliberation invariant tests**
+- [x] **Step 2 - Write failing deliberation invariant tests**
 
 Reject same-run/same-agent/same-family quorum, revealed-before-quorum proposals, duplicate review edges, unbounded rounds/agents/requests, specialist requests without reason/context/budget, claims without citations, nonterminal claim sets at synthesis, lost dissent, selected approaches without evidence, malformed severe objections, multiple final objections per participant/round, and incomplete plan approval bindings.
 
@@ -133,11 +133,11 @@ cargo test -p local-agent-terminal-domain --test context_contract --test deliber
 
 Expected RED: context/deliberation modules and extended request limits do not exist.
 
-- [ ] **Step 3 - Implement the minimum validated value objects**
+- [x] **Step 3 - Implement the minimum validated value objects**
 
 Use enums rather than state strings, borrowed inputs where ownership is unnecessary, private fields where invariants matter, and narrow constructors. Extend `AgentRunLimits` with explicit context-query and specialist-request counts while keeping old run artifacts parseable through versioned application decoding.
 
-- [ ] **Step 4 - Verify and commit**
+- [x] **Step 4 - Verify and commit**
 
 ```powershell
 cargo fmt --all -- --check

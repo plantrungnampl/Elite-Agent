@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 mod agent;
+mod context;
+mod deliberation;
 mod event;
 mod identity;
 mod policy;
@@ -14,6 +16,18 @@ pub use agent::{
     AgentRunTerminal, AgentUsage, BoundAgentConnection, BoundAgentRunRequest,
     BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, CancelAgentRun,
     MAX_GENERATION_PARAMETERS_BYTES,
+};
+pub use context::{
+    ContextBudget, ContextError, ContextPackageArtifact, ContextPackageBinding,
+    ContextPackageDescriptor, ContextPackageMember, ContextVersionSet, Disclosure, DisclosureKind,
+    EvidenceCitation, EvidenceFreshness, LineRange, PolicyDecisionSet, SourceIdentity,
+};
+pub use deliberation::{
+    AgentFamilyKey, ApprovalAuthority, ApprovalExecution, ApprovalScope, ClaimVerification,
+    DecisionApproach, DecisionPackage, DeliberationBudget, DeliberationError, DeliberationLimits,
+    Dissent, FinalObjection, FinalObjectionSet, IndependentProposal, IndependentQuorum,
+    MaterialClaim, ObjectionSeverity, PlanApprovalBinding, PlanIdentity, RejectedApproach,
+    ReviewEdge, ReviewPlan, SpecialistBudget, SpecialistRequest, VerificationMethod,
 };
 pub use event::{Effect, GuardEvaluations, GuardName, WorkflowEvent};
 pub use identity::{

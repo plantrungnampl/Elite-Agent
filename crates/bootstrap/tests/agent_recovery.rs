@@ -350,6 +350,8 @@ fn bound_request(
                 deadline: Timestamp::from_unix_seconds(2_000_000_000),
                 max_output_tokens: 256,
                 max_tool_requests: 0,
+                max_context_queries: 0,
+                max_specialist_requests: 0,
             },
         },
         connection,

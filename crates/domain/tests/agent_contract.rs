@@ -120,6 +120,14 @@ fn run_limits_reject_wire_values_outside_the_immutable_schema() {
     let mut request = bound_run();
     request.run_config.limits.max_tool_requests = 10_001;
     assert!(request.validate().is_err());
+
+    let mut request = bound_run();
+    request.run_config.limits.max_context_queries = 10_001;
+    assert!(request.validate().is_err());
+
+    let mut request = bound_run();
+    request.run_config.limits.max_specialist_requests = 10_001;
+    assert!(request.validate().is_err());
 }
 
 #[test]
@@ -246,6 +254,8 @@ fn bound_run() -> BoundAgentRunRequest {
                 deadline: Timestamp::from_unix_seconds(1_800_000_300),
                 max_output_tokens: 8_000,
                 max_tool_requests: 8,
+                max_context_queries: 0,
+                max_specialist_requests: 0,
             },
         },
         connection: BoundAgentConnection {

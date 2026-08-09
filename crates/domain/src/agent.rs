@@ -156,6 +156,8 @@ pub struct AgentRunLimits {
     pub deadline: Timestamp,
     pub max_output_tokens: u64,
     pub max_tool_requests: u64,
+    pub max_context_queries: u64,
+    pub max_specialist_requests: u64,
 }
 
 impl AgentRunLimits {
@@ -163,6 +165,8 @@ impl AgentRunLimits {
         if self.deadline.unix_seconds() <= 0
             || !(1..=1_000_000).contains(&self.max_output_tokens)
             || self.max_tool_requests > 10_000
+            || self.max_context_queries > 10_000
+            || self.max_specialist_requests > 10_000
         {
             Err(AgentError::InvalidRunLimits)
         } else {

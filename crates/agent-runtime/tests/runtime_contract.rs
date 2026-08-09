@@ -2072,6 +2072,8 @@ fn run_request(run: &str, supersedes: Option<&str>) -> BoundAgentRunRequest {
                 deadline: Timestamp::from_unix_seconds(1_800_000_300),
                 max_output_tokens: 8_000,
                 max_tool_requests: 8,
+                max_context_queries: 0,
+                max_specialist_requests: 0,
             },
         },
         connection: BoundAgentConnection {
