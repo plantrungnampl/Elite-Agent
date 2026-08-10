@@ -7,7 +7,10 @@ use std::{
     io::{BufRead, BufReader, ErrorKind, Read, Write},
     net::{TcpListener, TcpStream},
     path::Path,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -24,7 +27,9 @@ use local_agent_terminal_domain::{
     BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, CancelAgentRun, RunId,
     Sha256Digest, TaskId, Timestamp, TrustTier,
 };
-use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
+use local_agent_terminal_storage_files::{
+    ContentAddressedArtifactReader, ContentAddressedArtifactStore, JournaledArtifactWriter,
+};
 use local_agent_terminal_storage_sqlite::{canonical_agent_run_config_artifact, SqliteStore};
 use rusqlite::params;
 use serde_json::{json, Value};
@@ -866,6 +871,7 @@ fn load_run(
 ) -> Option<local_agent_terminal_domain::AgentRunSnapshot> {
     SqliteStore::open(&fixture.database_path)
         .expect("database")
+        .with_artifact_reader(Arc::new(ContentAddressedArtifactReader))
         .load_run(run_id)
         .expect("run query")
 }

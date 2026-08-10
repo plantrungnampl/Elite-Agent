@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, EventId, Sequence, StreamId, TaskId, WorkflowEvent, WorkflowState,
 };
@@ -95,6 +97,14 @@ pub struct ArtifactContent {
 pub trait ArtifactStore: Send + Sync {
     fn put(&self, artifact: NewArtifact) -> Result<ArtifactRef, PortError>;
     fn read(&self, reference: &ArtifactRef) -> Result<ArtifactContent, PortError>;
+}
+
+pub trait ArtifactRootReader: Send + Sync {
+    fn read_from_root(
+        &self,
+        root: &Path,
+        reference: &ArtifactRef,
+    ) -> Result<ArtifactContent, PortError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

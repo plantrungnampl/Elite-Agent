@@ -389,6 +389,19 @@ pub struct PlanApprovalCurrentState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanApprovalCurrentAuthority {
+    pub repository_fingerprint: Sha256Digest,
+    pub policy_snapshot_digest: Sha256Digest,
+}
+
+pub trait PlanApprovalCurrentAuthoritySource: Send + Sync {
+    fn current_authority(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<PlanApprovalCurrentAuthority, PortError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanApprovalResolution {
     pub approval_id: ApprovalId,
     pub action: PlanApprovalAction,
@@ -952,6 +965,11 @@ fn approval_fact_append(
     if occurred_at.trim().is_empty() {
         return Err(invalid_input());
     }
+    let observation_class = match actor_type {
+        "user" => "user_asserted",
+        "core" => "core_observed",
+        _ => return Err(conflict()),
+    };
     Ok(AppendOperation {
         stream_id: StreamId::new(task_id.as_str()).map_err(|_| conflict())?,
         expected_version: local_agent_terminal_domain::Sequence::new(expected_version),
@@ -961,7 +979,7 @@ fn approval_fact_append(
             schema_version: 1,
             actor_type: actor_type.to_owned(),
             actor_id,
-            observation_class: "system_observed".to_owned(),
+            observation_class: observation_class.to_owned(),
             payload,
             metadata: serde_json::json!({}),
             causation_id: None,

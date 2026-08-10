@@ -8,18 +8,22 @@ use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeD
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, OpenOptions};
 use local_agent_terminal_application::{
-    ArtifactContent, ArtifactRef, ArtifactStore, ArtifactWriteReservation, NewArtifact, PortError,
-    Retryability, SafeErrorClassification,
+    ArtifactContent, ArtifactRef, ArtifactRootReader, ArtifactStore, ArtifactWriteReservation,
+    NewArtifact, PortError, Retryability, SafeErrorClassification,
 };
 use sha2::{Digest, Sha256};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+const MAX_ARTIFACT_READ_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct ContentAddressedArtifactStore {
     root: PathBuf,
     directory: Dir,
 }
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContentAddressedArtifactReader;
 
 enum InspectedFile {
     Missing,
@@ -342,9 +346,13 @@ impl ContentAddressedArtifactStore {
         &self,
         reference: &ArtifactRef,
         after_open: impl FnOnce() -> std::io::Result<()>,
+        after_metadata: impl FnOnce() -> std::io::Result<()>,
     ) -> Result<ArtifactContent, PortError> {
         let expected_key = Self::storage_key(&reference.content_hash)?;
         if reference.storage_key != expected_key {
+            return Err(invalid_input());
+        }
+        if reference.size_bytes > MAX_ARTIFACT_READ_BYTES {
             return Err(invalid_input());
         }
         let path = self.object_path(&reference.content_hash)?;
@@ -353,6 +361,7 @@ impl ContentAddressedArtifactStore {
             &reference.content_hash,
             reference.size_bytes,
             after_open,
+            after_metadata,
         )? {
             InspectedFile::Missing => return Err(not_found()),
             InspectedFile::Invalid => return Err(integrity_failure()),
@@ -367,7 +376,16 @@ impl ContentAddressedArtifactStore {
         reference: &ArtifactRef,
         hook: impl FnOnce() -> std::io::Result<()>,
     ) -> Result<ArtifactContent, PortError> {
-        self.read_internal(reference, hook)
+        self.read_internal(reference, hook, || Ok(()))
+    }
+
+    #[cfg(test)]
+    fn read_with_post_metadata_hook(
+        &self,
+        reference: &ArtifactRef,
+        hook: impl FnOnce() -> std::io::Result<()>,
+    ) -> Result<ArtifactContent, PortError> {
+        self.read_internal(reference, || Ok(()), hook)
     }
 
     fn verify_relative(
@@ -396,6 +414,7 @@ impl ContentAddressedArtifactStore {
         expected_hash: &str,
         expected_size: u64,
         after_open: impl FnOnce() -> std::io::Result<()>,
+        after_metadata: impl FnOnce() -> std::io::Result<()>,
     ) -> Result<InspectedFile, PortError> {
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
@@ -411,14 +430,11 @@ impl ContentAddressedArtifactStore {
         if !metadata.is_file() || metadata.len() != expected_size {
             return Ok(InspectedFile::Invalid);
         }
-        let mut bytes = Vec::with_capacity(expected_size.min(usize::MAX as u64) as usize);
-        file.read_to_end(&mut bytes).map_err(io_error)?;
-        if bytes.len() as u64 != expected_size
-            || format!("sha256:{:x}", Sha256::digest(&bytes)) != expected_hash
-        {
-            return Ok(InspectedFile::Invalid);
-        }
-        Ok(InspectedFile::Valid(bytes))
+        after_metadata().map_err(io_error)?;
+        read_verified_content(&mut file, expected_hash, expected_size)?.map_or_else(
+            || Ok(InspectedFile::Invalid),
+            |bytes| Ok(InspectedFile::Valid(bytes)),
+        )
     }
 
     fn relative<'a>(&self, path: &'a Path) -> Result<&'a Path, PortError> {
@@ -513,7 +529,17 @@ impl ArtifactStore for ContentAddressedArtifactStore {
     }
 
     fn read(&self, reference: &ArtifactRef) -> Result<ArtifactContent, PortError> {
-        self.read_internal(reference, || Ok(()))
+        self.read_internal(reference, || Ok(()), || Ok(()))
+    }
+}
+
+impl ArtifactRootReader for ContentAddressedArtifactReader {
+    fn read_from_root(
+        &self,
+        root: &Path,
+        reference: &ArtifactRef,
+    ) -> Result<ArtifactContent, PortError> {
+        ContentAddressedArtifactStore::open(root)?.read(reference)
     }
 }
 
@@ -572,6 +598,45 @@ fn verify_stream(
         hash.update(&buffer[..read]);
     }
     Ok(size == expected_size && format!("sha256:{:x}", hash.finalize()) == expected_hash)
+}
+
+fn read_verified_content(
+    reader: &mut impl Read,
+    expected_hash: &str,
+    expected_size: u64,
+) -> Result<Option<Vec<u8>>, PortError> {
+    let initial_capacity =
+        usize::try_from(expected_size.min(64 * 1024)).map_err(|_| integrity_failure())?;
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    let mut hash = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let remaining = expected_size.saturating_sub(size);
+        let read_limit = if remaining == 0 {
+            1
+        } else {
+            usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| integrity_failure())?
+        };
+        let read = reader.read(&mut buffer[..read_limit]).map_err(io_error)?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read as u64)
+            .ok_or_else(integrity_failure)?;
+        if size > expected_size {
+            return Ok(None);
+        }
+        bytes.try_reserve(read).map_err(|_| integrity_failure())?;
+        bytes.extend_from_slice(&buffer[..read]);
+        hash.update(&buffer[..read]);
+    }
+    if size == expected_size && format!("sha256:{:x}", hash.finalize()) == expected_hash {
+        Ok(Some(bytes))
+    } else {
+        Ok(None)
+    }
 }
 
 fn validate_hash(hash: &str) -> Result<&str, PortError> {
@@ -813,6 +878,72 @@ mod tests {
             .unwrap();
 
         assert_eq!(content.bytes, b"hello");
+    }
+
+    #[test]
+    fn artifact_read_rejects_a_declared_size_above_the_memory_bound_before_opening() {
+        let root = TempDir::new().unwrap();
+        let store = ContentAddressedArtifactStore::open(root.path()).unwrap();
+        let error = store
+            .read(&ArtifactRef {
+                content_hash: HELLO_HASH.to_owned(),
+                storage_key: ContentAddressedArtifactStore::storage_key(HELLO_HASH).unwrap(),
+                size_bytes: 64 * 1024 * 1024 + 1,
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error.safe_classification(),
+            SafeErrorClassification::InvalidInput
+        );
+    }
+
+    #[test]
+    fn artifact_read_rejects_file_growth_after_same_handle_metadata() {
+        let root = TempDir::new().unwrap();
+        let store = ContentAddressedArtifactStore::open(root.path()).unwrap();
+        let reference = store
+            .put(NewArtifact {
+                expected_hash: HELLO_HASH.to_owned(),
+                expected_size: 5,
+                content: b"hello".to_vec(),
+            })
+            .unwrap();
+        let object = root.path().join(&reference.storage_key);
+
+        let error = store
+            .read_with_post_metadata_hook(&reference, || {
+                let mut file = fs::OpenOptions::new().append(true).open(&object)?;
+                file.write_all(b"!")?;
+                file.flush()
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error.safe_classification(),
+            SafeErrorClassification::IntegrityFailure
+        );
+    }
+
+    #[test]
+    fn verified_content_read_consumes_at_most_one_byte_past_the_declared_size() {
+        struct RepeatingReader {
+            consumed: usize,
+        }
+
+        impl Read for RepeatingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                buffer.fill(b'x');
+                self.consumed += buffer.len();
+                Ok(buffer.len())
+            }
+        }
+
+        let mut reader = RepeatingReader { consumed: 0 };
+        assert!(read_verified_content(&mut reader, HELLO_HASH, 5)
+            .unwrap()
+            .is_none());
+        assert_eq!(reader.consumed, 6);
     }
 
     #[test]

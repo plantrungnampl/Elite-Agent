@@ -1,7 +1,7 @@
 #[allow(dead_code)]
 mod support;
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Arc};
 
 use local_agent_terminal_application::{
     AgentRunStore, ArtifactRef, ArtifactStore, ArtifactWriteReservation, Clock, ReservedArtifact,
@@ -15,7 +15,9 @@ use local_agent_terminal_domain::{
     BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, RunId, Sha256Digest, TaskId,
     Timestamp, TrustTier,
 };
-use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
+use local_agent_terminal_storage_files::{
+    ContentAddressedArtifactReader, ContentAddressedArtifactStore, JournaledArtifactWriter,
+};
 use local_agent_terminal_storage_sqlite::{canonical_agent_run_config_artifact, SqliteStore};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -86,7 +88,7 @@ fn restart_interrupts_an_incomplete_openai_run_and_reconstructs_its_durable_inpu
         &canonical_agent_run_config_artifact(&request).expect("run config"),
     );
     let before = task_snapshot(&fixture);
-    let database = SqliteStore::open(&fixture.database_path).expect("database");
+    let database = agent_store(&fixture);
     database.create_bound_run(&request).expect("created run");
     database
         .accept_run(&request.run_id, &database.now_utc().expect("clock"))
@@ -111,8 +113,7 @@ fn restart_interrupts_an_incomplete_openai_run_and_reconstructs_its_durable_inpu
     );
     assert!(restarted.agent_runtime_handle().is_some());
 
-    let reopened = SqliteStore::open(&fixture.database_path)
-        .expect("database")
+    let reopened = agent_store(&fixture)
         .load_run(&request.run_id)
         .expect("run query")
         .expect("interrupted run");
@@ -178,8 +179,7 @@ fn adapter_version_rotation_interrupts_incomplete_core_adapter_runs() {
         local_agent_terminal_application::StartupStateDto::Ready
     );
     assert_eq!(
-        SqliteStore::open(&fixture.database_path)
-            .expect("database")
+        agent_store(&fixture)
             .load_run(&request.run_id)
             .expect("run query")
             .expect("interrupted run")
@@ -218,7 +218,7 @@ fn core_release_rotation_interrupts_incomplete_runs_and_reconstructs_completed_h
     );
     persist_running_bound_run(&fixture, &completed_request, &context);
     persist_running_bound_run(&fixture, &active_request, &context);
-    let database = SqliteStore::open(&fixture.database_path).expect("database");
+    let database = agent_store(&fixture);
     database
         .interrupt_connection(
             completed_request.connection.binding_digest.as_str(),
@@ -243,7 +243,7 @@ fn core_release_rotation_interrupts_incomplete_runs_and_reconstructs_completed_h
         restarted.status().state,
         local_agent_terminal_application::StartupStateDto::Ready
     );
-    let database = SqliteStore::open(&fixture.database_path).expect("database");
+    let database = agent_store(&fixture);
     let interrupted_active = database
         .load_run(&active_request.run_id)
         .expect("active query")
@@ -425,7 +425,7 @@ fn publish_artifact(
     artifact_type: &str,
     bytes: &[u8],
 ) {
-    let database = SqliteStore::open(&fixture.database_path).expect("database");
+    let database = agent_store(fixture);
     let artifacts = ContentAddressedArtifactStore::open(fixture.app_data.join("artifacts"))
         .expect("artifact store");
     let content_hash = digest_bytes(bytes);
@@ -481,7 +481,7 @@ fn persist_running_bound_run(
         "run-config",
         &canonical_agent_run_config_artifact(request).expect("run config"),
     );
-    let database = SqliteStore::open(&fixture.database_path).expect("database");
+    let database = agent_store(fixture);
     database.create_bound_run(request).expect("created run");
     database
         .accept_run(&request.run_id, &database.now_utc().expect("clock"))
@@ -496,6 +496,12 @@ fn task_snapshot(fixture: &WorkspaceFixture) -> local_agent_terminal_application
         .expect("database")
         .task(&TaskId::new(TASK_ID).expect("task id"))
         .expect("task")
+}
+
+fn agent_store(fixture: &WorkspaceFixture) -> SqliteStore {
+    SqliteStore::open(&fixture.database_path)
+        .expect("database")
+        .with_artifact_reader(Arc::new(ContentAddressedArtifactReader))
 }
 
 fn artifact_bytes(fixture: &WorkspaceFixture, artifact_id: &str) -> Vec<u8> {

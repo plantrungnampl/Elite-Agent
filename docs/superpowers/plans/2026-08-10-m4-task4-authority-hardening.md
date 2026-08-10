@@ -4,7 +4,7 @@
 
 **Goal:** Close the four blocking M4 Task 4 review findings by using live plan-approval authority, hardened content-addressed artifact reads, and immutable artifact identity metadata.
 
-**Architecture:** The application layer defines a live authority port that returns repository and policy digests for a task. The SQLite adapter combines that live observation with durable task and approval state inside every compare-and-terminalize path, while artifact bytes are delegated to the existing capability-rooted `ContentAddressedArtifactStore`. Migration V6 freezes artifact identity fields but preserves the two journal-owned lifecycle fields.
+**Architecture:** The application layer defines a live authority port and a root-aware artifact-reader port. The SQLite adapter combines live authority with durable task and approval state inside every compare-and-terminalize path, while storage-files implements the physical reader with the existing capability-rooted content-addressed store and bootstrap injects it at the agent-runtime composition root. Migration V6 freezes artifact identity fields but preserves the two journal-owned lifecycle fields.
 
 **Tech Stack:** Rust 2021, rusqlite 0.32, SHA-256 domain digests, `local-agent-terminal-storage-files`, SQLite strict tables and triggers.
 
@@ -15,10 +15,11 @@
 - Preserve exact migration checksums for V1 through V5.
 - A store without a live plan-approval authority source must fail closed and write no terminal event or approval state.
 - Repository identity and historical context packages are not live authority sources.
-- SQLite artifact reads must use the existing `ArtifactStore::read` contract.
+- SQLite artifact reads must cross `ArtifactRootReader`; the storage-files implementation must use the existing `ArtifactStore::read` contract.
 - Artifact journal transitions may continue changing only `availability` and `verification_state`.
 - Apply test-driven development: observe each focused regression fail before implementing its minimal fix.
 - Mark a checkbox only after its command or stated verification has succeeded.
+- The corrective tasks modify interdependent files in the already-dirty parent Task 4 implementation; record verified checkpoints after Tasks 1-3 and create one buildable parent Task 4 source commit only after fresh review and full gates.
 
 ---
 
@@ -39,7 +40,7 @@
 - Produces: `SqliteStore::with_plan_approval_authority_source(Arc<dyn PlanApprovalCurrentAuthoritySource>) -> SqliteStore`.
 - Consumes: the stored `PlanApprovalBindingInput` and durable workflow state already loaded by `PlanApprovalStore`.
 
-- [ ] **Step 1: Write live-authority RED tests**
+- [x] **Step 1: Write live-authority RED tests**
 
 Add a thread-safe test provider whose values survive store reopen:
 
@@ -94,9 +95,9 @@ fn missing_live_authority_fails_closed_without_mutation() {
 }
 ```
 
-Retain the existing task-version, manifest-drift, expiry, reopen, and one-terminal-winner cases so the new boundary does not weaken existing CAS behavior.
+Retain the existing task-version, manifest-drift, expiry, and reopen cases. Add a concurrent approve/reject SQLite regression that starts both resolvers together and proves exactly one success, one failure, one terminal event, and one task-sequence advance.
 
-- [ ] **Step 2: Run the focused RED tests**
+- [x] **Step 2: Run the focused RED tests**
 
 Run:
 
@@ -108,7 +109,7 @@ cargo test -p local-agent-terminal-storage-sqlite --test plan_approval_store mis
 
 Expected: FAIL because `PlanApprovalCurrentAuthoritySource` and configured-store behavior do not exist yet.
 
-- [ ] **Step 3: Add the application port and explicit store configuration**
+- [x] **Step 3: Add the application port and explicit store configuration**
 
 Add and export the validated live value and source:
 
@@ -142,7 +143,7 @@ pub fn with_plan_approval_authority_source(
 
 Implement `Debug` manually so the trait object is not required to implement `Debug`; expose only whether the source is configured, never its internals.
 
-- [ ] **Step 4: Replace historical inference in every approval comparison**
+- [x] **Step 4: Replace historical inference in every approval comparison**
 
 Remove `normalize_repository_fingerprint`, the `projects.repository_identity` projection, and the newest-`context_packages` policy query from `current_state_for_binding`.
 
@@ -157,7 +158,7 @@ let live_authority = self
 
 Pass `&PlanApprovalCurrentAuthority` into `current_state_for_binding` and assign both live digests to the cloned binding. In terminal CAS methods, obtain the task ID from the validated expected binding, observe live authority before opening the immediate transaction, and compare that exact observation inside `compare_expected`. Any missing, malformed, or mismatched observation must return without appending an event or changing `approvals.status`.
 
-- [ ] **Step 5: Run Task 1 GREEN tests and commit**
+- [x] **Step 5: Run Task 1 GREEN tests and record the verified checkpoint**
 
 Run:
 
@@ -169,13 +170,8 @@ cargo test -p local-agent-terminal-application plan_approval
 
 Expected: PASS, including reopen, repo drift, policy drift, missing provider, task/manifest drift, expiry, and one-winner CAS.
 
-Then commit only the Task 1 files:
-
-```powershell
-git add crates/application/src/plan_approval.rs crates/application/src/lib.rs crates/storage-sqlite/src/lib.rs crates/storage-sqlite/src/plan_approval_store.rs crates/storage-sqlite/tests/plan_approval_store.rs
-git diff --cached --check
-git commit -m "fix: bind plan approval to live authority"
-```
+Do not create a partial commit: `crates/storage-sqlite/src/lib.rs` already registers the
+uncommitted parent Task 4 modules, so a Task 1-only commit would not build from a clean checkout.
 
 ---
 
@@ -183,23 +179,31 @@ git commit -m "fix: bind plan approval to live authority"
 
 **Files:**
 
+- Modify: `crates/application/src/ports.rs`
+- Modify: `crates/application/src/lib.rs`
 - Modify: `crates/storage-sqlite/Cargo.toml`
+- Modify: `crates/storage-sqlite/src/lib.rs`
 - Modify: `crates/storage-sqlite/src/agent_store.rs`
 - Modify: `crates/storage-sqlite/src/context_store.rs`
 - Modify: `crates/storage-sqlite/tests/agent_store.rs`
 - Modify: `crates/storage-sqlite/tests/context_store.rs`
-- Verify: `crates/storage-files/tests/artifact_store.rs`
-- Verify: `crates/storage-files/src/content_address.rs`
+- Modify: `crates/storage-files/src/content_address.rs`
+- Modify: `crates/storage-files/src/lib.rs`
+- Modify: `crates/storage-files/tests/crash_matrix.rs`
+- Modify: `crates/bootstrap/src/agent_runtime.rs`
+- Modify: `crates/bootstrap/tests/agent_runtime_e2e.rs`
 
 **Interfaces:**
 
-- Consumes: `ContentAddressedArtifactStore::open(root)` and `ArtifactStore::read(&ArtifactRef)`.
-- Produces: `validate_available_artifact_kind(connection, artifact_id, task_id, expected_kind, expected_hash, expected_size)` for adapter-owned semantic checks.
+- Produces: `ArtifactRootReader::read_from_root(&Path, &ArtifactRef) -> Result<ArtifactContent, PortError>` in application.
+- Produces: `ContentAddressedArtifactReader`, which opens the supplied root and delegates to `ArtifactStore::read`.
+- Produces: `SqliteStore::with_artifact_reader(Arc<dyn ArtifactRootReader>)` without a storage-sqlite to storage-files dependency.
+- Produces: `validate_available_artifact_kind(connection, reader, artifact_id, task_id, expected_kind, expected_hash, expected_size)` for adapter-owned semantic checks.
 - Produces: context-package manifest validation with exact artifact kind `manifest`.
 
-- [ ] **Step 1: Write adapter-boundary RED tests**
+- [x] **Step 1: Write adapter-boundary RED tests**
 
-Move `local-agent-terminal-storage-files` from dev-dependencies to dependencies. Add regressions proving the SQLite adapter cannot bypass the reader:
+Add regressions proving the SQLite adapter cannot bypass the injected reader:
 
 ```rust
 #[test]
@@ -223,7 +227,7 @@ fn context_package_rejects_a_non_manifest_manifest_artifact() {
 
 The key-rewrite test must use a legacy/pre-V6 fixture or perform the rewrite before installing the V6 immutability trigger; Task 3 will separately prove post-V6 metadata updates are blocked.
 
-- [ ] **Step 2: Run the focused RED tests**
+- [x] **Step 2: Run the focused RED tests**
 
 Run:
 
@@ -234,33 +238,27 @@ cargo test -p local-agent-terminal-storage-sqlite --test context_store context_p
 
 Expected: at least one test FAILS because `load_available_artifact` still calls `fs::read` and package persistence does not require manifest kind.
 
-- [ ] **Step 3: Delegate physical access to `ContentAddressedArtifactStore`**
+- [x] **Step 3: Delegate physical access through the inward reader port**
 
-Replace the path-component validation and `fs::read` block with:
+Define the root-aware port in application and inject it into `SqliteStore`:
 
 ```rust
-let content_hash = Sha256Digest::new(&content_hash).map_err(|_| integrity_failure())?;
-let size_bytes = u64::try_from(size_bytes).map_err(|_| integrity_failure())?;
-let store = ContentAddressedArtifactStore::open(&artifact_root)
-    .map_err(|_| integrity_failure())?;
-let content = ArtifactStore::read(
-    &store,
-    &ArtifactRef {
-        content_hash: content_hash.as_str().to_owned(),
-        storage_key,
-        size_bytes,
-    },
-)
-.map_err(|_| integrity_failure())?;
+pub trait ArtifactRootReader: Send + Sync {
+    fn read_from_root(
+        &self,
+        root: &Path,
+        reference: &ArtifactRef,
+    ) -> Result<ArtifactContent, PortError>;
+}
 ```
 
-Keep the existing SQLite checks for task owner, availability, artifact kind, expected hash, and expected size before physical access. Return only the verified same-handle bytes from the content-addressed reader.
+Implement the port in storage-files by opening `ContentAddressedArtifactStore` for the per-project root and calling `ArtifactStore::read`. Keep the existing SQLite checks for task owner, availability, artifact kind, expected hash, and expected size before physical access. Return only the verified same-handle bytes. Configure the reader in bootstrap's agent-runtime composition and keep a missing reader fail-closed.
 
-- [ ] **Step 4: Require manifest kind at context-package persistence**
+- [x] **Step 4: Require manifest kind at context-package persistence**
 
 Add a kind-aware helper that forwards to `load_available_artifact` with `Some(expected_kind)`. Call it for `descriptor.agent_manifest_artifact_id()` with `"manifest"`; leave content/source artifact callers on their existing semantic kind rules.
 
-- [ ] **Step 5: Run Task 2 GREEN and hardened-reader regressions, then commit**
+- [x] **Step 5: Run Task 2 GREEN and hardened-reader regressions**
 
 Run:
 
@@ -268,17 +266,12 @@ Run:
 cargo fmt --all
 cargo test -p local-agent-terminal-storage-sqlite --test agent_store --test context_store --test plan_approval_store
 cargo test -p local-agent-terminal-storage-files
+cargo test -p local-agent-terminal-bootstrap --test agent_runtime_e2e loopback_sse_persists_a_terminal_run_and_reconstructs_its_bound_inputs_after_reopen -- --exact
 ```
 
-Expected: PASS. The storage-files suite is the verification source for traversal, non-hash key, symlink/junction or reparse escape, special-file rejection, oversize rejection, and post-open replacement on the same handle.
+Expected: PASS. The storage-files suite is the verification source for traversal, non-hash key, symlink/junction or reparse escape, special-file rejection, bounded oversize rejection, and post-open growth/replacement on the same handle. The bootstrap e2e proves production composition supplies the reader and reopens a terminal run.
 
-Then commit:
-
-```powershell
-git add crates/storage-sqlite/Cargo.toml crates/storage-sqlite/src/agent_store.rs crates/storage-sqlite/src/context_store.rs crates/storage-sqlite/tests/agent_store.rs crates/storage-sqlite/tests/context_store.rs
-git diff --cached --check
-git commit -m "fix: harden sqlite artifact reads"
-```
+Record the passing commands in the plan; defer the interdependent source commit to Task 4.
 
 ---
 
@@ -296,7 +289,7 @@ git commit -m "fix: harden sqlite artifact reads"
 - Preserves: updates that change only `availability` and/or `verification_state`.
 - Preserves: exact deployed checksums for migration versions 1 through 5.
 
-- [ ] **Step 1: Write migration RED tests**
+- [x] **Step 1: Write migration RED tests**
 
 Extend the exact V5-to-V6 test to require `artifact_identity_immutable`. Add a behavioral regression:
 
@@ -322,7 +315,7 @@ fn v6_freezes_artifact_identity_but_allows_journal_state_updates() {
 
 Also reopen a V5 fixture after upgrade and prove the trigger exists without changing the recorded V5 checksum.
 
-- [ ] **Step 2: Run migration RED tests**
+- [x] **Step 2: Run migration RED tests**
 
 Run:
 
@@ -333,7 +326,7 @@ cargo test -p local-agent-terminal-storage-sqlite --test schema_health exact_dep
 
 Expected: FAIL because V6 does not yet install `artifact_identity_immutable`.
 
-- [ ] **Step 3: Add the minimal V6 update trigger**
+- [x] **Step 3: Add the minimal V6 update trigger**
 
 Append this shape to `V6_CONTEXT_HARDENING_SQL`, listing every identity/location field and intentionally omitting only `availability` and `verification_state`:
 
@@ -361,7 +354,7 @@ END;
 
 Do not modify V1-V5 SQL constants or their checksum functions.
 
-- [ ] **Step 4: Run Task 3 GREEN tests and commit**
+- [x] **Step 4: Run Task 3 GREEN tests**
 
 Run:
 
@@ -373,13 +366,7 @@ cargo test -p local-agent-terminal-storage-sqlite --test context_store
 
 Expected: PASS, including V1/V3/V4/V5 upgrade preservation and permitted artifact journal state updates.
 
-Then commit:
-
-```powershell
-git add crates/storage-sqlite/src/migrations.rs crates/storage-sqlite/tests/schema_health.rs crates/storage-sqlite/tests/context_store.rs
-git diff --cached --check
-git commit -m "fix: freeze persisted artifact identity"
-```
+Record the passing commands in the plan; defer the interdependent source commit to Task 4.
 
 ---
 
@@ -397,7 +384,7 @@ git commit -m "fix: freeze persisted artifact identity"
 - Consumes: all three corrective tasks plus the existing context/deliberation/approval persistence implementation.
 - Produces: a reviewer-approved, fully gated M4 Task 4 commit and synchronized plan/progress checkboxes.
 
-- [ ] **Step 1: Request a fresh read-only code review**
+- [x] **Step 1: Request a fresh read-only code review**
 
 Provide the reviewer with the approved spec, this plan, `git diff cabce5f..HEAD`, and remaining working-tree diff. Require explicit review of:
 
@@ -411,7 +398,7 @@ Provide the reviewer with the approved spec, this plan, `git diff cabce5f..HEAD`
 
 Expected: no Critical or Important finding remains. If a finding is valid, add a RED regression, fix it, rerun the focused suite, and request review again before continuing.
 
-- [ ] **Step 2: Run the complete Rust and architecture gates**
+- [x] **Step 2: Run the complete Rust and architecture gates**
 
 Run fresh, without relying on earlier output:
 
@@ -444,7 +431,7 @@ Run:
 ```powershell
 git status --short
 git diff -- docs/multi-agent-terminal-design
-git add crates/application crates/domain crates/storage-sqlite docs/superpowers/plans .superpowers/sdd/progress.md
+git add crates/application crates/bootstrap crates/domain crates/storage-files crates/storage-sqlite docs/superpowers/plans .superpowers/sdd/progress.md
 git diff --cached --check
 git commit -m "feat: persist m4 context deliberation state"
 git status --short

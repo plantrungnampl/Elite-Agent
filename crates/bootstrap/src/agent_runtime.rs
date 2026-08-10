@@ -18,7 +18,9 @@ use local_agent_terminal_application::{
 };
 pub use local_agent_terminal_provider_openai::OpenAiApiKey;
 use local_agent_terminal_provider_openai::{OpenAiProviderConfig, OpenAiResponsesAdapter};
-use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
+use local_agent_terminal_storage_files::{
+    ContentAddressedArtifactReader, ContentAddressedArtifactStore, JournaledArtifactWriter,
+};
 use local_agent_terminal_storage_sqlite::{canonical_agent_run_config_artifact, SqliteStore};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -111,6 +113,7 @@ fn compose_runtime(
     connection: BoundAgentConnection,
     peer: Arc<dyn ProtocolPeer>,
 ) -> Result<Arc<ComposedAgentRuntime>, PortError> {
+    let database = database.with_artifact_reader(Arc::new(ContentAddressedArtifactReader));
     let durable_artifacts = Arc::new(DurableAgentArtifacts {
         database: database.clone(),
         artifacts,

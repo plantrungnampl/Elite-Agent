@@ -8,7 +8,7 @@ use local_agent_terminal_domain::{
 };
 
 use crate::{
-    parse_policy_timestamp, AppendOperation, NewEvent, NewPlanApproval,
+    parse_policy_timestamp, AppendOperation, CanonicalDeliberationFact, NewEvent, NewPlanApproval,
     PlanApprovalAuthorityBinding, PlanApprovalCurrentState, PortError, PreparePlanApprovalRequest,
     PreparePlanApprovalRequestInput, ProjectionChange, Retryability, SafeErrorClassification,
 };
@@ -387,11 +387,16 @@ impl DeliberationRecord {
         }
     }
 
-    fn event_payload(&self, task_id: &TaskId) -> serde_json::Value {
+    fn event_payload(
+        &self,
+        task_id: &TaskId,
+        canonical_record_digest: &Sha256Digest,
+    ) -> serde_json::Value {
         let artifact = self.primary_artifact();
         let mut payload = serde_json::json!({
             "taskId": task_id.as_str(),
             "recordType": self.event_type(),
+            "canonicalRecordDigest": canonical_record_digest.as_str(),
             "artifactId": artifact.artifact_id.as_str(),
             "artifactDigest": artifact.content_digest.as_str(),
             "artifactSizeBytes": artifact.size_bytes,
@@ -2419,6 +2424,14 @@ fn build_append(
 ) -> Result<AppendOperation, PortError> {
     let event_type = WorkflowEvent::new(record.event_type()).map_err(|_| conflict())?;
     let (actor_type, observation_class) = record.authority_labels(&authority.actor_id)?;
+    let event_sequence = expected_task_version.checked_add(1).ok_or_else(conflict)?;
+    let canonical_record = CanonicalDeliberationFact::issue(
+        task_id.clone(),
+        authority.event_id.clone(),
+        event_sequence,
+        authority.actor_id.clone(),
+        record.clone(),
+    )?;
     let projection_changes = if record.changes_phase() {
         let mut guards = GuardEvaluations::new();
         let guard = record.transition_guard().ok_or_else(conflict)?;
@@ -2444,7 +2457,7 @@ fn build_append(
             actor_type: actor_type.to_owned(),
             actor_id: authority.actor_id.clone(),
             observation_class: observation_class.to_owned(),
-            payload: record.event_payload(task_id),
+            payload: record.event_payload(task_id, canonical_record.content_digest()),
             metadata: serde_json::json!({}),
             causation_id: None,
             correlation_id: authority.correlation_id.clone(),

@@ -3,7 +3,7 @@ use std::fmt;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-const SUPPORTED_SCHEMA_VERSION: i64 = 5;
+const SUPPORTED_SCHEMA_VERSION: i64 = 6;
 const NORMATIVE_SQL: &str =
     include_str!("../../../docs/multi-agent-terminal-design/schemas/sqlite-v1.sql");
 const V1_ADAPTER_HARDENING_SQL: &str = r#"
@@ -283,6 +283,123 @@ BEGIN
 END;
 "#;
 
+const V6_CONTEXT_HARDENING_SQL: &str = r#"
+CREATE TRIGGER context_packages_update_forbidden
+BEFORE UPDATE ON context_packages
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'context packages are immutable');
+END;
+
+CREATE TRIGGER context_packages_delete_forbidden
+BEFORE DELETE ON context_packages
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'context packages are immutable');
+END;
+
+CREATE TRIGGER context_package_policy_decisions_update_forbidden
+BEFORE UPDATE ON context_package_policy_decisions
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'context package policy decisions are immutable');
+END;
+
+CREATE TRIGGER context_package_policy_decisions_delete_forbidden
+BEFORE DELETE ON context_package_policy_decisions
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'context package policy decisions are immutable');
+END;
+
+CREATE TRIGGER artifact_identity_immutable
+BEFORE UPDATE ON artifacts
+FOR EACH ROW
+WHEN NEW.id IS NOT OLD.id
+    OR NEW.task_id IS NOT OLD.task_id
+    OR NEW.project_id IS NOT OLD.project_id
+    OR NEW.artifact_type IS NOT OLD.artifact_type
+    OR NEW.logical_path IS NOT OLD.logical_path
+    OR NEW.content_hash IS NOT OLD.content_hash
+    OR NEW.storage_key IS NOT OLD.storage_key
+    OR NEW.size_bytes IS NOT OLD.size_bytes
+    OR NEW.mime_type IS NOT OLD.mime_type
+    OR NEW.created_by_type IS NOT OLD.created_by_type
+    OR NEW.created_by_id IS NOT OLD.created_by_id
+    OR NEW.created_at IS NOT OLD.created_at
+    OR NEW.supersedes IS NOT OLD.supersedes
+BEGIN
+    SELECT RAISE(ABORT, 'artifact identity is immutable');
+END;
+
+CREATE TRIGGER source_document_identity_immutable
+BEFORE UPDATE ON source_documents
+FOR EACH ROW
+WHEN NEW.project_id IS NOT OLD.project_id
+    OR NEW.task_id IS NOT OLD.task_id
+    OR NEW.source_kind IS NOT OLD.source_kind
+    OR NEW.logical_path IS NOT OLD.logical_path
+    OR NEW.revision IS NOT OLD.revision
+    OR NEW.content_hash IS NOT OLD.content_hash
+    OR NEW.sensitivity IS NOT OLD.sensitivity
+    OR NEW.classification_digest IS NOT OLD.classification_digest
+BEGIN
+    SELECT RAISE(ABORT, 'source document identity is immutable');
+END;
+
+CREATE TRIGGER source_document_state_forward_only
+BEFORE UPDATE OF index_state ON source_documents
+FOR EACH ROW
+WHEN OLD.index_state <> NEW.index_state
+    AND NOT (
+        (OLD.index_state = 'pending'
+            AND NEW.index_state IN ('current', 'denied', 'failed'))
+        OR (OLD.index_state = 'current' AND NEW.index_state = 'stale')
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'source document state must move forward');
+END;
+
+CREATE INDEX source_documents_revision_hash_lookup
+ON source_documents(task_id, revision, content_hash, index_state);
+
+CREATE INDEX source_chunks_document_lookup
+ON source_chunks(document_id, created_at, id);
+
+CREATE TABLE deliberation_records (
+    event_id TEXT PRIMARY KEY REFERENCES events(event_id) ON DELETE RESTRICT,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    record_type TEXT NOT NULL,
+    primary_artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE RESTRICT,
+    canonical_record_json TEXT NOT NULL CHECK (json_valid(canonical_record_json)),
+    canonical_record_digest TEXT NOT NULL CHECK (
+        length(canonical_record_digest) = 71
+        AND substr(canonical_record_digest, 1, 7) = 'sha256:'
+        AND substr(canonical_record_digest, 8) NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at TEXT NOT NULL,
+    UNIQUE (task_id, sequence)
+) STRICT;
+
+CREATE TRIGGER deliberation_records_update_forbidden
+BEFORE UPDATE ON deliberation_records
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'deliberation recovery records are immutable');
+END;
+
+CREATE TRIGGER deliberation_records_delete_forbidden
+BEFORE DELETE ON deliberation_records
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'deliberation recovery records are immutable');
+END;
+
+CREATE INDEX deliberation_records_task_sequence
+ON deliberation_records(task_id, sequence);
+"#;
+
 #[derive(Debug)]
 pub enum OpenError {
     Database(rusqlite::Error),
@@ -345,7 +462,7 @@ impl From<rusqlite::Error> for OpenError {
 }
 
 pub fn migration_checksum() -> String {
-    checksum(V5_PRE_EFFECT_TERMINAL_SQL)
+    checksum(V6_CONTEXT_HARDENING_SQL)
 }
 
 fn v1_migration_checksum() -> String {
@@ -362,6 +479,10 @@ fn v3_migration_checksum() -> String {
 
 fn v4_migration_checksum() -> String {
     checksum(V4_TOOL_EXECUTION_LIFECYCLE_SQL)
+}
+
+fn v5_migration_checksum() -> String {
+    checksum(V5_PRE_EFFECT_TERMINAL_SQL)
 }
 
 fn checksum(sql: &str) -> String {
@@ -431,12 +552,21 @@ pub(crate) fn validate_or_migrate(connection: &mut Connection) -> Result<(), Ope
             validate_checksum(connection, 4, v4_migration_checksum())?;
             apply_upgrade_migrations(connection, version)?;
         }
+        5 => {
+            validate_checksum(connection, 1, v1_migration_checksum())?;
+            validate_checksum(connection, 2, v2_migration_checksum())?;
+            validate_checksum(connection, 3, v3_migration_checksum())?;
+            validate_checksum(connection, 4, v4_migration_checksum())?;
+            validate_checksum(connection, 5, v5_migration_checksum())?;
+            apply_upgrade_migrations(connection, version)?;
+        }
         SUPPORTED_SCHEMA_VERSION => {
             validate_checksum(connection, 1, v1_migration_checksum())?;
             validate_checksum(connection, 2, v2_migration_checksum())?;
             validate_checksum(connection, 3, v3_migration_checksum())?;
             validate_checksum(connection, 4, v4_migration_checksum())?;
-            validate_checksum(connection, 5, migration_checksum())?;
+            validate_checksum(connection, 5, v5_migration_checksum())?;
+            validate_checksum(connection, 6, migration_checksum())?;
         }
         _ => {
             return Err(OpenError::UnsupportedSchema {
@@ -582,6 +712,18 @@ fn apply_initial_migration(connection: &mut Connection) -> Result<(), OpenError>
             5,
             "pre_effect_terminal_v5",
             env!("CARGO_PKG_VERSION"),
+            v5_migration_checksum()
+        ],
+    )?;
+    transaction.execute_batch(V6_CONTEXT_HARDENING_SQL)?;
+    transaction.execute(
+        "INSERT INTO schema_migrations (
+            version, name, applied_at, application_version, checksum
+         ) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4)",
+        params![
+            6,
+            "context_hardening_v6",
+            env!("CARGO_PKG_VERSION"),
             migration_checksum()
         ],
     )?;
@@ -615,6 +757,12 @@ fn apply_upgrade_migrations(connection: &mut Connection, version: i64) -> Result
                 5,
                 "pre_effect_terminal_v5",
                 V5_PRE_EFFECT_TERMINAL_SQL,
+                v5_migration_checksum(),
+            ),
+            (
+                6,
+                "context_hardening_v6",
+                V6_CONTEXT_HARDENING_SQL,
                 migration_checksum(),
             ),
         ],
@@ -635,6 +783,12 @@ fn apply_upgrade_migrations(connection: &mut Connection, version: i64) -> Result
                 5,
                 "pre_effect_terminal_v5",
                 V5_PRE_EFFECT_TERMINAL_SQL,
+                v5_migration_checksum(),
+            ),
+            (
+                6,
+                "context_hardening_v6",
+                V6_CONTEXT_HARDENING_SQL,
                 migration_checksum(),
             ),
         ],
@@ -649,13 +803,33 @@ fn apply_upgrade_migrations(connection: &mut Connection, version: i64) -> Result
                 5,
                 "pre_effect_terminal_v5",
                 V5_PRE_EFFECT_TERMINAL_SQL,
+                v5_migration_checksum(),
+            ),
+            (
+                6,
+                "context_hardening_v6",
+                V6_CONTEXT_HARDENING_SQL,
                 migration_checksum(),
             ),
         ],
-        4 => vec![(
-            5,
-            "pre_effect_terminal_v5",
-            V5_PRE_EFFECT_TERMINAL_SQL,
+        4 => vec![
+            (
+                5,
+                "pre_effect_terminal_v5",
+                V5_PRE_EFFECT_TERMINAL_SQL,
+                v5_migration_checksum(),
+            ),
+            (
+                6,
+                "context_hardening_v6",
+                V6_CONTEXT_HARDENING_SQL,
+                migration_checksum(),
+            ),
+        ],
+        5 => vec![(
+            6,
+            "context_hardening_v6",
+            V6_CONTEXT_HARDENING_SQL,
             migration_checksum(),
         )],
         _ => Vec::new(),

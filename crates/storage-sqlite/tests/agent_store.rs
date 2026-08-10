@@ -19,7 +19,9 @@ use local_agent_terminal_domain::{
     ArtifactId, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
     BoundGenerationParameters, BoundRunConfig, RunId, Sha256Digest, TaskId, Timestamp, TrustTier,
 };
-use local_agent_terminal_storage_files::ContentAddressedArtifactStore;
+use local_agent_terminal_storage_files::{
+    ContentAddressedArtifactReader, ContentAddressedArtifactStore,
+};
 use local_agent_terminal_storage_sqlite::{canonical_agent_run_config_artifact, SqliteStore};
 use rusqlite::{params, Connection};
 use serde_json::Value;
@@ -65,7 +67,9 @@ impl TestDatabase {
     }
 
     fn store(&self) -> SqliteStore {
-        SqliteStore::open(&self.path).unwrap()
+        SqliteStore::open(&self.path)
+            .unwrap()
+            .with_artifact_reader(Arc::new(ContentAddressedArtifactReader))
     }
 
     fn connection(&self) -> Connection {
@@ -104,6 +108,17 @@ impl TestDatabase {
     }
 
     fn put_artifact(&self, artifact_id: &ArtifactId, task_id: &str, kind: &str, bytes: &[u8]) {
+        self.put_artifact_with_storage_key(artifact_id, task_id, kind, bytes, None);
+    }
+
+    fn put_artifact_with_storage_key(
+        &self,
+        artifact_id: &ArtifactId,
+        task_id: &str,
+        kind: &str,
+        bytes: &[u8],
+        storage_key_override: Option<&str>,
+    ) {
         let content_hash = digest_bytes(bytes);
         let reference = ContentAddressedArtifactStore::open(&self.artifact_root)
             .unwrap()
@@ -113,6 +128,16 @@ impl TestDatabase {
                 content: bytes.to_vec(),
             })
             .unwrap();
+        let storage_key = storage_key_override.unwrap_or(&reference.storage_key);
+        if storage_key_override.is_some() {
+            let substituted_path = self.artifact_root.join(storage_key);
+            fs::create_dir_all(substituted_path.parent().unwrap()).unwrap();
+            fs::copy(
+                self.artifact_root.join(&reference.storage_key),
+                &substituted_path,
+            )
+            .unwrap();
+        }
         self.connection()
             .execute(
                 "INSERT OR REPLACE INTO artifacts (
@@ -127,39 +152,11 @@ impl TestDatabase {
                     kind,
                     format!("agent/{}.json", artifact_id.as_str()),
                     content_hash.as_str(),
-                    reference.storage_key,
+                    storage_key,
                     i64::try_from(bytes.len()).unwrap(),
                 ],
             )
             .unwrap();
-    }
-
-    fn replace_artifact_bytes(&self, artifact_id: &ArtifactId, bytes: &[u8]) {
-        let content_hash = digest_bytes(bytes);
-        let reference = ContentAddressedArtifactStore::open(&self.artifact_root)
-            .unwrap()
-            .put(NewArtifact {
-                expected_hash: content_hash.as_str().to_owned(),
-                expected_size: u64::try_from(bytes.len()).unwrap(),
-                content: bytes.to_vec(),
-            })
-            .unwrap();
-        assert_eq!(
-            self.connection()
-                .execute(
-                    "UPDATE artifacts
-                     SET content_hash = ?1, storage_key = ?2, size_bytes = ?3
-                     WHERE id = ?4",
-                    params![
-                        content_hash.as_str(),
-                        reference.storage_key,
-                        i64::try_from(bytes.len()).unwrap(),
-                        artifact_id.as_str(),
-                    ],
-                )
-                .unwrap(),
-            1,
-        );
     }
 }
 
@@ -325,14 +322,13 @@ fn legacy_v1_run_config_artifacts_default_new_limits_to_zero() {
     let descriptor = descriptor();
     let request = bound_run("legacy-v1", "legacy-v1-key");
     store.register_descriptor(&descriptor).unwrap();
-    seed_default_artifacts(&database, &request, &descriptor);
-    store.create_bound_run(&request).unwrap();
-    drop(store);
-
-    database.replace_artifact_bytes(
-        &request.run_config.run_config_artifact_id,
+    seed_historical_created_run(
+        &database,
+        &request,
+        &descriptor,
         &legacy_v1_run_config_artifact(&request),
     );
+    drop(store);
 
     let reconstructed = database.store().load_run(&request.run_id).unwrap().unwrap();
     assert_eq!(
@@ -351,20 +347,20 @@ fn legacy_v1_run_config_artifacts_default_new_limits_to_zero() {
 
 #[test]
 fn run_config_parser_rejects_nonexact_or_unknown_versioned_shapes() {
-    assert_replaced_run_config_rejected("v1-extra", |value| {
+    assert_historical_run_config_rejected("v1-extra", |value| {
         value["schema"] = Value::String("agent-run-config.v1".to_owned());
         let limits = value["runConfig"]["limits"].as_object_mut().unwrap();
         limits.remove("maxContextQueries");
         limits.remove("maxSpecialistRequests");
         limits.insert("maxContextQueries".to_owned(), Value::from(0));
     });
-    assert_replaced_run_config_rejected("v2-missing", |value| {
+    assert_historical_run_config_rejected("v2-missing", |value| {
         value["schema"] = Value::String("agent-run-config.v2".to_owned());
         let limits = value["runConfig"]["limits"].as_object_mut().unwrap();
         limits.insert("maxContextQueries".to_owned(), Value::from(0));
         limits.remove("maxSpecialistRequests");
     });
-    assert_replaced_run_config_rejected("unknown", |value| {
+    assert_historical_run_config_rejected("unknown", |value| {
         value["schema"] = Value::String("agent-run-config.v3".to_owned());
     });
 }
@@ -432,6 +428,94 @@ fn create_bound_run_rejects_missing_foreign_mismatched_or_wrong_kind_artifacts()
         br#"{"schema":"agent-run-config.v1"}"#,
     );
     assert_integrity_failure(store.create_bound_run(&mismatched_config));
+}
+
+#[test]
+fn available_artifact_with_non_hash_derived_storage_key_is_rejected() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let descriptor = descriptor();
+    let request = bound_run("wrong-storage-key", "wrong-storage-key-idempotency");
+    store.register_descriptor(&descriptor).unwrap();
+    database.put_artifact(
+        &request.context.manifest_artifact_id,
+        "task-1",
+        "manifest",
+        &descriptor.manifest_json,
+    );
+    database.put_artifact(
+        &request.context.effective_context_artifact_id,
+        "task-1",
+        "content",
+        CONTEXT_BYTES,
+    );
+    database.put_artifact_with_storage_key(
+        &request.run_config.run_config_artifact_id,
+        "task-1",
+        "run-config",
+        &canonical_agent_run_config_artifact(&request).unwrap(),
+        Some("objects/00/not-the-content-hash"),
+    );
+
+    assert_integrity_failure(store.create_bound_run(&request));
+}
+
+#[test]
+fn pre_persisted_context_is_reused_exactly_and_changed_payload_with_same_identity_conflicts() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let descriptor = descriptor();
+    store.register_descriptor(&descriptor).unwrap();
+    let request = bound_run("pre-persisted-context", "pre-persisted-context-key");
+    seed_default_artifacts(&database, &request, &descriptor);
+    database
+        .connection()
+        .execute(
+            "INSERT INTO context_packages (
+                id, task_id, agent_id, role, objective, manifest_artifact_id,
+                effective_content_artifact_id, content_hash, policy_snapshot_digest,
+                prompt_template_version, retrieval_pipeline_version, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                strftime('%Y-%m-%dT%H:%M:%SZ', ?12, 'unixepoch'))",
+            params![
+                request.context.context_package_id,
+                request.context.task_id.as_str(),
+                request.context.agent_id,
+                request.context.role,
+                request.context.objective,
+                request.context.manifest_artifact_id.as_str(),
+                request.context.effective_context_artifact_id.as_str(),
+                request.context.content_digest.as_str(),
+                request.context.policy_snapshot_digest.as_str(),
+                request.context.prompt_template_version,
+                request.context.retrieval_pipeline_version,
+                request.context.created_at.unix_seconds(),
+            ],
+        )
+        .unwrap();
+
+    store.create_bound_run(&request).unwrap();
+
+    let mut changed = request.clone();
+    changed.run_id = RunId::new("run-pre-persisted-context-changed").unwrap();
+    changed.idempotency_key = "pre-persisted-context-changed-key".to_owned();
+    changed.context.objective = "changed objective".to_owned();
+    assert_eq!(
+        store
+            .create_bound_run(&changed)
+            .unwrap_err()
+            .safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(
+        database
+            .connection()
+            .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -1093,23 +1177,93 @@ fn legacy_v1_run_config_artifact(request: &BoundAgentRunRequest) -> Vec<u8> {
     serde_json_canonicalizer::to_vec(&value).unwrap()
 }
 
-fn assert_replaced_run_config_rejected(suffix: &str, mutate: impl FnOnce(&mut Value)) {
+fn assert_historical_run_config_rejected(suffix: &str, mutate: impl FnOnce(&mut Value)) {
     let database = TestDatabase::new();
     let store = database.store();
     let descriptor = descriptor();
     let request = bound_run(suffix, &format!("{suffix}-key"));
     store.register_descriptor(&descriptor).unwrap();
-    seed_default_artifacts(&database, &request, &descriptor);
-    store.create_bound_run(&request).unwrap();
-    drop(store);
 
     let mut value: Value =
         serde_json::from_slice(&canonical_agent_run_config_artifact(&request).unwrap()).unwrap();
     mutate(&mut value);
     let bytes = serde_json_canonicalizer::to_vec(&value).unwrap();
-    database.replace_artifact_bytes(&request.run_config.run_config_artifact_id, &bytes);
+    seed_historical_created_run(&database, &request, &descriptor, &bytes);
+    drop(store);
 
     assert_integrity_failure(database.store().load_run(&request.run_id));
+}
+
+fn seed_historical_created_run(
+    database: &TestDatabase,
+    request: &BoundAgentRunRequest,
+    descriptor: &AgentDescriptor,
+    run_config_bytes: &[u8],
+) {
+    database.put_artifact(
+        &request.context.manifest_artifact_id,
+        "task-1",
+        "manifest",
+        &descriptor.manifest_json,
+    );
+    database.put_artifact(
+        &request.context.effective_context_artifact_id,
+        "task-1",
+        "content",
+        CONTEXT_BYTES,
+    );
+    database.put_artifact(
+        &request.run_config.run_config_artifact_id,
+        "task-1",
+        "run-config",
+        run_config_bytes,
+    );
+    let connection = database.connection();
+    connection
+        .execute(
+            "INSERT INTO context_packages (
+                id, task_id, agent_id, role, objective, manifest_artifact_id,
+                effective_content_artifact_id, content_hash, policy_snapshot_digest,
+                prompt_template_version, retrieval_pipeline_version, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                '1970-01-01T00:00:01Z')",
+            params![
+                request.context.context_package_id,
+                request.task_id.as_str(),
+                request.agent_id,
+                request.role,
+                request.context.objective,
+                request.context.manifest_artifact_id.as_str(),
+                request.context.effective_context_artifact_id.as_str(),
+                request.context.content_digest.as_str(),
+                request.context.policy_snapshot_digest.as_str(),
+                request.context.prompt_template_version,
+                request.context.retrieval_pipeline_version,
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO agent_runs (
+                id, task_id, agent_id, role, phase, status, context_package_id,
+                idempotency_key, connection_binding_digest, run_config_artifact_id,
+                supersedes_run_id, started_at, completed_at, provider_usage_json,
+                core_usage_json, estimated_cost_microunits, error_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'created', ?6, ?7, ?8, ?9, NULL,
+                NULL, NULL, NULL, NULL, NULL, NULL)",
+            params![
+                request.run_id.as_str(),
+                request.task_id.as_str(),
+                request.agent_id,
+                request.role,
+                request.phase,
+                request.context.context_package_id,
+                request.idempotency_key,
+                request.connection.binding_digest.as_str(),
+                request.run_config.run_config_artifact_id.as_str(),
+            ],
+        )
+        .unwrap();
 }
 
 #[allow(clippy::too_many_arguments)]

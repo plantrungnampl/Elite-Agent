@@ -1159,31 +1159,22 @@ fn sqlite_resume_loads_the_exact_approval_intent_and_full_request_relation() {
 fn sqlite_resume_rejects_artifacts_outside_canonical_paths() {
     for approval_artifact in [false, true] {
         let database = TempDatabase::new();
-        let (store, claim, approval_id, _) =
-            exact_approval_claim_fixture(&database, "execution-resume-wrong-path");
-        let artifact_id = if approval_artifact {
-            claim
-                .approval
-                .as_ref()
-                .unwrap()
-                .approval_artifact_id()
-                .as_str()
+        let overrides = if approval_artifact {
+            ExactApprovalArtifactOverrides {
+                approval_logical_path: Some("wrong/path.json"),
+                ..Default::default()
+            }
         } else {
-            claim.request_artifact_id.as_str()
+            ExactApprovalArtifactOverrides {
+                request_logical_path: Some("tool-requests/another-execution.json"),
+                ..Default::default()
+            }
         };
-        configured_connection(&database.path)
-            .execute(
-                "UPDATE artifacts SET logical_path = ?1 WHERE id = ?2",
-                params![
-                    if approval_artifact {
-                        "wrong/path.json"
-                    } else {
-                        "tool-requests/another-execution.json"
-                    },
-                    artifact_id,
-                ],
-            )
-            .unwrap();
+        let (store, claim, approval_id, _) = exact_approval_claim_fixture_with_overrides(
+            &database,
+            "execution-resume-wrong-path",
+            overrides,
+        );
 
         if approval_artifact {
             assert_integrity_failure(store.load_approval_request(&approval_id));
@@ -1212,17 +1203,21 @@ fn sqlite_resume_rejects_an_intent_owned_by_another_task() {
 #[test]
 fn sqlite_resume_rejects_a_request_artifact_owned_by_another_task() {
     let database = TempDatabase::new();
-    let (store, claim, _, _) =
-        exact_approval_claim_fixture(&database, "execution-resume-wrong-artifact-task");
     seed_other_task(&database);
-    configured_connection(&database.path)
-        .execute(
-            "UPDATE artifacts SET task_id = 'task-2' WHERE id = ?1",
-            [claim.request_artifact_id.as_str()],
-        )
-        .unwrap();
+    let store = SqliteStore::open(&database.path).unwrap();
+    let request = exact_tool_request("execution-resume-wrong-artifact-task");
+    let immutable = canonical_tool_request(&request).unwrap();
+    let artifact_id = ArtifactId::new("request-execution-resume-wrong-artifact-task").unwrap();
+    persist_artifact_for_task(
+        &database,
+        "task-2",
+        artifact_id.as_str(),
+        "tool-requests/execution-resume-wrong-artifact-task.json",
+        "tool-request",
+        immutable.canonical_bytes(),
+    );
 
-    assert_integrity_failure(store.load_request_artifact(&claim.request_artifact_id));
+    assert_integrity_failure(store.load_request_artifact(&artifact_id));
 }
 
 #[test]
@@ -1344,23 +1339,19 @@ fn authorized_begin_rejects_wrong_request_or_approval_artifact_kinds() {
         } else {
             "execution-wrong-request-kind"
         };
-        let (store, claim, _, _) = exact_approval_claim_fixture(&database, execution_id);
-        let artifact_id = if approval_artifact {
-            claim
-                .approval
-                .as_ref()
-                .unwrap()
-                .approval_artifact_id()
-                .as_str()
+        let overrides = if approval_artifact {
+            ExactApprovalArtifactOverrides {
+                approval_artifact_type: Some("evidence"),
+                ..Default::default()
+            }
         } else {
-            claim.request_artifact_id.as_str()
+            ExactApprovalArtifactOverrides {
+                request_artifact_type: Some("evidence"),
+                ..Default::default()
+            }
         };
-        configured_connection(&database.path)
-            .execute(
-                "UPDATE artifacts SET artifact_type = 'evidence' WHERE id = ?1",
-                [artifact_id],
-            )
-            .unwrap();
+        let (store, claim, _, _) =
+            exact_approval_claim_fixture_with_overrides(&database, execution_id, overrides);
 
         assert!(store.begin_authorized(claim).is_err());
         assert_eq!(
@@ -2343,14 +2334,12 @@ fn terminal_artifact_references_must_be_available_and_owned_by_the_task() {
             }
             "cross-task" => {
                 seed_other_task(&database);
-                let (artifact_id, _) =
-                    persist_durable_artifact(&database, "cross-task-artifact", b"cross-task");
-                configured_connection(&database.path)
-                    .execute(
-                        "UPDATE artifacts SET task_id = 'task-2' WHERE id = ?1",
-                        [artifact_id.as_str()],
-                    )
-                    .unwrap();
+                let (artifact_id, _) = persist_durable_artifact_for_task(
+                    &database,
+                    "task-2",
+                    "cross-task-artifact",
+                    b"cross-task",
+                );
                 artifact_id
             }
             _ => unreachable!(),
@@ -3084,8 +3073,18 @@ fn persist_durable_artifact(
     artifact_id: &str,
     bytes: &[u8],
 ) -> (ArtifactId, Sha256Digest) {
-    persist_artifact(
+    persist_durable_artifact_for_task(database, "task-1", artifact_id, bytes)
+}
+
+fn persist_durable_artifact_for_task(
+    database: &TempDatabase,
+    task_id: &str,
+    artifact_id: &str,
+    bytes: &[u8],
+) -> (ArtifactId, Sha256Digest) {
+    persist_artifact_for_task(
         database,
+        task_id,
         artifact_id,
         &format!("tool-output/{artifact_id}"),
         "tool-output",
@@ -3871,15 +3870,44 @@ fn exact_approval_claim_fixture(
     ApprovalId,
     local_agent_terminal_application::PolicyDecisionId,
 ) {
+    exact_approval_claim_fixture_with_overrides(
+        database,
+        execution_id,
+        ExactApprovalArtifactOverrides::default(),
+    )
+}
+
+#[derive(Default)]
+struct ExactApprovalArtifactOverrides<'a> {
+    request_logical_path: Option<&'a str>,
+    request_artifact_type: Option<&'a str>,
+    approval_logical_path: Option<&'a str>,
+    approval_artifact_type: Option<&'a str>,
+}
+
+fn exact_approval_claim_fixture_with_overrides(
+    database: &TempDatabase,
+    execution_id: &str,
+    overrides: ExactApprovalArtifactOverrides<'_>,
+) -> (
+    SqliteStore,
+    AuthorizedToolExecutionClaim,
+    ApprovalId,
+    local_agent_terminal_application::PolicyDecisionId,
+) {
     let store = SqliteStore::open(&database.path).unwrap();
     let request = exact_tool_request(execution_id);
     let immutable = canonical_tool_request(&request).unwrap();
     let request_artifact_id = ArtifactId::new(format!("request-{execution_id}")).unwrap();
-    persist_artifact(
+    let default_request_path = format!("tool-requests/{execution_id}.json");
+    persist_artifact_for_task(
         database,
+        "task-1",
         request_artifact_id.as_str(),
-        &format!("tool-requests/{execution_id}.json"),
-        "tool-request",
+        overrides
+            .request_logical_path
+            .unwrap_or(&default_request_path),
+        overrides.request_artifact_type.unwrap_or("tool-request"),
         immutable.canonical_bytes(),
     );
     store
@@ -3947,11 +3975,17 @@ fn exact_approval_claim_fixture(
         bound.payload().clone(),
     )
     .unwrap();
-    persist_artifact(
+    let default_approval_path = format!("approvals/{}.json", approval_id.as_str());
+    persist_artifact_for_task(
         database,
+        "task-1",
         approval_artifact_id.as_str(),
-        &format!("approvals/{}.json", approval_id.as_str()),
-        "approval-payload",
+        overrides
+            .approval_logical_path
+            .unwrap_or(&default_approval_path),
+        overrides
+            .approval_artifact_type
+            .unwrap_or("approval-payload"),
         &approval.canonical_payload().canonical_bytes,
     );
     let connection = configured_connection(&database.path);
@@ -4305,6 +4339,17 @@ fn persist_artifact(
     artifact_type: &str,
     bytes: &[u8],
 ) {
+    persist_artifact_for_task(database, "task-1", id, logical_path, artifact_type, bytes);
+}
+
+fn persist_artifact_for_task(
+    database: &TempDatabase,
+    task_id: &str,
+    id: &str,
+    logical_path: &str,
+    artifact_type: &str,
+    bytes: &[u8],
+) {
     let hash = format!("sha256:{:x}", Sha256::digest(bytes));
     let storage_key = format!("objects/{}", &hash[7..]);
     let object = database.directory.join(&storage_key);
@@ -4316,10 +4361,11 @@ fn persist_artifact(
                 id, task_id, project_id, artifact_type, logical_path, content_hash, storage_key,
                 size_bytes, mime_type, availability, created_by_type, created_by_id, created_at,
                 supersedes, verification_state
-             ) VALUES (?1, 'task-1', 'project-1', ?2, ?3, ?4, ?5, ?6, NULL, 'available',
+             ) VALUES (?1, ?2, 'project-1', ?3, ?4, ?5, ?6, ?7, NULL, 'available',
                 'tool', 'execution', '2026-07-23T12:00:00Z', NULL, 'hash_verified')",
             params![
                 id,
+                task_id,
                 artifact_type,
                 logical_path,
                 hash,

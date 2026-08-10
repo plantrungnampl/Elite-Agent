@@ -106,11 +106,12 @@ pub use plan_approval::{
     CompareAndExpirePlanApproval, CompareAndInvalidatePlanApproval, CompareAndResolvePlanApproval,
     InvalidatePlanApproval, InvalidatePlanApprovalInput, NewPlanApproval,
     NewPlanApprovalRehydration, PlanApprovalAction, PlanApprovalAuthorityBinding,
-    PlanApprovalBindingInput, PlanApprovalCurrentState, PlanApprovalExpiry,
-    PlanApprovalInvalidation, PlanApprovalRequestArtifact, PlanApprovalResolution,
-    PlanApprovalState, PlanApprovalStore, PlanApprovalTerminal, PreparePlanApprovalRequest,
-    PreparePlanApprovalRequestInput, ResolvePlanApproval, ResolvePlanApprovalInput,
-    StoredPlanApproval, StoredPlanApprovalRehydration,
+    PlanApprovalBindingInput, PlanApprovalCurrentAuthority, PlanApprovalCurrentAuthoritySource,
+    PlanApprovalCurrentState, PlanApprovalExpiry, PlanApprovalInvalidation,
+    PlanApprovalRequestArtifact, PlanApprovalResolution, PlanApprovalState, PlanApprovalStore,
+    PlanApprovalTerminal, PreparePlanApprovalRequest, PreparePlanApprovalRequestInput,
+    ResolvePlanApproval, ResolvePlanApprovalInput, StoredPlanApproval,
+    StoredPlanApprovalRehydration,
 };
 pub use policy::{
     bind_disclosure_channel, parse_policy_timestamp, DisclosureChannel, DisclosureContextProvider,
@@ -122,8 +123,8 @@ pub use policy::{
 pub use ports::{
     AppendOperation, AppendResult, ArtifactContent, ArtifactJournal, ArtifactJournalEntry,
     ArtifactJournalInvalidation, ArtifactJournalStatus, ArtifactJournalTransition, ArtifactRef,
-    ArtifactStore, ArtifactUnavailableState, ArtifactWriteReservation, Clock, EventStore,
-    IdGenerator, NewArtifact, NewEvent, ProjectionChange, ReservedArtifact, TaskQuery,
+    ArtifactRootReader, ArtifactStore, ArtifactUnavailableState, ArtifactWriteReservation, Clock,
+    EventStore, IdGenerator, NewArtifact, NewEvent, ProjectionChange, ReservedArtifact, TaskQuery,
     WorkspaceEvidenceStore, WorkspaceMutationStore,
 };
 pub use repository::{

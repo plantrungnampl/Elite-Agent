@@ -383,9 +383,9 @@ fn incomplete_metadata_mismatch_quarantines_staging_once() {
     Connection::open(&fixture.database_path)
         .unwrap()
         .execute(
-            "UPDATE artifacts SET content_hash = ?1, storage_key = ?2
-             WHERE id = 'artifact-metadata'",
-            params![WORLD_HASH, format!("objects/48/{}", &WORLD_HASH[7..])],
+            "UPDATE artifact_operations SET expected_hash = ?1
+             WHERE id = 'operation-metadata'",
+            [WORLD_HASH],
         )
         .unwrap();
 
@@ -445,9 +445,9 @@ fn completed_metadata_mismatch_quarantines_staging_once() {
     Connection::open(&fixture.database_path)
         .unwrap()
         .execute(
-            "UPDATE artifacts SET content_hash = ?1, storage_key = ?2
-             WHERE id = 'artifact-completed-metadata'",
-            params![WORLD_HASH, format!("objects/48/{}", &WORLD_HASH[7..])],
+            "UPDATE artifact_operations SET expected_hash = ?1
+             WHERE id = 'operation-completed-metadata'",
+            [WORLD_HASH],
         )
         .unwrap();
 

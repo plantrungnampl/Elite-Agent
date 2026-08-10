@@ -1,13 +1,14 @@
-use std::fs;
-use std::path::{Component, Path};
+use std::path::Path;
 
 use local_agent_terminal_application::{
-    AgentRunStore, PortError, Retryability, SafeErrorClassification,
+    AgentRunStore, ArtifactRef, ArtifactRootReader, DeliberationRunAssignment, PortError,
+    Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
-    AgentDescriptor, AgentRunLimits, AgentRunSnapshot, AgentRunStatus, AgentRunTerminal,
-    AgentUsage, ArtifactId, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
-    BoundGenerationParameters, BoundRunConfig, RunId, Sha256Digest, TaskId, Timestamp, TrustTier,
+    ActorId, AgentDescriptor, AgentFamilyKey, AgentRunLimits, AgentRunSnapshot, AgentRunStatus,
+    AgentRunTerminal, AgentUsage, ArtifactId, BoundAgentConnection, BoundAgentRunRequest,
+    BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, RunId, Sha256Digest, TaskId,
+    Timestamp, TrustTier,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
@@ -277,6 +278,7 @@ impl AgentRunStore for SqliteStore {
     ) -> Result<AgentRunSnapshot, PortError> {
         request.validate().map_err(|_| invalid_input())?;
         let expected_run_config = canonical_agent_run_config_artifact(request)?;
+        let artifact_reader = configured_artifact_reader(self)?;
         let mut connection = self.connection().map_err(open_error_to_port)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -285,27 +287,33 @@ impl AgentRunStore for SqliteStore {
         let manifest = verify_descriptor(&transaction, request)?;
         let manifest_artifact = load_available_artifact(
             &transaction,
+            artifact_reader,
             &request.context.manifest_artifact_id,
             &request.task_id,
-            MANIFEST_ARTIFACT_KIND,
+            Some(MANIFEST_ARTIFACT_KIND),
             Some(request.run_config.manifest_digest.as_str()),
+            None,
         )?;
         if manifest_artifact.bytes != manifest {
             return Err(integrity_failure());
         }
         load_available_artifact(
             &transaction,
+            artifact_reader,
             &request.context.effective_context_artifact_id,
             &request.task_id,
-            CONTEXT_ARTIFACT_KIND,
+            Some(CONTEXT_ARTIFACT_KIND),
             Some(request.context.content_digest.as_str()),
+            None,
         )?;
         let run_config_artifact = load_available_artifact(
             &transaction,
+            artifact_reader,
             &request.run_config.run_config_artifact_id,
             &request.task_id,
-            RUN_CONFIG_ARTIFACT_KIND,
+            Some(RUN_CONFIG_ARTIFACT_KIND),
             Some(digest_bytes(&expected_run_config).as_str()),
+            None,
         )?;
         if run_config_artifact.bytes != expected_run_config {
             return Err(integrity_failure());
@@ -350,7 +358,7 @@ impl AgentRunStore for SqliteStore {
             if bound_run_id.as_deref() != Some(request.run_id.as_str()) {
                 return Err(conflict());
             }
-            let snapshot = load_run_on_connection(&transaction, &request.run_id)?
+            let snapshot = load_run_on_connection(&transaction, artifact_reader, &request.run_id)?
                 .ok_or_else(integrity_failure)?;
             if snapshot.request != *request {
                 return Err(conflict());
@@ -424,12 +432,13 @@ impl AgentRunStore for SqliteStore {
     fn persist_terminal(&self, terminal: &AgentRunTerminal) -> Result<(), PortError> {
         terminal.validate().map_err(|_| invalid_input())?;
         let completed_at = terminal.core_received_at.ok_or_else(invalid_input)?;
+        let artifact_reader = configured_artifact_reader(self)?;
         let mut connection = self.connection().map_err(open_error_to_port)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
-        let mut snapshot =
-            load_run_on_connection(&transaction, &terminal.run_id)?.ok_or_else(not_found)?;
+        let mut snapshot = load_run_on_connection(&transaction, artifact_reader, &terminal.run_id)?
+            .ok_or_else(not_found)?;
         if snapshot.request.task_id != terminal.task_id {
             return Err(invalid_input());
         }
@@ -439,9 +448,11 @@ impl AgentRunStore for SqliteStore {
             .map_err(|_| conflict())?;
         load_available_artifact(
             &transaction,
+            artifact_reader,
             &terminal.message.content_artifact_id,
             &terminal.task_id,
-            MESSAGE_ARTIFACT_KIND,
+            Some(MESSAGE_ARTIFACT_KIND),
+            None,
             None,
         )?;
         let receipt_time = format_timestamp(&transaction, completed_at)?;
@@ -529,8 +540,9 @@ impl AgentRunStore for SqliteStore {
     }
 
     fn load_run(&self, run_id: &RunId) -> Result<Option<AgentRunSnapshot>, PortError> {
+        let artifact_reader = configured_artifact_reader(self)?;
         let connection = self.connection().map_err(open_error_to_port)?;
-        load_run_on_connection(&connection, run_id)
+        load_run_on_connection(&connection, artifact_reader, run_id)
     }
 }
 
@@ -679,6 +691,7 @@ struct RawRun {
 
 fn load_run_on_connection(
     connection: &Connection,
+    artifact_reader: &dyn ArtifactRootReader,
     run_id: &RunId,
 ) -> Result<Option<AgentRunSnapshot>, PortError> {
     let raw = connection
@@ -724,20 +737,26 @@ fn load_run_on_connection(
         )
         .optional()
         .map_err(sqlite_error_to_port)?;
-    raw.map(|raw| snapshot_from_raw(connection, raw))
+    raw.map(|raw| snapshot_from_raw(connection, artifact_reader, raw))
         .transpose()
 }
 
-fn snapshot_from_raw(connection: &Connection, raw: RawRun) -> Result<AgentRunSnapshot, PortError> {
+fn snapshot_from_raw(
+    connection: &Connection,
+    artifact_reader: &dyn ArtifactRootReader,
+    raw: RawRun,
+) -> Result<AgentRunSnapshot, PortError> {
     let task_id = TaskId::new(raw.task_id).map_err(|_| integrity_failure())?;
     let run_id = RunId::new(raw.id).map_err(|_| integrity_failure())?;
     let run_config_artifact_id =
         ArtifactId::new(raw.run_config_artifact_id).map_err(|_| integrity_failure())?;
     let artifact = load_available_artifact(
         connection,
+        artifact_reader,
         &run_config_artifact_id,
         &task_id,
-        RUN_CONFIG_ARTIFACT_KIND,
+        Some(RUN_CONFIG_ARTIFACT_KIND),
+        None,
         None,
     )?;
     let (run_config, connection_binding) = parse_run_config_artifact(&artifact.bytes)?;
@@ -779,18 +798,22 @@ fn snapshot_from_raw(connection: &Connection, raw: RawRun) -> Result<AgentRunSna
     };
     let manifest_artifact = load_available_artifact(
         connection,
+        artifact_reader,
         &request.context.manifest_artifact_id,
         &request.task_id,
-        MANIFEST_ARTIFACT_KIND,
+        Some(MANIFEST_ARTIFACT_KIND),
         Some(request.run_config.manifest_digest.as_str()),
+        None,
     )?;
     verify_historical_run_binding(&request, &manifest_artifact.bytes)?;
     load_available_artifact(
         connection,
+        artifact_reader,
         &request.context.effective_context_artifact_id,
         &request.task_id,
-        CONTEXT_ARTIFACT_KIND,
+        Some(CONTEXT_ARTIFACT_KIND),
         Some(request.context.content_digest.as_str()),
+        None,
     )?;
     let status = parse_status(&raw.status).ok_or_else(integrity_failure)?;
     let accepted_at = load_run_event_timestamp(connection, &run_id, "agent.run.accepted")?;
@@ -977,10 +1000,12 @@ fn insert_or_verify_context(
 
 fn load_available_artifact(
     connection: &Connection,
+    artifact_reader: &dyn ArtifactRootReader,
     artifact_id: &ArtifactId,
     task_id: &TaskId,
-    expected_kind: &str,
+    expected_kind: Option<&str>,
     expected_hash: Option<&str>,
+    expected_size: Option<u64>,
 ) -> Result<ArtifactBytes, PortError> {
     let artifact: Option<(Option<String>, String, String, String, i64, String)> = connection
         .query_row(
@@ -1007,27 +1032,159 @@ fn load_available_artifact(
         return Err(integrity_failure());
     };
     if owner.as_deref() != Some(task_id.as_str())
-        || kind != expected_kind
+        || expected_kind.is_some_and(|expected| expected != kind)
         || expected_hash.is_some_and(|expected| expected != content_hash)
+        || expected_size.is_some_and(|expected| i64::try_from(expected).ok() != Some(size_bytes))
     {
         return Err(integrity_failure());
     }
-    let relative = Path::new(&storage_key);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(integrity_failure());
-    }
-    let bytes =
-        fs::read(Path::new(&artifact_root).join(relative)).map_err(|_| integrity_failure())?;
-    if i64::try_from(bytes.len()).ok() != Some(size_bytes)
-        || digest_bytes(&bytes).as_str() != content_hash
-    {
-        return Err(integrity_failure());
-    }
-    Ok(ArtifactBytes { bytes })
+    let content_hash = Sha256Digest::new(content_hash).map_err(|_| integrity_failure())?;
+    let size_bytes = u64::try_from(size_bytes).map_err(|_| integrity_failure())?;
+    let content = artifact_reader
+        .read_from_root(
+            Path::new(&artifact_root),
+            &ArtifactRef {
+                content_hash: content_hash.as_str().to_owned(),
+                storage_key,
+                size_bytes,
+            },
+        )
+        .map_err(|_| integrity_failure())?;
+    Ok(ArtifactBytes {
+        bytes: content.bytes,
+    })
+}
+
+pub(crate) fn validate_available_artifact(
+    connection: &Connection,
+    artifact_reader: &dyn ArtifactRootReader,
+    artifact_id: &ArtifactId,
+    task_id: &TaskId,
+    expected_hash: Option<&str>,
+    expected_size: Option<u64>,
+) -> Result<(), PortError> {
+    load_available_artifact(
+        connection,
+        artifact_reader,
+        artifact_id,
+        task_id,
+        None,
+        expected_hash,
+        expected_size,
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn validate_available_artifact_kind(
+    connection: &Connection,
+    artifact_reader: &dyn ArtifactRootReader,
+    artifact_id: &ArtifactId,
+    task_id: &TaskId,
+    expected_kind: &str,
+    expected_hash: Option<&str>,
+    expected_size: Option<u64>,
+) -> Result<(), PortError> {
+    load_available_artifact(
+        connection,
+        artifact_reader,
+        artifact_id,
+        task_id,
+        Some(expected_kind),
+        expected_hash,
+        expected_size,
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn read_available_artifact(
+    connection: &Connection,
+    artifact_reader: &dyn ArtifactRootReader,
+    artifact_id: &ArtifactId,
+    task_id: &TaskId,
+    expected_hash: Option<&str>,
+    expected_size: Option<u64>,
+) -> Result<Vec<u8>, PortError> {
+    load_available_artifact(
+        connection,
+        artifact_reader,
+        artifact_id,
+        task_id,
+        None,
+        expected_hash,
+        expected_size,
+    )
+    .map(|artifact| artifact.bytes)
+}
+
+pub(crate) fn load_deliberation_run_assignments(
+    connection: &Connection,
+    artifact_reader: &dyn ArtifactRootReader,
+    task_id: &TaskId,
+) -> Result<Vec<DeliberationRunAssignment>, PortError> {
+    let rows = {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, agent_id, role, context_package_id,
+                        run_config_artifact_id, connection_binding_digest
+                 FROM agent_runs WHERE task_id = ?1 ORDER BY id",
+            )
+            .map_err(sqlite_error_to_port)?;
+        let rows = statement
+            .query_map([task_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(sqlite_error_to_port)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_error_to_port)?;
+        rows
+    };
+
+    rows.into_iter()
+        .map(
+            |(run_id, agent_id, role, context_package_id, artifact_id, binding_digest)| {
+                let artifact_id = ArtifactId::new(artifact_id).map_err(|_| integrity_failure())?;
+                let artifact = load_available_artifact(
+                    connection,
+                    artifact_reader,
+                    &artifact_id,
+                    task_id,
+                    Some(RUN_CONFIG_ARTIFACT_KIND),
+                    None,
+                    None,
+                )?;
+                let (config, binding) = parse_run_config_artifact(&artifact.bytes)?;
+                if config.run_config_artifact_id != artifact_id
+                    || config.task_id != *task_id
+                    || config.agent_id != agent_id
+                    || config.role != role
+                    || config.context_package_id != context_package_id
+                    || binding.agent_id != agent_id
+                    || binding.binding_digest.as_str() != binding_digest
+                    || config.trust_tier != binding.trust_tier
+                    || config.manifest_digest != binding.manifest_digest
+                    || config.executable_digest != binding.executable_digest
+                    || config.contract_version != binding.contract_version
+                    || config.adapter_version != binding.adapter_version
+                {
+                    return Err(integrity_failure());
+                }
+                DeliberationRunAssignment::new(
+                    RunId::new(run_id).map_err(|_| integrity_failure())?,
+                    agent_id.clone(),
+                    AgentFamilyKey::from_provider_model(&config.provider_id, &config.model_id)
+                        .map_err(|_| integrity_failure())?,
+                    ActorId::new(agent_id).map_err(|_| integrity_failure())?,
+                )
+            },
+        )
+        .collect()
 }
 
 fn append_run_event(
@@ -1315,6 +1472,10 @@ fn digest_bytes(bytes: &[u8]) -> Sha256Digest {
         .expect("SHA-256 formatting is valid")
 }
 
+fn configured_artifact_reader(store: &SqliteStore) -> Result<&dyn ArtifactRootReader, PortError> {
+    store.artifact_reader().ok_or_else(unavailable)
+}
+
 fn transport_type(trust_tier: TrustTier) -> &'static str {
     if matches!(trust_tier, TrustTier::CoreAdapter) {
         "in_process"
@@ -1363,6 +1524,13 @@ fn integrity_failure() -> PortError {
     PortError::failure(
         SafeErrorClassification::IntegrityFailure,
         Retryability::NonRetryable,
+    )
+}
+
+fn unavailable() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::Unavailable,
+        Retryability::Retryable,
     )
 }
 

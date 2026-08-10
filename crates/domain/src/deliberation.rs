@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use sha2::{Digest, Sha256};
+
 use crate::{
     ActorId, ArtifactId, EvidenceCitation, EvidenceFreshness, GitObjectId, RunId, Sha256Digest,
     StructuredToolName, TaskId, Timestamp,
@@ -75,6 +77,22 @@ impl AgentFamilyKey {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn from_provider_model(
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<Self, DeliberationError> {
+        if !valid_identifier(provider_id) || !valid_identifier(model_id) {
+            return Err(DeliberationError::InvalidIdentity);
+        }
+        let value = serde_json::json!({
+            "modelId": model_id,
+            "providerId": provider_id,
+        });
+        let canonical = serde_json_canonicalizer::to_vec(&value)
+            .map_err(|_| DeliberationError::InvalidIdentity)?;
+        Self::new(format!("sha256:{:x}", Sha256::digest(canonical)))
     }
 }
 

@@ -230,13 +230,13 @@ git commit -m "feat: define context deliberation use cases"
 - Modify: `crates/storage-sqlite/tests/schema_health.rs`
 - Modify: `crates/storage-sqlite/tests/agent_store.rs`
 
-- [ ] **Step 1 - Write failing migration and context-store tests**
+- [x] **Step 1 - Write failing migration and context-store tests**
 
 Use the existing normative `source_documents`, `source_chunks`, `context_packages`, and `context_package_policy_decisions` tables. Add only adapter-hardening migration triggers/indexes required for immutable package fields, safe source-state transitions, and immutable package-policy relations; do not modify the normative SQL.
 
 Test idempotent exact replay, conflict on changed canonical bytes, denied documents without chunks/content artifacts, redacted logical identifiers, current-to-stale transition, revision/hash lookup, package-before-run persistence, all policy links, and unavailable/tampered artifact rejection.
 
-- [ ] **Step 2 - Write failing private-deliberation and approval tests**
+- [x] **Step 2 - Write failing private-deliberation and approval tests**
 
 Persist private proposal receipt as immutable artifact/event without a shared `messages` projection. Publish proposal projections atomically only after quorum. Persist review edges, thread summaries, claim sets, verification sets, decision drafts, objections, and supersession through exact artifact/event references.
 
@@ -246,7 +246,7 @@ Use `approvals` with `approval_type = plan` through a dedicated application port
 cargo test -p local-agent-terminal-storage-sqlite --test context_store --test deliberation_store --test plan_approval_store --test schema_health --test agent_store
 ```
 
-- [ ] **Step 3 - Implement transactional adapters and recovery reads**
+- [x] **Step 3 - Implement transactional adapters and recovery reads**
 
 Keep authoritative payload bytes in the content-addressed artifact store; SQLite stores verified references and projections. Reuse optimistic stream versions and `ProjectionChange::TaskState` so phase events and task projections commit atomically. Do not add a mutable in-memory sole source.
 

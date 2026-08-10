@@ -9,6 +9,19 @@ use local_agent_terminal_domain::{
 };
 
 #[test]
+fn provider_model_family_key_is_collision_resistant_and_bounded() {
+    let left = AgentFamilyKey::from_provider_model("a/b", "c").unwrap();
+    let right = AgentFamilyKey::from_provider_model("a", "b/c").unwrap();
+    assert_ne!(left, right);
+
+    let maximum_identifier = "x".repeat(256);
+    let family =
+        AgentFamilyKey::from_provider_model(&maximum_identifier, &maximum_identifier).unwrap();
+    assert!(family.as_str().starts_with("sha256:"));
+    assert_eq!(family.as_str().len(), 71);
+}
+
+#[test]
 fn quorum_requires_distinct_run_agent_and_exact_family_identity() {
     let first = proposal("run-1", "agent-1", "family-a", "proposal-1");
 

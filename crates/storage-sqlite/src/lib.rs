@@ -3,10 +3,13 @@
 mod agent_store;
 mod approval_store;
 mod artifact_journal;
+mod context_store;
+mod deliberation_store;
 mod event_store;
 mod health;
 mod lease_store;
 mod migrations;
+mod plan_approval_store;
 mod policy_store;
 mod project_store;
 mod task_query;
@@ -14,9 +17,13 @@ mod tool_activity;
 mod tool_execution_store;
 mod workspace_store;
 
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use local_agent_terminal_application::{Clock, PortError};
+use local_agent_terminal_application::{
+    ArtifactRootReader, Clock, PlanApprovalCurrentAuthoritySource, PortError,
+};
 use rusqlite::Connection;
 
 pub use agent_store::canonical_agent_run_config_artifact;
@@ -24,9 +31,28 @@ pub use health::{artifact_root_health, ArtifactRootIssue, DatabaseHealth, Databa
 pub use lease_store::CoreSystemRunRequest;
 pub use migrations::{migration_checksum, OpenError};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SqliteStore {
     path: PathBuf,
+    artifact_reader: Option<Arc<dyn ArtifactRootReader>>,
+    plan_approval_authority_source: Option<Arc<dyn PlanApprovalCurrentAuthoritySource>>,
+}
+
+impl fmt::Debug for SqliteStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SqliteStore")
+            .field("path", &self.path)
+            .field(
+                "artifact_reader_configured",
+                &self.artifact_reader.is_some(),
+            )
+            .field(
+                "plan_approval_authority_source_configured",
+                &self.plan_approval_authority_source.is_some(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +69,8 @@ impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OpenError> {
         let store = Self {
             path: path.as_ref().to_owned(),
+            artifact_reader: None,
+            plan_approval_authority_source: None,
         };
         let mut connection = Connection::open(&store.path)?;
         migrations::reject_unknown_schema_without_mutation(&connection)?;
@@ -50,6 +78,21 @@ impl SqliteStore {
         migrations::validate_or_migrate(&mut connection)?;
         initialize_connection(&connection)?;
         Ok(store)
+    }
+
+    #[must_use]
+    pub fn with_artifact_reader(mut self, reader: Arc<dyn ArtifactRootReader>) -> Self {
+        self.artifact_reader = Some(reader);
+        self
+    }
+
+    #[must_use]
+    pub fn with_plan_approval_authority_source(
+        mut self,
+        source: Arc<dyn PlanApprovalCurrentAuthoritySource>,
+    ) -> Self {
+        self.plan_approval_authority_source = Some(source);
+        self
     }
 
     pub fn pragma_settings(&self) -> Result<PragmaSettings, OpenError> {
@@ -70,6 +113,16 @@ impl SqliteStore {
         let connection = Connection::open(&self.path)?;
         initialize_connection(&connection)?;
         Ok(connection)
+    }
+
+    pub(crate) fn plan_approval_authority_source(
+        &self,
+    ) -> Option<&dyn PlanApprovalCurrentAuthoritySource> {
+        self.plan_approval_authority_source.as_deref()
+    }
+
+    pub(crate) fn artifact_reader(&self) -> Option<&dyn ArtifactRootReader> {
+        self.artifact_reader.as_deref()
     }
 }
 
