@@ -415,7 +415,7 @@ git diff --check
 
 Expected: every command exits 0.
 
-- [ ] **Step 3: Synchronize plan and progress checkboxes**
+- [x] **Step 3: Synchronize plan and progress checkboxes**
 
 Only after review and all gates pass:
 
@@ -424,7 +424,7 @@ Only after review and all gates pass:
 3. update `.superpowers/sdd/progress.md` with Task 4 completion evidence and the exact gate commands;
 4. confirm `docs/multi-agent-terminal-design/**` remains unchanged.
 
-- [ ] **Step 4: Commit the remaining parent Task 4 implementation**
+- [x] **Step 4: Commit the remaining parent Task 4 implementation**
 
 Run:
 

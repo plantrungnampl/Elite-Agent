@@ -252,7 +252,7 @@ Keep authoritative payload bytes in the content-addressed artifact store; SQLite
 
 Keep `create_bound_run` compatible with M3: it may idempotently verify an already-persisted context package but must reject a different package with the same identity.
 
-- [ ] **Step 4 - Run crash/reopen regressions and commit**
+- [x] **Step 4 - Run crash/reopen regressions and commit**
 
 ```powershell
 cargo fmt --all -- --check
