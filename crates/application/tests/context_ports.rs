@@ -436,8 +436,8 @@ fn denied_content_never_reaches_artifact_or_index_ports() {
         .artifacts
         .iter()
         .all(|artifact| !artifact.bytes.windows(6).any(|bytes| bytes == b"SECRET")));
-    assert_eq!(package.policy().decision_ids().len(), 2);
-    assert_eq!(state.links.len(), 2);
+    assert_eq!(package.policy().decision_ids().len(), 3);
+    assert_eq!(state.links.len(), 3);
 }
 
 #[test]

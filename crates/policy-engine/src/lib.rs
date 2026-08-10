@@ -17,6 +17,7 @@ mod bundle;
 mod classification;
 mod redaction;
 
+pub use classification::PolicyContextSourceClassifier;
 pub use redaction::{RedactionEntry, RedactionReport};
 
 use classification::PolicyRuleV1;

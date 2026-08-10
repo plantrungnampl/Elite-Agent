@@ -6,6 +6,7 @@ members = [
     "crates/agent-runtime",
     "crates/provider-openai",
     "crates/bootstrap",
+    "crates/context-engine",
     "crates/domain",
     "crates/policy-engine",
     "crates/platform-core",

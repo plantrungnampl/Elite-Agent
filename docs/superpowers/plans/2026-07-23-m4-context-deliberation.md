@@ -286,19 +286,19 @@ git commit -m "feat: persist m4 context deliberation state"
 - Modify: `crates/policy-engine/src/classification.rs`
 - Create: `crates/policy-engine/tests/context_disclosure.rs`
 
-- [ ] **Step 1 - Write failing coherent source-reader tests**
+- [x] **Step 1 - Write failing coherent source-reader tests**
 
 Enumerate the committed base tree through libgit2 without checkout/process execution. Overlay any accepted current tracked-worktree bytes only when they are bound to one coherent workspace fingerprint; label committed and overlay revisions distinctly. Reject repository identity changes, blob/hash mismatch, submodule/symlink/device ambiguity, path traversal, unsupported binary/oversized content, and mutation during capture. Prove HEAD/index/worktree bytes are unchanged.
 
-- [ ] **Step 2 - Write failing pre-index filtering tests**
+- [x] **Step 2 - Write failing pre-index filtering tests**
 
 Use recording persistence ports and fake canaries to prove metadata disclosure precedes content disclosure, both precede chunk/index/artifact writes, all deny/scan failures fail closed, denied names become stable redacted identifiers, prompt-injection and secret patterns are redacted or denied, and no original canary occurs in persisted/indexed/diagnostic output.
 
-- [ ] **Step 3 - Write failing keyword/metadata retrieval tests**
+- [x] **Step 3 - Write failing keyword/metadata retrieval tests**
 
 Test exact path/symbol/term ranking, role relevance, accepted-decision boost, deterministic tie order, hash deduplication, metadata-only degraded mode, current/stale/failed/denied states, changed revision rejection, and bounded result count. Do not add FTS/vector/graph dependencies; a deterministic normalized inverted map is sufficient and rebuildable.
 
-- [ ] **Step 4 - Write failing package-builder tests**
+- [x] **Step 4 - Write failing package-builder tests**
 
 Use a conservative `byte-token-v1` budget where one retained UTF-8 byte consumes at least one budget unit; this may underfill but cannot overrun the provider-neutral cap. Test role-sensitive allocations, response reserve, stable serialization, exact artifact digest, all policy relations, redaction/provenance completeness, final serialized-payload disclosure, and unchanged source citation identity.
 
@@ -308,11 +308,11 @@ cargo test -p local-agent-terminal-policy-engine --test context_disclosure
 cargo test -p local-agent-terminal-context-engine
 ```
 
-- [ ] **Step 5 - Implement the minimum engine and adapters**
+- [x] **Step 5 - Implement the minimum engine and adapters**
 
 Chunk UTF-8 text on bounded line/paragraph boundaries; preserve path, revision, content hash, line range, language, and optional supplied symbol. Keep the index non-authoritative and rebuildable. Avoid speculative parsers, embeddings, caches, or generic plugin abstractions.
 
-- [ ] **Step 6 - Verify security/regressions and commit**
+- [x] **Step 6 - Verify security/regressions and commit**
 
 ```powershell
 cargo fmt --all -- --check

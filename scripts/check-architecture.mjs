@@ -107,6 +107,7 @@ function verifyCargo(metadata, requireM3, requireM4) {
       new Set(["serde", "serde_json", "serde_json_canonicalizer", "sha2", "time"]),
     ],
     [domain, new Set(["serde", "serde_json", "serde_json_canonicalizer", "sha2"])],
+    [contextEngine, new Set(["serde", "serde_json", "serde_json_canonicalizer", "sha2"])],
     [
       "local-agent-terminal-policy-engine",
       new Set(["serde", "serde_json", "serde_json_canonicalizer", "sha2"]),

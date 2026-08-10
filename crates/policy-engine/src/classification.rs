@@ -4,7 +4,79 @@ use local_agent_terminal_domain::{
 };
 use serde::Deserialize;
 
+use local_agent_terminal_application::{
+    ContextArtifactRef, ContextClassificationOutcome, ContextSensitivity,
+    ContextSourceClassification, ContextSourceClassifier, SourceClassificationRequest,
+};
+use local_agent_terminal_domain::{ArtifactId, Timestamp};
+
 use crate::{invalid_input, PolicyBundleV1, PolicyDecision, PortError, Sha256Digest};
+
+#[derive(Debug, Clone, Copy)]
+pub struct PolicyContextSourceClassifier {
+    classified_at: Timestamp,
+}
+
+impl PolicyContextSourceClassifier {
+    pub fn new(classified_at: Timestamp) -> Result<Self, PortError> {
+        if classified_at.unix_seconds() <= 0 {
+            return Err(invalid_input());
+        }
+        Ok(Self { classified_at })
+    }
+}
+
+impl ContextSourceClassifier for PolicyContextSourceClassifier {
+    fn classify(
+        &self,
+        request: SourceClassificationRequest,
+    ) -> Result<ContextClassificationOutcome, PortError> {
+        let sensitivity = classify_source_path(request.identity().path_identity());
+        let evidence_bytes = serde_json_canonicalizer::to_vec(&serde_json::json!({
+            "schema": "context-source-classification.v1",
+            "requestDigest": request.request_digest().as_str(),
+            "sensitivity": sensitivity_name(sensitivity),
+            "classifiedAtUnixSeconds": self.classified_at.unix_seconds(),
+        }))
+        .map_err(|_| invalid_input())?;
+        let evidence_digest = crate::digest_bytes(&evidence_bytes)?;
+        let evidence = ContextArtifactRef::new(
+            ArtifactId::new(format!(
+                "context-classification-{}",
+                evidence_digest.as_str().trim_start_matches("sha256:")
+            ))
+            .map_err(|_| invalid_input())?,
+            evidence_digest,
+            u64::try_from(evidence_bytes.len()).map_err(|_| invalid_input())?,
+        )?;
+        Ok(ContextClassificationOutcome {
+            classification: ContextSourceClassification::issue(
+                &request,
+                sensitivity,
+                evidence,
+                self.classified_at,
+            )?,
+            evidence_bytes,
+        })
+    }
+}
+
+fn classify_source_path(path: &str) -> ContextSensitivity {
+    if is_secret_filename(path) {
+        ContextSensitivity::Secret
+    } else {
+        ContextSensitivity::InternalCode
+    }
+}
+
+const fn sensitivity_name(sensitivity: ContextSensitivity) -> &'static str {
+    match sensitivity {
+        ContextSensitivity::Public => "public",
+        ContextSensitivity::InternalCode => "internal-code",
+        ContextSensitivity::Restricted => "restricted",
+        ContextSensitivity::Secret => "secret",
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]

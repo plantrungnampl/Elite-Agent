@@ -1,5 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod context_source;
 mod hazards;
 mod inspect;
 mod paths;
@@ -20,6 +21,8 @@ use local_agent_terminal_application::{
 };
 use local_agent_terminal_domain::{GitObjectId, TaskId};
 use sha2::{Digest, Sha256};
+
+pub use context_source::GitRepositoryContextSource;
 
 pub struct GitStructuredTools {
     registrations: Vec<GitWorktreeRegistration>,

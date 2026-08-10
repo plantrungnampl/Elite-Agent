@@ -149,26 +149,45 @@ pub struct SourceClassificationRequest {
 }
 
 impl SourceClassificationRequest {
+    pub fn new(
+        task_id: TaskId,
+        document_id: impl Into<String>,
+        member_id: impl Into<String>,
+        identity: SourceIdentity,
+        content_artifact: ContextArtifactRef,
+    ) -> Result<Self, PortError> {
+        content_artifact.validate()?;
+        let document_id = validated_label(document_id)?;
+        let member_id = validated_label(member_id)?;
+        let request_digest = classification_request_digest(
+            &task_id,
+            &document_id,
+            &member_id,
+            &identity,
+            &content_artifact,
+        )?;
+        Ok(Self {
+            task_id,
+            document_id,
+            member_id,
+            identity,
+            content_artifact,
+            request_digest,
+        })
+    }
+
     fn from_item(
         task_id: &TaskId,
         item: &SourceSnapshotItem,
         content_artifact: ContextArtifactRef,
     ) -> Result<Self, PortError> {
-        let request_digest = classification_request_digest(
-            task_id,
+        Self::new(
+            task_id.clone(),
             &item.document_id,
             &item.member_id,
-            &item.identity,
-            &content_artifact,
-        )?;
-        Ok(Self {
-            task_id: task_id.clone(),
-            document_id: validated_label(&item.document_id)?,
-            member_id: validated_label(&item.member_id)?,
-            identity: item.identity.clone(),
+            item.identity.clone(),
             content_artifact,
-            request_digest,
-        })
+        )
     }
 
     pub fn task_id(&self) -> &TaskId {
@@ -925,6 +944,20 @@ impl CandidateIndexRecordV1 {
             .map(|range| LineRange::new(range.start, range.end).map_err(|_| integrity_failure()))
             .transpose()
     }
+
+    fn same_index_identity(&self, other: &Self) -> bool {
+        self.schema == other.schema
+            && self.version == other.version
+            && self.document_id == other.document_id
+            && self.task_id == other.task_id
+            && self.member_id == other.member_id
+            && self.source == other.source
+            && self.source_kind == other.source_kind
+            && self.line_range == other.line_range
+            && self.symbol == other.symbol
+            && self.metadata == other.metadata
+            && self.classification == other.classification
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1066,6 +1099,34 @@ impl<'a> BuildInitialContext<'a> {
         let classification = classification_outcome.classification.clone();
         let resource_class = classification.sensitivity().resource_class();
 
+        let preflight_candidate = CandidateIndexRecordV1::from_source(
+            task_id,
+            &item,
+            &classification,
+            classification_request.content_artifact(),
+        )?;
+        let preflight_metadata = disclose_source(
+            self.disclosures,
+            self.policy_decisions,
+            policy,
+            &item.identity,
+            resource_class,
+            DisclosureChannel::IndexMetadata,
+            preflight_candidate.canonical_bytes()?,
+        )?;
+        decision_ids.push(preflight_metadata.decision_id.clone());
+        let preflight_metadata_policy = ContextPolicyDecisionRef::new(
+            preflight_metadata.decision_id.clone(),
+            preflight_metadata.operation_digest.clone(),
+        );
+        let Some(preflight_metadata) = preflight_metadata.disclosed else {
+            return Ok(None);
+        };
+        let preflight_effective = CandidateIndexRecordV1::parse_effective(
+            &preflight_metadata.bytes,
+            &preflight_candidate,
+        )?;
+
         let content = disclose_source(
             self.disclosures,
             self.policy_decisions,
@@ -1088,29 +1149,41 @@ impl<'a> BuildInitialContext<'a> {
             content.digest.clone(),
             u64::try_from(content.bytes.len()).map_err(|_| integrity_failure())?,
         )?;
-        let candidate =
-            CandidateIndexRecordV1::from_source(task_id, &item, &classification, &artifact)?;
-        let candidate_bytes = candidate.canonical_bytes()?;
-
-        let metadata = disclose_source(
-            self.disclosures,
-            self.policy_decisions,
-            policy,
-            &item.identity,
-            resource_class,
-            DisclosureChannel::IndexMetadata,
-            candidate_bytes,
-        )?;
-        decision_ids.push(metadata.decision_id.clone());
-        let metadata_policy = ContextPolicyDecisionRef::new(
-            metadata.decision_id.clone(),
-            metadata.operation_digest.clone(),
-        );
-        let Some(metadata) = metadata.disclosed else {
-            return Ok(None);
+        let (metadata, metadata_policy, effective_candidate) = if &artifact
+            == classification_request.content_artifact()
+        {
+            (
+                preflight_metadata,
+                preflight_metadata_policy,
+                preflight_effective,
+            )
+        } else {
+            let candidate =
+                CandidateIndexRecordV1::from_source(task_id, &item, &classification, &artifact)?;
+            let metadata = disclose_source(
+                self.disclosures,
+                self.policy_decisions,
+                policy,
+                &item.identity,
+                resource_class,
+                DisclosureChannel::IndexMetadata,
+                candidate.canonical_bytes()?,
+            )?;
+            decision_ids.push(metadata.decision_id.clone());
+            let metadata_policy = ContextPolicyDecisionRef::new(
+                metadata.decision_id.clone(),
+                metadata.operation_digest.clone(),
+            );
+            let Some(metadata) = metadata.disclosed else {
+                return Ok(None);
+            };
+            let effective_candidate =
+                CandidateIndexRecordV1::parse_effective(&metadata.bytes, &candidate)?;
+            if !effective_candidate.same_index_identity(&preflight_effective) {
+                return Err(integrity_failure());
+            }
+            (metadata, metadata_policy, effective_candidate)
         };
-        let effective_candidate =
-            CandidateIndexRecordV1::parse_effective(&metadata.bytes, &candidate)?;
         let effective_identity = effective_candidate.source_identity()?;
         let effective_logical_identity = effective_candidate.logical_identity()?;
         let effective_line_range = effective_candidate.line_range()?;
@@ -1505,13 +1578,23 @@ fn validate_snapshot(
     if &snapshot.request != request
         || snapshot.items.iter().any(|item| {
             item.identity.project_id() != &request.project_id
-                || item.identity.revision() != request.revision
+                || !snapshot_revision_matches(request, item.identity.revision())
         })
     {
         Err(integrity_failure())
     } else {
         Ok(())
     }
+}
+
+fn snapshot_revision_matches(request: &SourceSnapshotRequest, revision: &str) -> bool {
+    revision == request.revision
+        || revision
+            == format!(
+                "worktree:{}:{}",
+                request.revision,
+                request.repository_fingerprint.as_str()
+            )
 }
 
 fn validate_source_content(identity: &SourceIdentity, bytes: &[u8]) -> Result<(), PortError> {

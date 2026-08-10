@@ -235,31 +235,33 @@ struct BoundedOutput {
 }
 
 #[derive(PartialEq, Eq)]
-struct CapturedRepository {
-    head: GitObjectId,
-    index_digest: Sha256Digest,
+pub(crate) struct CapturedRepository {
+    pub(crate) head: GitObjectId,
+    pub(crate) index_digest: Sha256Digest,
     config_digest: Sha256Digest,
     state: git2::RepositoryState,
-    head_entries: BTreeMap<Vec<u8>, CapturedTreeEntry>,
+    pub(crate) head_entries: BTreeMap<Vec<u8>, CapturedTreeEntry>,
     index_entries: BTreeMap<Vec<u8>, CapturedFile>,
-    worktree_entries: BTreeMap<Vec<u8>, CapturedFile>,
+    pub(crate) worktree_entries: BTreeMap<Vec<u8>, CapturedFile>,
 }
 
 #[derive(PartialEq, Eq)]
-struct CapturedTreeEntry {
-    oid: Oid,
-    mode: u32,
-    bytes: Vec<u8>,
+pub(crate) struct CapturedTreeEntry {
+    pub(crate) oid: Oid,
+    pub(crate) mode: u32,
+    pub(crate) bytes: Vec<u8>,
 }
 
 #[derive(PartialEq, Eq)]
-struct CapturedFile {
-    oid: Option<Oid>,
-    mode: u32,
-    bytes: Vec<u8>,
+pub(crate) struct CapturedFile {
+    pub(crate) oid: Option<Oid>,
+    pub(crate) mode: u32,
+    pub(crate) bytes: Vec<u8>,
 }
 
-fn capture_repository(repository: &git2::Repository) -> Result<CapturedRepository, PortError> {
+pub(crate) fn capture_repository(
+    repository: &git2::Repository,
+) -> Result<CapturedRepository, PortError> {
     let head = revision(repository)?;
     let index_path = repository
         .index()
@@ -273,6 +275,33 @@ fn capture_repository(repository: &git2::Repository) -> Result<CapturedRepositor
     let head_entries = capture_head(repository)?;
     let index_entries = capture_index(repository)?;
     let worktree_entries = capture_worktree(repository)?;
+    Ok(CapturedRepository {
+        head,
+        index_digest: digest(&index_bytes),
+        config_digest: digest(&config_bytes),
+        state: repository.state(),
+        head_entries,
+        index_entries,
+        worktree_entries,
+    })
+}
+
+pub(crate) fn capture_context_repository(
+    repository: &git2::Repository,
+) -> Result<CapturedRepository, PortError> {
+    let head = revision(repository)?;
+    let index_path = repository
+        .index()
+        .map_err(|_| denied())?
+        .path()
+        .ok_or_else(denied)?
+        .to_owned();
+    let (_index_lock, index_bytes) = open_and_read_bounded(&index_path, MAX_INDEX_BYTES)?;
+    let (_config_lock, config_bytes) =
+        open_and_read_bounded(&repository.commondir().join("config"), MAX_CONFIG_BYTES)?;
+    let head_entries = capture_head(repository)?;
+    let index_entries = capture_context_index(repository, &head_entries)?;
+    let worktree_entries = capture_tracked_worktree(repository, &head_entries)?;
     Ok(CapturedRepository {
         head,
         index_digest: digest(&index_bytes),
@@ -298,7 +327,11 @@ fn open_and_read_bounded(path: &Path, max_bytes: u64) -> Result<(File, Vec<u8>),
     }
     let mut file = options.open(path).map_err(|_| denied())?;
     let metadata = file.metadata().map_err(|_| denied())?;
-    if !metadata.is_file() || metadata.len() > max_bytes {
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || is_reparse_point(&metadata)
+        || metadata.len() > max_bytes
+    {
         return Err(denied());
     }
     let capacity = usize::try_from(metadata.len()).map_err(|_| denied())?;
@@ -432,6 +465,48 @@ fn capture_index(
     Ok(entries)
 }
 
+fn capture_context_index(
+    repository: &git2::Repository,
+    head_entries: &BTreeMap<Vec<u8>, CapturedTreeEntry>,
+) -> Result<BTreeMap<Vec<u8>, CapturedFile>, PortError> {
+    let index = repository.index().map_err(|_| denied())?;
+    if index.has_conflicts() || index.len() > MAX_CAPTURE_ENTRIES {
+        return Err(denied());
+    }
+    let odb = repository.odb().map_err(|_| denied())?;
+    let mut entries = BTreeMap::new();
+    let mut total_bytes = 0u64;
+    for entry in index.iter() {
+        if !head_entries.contains_key(entry.path.as_slice()) {
+            continue;
+        }
+        if entry.flags & 0x3000 != 0 || hazardous_path(&entry.path) || !valid_blob_mode(entry.mode)
+        {
+            return Err(denied());
+        }
+        let (size, kind) = odb.read_header(entry.id).map_err(|_| denied())?;
+        let size = u64::try_from(size).map_err(|_| denied())?;
+        total_bytes = total_bytes.saturating_add(size);
+        if kind != ObjectType::Blob || size > MAX_FILE_BYTES || total_bytes > MAX_CAPTURE_BYTES {
+            return Err(denied());
+        }
+        let blob = repository.find_blob(entry.id).map_err(|_| denied())?;
+        let bytes = blob.content().to_vec();
+        if u64::try_from(bytes.len()).ok() != Some(size) || lfs_pointer(&bytes) {
+            return Err(denied());
+        }
+        entries.insert(
+            entry.path.clone(),
+            CapturedFile {
+                oid: Some(entry.id),
+                mode: entry.mode,
+                bytes,
+            },
+        );
+    }
+    Ok(entries)
+}
+
 fn capture_worktree(
     repository: &git2::Repository,
 ) -> Result<BTreeMap<Vec<u8>, CapturedFile>, PortError> {
@@ -487,6 +562,97 @@ fn capture_worktree(
     Ok(entries)
 }
 
+fn capture_tracked_worktree(
+    repository: &git2::Repository,
+    head_entries: &BTreeMap<Vec<u8>, CapturedTreeEntry>,
+) -> Result<BTreeMap<Vec<u8>, CapturedFile>, PortError> {
+    let workdir = repository.workdir().ok_or_else(denied)?;
+    let mut entries = BTreeMap::new();
+    let mut total_bytes = 0u64;
+    for (path, head_entry) in head_entries {
+        let path_text = std::str::from_utf8(path).map_err(|_| denied())?;
+        let relative = Path::new(path_text);
+        if !paths::safe_relative(relative)
+            || relative.components().any(|component| {
+                let std::path::Component::Normal(value) = component else {
+                    return true;
+                };
+                !paths::valid_component(&value.to_string_lossy())
+            })
+        {
+            return Err(denied());
+        }
+        let absolute = workdir.join(relative);
+        let Some(metadata) = tracked_file_metadata(workdir, relative)? else {
+            continue;
+        };
+        let (lock, bytes) = open_and_read_bounded(&absolute, MAX_FILE_BYTES)?;
+        let locked_metadata = lock.metadata().map_err(|_| denied())?;
+        if locked_metadata.len() != metadata.len()
+            || is_reparse_point(&locked_metadata)
+            || lfs_pointer(&bytes)
+        {
+            return Err(denied());
+        }
+        total_bytes = total_bytes.saturating_add(u64::try_from(bytes.len()).map_err(|_| denied())?);
+        if total_bytes > MAX_CAPTURE_BYTES {
+            return Err(denied());
+        }
+        entries.insert(
+            path.clone(),
+            CapturedFile {
+                oid: None,
+                mode: worktree_file_mode(&locked_metadata, head_entry.mode),
+                bytes,
+            },
+        );
+    }
+    Ok(entries)
+}
+
+fn tracked_file_metadata(
+    workdir: &Path,
+    relative: &Path,
+) -> Result<Option<fs::Metadata>, PortError> {
+    let components = relative.components().collect::<Vec<_>>();
+    let mut current = workdir.to_owned();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(denied()),
+        };
+        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            return Err(denied());
+        }
+        let is_leaf = index + 1 == components.len();
+        if (is_leaf && !metadata.is_file()) || (!is_leaf && !metadata.is_dir()) {
+            return Err(denied());
+        }
+        if is_leaf {
+            return Ok(Some(metadata));
+        }
+    }
+    Err(denied())
+}
+
+#[cfg(unix)]
+fn worktree_file_mode(metadata: &fs::Metadata, _fallback: u32) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    if metadata.permissions().mode() & 0o111 == 0 {
+        0o100644
+    } else {
+        0o100755
+    }
+}
+
+#[cfg(not(unix))]
+fn worktree_file_mode(_metadata: &fs::Metadata, fallback: u32) -> u32 {
+    fallback
+}
+
 fn bounded_status(captured: &CapturedRepository) -> Result<BoundedOutput, PortError> {
     let mut output = BoundedOutput {
         bytes: Vec::new(),
@@ -503,7 +669,7 @@ fn bounded_status(captured: &CapturedRepository) -> Result<BoundedOutput, PortEr
     Ok(output)
 }
 
-fn status_records(captured: &CapturedRepository) -> Vec<(&[u8], u32)> {
+pub(crate) fn status_records(captured: &CapturedRepository) -> Vec<(&[u8], u32)> {
     let paths = captured
         .head_entries
         .keys()
