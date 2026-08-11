@@ -407,10 +407,16 @@ pub(crate) fn load_workflow_state(
         OperationState::from_str(&operation).map_err(|_| integrity_failure())?,
         Sequence::try_from(sequence).map_err(|_| integrity_failure())?,
         WorkspaceVersion::try_from(workspace).map_err(|_| integrity_failure())?,
-        FencingToken::new(u64::try_from(fencing).map_err(|_| integrity_failure())?)
-            .map_err(|_| integrity_failure())?,
+        workflow_fencing_token(fencing)?,
     )
     .map_err(|_| integrity_failure())
+}
+
+fn workflow_fencing_token(persisted_epoch: i64) -> Result<FencingToken, PortError> {
+    let epoch = u64::try_from(persisted_epoch).map_err(|_| integrity_failure())?;
+    // A task has epoch zero before its first writer lease. The workflow reducer still requires
+    // a positive identity token, but this value is never used as lease authority.
+    FencingToken::new(epoch.max(1)).map_err(|_| integrity_failure())
 }
 
 fn validate_record_artifacts(

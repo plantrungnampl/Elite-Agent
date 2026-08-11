@@ -7,8 +7,8 @@ use local_agent_terminal_application::{
 use local_agent_terminal_domain::{
     ActorId, AgentDescriptor, AgentFamilyKey, AgentRunLimits, AgentRunSnapshot, AgentRunStatus,
     AgentRunTerminal, AgentUsage, ArtifactId, BoundAgentConnection, BoundAgentRunRequest,
-    BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, RunId, Sha256Digest, TaskId,
-    Timestamp, TrustTier,
+    BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, Phase, RunId, Sha256Digest,
+    TaskId, Timestamp, TrustTier,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
@@ -297,14 +297,12 @@ impl AgentRunStore for SqliteStore {
         if manifest_artifact.bytes != manifest {
             return Err(integrity_failure());
         }
-        load_available_artifact(
+        load_effective_context_artifact(
             &transaction,
             artifact_reader,
             &request.context.effective_context_artifact_id,
             &request.task_id,
-            Some(CONTEXT_ARTIFACT_KIND),
-            Some(request.context.content_digest.as_str()),
-            None,
+            request.context.content_digest.as_str(),
         )?;
         let run_config_artifact = load_available_artifact(
             &transaction,
@@ -456,24 +454,45 @@ impl AgentRunStore for SqliteStore {
             None,
         )?;
         let receipt_time = format_timestamp(&transaction, completed_at)?;
-        transaction
-            .execute(
-                "INSERT INTO messages (
-                    id, task_id, run_id, thread_id, message_type, reply_to,
-                    content_artifact_id, status, core_received_at, superseded_by
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'accepted', ?8, NULL)",
-                params![
-                    terminal.message.message_id,
-                    terminal.task_id.as_str(),
-                    terminal.run_id.as_str(),
-                    terminal.message.thread_id,
-                    terminal.message.message_type,
-                    terminal.message.reply_to,
-                    terminal.message.content_artifact_id.as_str(),
-                    receipt_time,
-                ],
-            )
-            .map_err(sqlite_error_to_port)?;
+        if snapshot.request.phase == Phase::ParallelAnalysis.as_str() {
+            transaction
+                .execute(
+                    "INSERT INTO agent_run_outputs (
+                        run_id, task_id, message_id, thread_id, message_type, reply_to,
+                        content_artifact_id, core_received_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        terminal.run_id.as_str(),
+                        terminal.task_id.as_str(),
+                        terminal.message.message_id,
+                        terminal.message.thread_id,
+                        terminal.message.message_type,
+                        terminal.message.reply_to,
+                        terminal.message.content_artifact_id.as_str(),
+                        receipt_time,
+                    ],
+                )
+                .map_err(sqlite_error_to_port)?;
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO messages (
+                        id, task_id, run_id, thread_id, message_type, reply_to,
+                        content_artifact_id, status, core_received_at, superseded_by
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'accepted', ?8, NULL)",
+                    params![
+                        terminal.message.message_id,
+                        terminal.task_id.as_str(),
+                        terminal.run_id.as_str(),
+                        terminal.message.thread_id,
+                        terminal.message.message_type,
+                        terminal.message.reply_to,
+                        terminal.message.content_artifact_id.as_str(),
+                        receipt_time,
+                    ],
+                )
+                .map_err(sqlite_error_to_port)?;
+        }
         let provider_usage = terminal.provider_usage.as_ref().map(usage_json);
         let core_usage = terminal.core_usage.as_ref().map(usage_json);
         let error_json = terminal
@@ -806,14 +825,12 @@ fn snapshot_from_raw(
         None,
     )?;
     verify_historical_run_binding(&request, &manifest_artifact.bytes)?;
-    load_available_artifact(
+    load_effective_context_artifact(
         connection,
         artifact_reader,
         &request.context.effective_context_artifact_id,
         &request.task_id,
-        Some(CONTEXT_ARTIFACT_KIND),
-        Some(request.context.content_digest.as_str()),
-        None,
+        request.context.content_digest.as_str(),
     )?;
     let status = parse_status(&raw.status).ok_or_else(integrity_failure)?;
     let accepted_at = load_run_event_timestamp(connection, &run_id, "agent.run.accepted")?;
@@ -1053,6 +1070,39 @@ fn load_available_artifact(
     Ok(ArtifactBytes {
         bytes: content.bytes,
     })
+}
+
+fn load_effective_context_artifact(
+    connection: &Connection,
+    artifact_reader: &dyn ArtifactRootReader,
+    artifact_id: &ArtifactId,
+    task_id: &TaskId,
+    expected_hash: &str,
+) -> Result<ArtifactBytes, PortError> {
+    let kind: Option<String> = connection
+        .query_row(
+            "SELECT artifact_type FROM artifacts
+             WHERE id = ?1 AND availability = 'available'",
+            [artifact_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error_to_port)?;
+    if !matches!(
+        kind.as_deref(),
+        Some(CONTEXT_ARTIFACT_KIND | "context_package")
+    ) {
+        return Err(integrity_failure());
+    }
+    load_available_artifact(
+        connection,
+        artifact_reader,
+        artifact_id,
+        task_id,
+        None,
+        Some(expected_hash),
+        None,
+    )
 }
 
 pub(crate) fn validate_available_artifact(

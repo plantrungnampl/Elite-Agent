@@ -17,7 +17,8 @@ use local_agent_terminal_application::{
 use local_agent_terminal_domain::{
     AgentDescriptor, AgentRunLimits, AgentRunMessage, AgentRunStatus, AgentRunTerminal, AgentUsage,
     ArtifactId, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
-    BoundGenerationParameters, BoundRunConfig, RunId, Sha256Digest, TaskId, Timestamp, TrustTier,
+    BoundGenerationParameters, BoundRunConfig, Phase, RunId, Sha256Digest, TaskId, Timestamp,
+    TrustTier,
 };
 use local_agent_terminal_storage_files::{
     ContentAddressedArtifactReader, ContentAddressedArtifactStore,
@@ -672,6 +673,57 @@ fn terminal_persists_message_and_separate_usage_atomically_and_only_once() {
             .unwrap(),
         0,
     );
+}
+
+#[test]
+fn parallel_analysis_terminal_stays_private_and_immutable() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let descriptor = descriptor();
+    store.register_descriptor(&descriptor).unwrap();
+    let mut request = bound_run("private", "private-key");
+    request.phase = Phase::ParallelAnalysis.as_str().to_owned();
+    request.validate().unwrap();
+    seed_default_artifacts(&database, &request, &descriptor);
+    store.create_bound_run(&request).unwrap();
+    store.accept_run(&request.run_id, timestamp(10)).unwrap();
+    store.mark_running(&request.run_id, timestamp(11)).unwrap();
+    let terminal = terminal("private", "message-private", AgentRunStatus::Succeeded);
+    database.put_artifact(
+        &terminal.message.content_artifact_id,
+        "task-1",
+        "agent-message",
+        br#"{"message":"private proposal"}"#,
+    );
+
+    store.persist_terminal(&terminal).unwrap();
+
+    let connection = database.connection();
+    assert_eq!(row_count(&database.path, "messages"), 0);
+    assert_eq!(row_count(&database.path, "agent_run_outputs"), 1);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT message_id || ':' || content_artifact_id
+                 FROM agent_run_outputs WHERE run_id = ?1",
+                [request.run_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "message-private:artifact-message-private"
+    );
+    assert!(connection
+        .execute(
+            "UPDATE agent_run_outputs SET message_id = 'forged' WHERE run_id = ?1",
+            [request.run_id.as_str()],
+        )
+        .is_err());
+    assert!(connection
+        .execute(
+            "DELETE FROM agent_run_outputs WHERE run_id = ?1",
+            [request.run_id.as_str()],
+        )
+        .is_err());
 }
 
 #[test]

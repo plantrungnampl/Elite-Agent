@@ -19,6 +19,7 @@ use local_agent_terminal_storage_sqlite::{DatabaseHealth, DatabaseIssue, OpenErr
 use crate::agent_runtime::{
     compose_agent_runtime, AnthropicBootstrapConfig, ComposedAgentRuntime, OpenAiBootstrapConfig,
 };
+use crate::context_runtime::{compose_context_runtime, ContextRuntime};
 use crate::logging::LocalLog;
 #[cfg(windows)]
 use crate::production_tools::production_tool_broker;
@@ -42,6 +43,7 @@ pub struct Bootstrap {
     status: StartupStatusDto,
     diagnostics: Vec<LocalDiagnosticDto>,
     runtime: Option<WorkspaceRuntime>,
+    context_runtime: Option<Arc<ContextRuntime>>,
     agent_runtime: Option<Arc<ComposedAgentRuntime>>,
     tool_runtime: Option<Arc<ToolRuntime>>,
     tool_broker: Option<ToolBrokerConfig>,
@@ -50,6 +52,7 @@ pub struct Bootstrap {
 
 struct StartupRuntimes {
     workspace: WorkspaceRuntime,
+    context: Arc<ContextRuntime>,
     agent_runtime: Option<Arc<ComposedAgentRuntime>>,
     tools: ToolRuntime,
 }
@@ -134,6 +137,7 @@ impl Bootstrap {
             },
             diagnostics: Vec::new(),
             runtime: None,
+            context_runtime: None,
             agent_runtime,
             tool_runtime,
             tool_broker: None,
@@ -150,6 +154,7 @@ impl Bootstrap {
             },
             diagnostics: Vec::new(),
             runtime: None,
+            context_runtime: None,
             agent_runtime: None,
             tool_runtime: None,
             tool_broker,
@@ -232,6 +237,7 @@ impl Bootstrap {
                     issues: Vec::new(),
                 };
                 self.runtime = Some(runtimes.workspace);
+                self.context_runtime = Some(runtimes.context);
                 self.agent_runtime = runtimes.agent_runtime;
                 self.tool_runtime = Some(Arc::new(runtimes.tools));
                 log.push(record(
@@ -274,6 +280,10 @@ impl Bootstrap {
         self.runtime.as_ref()
     }
 
+    pub fn context_runtime(&self) -> Option<&ContextRuntime> {
+        self.context_runtime.as_deref()
+    }
+
     pub fn agent_runtime(&self) -> Option<&dyn AgentRuntime> {
         self.agent_runtime
             .as_deref()
@@ -311,6 +321,7 @@ impl Bootstrap {
             }],
         };
         self.runtime = None;
+        self.context_runtime = None;
     }
 
     fn shutdown_owned_runtimes(&mut self) -> Result<(), StartupFailure> {
@@ -366,6 +377,7 @@ impl Bootstrap {
             },
             diagnostics: log.into_records(),
             runtime: None,
+            context_runtime: None,
             agent_runtime: None,
             tool_runtime: None,
             tool_broker: None,
@@ -603,6 +615,11 @@ fn start(
             "Configured trusted agent runtime was composed.",
         ));
     }
+    let context_agents: Option<Arc<dyn AgentRuntime>> = agent_runtime
+        .as_ref()
+        .map(|runtime| Arc::clone(runtime) as Arc<dyn AgentRuntime>);
+    let context = compose_context_runtime(database.clone(), Arc::clone(&artifacts), context_agents)
+        .map_err(context_runtime_failure)?;
 
     Ok(StartupRuntimes {
         workspace: WorkspaceRuntime::new(
@@ -612,6 +629,7 @@ fn start(
             workspace_report.recovery_candidates,
             workspace_writes,
         ),
+        context,
         agent_runtime,
         tools,
     })
@@ -682,6 +700,21 @@ fn agent_runtime_failure(error: PortError) -> StartupFailure {
         category: classification_name(error.safe_classification()),
         detail: format!(
             "Configured agent runtime composition failed ({:?}, {:?}).",
+            error.safe_classification(),
+            error.retryability()
+        ),
+        recovery: RecoveryMode::Retry,
+    }
+}
+
+fn context_runtime_failure(error: PortError) -> StartupFailure {
+    StartupFailure {
+        state: StartupStateDto::RecoverableFailure,
+        code: "startup.context_runtime_unavailable",
+        message: "The context runtime could not be composed.",
+        category: classification_name(error.safe_classification()),
+        detail: format!(
+            "Context runtime composition failed ({:?}, {:?}).",
             error.safe_classification(),
             error.retryability()
         ),

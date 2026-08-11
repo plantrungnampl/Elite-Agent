@@ -564,7 +564,7 @@ pub fn recover_deliberation(
 
 fn valid_assignments(assignments: &[DeliberationRunAssignment]) -> bool {
     if assignments.is_empty() {
-        return false;
+        return true;
     }
     let unique_runs = assignments
         .iter()

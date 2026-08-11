@@ -73,13 +73,15 @@ pub(crate) fn compose_agent_runtime(
     openai: Option<&OpenAiBootstrapConfig>,
     anthropic: Option<&AnthropicBootstrapConfig>,
 ) -> Result<Option<Arc<ComposedAgentRuntime>>, PortError> {
-    let mut peers = Vec::new();
-    if let Some(config) = openai {
-        peers.push(compose_openai_peer(config)?);
-    }
-    if let Some(config) = anthropic {
-        peers.push(compose_anthropic_peer(config)?);
-    }
+    let peers = openai
+        .iter()
+        .map(|config| compose_openai_peer(config))
+        .chain(
+            anthropic
+                .iter()
+                .map(|config| compose_anthropic_peer(config)),
+        )
+        .collect::<Result<Vec<_>, _>>()?;
     if peers.is_empty() {
         return Ok(None);
     }
@@ -107,22 +109,25 @@ fn compose_openai_peer(config: &OpenAiBootstrapConfig) -> Result<ComposedPeer, P
     )?;
     let peer_descriptor = peer_descriptor(&connection)?;
     let endpoint = Url::parse(&config.endpoint).map_err(|_| invalid_input())?;
-    let provider = match endpoint.scheme() {
-        "https" => OpenAiProviderConfig::new(
-            endpoint,
-            config.api_key.clone(),
-            CONNECT_TIMEOUT,
-            READ_TIMEOUT,
-        ),
-        "http" => OpenAiProviderConfig::for_loopback_test(
-            endpoint,
-            config.api_key.clone(),
-            CONNECT_TIMEOUT,
-            READ_TIMEOUT,
-        ),
-        _ => return Err(invalid_input()),
-    }
-    .map_err(|_| invalid_input())?;
+    let provider = select_provider_config(
+        endpoint,
+        |endpoint| {
+            OpenAiProviderConfig::new(
+                endpoint,
+                config.api_key.clone(),
+                CONNECT_TIMEOUT,
+                READ_TIMEOUT,
+            )
+        },
+        |endpoint| {
+            OpenAiProviderConfig::for_loopback_test(
+                endpoint,
+                config.api_key.clone(),
+                CONNECT_TIMEOUT,
+                READ_TIMEOUT,
+            )
+        },
+    )?;
     let peer: Arc<dyn ProtocolPeer> = Arc::new(
         OpenAiResponsesAdapter::new(provider, peer_descriptor).map_err(|_| unavailable())?,
     );
@@ -151,22 +156,25 @@ fn compose_anthropic_peer(config: &AnthropicBootstrapConfig) -> Result<ComposedP
     )?;
     let peer_descriptor = peer_descriptor(&connection)?;
     let endpoint = Url::parse(&config.endpoint).map_err(|_| invalid_input())?;
-    let provider = match endpoint.scheme() {
-        "https" => AnthropicProviderConfig::new(
-            endpoint,
-            config.api_key.clone(),
-            CONNECT_TIMEOUT,
-            READ_TIMEOUT,
-        ),
-        "http" => AnthropicProviderConfig::for_loopback_test(
-            endpoint,
-            config.api_key.clone(),
-            CONNECT_TIMEOUT,
-            READ_TIMEOUT,
-        ),
-        _ => return Err(invalid_input()),
-    }
-    .map_err(|_| invalid_input())?;
+    let provider = select_provider_config(
+        endpoint,
+        |endpoint| {
+            AnthropicProviderConfig::new(
+                endpoint,
+                config.api_key.clone(),
+                CONNECT_TIMEOUT,
+                READ_TIMEOUT,
+            )
+        },
+        |endpoint| {
+            AnthropicProviderConfig::for_loopback_test(
+                endpoint,
+                config.api_key.clone(),
+                CONNECT_TIMEOUT,
+                READ_TIMEOUT,
+            )
+        },
+    )?;
     let peer: Arc<dyn ProtocolPeer> = Arc::new(
         AnthropicMessagesAdapter::new(provider, peer_descriptor).map_err(|_| unavailable())?,
     );
@@ -176,6 +184,19 @@ fn compose_anthropic_peer(config: &AnthropicBootstrapConfig) -> Result<ComposedP
         provider_id: "anthropic".to_owned(),
         peer,
     })
+}
+
+fn select_provider_config<T, E>(
+    endpoint: Url,
+    production: impl FnOnce(Url) -> Result<T, E>,
+    loopback: impl FnOnce(Url) -> Result<T, E>,
+) -> Result<T, PortError> {
+    match endpoint.scheme() {
+        "https" => production(endpoint),
+        "http" => loopback(endpoint),
+        _ => return Err(invalid_input()),
+    }
+    .map_err(|_| invalid_input())
 }
 
 fn peer_descriptor(connection: &BoundAgentConnection) -> Result<PeerDescriptor, PortError> {
@@ -195,6 +216,7 @@ fn peer_descriptor(connection: &BoundAgentConnection) -> Result<PeerDescriptor, 
         protocol_version: PROTOCOL_VERSION.to_owned(),
         capabilities: ProtocolCapabilities {
             roles: BTreeSet::from([
+                "lead".to_owned(),
                 "proposer".to_owned(),
                 "critic".to_owned(),
                 "reviewer".to_owned(),

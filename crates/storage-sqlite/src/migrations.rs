@@ -3,7 +3,7 @@ use std::fmt;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-const SUPPORTED_SCHEMA_VERSION: i64 = 6;
+const SUPPORTED_SCHEMA_VERSION: i64 = 7;
 const NORMATIVE_SQL: &str =
     include_str!("../../../docs/multi-agent-terminal-design/schemas/sqlite-v1.sql");
 const V1_ADAPTER_HARDENING_SQL: &str = r#"
@@ -400,6 +400,36 @@ CREATE INDEX deliberation_records_task_sequence
 ON deliberation_records(task_id, sequence);
 "#;
 
+const V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL: &str = r#"
+CREATE TABLE agent_run_outputs (
+    run_id TEXT PRIMARY KEY REFERENCES agent_runs(id) ON DELETE RESTRICT,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+    message_id TEXT NOT NULL UNIQUE,
+    thread_id TEXT NOT NULL,
+    message_type TEXT NOT NULL,
+    reply_to TEXT,
+    content_artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE RESTRICT,
+    core_received_at TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX agent_run_outputs_task_received
+ON agent_run_outputs(task_id, core_received_at, run_id);
+
+CREATE TRIGGER agent_run_outputs_update_forbidden
+BEFORE UPDATE ON agent_run_outputs
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'private agent run outputs are immutable');
+END;
+
+CREATE TRIGGER agent_run_outputs_delete_forbidden
+BEFORE DELETE ON agent_run_outputs
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'private agent run outputs are immutable');
+END;
+"#;
+
 #[derive(Debug)]
 pub enum OpenError {
     Database(rusqlite::Error),
@@ -462,7 +492,7 @@ impl From<rusqlite::Error> for OpenError {
 }
 
 pub fn migration_checksum() -> String {
-    checksum(V6_CONTEXT_HARDENING_SQL)
+    checksum(V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL)
 }
 
 fn v1_migration_checksum() -> String {
@@ -483,6 +513,10 @@ fn v4_migration_checksum() -> String {
 
 fn v5_migration_checksum() -> String {
     checksum(V5_PRE_EFFECT_TERMINAL_SQL)
+}
+
+fn v6_migration_checksum() -> String {
+    checksum(V6_CONTEXT_HARDENING_SQL)
 }
 
 fn checksum(sql: &str) -> String {
@@ -560,13 +594,23 @@ pub(crate) fn validate_or_migrate(connection: &mut Connection) -> Result<(), Ope
             validate_checksum(connection, 5, v5_migration_checksum())?;
             apply_upgrade_migrations(connection, version)?;
         }
+        6 => {
+            validate_checksum(connection, 1, v1_migration_checksum())?;
+            validate_checksum(connection, 2, v2_migration_checksum())?;
+            validate_checksum(connection, 3, v3_migration_checksum())?;
+            validate_checksum(connection, 4, v4_migration_checksum())?;
+            validate_checksum(connection, 5, v5_migration_checksum())?;
+            validate_checksum(connection, 6, v6_migration_checksum())?;
+            apply_upgrade_migrations(connection, version)?;
+        }
         SUPPORTED_SCHEMA_VERSION => {
             validate_checksum(connection, 1, v1_migration_checksum())?;
             validate_checksum(connection, 2, v2_migration_checksum())?;
             validate_checksum(connection, 3, v3_migration_checksum())?;
             validate_checksum(connection, 4, v4_migration_checksum())?;
             validate_checksum(connection, 5, v5_migration_checksum())?;
-            validate_checksum(connection, 6, migration_checksum())?;
+            validate_checksum(connection, 6, v6_migration_checksum())?;
+            validate_checksum(connection, 7, migration_checksum())?;
         }
         _ => {
             return Err(OpenError::UnsupportedSchema {
@@ -724,6 +768,18 @@ fn apply_initial_migration(connection: &mut Connection) -> Result<(), OpenError>
             6,
             "context_hardening_v6",
             env!("CARGO_PKG_VERSION"),
+            v6_migration_checksum()
+        ],
+    )?;
+    transaction.execute_batch(V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL)?;
+    transaction.execute(
+        "INSERT INTO schema_migrations (
+            version, name, applied_at, application_version, checksum
+         ) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4)",
+        params![
+            7,
+            "private_agent_run_outputs_v7",
+            env!("CARGO_PKG_VERSION"),
             migration_checksum()
         ],
     )?;
@@ -763,6 +819,12 @@ fn apply_upgrade_migrations(connection: &mut Connection, version: i64) -> Result
                 6,
                 "context_hardening_v6",
                 V6_CONTEXT_HARDENING_SQL,
+                v6_migration_checksum(),
+            ),
+            (
+                7,
+                "private_agent_run_outputs_v7",
+                V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
                 migration_checksum(),
             ),
         ],
@@ -789,6 +851,12 @@ fn apply_upgrade_migrations(connection: &mut Connection, version: i64) -> Result
                 6,
                 "context_hardening_v6",
                 V6_CONTEXT_HARDENING_SQL,
+                v6_migration_checksum(),
+            ),
+            (
+                7,
+                "private_agent_run_outputs_v7",
+                V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
                 migration_checksum(),
             ),
         ],
@@ -809,6 +877,12 @@ fn apply_upgrade_migrations(connection: &mut Connection, version: i64) -> Result
                 6,
                 "context_hardening_v6",
                 V6_CONTEXT_HARDENING_SQL,
+                v6_migration_checksum(),
+            ),
+            (
+                7,
+                "private_agent_run_outputs_v7",
+                V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
                 migration_checksum(),
             ),
         ],
@@ -823,13 +897,33 @@ fn apply_upgrade_migrations(connection: &mut Connection, version: i64) -> Result
                 6,
                 "context_hardening_v6",
                 V6_CONTEXT_HARDENING_SQL,
+                v6_migration_checksum(),
+            ),
+            (
+                7,
+                "private_agent_run_outputs_v7",
+                V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
                 migration_checksum(),
             ),
         ],
-        5 => vec![(
-            6,
-            "context_hardening_v6",
-            V6_CONTEXT_HARDENING_SQL,
+        5 => vec![
+            (
+                6,
+                "context_hardening_v6",
+                V6_CONTEXT_HARDENING_SQL,
+                v6_migration_checksum(),
+            ),
+            (
+                7,
+                "private_agent_run_outputs_v7",
+                V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
+                migration_checksum(),
+            ),
+        ],
+        6 => vec![(
+            7,
+            "private_agent_run_outputs_v7",
+            V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
             migration_checksum(),
         )],
         _ => Vec::new(),

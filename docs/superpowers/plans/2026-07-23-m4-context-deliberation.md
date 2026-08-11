@@ -586,7 +586,7 @@ git commit -m "feat: add deliberation approval workspace"
 - Modify: `.superpowers/sdd/progress.md`
 - Modify: `docs/superpowers/plans/2026-07-23-m4-context-deliberation.md`
 
-- [ ] **Step 1 - Write failing bootstrap E2E and recovery tests**
+- [x] **Step 1 - Write failing bootstrap E2E and recovery tests**
 
 Compose real SQLite/content-addressed artifacts, read-only libgit2 source capture, policy engine, context engine, orchestration, agent runtime, deterministic OpenAI/Anthropic loopback fixtures, and typed approvals.
 
@@ -603,7 +603,7 @@ Prove:
 9. provider failure remains isolated and restart reconstructs durable state;
 10. pre/post repository HEAD, refs, index, tracked/untracked bytes, modes, and worktree list are identical before exact approval.
 
-- [ ] **Step 2 - Write failing evidence contracts**
+- [x] **Step 2 - Write failing evidence contracts**
 
 Require a source-commit-bound manifest, pinned tool versions, hashes for every retained output, zero skipped approval-critical tests, immutable design proof, complete M0–M3 regressions, context security matrix, retrieval/freshness matrix, two-provider conformance, deliberation/recovery matrix, UI/browser accessibility, exact plan approval, repository no-mutation proof, credential canary absence, and independent final review with no unresolved Critical/Important finding.
 

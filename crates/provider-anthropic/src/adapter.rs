@@ -595,7 +595,7 @@ fn stream_response(
             }
             "error" => {
                 return Err(StreamFailure {
-                    error: anthropic_error(&event),
+                    error: provider_error(&event),
                     response_id,
                     retry_after: None,
                     message: "provider response failed",
@@ -682,7 +682,7 @@ fn required_u64(
         .ok_or_else(|| StreamFailure::from_error(ProtocolError::InvalidJson, response_id.clone()))
 }
 
-fn anthropic_error(event: &Value) -> ProtocolError {
+fn provider_error(event: &Value) -> ProtocolError {
     match event.pointer("/error/type").and_then(Value::as_str) {
         Some("rate_limit_error") => ProtocolError::RateLimited,
         Some("overloaded_error") => ProtocolError::ProviderUnavailable,

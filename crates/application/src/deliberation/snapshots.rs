@@ -900,7 +900,6 @@ impl DeliberationSnapshot {
 
     pub fn validate(&self) -> Result<(), PortError> {
         if self.task_version != self.task_state.sequence().get()
-            || self.run_assignments.is_empty()
             || self
                 .run_assignments
                 .iter()

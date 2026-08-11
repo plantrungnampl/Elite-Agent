@@ -241,6 +241,36 @@ test("final M4 gate permits provider identifiers in composition data", () => {
   });
 });
 
+test("final M4 gate ignores unrelated Rust predicates around provider composition", () => {
+  withM4Environment({
+    sourceFiles: {
+      "crates/bootstrap/src/lib.rs": [
+        "fn compose(value: u8) -> Result<(), Error> {",
+        "    if value == 0 { validate()?; }",
+        "    let anthropic = AnthropicMessagesAdapter::new()?;",
+        "    registry.insert(\"anthropic\", anthropic);",
+        "    Ok(())",
+        "}",
+        "",
+      ].join("\n"),
+    },
+  }, ({ appRoot, metadataPath, sourceRoot }) => {
+    assert.match(
+      run(
+        "scripts/check-architecture.mjs",
+        "--require-m4",
+        "--metadata",
+        metadataPath,
+        "--m4-source-fixture",
+        sourceRoot,
+        "--fixture",
+        appRoot,
+      ),
+      /architecture contracts: ok/,
+    );
+  });
+});
+
 test("architecture checker confines provider HTTP and provider construction", () => {
   withM4Source({
     "crates/context-engine/src/lib.rs": "use reqwest::blocking::Client;\n",

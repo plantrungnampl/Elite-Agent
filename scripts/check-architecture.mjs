@@ -905,6 +905,7 @@ function hasProviderConditionalBranch(source, language) {
     if (hasProviderName(branch)) return true;
   }
 
+  if (language !== "typescript") return false;
   return code
     .split(/;/)
     .some((statement) => statement.includes("?") && /[!=]==?/.test(statement) && hasProviderName(statement));

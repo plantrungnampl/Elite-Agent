@@ -26,11 +26,11 @@ use local_agent_terminal_storage_files::ContentAddressedArtifactStore;
 use local_agent_terminal_storage_sqlite::{DatabaseHealth, SqliteStore};
 use local_agent_terminal_tool_runtime::ToolRuntime as StructuredToolRuntime;
 
+use crate::context_runtime::DEFAULT_POLICY_BUNDLE;
 use crate::startup::StartupConfig;
 use crate::tool_runtime::{ToolArtifactPublisher, ToolBrokerConfig};
 use crate::workspace_monitor::publish_canonical_json;
 
-const DEFAULT_POLICY_BUNDLE: &str = r#"{"version":1,"rules":[{"id":"default-deny-process","effect":"deny","action":"process.exec"},{"id":"structured-read","effect":"allow_with_redaction","action":"context.disclose","redactions":["secret_scanner"]},{"id":"tool-display","effect":"allow_with_redaction","action":"tool.approval.display","redactions":["secret_scanner"]}]}"#;
 const PRODUCTION_TOOL_PURPOSE: &str = "execute a structured local tool";
 
 #[derive(Clone)]
