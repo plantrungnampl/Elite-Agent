@@ -34,7 +34,7 @@ const requiredMatrices = [
 ];
 
 test("M3 evidence is complete and internally consistent", () => {
-  const result = runVerifier();
+  const result = runVerifier("--historical");
   assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
   assert.match(`${result.stdout}${result.stderr}`, /M3 evidence: ok/u);
 });

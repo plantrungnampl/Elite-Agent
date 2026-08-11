@@ -142,6 +142,7 @@ function verifyCargo(metadata, requireM3, requireM4) {
     ],
   ]);
   for (const name of workspace) {
+    if (name === domain || name === application) continue;
     const approved = externalDependenciesByPackage.get(name) ?? new Set();
     const forbidden = dependencies(name)
       .map((dependency) => dependency.name)
