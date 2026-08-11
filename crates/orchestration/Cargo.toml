@@ -1,0 +1,8 @@
+[package]
+name = "local-agent-terminal-orchestration"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+local-agent-terminal-application = { path = "../application" }
+local-agent-terminal-domain = { path = "../domain" }

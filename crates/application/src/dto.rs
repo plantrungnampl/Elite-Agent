@@ -48,6 +48,53 @@ pub struct DeliberationWorkspaceDto {
     pub unresolved_objection_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliberationBoundaryDto {
+    pub phase: String,
+    pub blocked: bool,
+    pub expected_head: String,
+    pub observed_head: String,
+    pub context_packages_invalidated: bool,
+    pub plan_approval_invalidated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliberationRejectedAlternativeDto {
+    pub approach_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliberationPlanDto {
+    pub selected_approach_id: String,
+    pub rejected_alternatives: Vec<DeliberationRejectedAlternativeDto>,
+    pub verified_claim_ids: Vec<String>,
+    pub inconclusive_claim_ids: Vec<String>,
+    pub dissent_ids: Vec<String>,
+    pub affected_files: Vec<String>,
+    pub implementation_steps: Vec<String>,
+    pub planned_tools: Vec<String>,
+    pub verification_profile: String,
+    pub rollback_plan: String,
+    pub risk: String,
+    pub estimated_cost_microunits: Option<u64>,
+    pub estimated_duration_seconds: Option<u64>,
+    pub confidence: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeliberationRecoveryActionDto {
+    ResumePersisted,
+    StartReplacement,
+    WaitForTerminal,
+    AwaitExplicitResolution,
+    Complete,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StartupStateDto {

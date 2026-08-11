@@ -2016,6 +2016,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "local-agent-terminal-orchestration"
+version = "0.1.0"
+dependencies = [
+ "local-agent-terminal-application",
+ "local-agent-terminal-domain",
+]
+
+[[package]]
 name = "local-agent-terminal-platform-core"
 version = "0.1.0"
 dependencies = [

@@ -385,7 +385,7 @@ git commit -m "feat: route bounded agent context requests"
 - Modify: `crates/application/src/deliberation.rs`
 - Modify: `crates/application/src/dto.rs`
 
-- [ ] **Step 1 - Write failing phase and quorum tests**
+- [x] **Step 1 - Write failing phase and quorum tests**
 
 Drive the exact normative sequence:
 
@@ -397,17 +397,17 @@ Intake -> ContextBuild -> ParallelAnalysis -> CrossReview
 
 Prove every phase event is accepted by the normative reducer, every required effect is persisted before dispatch, two distinct family keys are required, proposals remain hidden until quorum, early consensus never skips quorum/verification/approval, and provider unavailability blocks rather than inventing a single-provider pass.
 
-- [ ] **Step 2 - Write failing review, specialist, verification, and dissent tests**
+- [x] **Step 2 - Write failing review, specialist, verification, and dissent tests**
 
 Test bounded review-edge assignment without broadcast, one review per edge, bounded specialist eligibility/budget/thread context, accepted summary promotion, and typed denial.
 
 Extract stable material claims, run deterministic checks first, require one terminal classification per claim, reject stale citations, and prevent agent confidence from changing trusted status. Synthesis must preserve selected/rejected alternatives, verified/inconclusive evidence, dissent, files, steps, tools, verification, rollback, risk, cost, and confidence.
 
-- [ ] **Step 3 - Write failing objection and approval-transition tests**
+- [x] **Step 3 - Write failing objection and approval-transition tests**
 
 Test one objection per participant/round, structured severity/impact/evidence, accepted severe objection reopening one bounded CrossReview round, preserved superseded draft/history, no close while severe accepted objection remains, and exact `plan.approved` transition only after canonical approval reload succeeds.
 
-- [ ] **Step 4 - Write failing recovery and zero-mutation tests**
+- [x] **Step 4 - Write failing recovery and zero-mutation tests**
 
 Crash after each event/artifact/run/visibility/claim/draft/approval boundary. Reopen and resume only missing idempotent work with new run IDs where required. Capture authoritative repository fingerprint before ContextBuild and at every phase boundary; any mismatch blocks and invalidates packages/approval.
 
@@ -417,11 +417,11 @@ Use a write-spy repository/tool/lease adapter to prove no pre-approval call can 
 cargo test -p local-agent-terminal-orchestration
 ```
 
-- [ ] **Step 5 - Implement the smallest resumable coordinator**
+- [x] **Step 5 - Implement the smallest resumable coordinator**
 
 Use application traits only. Keep selection capability-based, use family equality solely for diversity, append events/projection changes transactionally, and store all dispatch bindings before calling external runtimes. Do not add a generic supervisor DSL or provider-specific orchestration.
 
-- [ ] **Step 6 - Verify and commit**
+- [x] **Step 6 - Verify and commit**
 
 ```powershell
 cargo fmt --all -- --check
