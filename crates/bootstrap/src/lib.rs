@@ -18,12 +18,15 @@ pub use context_runtime::ContextRuntime;
 pub use deliberation_runtime::DeliberationRuntime;
 pub use local_agent_terminal_application::{
     ApprovalId, CancelToolExecutionRequestDto, CommandErrorDto, ConfirmDiscardWorkspaceRequestDto,
-    CreateTaskWorkspaceRequestDto, GetApprovalRequestDto, LocalDiagnosticDto,
-    OnboardRepositoryRequestDto, ProjectSnapshot, RecoveryCandidateRequestDto,
-    ResolveToolApprovalRequestDto, StartupStateDto, StartupStatusDto, StopAllToolsReceiptDto,
-    TaskSnapshot, ToolActivityDto, ToolApprovalDecisionDto, ToolApprovalRequestDto,
-    ToolApprovalResolutionDto, ToolCancellationReceiptDto, ToolRuntimeAvailabilityDto,
-    WorkspaceDashboardDto, WorkspaceDashboardRequestDto,
+    ContextPackageDto, CreateTaskWorkspaceRequestDto, DeliberationWorkspaceDto,
+    GetApprovalRequestDto, GetContextPackageRequestDto, GetDeliberationWorkspaceRequestDto,
+    LocalDiagnosticDto, OnboardRepositoryRequestDto, PlanApprovalResolutionDto,
+    PlanApprovalResolutionStatusDto, ProjectSnapshot, RecoveryCandidateRequestDto,
+    ResolveDisplayedPlanApprovalRequestDto, ResolveToolApprovalRequestDto, Sha256Digest,
+    StartupStateDto, StartupStatusDto, StopAllToolsReceiptDto, TaskSnapshot, ToolActivityDto,
+    ToolApprovalDecisionDto, ToolApprovalRequestDto, ToolApprovalResolutionDto,
+    ToolCancellationReceiptDto, ToolRuntimeAvailabilityDto, WorkspaceDashboardDto,
+    WorkspaceDashboardRequestDto,
 };
 pub use startup::{Bootstrap, StartupConfig};
 pub use tool_runtime::{

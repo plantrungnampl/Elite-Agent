@@ -6,7 +6,8 @@ use local_agent_terminal_application::{
     canonical_approval_payload, canonical_plan_approval_payload,
     parse_canonical_plan_approval_payload, plan_approval_payload, ApprovalDigestPayload,
     ApprovalId, Clock, CompareAndExpirePlanApproval, CompareAndInvalidatePlanApproval,
-    CompareAndResolvePlanApproval, ContextPackageDto, DeliberationWorkspaceDto,
+    CompareAndResolvePlanApproval, ContextPackageBudgetDto, ContextPackageDto,
+    ContextPackageVersionsDto, DeliberationAvailabilityDto, DeliberationWorkspaceDto,
     InvalidatePlanApproval, InvalidatePlanApprovalInput, NewPlanApproval,
     NewPlanApprovalRehydration, PlanApprovalAction, PlanApprovalAuthorityBinding,
     PlanApprovalBindingInput, PlanApprovalCurrentState, PlanApprovalPathScopeV1,
@@ -809,16 +810,36 @@ fn plan_approval_store_and_request_handler_are_object_safe_and_narrow() {
             task_id: "task-1".into(),
             agent_id: "agent-1".into(),
             role: "critic".into(),
+            objective: "Review the exact boundary".into(),
             artifact_id: "artifact-package-1".into(),
             content_digest: digest('5'),
             policy_snapshot_digest: digest('6'),
             policy_decision_ids: vec!["policy-decision:1".into()],
+            versions: ContextPackageVersionsDto {
+                prompt_template: "prompt-v1".into(),
+                retrieval_pipeline: "keyword-v1".into(),
+                tokenizer: "byte-token-v1".into(),
+            },
+            budget: ContextPackageBudgetDto {
+                max_tokens: 4_000,
+                reserved_response_tokens: 1_000,
+                used_input_tokens: 2_000,
+            },
+            members: Vec::new(),
         })
         .unwrap(),
         serde_json::to_string(&DeliberationWorkspaceDto {
+            availability: DeliberationAvailabilityDto::Ready,
             task_id: "task-1".into(),
             phase: "AwaitingPlanApproval".into(),
             task_version: 9,
+            status_message: "Authoritative state loaded".into(),
+            workflow: Vec::new(),
+            agents: Vec::new(),
+            cards: Vec::new(),
+            thread: None,
+            evidence: Vec::new(),
+            approval: None,
             private_proposal_count: 2,
             published_proposal_ids: vec!["proposal-1".into()],
             decision_artifact_id: Some("decision-1".into()),
@@ -833,6 +854,22 @@ fn plan_approval_store_and_request_handler_are_object_safe_and_narrow() {
         "secretMatch",
     ] {
         assert!(!serialized.contains(forbidden));
+    }
+    for required in [
+        "\"availability\":\"ready\"",
+        "\"workflow\":[]",
+        "\"agents\":[]",
+        "\"cards\":[]",
+        "\"evidence\":[]",
+        "\"approval\":null",
+        "\"versions\":",
+        "\"budget\":",
+        "\"members\":[]",
+    ] {
+        assert!(
+            serialized.contains(required),
+            "missing UI DTO field {required}"
+        );
     }
 }
 

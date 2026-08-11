@@ -15,6 +15,56 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetDeliberationWorkspaceRequestDto {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetContextPackageRequestDto {
+    pub package_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolveDisplayedPlanApprovalRequestDto {
+    pub approval_id: String,
+    pub displayed_digest: String,
+    pub expected_task_version: u64,
+    pub action: PlanApprovalAction,
+}
+
+impl ResolveDisplayedPlanApprovalRequestDto {
+    pub fn with_actor(self, actor_id: impl Into<String>) -> ResolvePlanApprovalRequestDto {
+        ResolvePlanApprovalRequestDto {
+            approval_id: self.approval_id,
+            displayed_digest: self.displayed_digest,
+            expected_task_version: self.expected_task_version,
+            actor_id: actor_id.into(),
+            action: self.action,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanApprovalResolutionDto {
+    pub approval_id: String,
+    pub task_id: String,
+    pub task_version: u64,
+    pub status: PlanApprovalResolutionStatusDto,
+    pub action: PlanApprovalAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanApprovalResolutionStatusDto {
+    Resolved,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResolvePlanApprovalRequestDto {
     pub approval_id: String,
     pub displayed_digest: String,
@@ -30,22 +80,274 @@ pub struct ContextPackageDto {
     pub task_id: String,
     pub agent_id: String,
     pub role: String,
+    pub objective: String,
     pub artifact_id: String,
     pub content_digest: String,
     pub policy_snapshot_digest: String,
     pub policy_decision_ids: Vec<String>,
+    pub versions: ContextPackageVersionsDto,
+    pub budget: ContextPackageBudgetDto,
+    pub members: Vec<ContextPackageMemberDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPackageVersionsDto {
+    pub prompt_template: String,
+    pub retrieval_pipeline: String,
+    pub tokenizer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPackageBudgetDto {
+    pub max_tokens: u64,
+    pub reserved_response_tokens: u64,
+    pub used_input_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPackageMemberDto {
+    pub member_id: String,
+    pub source: ContextPackageSourceDto,
+    pub line_range: Option<ContextLineRangeDto>,
+    pub symbol: Option<String>,
+    pub freshness: ContextFreshnessDto,
+    pub disclosure: ContextDisclosureDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPackageSourceDto {
+    pub project_id: String,
+    pub revision: String,
+    pub path_identity: String,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextLineRangeDto {
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextFreshnessDto {
+    Current,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextDisclosureDto {
+    pub kind: ContextDisclosureKindDto,
+    pub stable_report_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextDisclosureKindDto {
+    Allowed,
+    Redacted,
+    Denied,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeliberationWorkspaceDto {
+    pub availability: DeliberationAvailabilityDto,
     pub task_id: String,
     pub phase: String,
     pub task_version: u64,
+    pub status_message: String,
+    pub workflow: Vec<WorkflowPhaseDto>,
+    pub agents: Vec<AgentRosterEntryDto>,
+    pub cards: Vec<DeliberationCardDto>,
+    pub thread: Option<DeliberationThreadDto>,
+    pub evidence: Vec<DeliberationEvidenceDto>,
+    pub approval: Option<PlanApprovalViewDto>,
     pub private_proposal_count: usize,
     pub published_proposal_ids: Vec<String>,
     pub decision_artifact_id: Option<String>,
     pub unresolved_objection_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliberationAvailabilityDto {
+    Ready,
+    Blocked,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowPhaseDto {
+    pub phase_id: String,
+    pub label: String,
+    pub state: WorkflowPhaseStateDto,
+    pub detail: String,
+    pub retry_count: u32,
+    pub approval_gate: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPhaseStateDto {
+    Completed,
+    Current,
+    Blocked,
+    Pending,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRosterEntryDto {
+    pub agent_id: String,
+    pub role: String,
+    pub provider_label: String,
+    pub locality: AgentLocalityDto,
+    pub status: String,
+    pub context_scope: String,
+    pub context_package_id: Option<String>,
+    pub used_tokens: u64,
+    pub cost_microunits: u64,
+    pub health: String,
+    pub permissions: Vec<String>,
+    pub trust_tier: String,
+    pub sandbox_status: String,
+    pub identity_changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLocalityDto {
+    Local,
+    Cloud,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliberationCardDto {
+    pub card_id: String,
+    pub kind: DeliberationCardKindDto,
+    pub title: String,
+    pub summary: String,
+    pub actor_id: String,
+    pub evidence_state: EvidenceStateDto,
+    pub stale: bool,
+    pub artifact_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliberationCardKindDto {
+    Proposal,
+    Review,
+    Evidence,
+    Objection,
+    Decision,
+    Status,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceStateDto {
+    Verified,
+    Unverified,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliberationThreadDto {
+    pub thread_id: String,
+    pub summary: String,
+    pub messages: Vec<ThreadMessageDto>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMessageDto {
+    pub message_id: String,
+    pub actor_id: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliberationEvidenceDto {
+    pub artifact_id: String,
+    pub label: String,
+    pub path_identity: String,
+    pub line_range: Option<ContextLineRangeDto>,
+    pub state: EvidenceStateDto,
+    pub freshness: ContextFreshnessDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanApprovalViewDto {
+    pub approval_id: String,
+    pub task_id: String,
+    pub status: PlanApprovalStatusDto,
+    pub selected_approach_id: String,
+    pub selected_approach_label: String,
+    pub rejected_alternatives: Vec<PlanRejectedAlternativeDto>,
+    pub agreement: Vec<PlanAgentAgreementDto>,
+    pub unresolved_objections: Vec<String>,
+    pub affected_files: Vec<String>,
+    pub planned_tools: Vec<String>,
+    pub verification_profile: String,
+    pub rollback_plan: String,
+    pub security_implications: Vec<String>,
+    pub estimated_cost_microunits: Option<u64>,
+    pub estimated_duration_seconds: Option<u64>,
+    pub plan_version: u64,
+    pub policy_snapshot_digest: String,
+    pub writable_scopes: Vec<String>,
+    pub fencing_epoch: u64,
+    pub operation_digest: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanApprovalStatusDto {
+    Requested,
+    Resolved,
+    Rejected,
+    Expired,
+    Invalidated,
+    DigestChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanRejectedAlternativeDto {
+    pub approach_id: String,
+    pub label: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanAgentAgreementDto {
+    pub agent_id: String,
+    pub position: PlanAgreementPositionDto,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanAgreementPositionDto {
+    Agree,
+    Dissent,
+    Abstain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

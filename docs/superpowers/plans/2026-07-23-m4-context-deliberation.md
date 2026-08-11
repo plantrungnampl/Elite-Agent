@@ -532,17 +532,17 @@ get_context_package(packageId)
 resolve_plan_approval(approvalId, displayedDigest, expectedTaskVersion, action)
 ```
 
-- [ ] **Step 1 - Write failing Tauri/API boundary tests**
+- [x] **Step 1 - Write failing Tauri/API boundary tests**
 
 React sends only opaque IDs, displayed digest, expected task version, and an allowlisted action enum. Reject raw plan/provider/policy/path/event/tool/workflow payloads, generic command names, invoke outside `src/api`, stale task version, and cross-task IDs. Tauri maps bootstrap/application DTOs without database handles or provider types.
 
-- [ ] **Step 2 - Write failing component tests**
+- [x] **Step 2 - Write failing component tests**
 
 Render workflow rail, agent roster, proposal/review/evidence/objection/decision cards, bounded thread, exact Context Inspector redactions/provenance/policy IDs, and Plan Approval selected/rejected alternatives, agreement, dissent, files, tools, security, cost/duration, versions, and digest.
 
 Use one primary Approve action and plainly labeled Revise, Reopen, Add/replace agent, and Reject actions. Test loading, success, empty, blocked, unavailable, rejected, stale evidence, redacted, expired, digest-changed, and recoverable error states.
 
-- [ ] **Step 3 - Write failing accessibility/browser tests**
+- [x] **Step 3 - Write failing accessibility/browser tests**
 
 Cover full keyboard order, skip link, visible focus, dialog focus trap/restore, live-region phase/approval feedback, non-color labels, no hover-only information, 44px targets where applicable, reduced motion, 4.5:1 text contrast, 200% zoom/reflow at 1280x720, narrow viewport, stale approval invalidation, and axe with zero serious/critical violations.
 
@@ -551,11 +551,11 @@ pnpm --dir apps/desktop test --run
 pnpm --dir apps/desktop test:browser -- deliberation.spec.ts
 ```
 
-- [ ] **Step 4 - Implement minimum typed UI and commands**
+- [x] **Step 4 - Implement minimum typed UI and commands**
 
 Extend the existing view navigation without rewriting workspace/tool screens. Reuse existing styles/tokens and semantic components. Do not add speculative routing/state libraries.
 
-- [ ] **Step 5 - Verify frontend, Tauri, architecture, and commit**
+- [x] **Step 5 - Verify frontend, Tauri, architecture, and commit**
 
 ```powershell
 pnpm --dir apps/desktop test --run

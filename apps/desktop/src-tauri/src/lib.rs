@@ -2,13 +2,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use local_agent_terminal_bootstrap::{
-    Bootstrap, CancelToolExecutionRequestDto, CommandErrorDto, ConfirmDiscardWorkspaceRequestDto,
-    CreateTaskWorkspaceRequestDto, GetApprovalRequestDto, LocalDiagnosticDto,
-    OnboardRepositoryRequestDto, ProjectSnapshot, RecoveryCandidateRequestDto,
-    ResolveToolApprovalRequestDto, StartupConfig, StartupStatusDto, StopAllToolsReceiptDto,
-    TaskSnapshot, ToolActivityDto, ToolApprovalRequestDto, ToolApprovalResolutionDto,
-    ToolCancellationReceiptDto, ToolRuntime, WorkspaceDashboardDto, WorkspaceDashboardRequestDto,
-    WorkspaceRuntime,
+    ApprovalId, Bootstrap, CancelToolExecutionRequestDto, CommandErrorDto,
+    ConfirmDiscardWorkspaceRequestDto, ContextPackageDto, CreateTaskWorkspaceRequestDto,
+    DeliberationWorkspaceDto, GetApprovalRequestDto, GetContextPackageRequestDto,
+    GetDeliberationWorkspaceRequestDto, LocalDiagnosticDto, OnboardRepositoryRequestDto,
+    PlanApprovalResolutionDto, ProjectSnapshot, RecoveryCandidateRequestDto,
+    ResolveDisplayedPlanApprovalRequestDto, ResolveToolApprovalRequestDto, Sha256Digest,
+    StartupConfig, StartupStatusDto, StopAllToolsReceiptDto, TaskSnapshot, ToolActivityDto,
+    ToolApprovalRequestDto, ToolApprovalResolutionDto, ToolCancellationReceiptDto, ToolRuntime,
+    WorkspaceDashboardDto, WorkspaceDashboardRequestDto, WorkspaceRuntime,
 };
 use tauri::Manager;
 
@@ -225,6 +227,65 @@ fn stop_all_tools(
     state.with_tool_runtime(|runtime| runtime.stop_all_for_ui().map_err(CommandErrorDto::from))
 }
 
+#[tauri::command]
+fn get_deliberation_workspace(
+    request: GetDeliberationWorkspaceRequestDto,
+) -> Result<DeliberationWorkspaceDto, CommandErrorDto> {
+    validate_opaque_id(&request.task_id)?;
+    Err(deliberation_runtime_unavailable())
+}
+
+#[tauri::command]
+fn get_context_package(
+    request: GetContextPackageRequestDto,
+) -> Result<ContextPackageDto, CommandErrorDto> {
+    validate_opaque_id(&request.package_id)?;
+    Err(deliberation_runtime_unavailable())
+}
+
+#[tauri::command]
+fn resolve_plan_approval(
+    request: ResolveDisplayedPlanApprovalRequestDto,
+) -> Result<PlanApprovalResolutionDto, CommandErrorDto> {
+    validate_opaque_id(&request.approval_id)?;
+    let request = request.with_actor("user");
+    ApprovalId::new(&request.approval_id).map_err(CommandErrorDto::from)?;
+    Sha256Digest::new(&request.displayed_digest).map_err(|_| invalid_deliberation_request())?;
+    if request.expected_task_version == 0 {
+        return Err(invalid_deliberation_request());
+    }
+    Err(deliberation_runtime_unavailable())
+}
+
+fn validate_opaque_id(value: &str) -> Result<(), CommandErrorDto> {
+    if !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        Ok(())
+    } else {
+        Err(invalid_deliberation_request())
+    }
+}
+
+fn invalid_deliberation_request() -> CommandErrorDto {
+    CommandErrorDto {
+        code: "invalid_input".to_owned(),
+        message: "The deliberation command request is invalid.".to_owned(),
+        retryable: false,
+    }
+}
+
+fn deliberation_runtime_unavailable() -> CommandErrorDto {
+    CommandErrorDto {
+        code: "deliberation_runtime_unavailable".to_owned(),
+        message: "Authoritative deliberation state is unavailable.".to_owned(),
+        retryable: true,
+    }
+}
+
 fn config(app_data_dir: PathBuf) -> StartupConfig {
     StartupConfig {
         trusted_workspace_root: app_data_dir.join("workspaces"),
@@ -258,7 +319,10 @@ pub fn run() {
             get_approval_request,
             resolve_tool_approval,
             cancel_tool_execution,
-            stop_all_tools
+            stop_all_tools,
+            get_deliberation_workspace,
+            get_context_package,
+            resolve_plan_approval
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -274,7 +338,10 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use super::ManagedBootstrap;
+    use super::{
+        GetContextPackageRequestDto, GetDeliberationWorkspaceRequestDto, ManagedBootstrap,
+        ResolveDisplayedPlanApprovalRequestDto,
+    };
 
     #[test]
     fn resolver_failure_is_typed_and_retry_re_resolves_before_ready() {
@@ -370,5 +437,68 @@ mod tests {
             .unwrap();
         assert_eq!(activity.availability, ToolRuntimeAvailabilityDto::Ready);
         assert!(activity.entries.is_empty());
+    }
+
+    #[test]
+    fn deliberation_command_requests_reject_replacement_payloads_and_unknown_fields() {
+        assert!(
+            serde_json::from_value::<GetDeliberationWorkspaceRequestDto>(serde_json::json!({
+                "taskId": "task-1",
+                "workflow": { "phase": "Implementation" }
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<GetContextPackageRequestDto>(serde_json::json!({
+                "packageId": "context-1",
+                "physicalPath": "D:\\repo\\secret.txt"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ResolveDisplayedPlanApprovalRequestDto>(serde_json::json!({
+                "approvalId": "approval-1",
+                "displayedDigest": format!("sha256:{}", "a".repeat(64)),
+                "expectedTaskVersion": 9,
+                "action": "approve",
+                "rawPlan": { "tools": ["shell"] }
+            }))
+            .is_err()
+        );
+
+        for forbidden in [
+            "providerPayload",
+            "policy",
+            "physicalPath",
+            "event",
+            "tool",
+            "workflow",
+        ] {
+            let mut hostile = serde_json::json!({
+                "approvalId": "approval-1",
+                "displayedDigest": format!("sha256:{}", "a".repeat(64)),
+                "expectedTaskVersion": 9,
+                "action": "approve"
+            });
+            hostile
+                .as_object_mut()
+                .unwrap()
+                .insert(forbidden.to_owned(), serde_json::json!("untrusted"));
+            assert!(
+                serde_json::from_value::<ResolveDisplayedPlanApprovalRequestDto>(hostile).is_err()
+            );
+        }
+
+        let request =
+            serde_json::from_value::<ResolveDisplayedPlanApprovalRequestDto>(serde_json::json!({
+                "approvalId": "approval-1",
+                "displayedDigest": format!("sha256:{}", "a".repeat(64)),
+                "expectedTaskVersion": 9,
+                "action": "approve"
+            }))
+            .unwrap()
+            .with_actor("user");
+        assert_eq!(request.actor_id, "user");
+        assert_eq!(request.approval_id, "approval-1");
     }
 }
