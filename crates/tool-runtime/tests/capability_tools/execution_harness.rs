@@ -225,7 +225,7 @@ struct RecordingDecisionStore {
 
 impl PolicyDecisionStore for RecordingDecisionStore {
     fn record(&self, decision: RecordedPolicyDecision) -> Result<PolicyDecisionId, PortError> {
-        let id = PolicyDecisionId::from_decision(&decision.decision);
+        let id = PolicyDecisionId::from_decision(decision.decision());
         self.recorded.lock().unwrap().push(decision);
         Ok(id)
     }
@@ -273,7 +273,7 @@ struct WrongIdDecisionStore {
 impl PolicyDecisionStore for WrongIdDecisionStore {
     fn record(&self, decision: RecordedPolicyDecision) -> Result<PolicyDecisionId, PortError> {
         self.recorded.lock().unwrap().push(decision.clone());
-        let mut different = decision.decision;
+        let mut different = decision.decision().clone();
         different.operation_digest = digest(b"different policy decision");
         Ok(PolicyDecisionId::from_decision(&different))
     }

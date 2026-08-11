@@ -93,7 +93,7 @@ fn file_read_forces_resolved_digest_records_authoritative_decision_and_returns_o
     assert_eq!(recorded.len(), 1);
     assert_eq!(
         disclosure.policy_decision_id,
-        PolicyDecisionId::from_decision(&recorded[0].decision)
+        PolicyDecisionId::from_decision(recorded[0].decision())
     );
 }
 
@@ -302,12 +302,12 @@ fn disclosure_channel_changes_the_recorded_decision_identity() {
 
     let recorded = decisions.recorded.lock().unwrap();
     assert_ne!(
-        recorded[0].decision.operation_digest,
-        recorded[1].decision.operation_digest
+        recorded[0].decision().operation_digest,
+        recorded[1].decision().operation_digest
     );
     assert_ne!(
-        PolicyDecisionId::from_decision(&recorded[0].decision),
-        PolicyDecisionId::from_decision(&recorded[1].decision)
+        PolicyDecisionId::from_decision(recorded[0].decision()),
+        PolicyDecisionId::from_decision(recorded[1].decision())
     );
 }
 

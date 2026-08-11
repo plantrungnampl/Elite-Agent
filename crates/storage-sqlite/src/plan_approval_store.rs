@@ -62,12 +62,12 @@ impl PlanApprovalStore for SqliteStore {
         command.validate()?;
         let task_id =
             TaskId::new(&command.expected_current.binding.task_id).map_err(|_| conflict())?;
-        let live_authority = load_current_authority(self, &task_id)?;
         let artifact_reader = configured_artifact_reader(self)?;
         let mut connection = self.connection().map_err(open_error_to_port)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
+        let live_authority = load_current_authority(self, &task_id)?;
         compare_expected(
             &transaction,
             artifact_reader,
@@ -80,10 +80,12 @@ impl PlanApprovalStore for SqliteStore {
             PlanApprovalAction::Approve => ("granted", "approve", "plan.approved"),
             PlanApprovalAction::Reject => ("denied", "reject", "task.cancelled"),
             PlanApprovalAction::Revise => ("denied", "revise", "plan.revision.requested"),
-            PlanApprovalAction::Reopen => ("denied", "reopen", "plan.revision.requested"),
-            PlanApprovalAction::AddOrReplaceAgent => {
-                ("denied", "add_or_replace_agent", "plan.revision.requested")
-            }
+            PlanApprovalAction::Reopen => ("denied", "reopen", "plan.discussion.reopened"),
+            PlanApprovalAction::AddOrReplaceAgent => (
+                "denied",
+                "add_or_replace_agent",
+                "plan.roster_change.requested",
+            ),
         };
         let changed = transaction
             .execute(
@@ -111,6 +113,7 @@ impl PlanApprovalStore for SqliteStore {
             event_type,
             Some(action),
         )?;
+        recheck_current_authority(self, &task_id, &live_authority)?;
         transaction.commit().map_err(sqlite_error_to_port)
     }
 
@@ -121,12 +124,12 @@ impl PlanApprovalStore for SqliteStore {
         command.validate()?;
         let task_id =
             TaskId::new(&command.expected_current.binding.task_id).map_err(|_| conflict())?;
-        let live_authority = load_current_authority(self, &task_id)?;
         let artifact_reader = configured_artifact_reader(self)?;
         let mut connection = self.connection().map_err(open_error_to_port)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
+        let live_authority = load_current_authority(self, &task_id)?;
         compare_expected(
             &transaction,
             artifact_reader,
@@ -161,6 +164,7 @@ impl PlanApprovalStore for SqliteStore {
             "approval.invalidated",
             None,
         )?;
+        recheck_current_authority(self, &task_id, &live_authority)?;
         transaction.commit().map_err(sqlite_error_to_port)
     }
 
@@ -168,12 +172,12 @@ impl PlanApprovalStore for SqliteStore {
         command.validate()?;
         let task_id =
             TaskId::new(&command.expected_current.binding.task_id).map_err(|_| conflict())?;
-        let live_authority = load_current_authority(self, &task_id)?;
         let artifact_reader = configured_artifact_reader(self)?;
         let mut connection = self.connection().map_err(open_error_to_port)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
+        let live_authority = load_current_authority(self, &task_id)?;
         compare_expected(
             &transaction,
             artifact_reader,
@@ -206,6 +210,7 @@ impl PlanApprovalStore for SqliteStore {
             "approval.expired",
             None,
         )?;
+        recheck_current_authority(self, &task_id, &live_authority)?;
         transaction.commit().map_err(sqlite_error_to_port)
     }
 }
@@ -483,7 +488,12 @@ fn load_denied_resolution_event(
         .query_row(
             "SELECT event_type FROM events
              WHERE stream_id = ?1
-               AND event_type IN ('task.cancelled', 'plan.revision.requested')
+               AND event_type IN (
+                   'task.cancelled',
+                   'plan.revision.requested',
+                   'plan.discussion.reopened',
+                   'plan.roster_change.requested'
+               )
                AND json_extract(payload_json, '$.approvalId') = ?2
              ORDER BY sequence DESC LIMIT 1",
             params![task_id, approval_id],
@@ -549,6 +559,18 @@ fn load_current_authority(
         .plan_approval_authority_source()
         .ok_or_else(unavailable)?
         .current_authority(task_id)
+}
+
+fn recheck_current_authority(
+    store: &SqliteStore,
+    task_id: &TaskId,
+    expected: &PlanApprovalCurrentAuthority,
+) -> Result<(), PortError> {
+    if load_current_authority(store, task_id)? == *expected {
+        Ok(())
+    } else {
+        Err(conflict())
+    }
 }
 
 fn configured_artifact_reader(store: &SqliteStore) -> Result<&dyn ArtifactRootReader, PortError> {

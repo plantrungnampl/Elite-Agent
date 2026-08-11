@@ -225,11 +225,14 @@ fn two_provider_runtime_routes_by_agent_and_isolates_an_openai_failure() {
         AgentRunStatus::Succeeded
     );
 
+    let diagnostics = format!("{:?}", bootstrap.local_diagnostics());
+    drop(runtime);
+    drop(bootstrap);
+
     let durable = durable_bytes(&fixture.app_data);
     assert_not_present(&durable, API_KEY_CANARY);
     assert_not_present(&durable, &openai_endpoint);
     assert_not_present(&durable, &anthropic_endpoint);
-    let diagnostics = format!("{:?}", bootstrap.local_diagnostics());
     assert_not_present(diagnostics.as_bytes(), API_KEY_CANARY);
     assert_not_present(diagnostics.as_bytes(), &openai_endpoint);
     assert_not_present(diagnostics.as_bytes(), &anthropic_endpoint);

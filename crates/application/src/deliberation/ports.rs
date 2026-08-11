@@ -325,6 +325,7 @@ impl DeliberationProposalDispatchPlan {
 pub struct DeliberationPhaseDispatchAuthority {
     task_id: TaskId,
     phase: Phase,
+    round: u32,
     assignments: Vec<DeliberationRunAssignment>,
     limits: DeliberationLimits,
     task_budget: DeliberationTaskBudget,
@@ -341,6 +342,27 @@ impl DeliberationPhaseDispatchAuthority {
         let authority = Self {
             task_id,
             phase,
+            round: 0,
+            assignments,
+            limits,
+            task_budget,
+        };
+        authority.validate()?;
+        Ok(authority)
+    }
+
+    pub fn for_round(
+        task_id: TaskId,
+        phase: Phase,
+        round: u32,
+        assignments: Vec<DeliberationRunAssignment>,
+        limits: DeliberationLimits,
+        task_budget: DeliberationTaskBudget,
+    ) -> Result<Self, PortError> {
+        let authority = Self {
+            task_id,
+            phase,
+            round,
             assignments,
             limits,
             task_budget,
@@ -355,6 +377,10 @@ impl DeliberationPhaseDispatchAuthority {
 
     pub const fn phase(&self) -> Phase {
         self.phase
+    }
+
+    pub const fn round(&self) -> u32 {
+        self.round
     }
 
     pub fn assignments(&self) -> &[DeliberationRunAssignment] {
@@ -380,7 +406,8 @@ impl DeliberationPhaseDispatchAuthority {
                 | Phase::PrePlanVerification
                 | Phase::Synthesis
                 | Phase::FinalObjection
-        ) || self.assignments.is_empty()
+        ) || self.round > self.limits.max_rounds()
+            || self.assignments.is_empty()
             || self.assignments.len() > maximum_assignments
         {
             return Err(invalid_input());

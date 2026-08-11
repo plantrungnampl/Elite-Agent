@@ -3,7 +3,7 @@ use local_agent_terminal_application::{
     SafeErrorClassification,
 };
 use local_agent_terminal_domain::{DeliberationTaskBudget, Sha256Digest, TaskId, Timestamp};
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::event_store::open_error_to_port;
 use crate::event_store::sqlite_error_to_port;
@@ -14,27 +14,83 @@ impl SqliteStore {
         &self,
         task_id: &TaskId,
     ) -> Result<Option<DeliberationTaskBudget>, PortError> {
-        let connection = self.connection().map_err(open_error_to_port)?;
-        let raw: Option<(i64, i64, i64, i64)> = connection
-            .query_row(
-                "SELECT max_threads, max_tokens, max_cost_microunits, deadline_unix_seconds
-                 FROM deliberation_task_budgets WHERE task_id = ?1",
-                [task_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
-        raw.map(|(threads, tokens, cost, deadline)| {
-            DeliberationTaskBudget::new(
-                u32::try_from(threads).map_err(|_| integrity_failure())?,
-                u64::try_from(tokens).map_err(|_| integrity_failure())?,
-                u64::try_from(cost).map_err(|_| integrity_failure())?,
-                Timestamp::from_unix_seconds(deadline),
-            )
-            .map_err(|_| integrity_failure())
-        })
-        .transpose()
+        let mut raw = load_budget_row(&transaction, task_id)?;
+        if raw.is_none() {
+            if let Some(recovered) = historical_budget_authority(&transaction, task_id)? {
+                let reservation = historical_reservation(&transaction, task_id)?;
+                insert_budget_row(&transaction, task_id, recovered, reservation)?;
+                raw = load_budget_row(&transaction, task_id)?;
+            }
+        }
+        let budget = raw.map(budget_from_row).transpose()?;
+        transaction.commit().map_err(sqlite_error_to_port)?;
+        Ok(budget)
     }
+}
+
+fn load_budget_row(
+    transaction: &Transaction<'_>,
+    task_id: &TaskId,
+) -> Result<Option<(i64, i64, i64, i64)>, PortError> {
+    transaction
+        .query_row(
+            "SELECT max_threads, max_tokens, max_cost_microunits, deadline_unix_seconds
+                 FROM deliberation_task_budgets WHERE task_id = ?1",
+            [task_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(sqlite_error_to_port)
+}
+
+fn budget_from_row(
+    (threads, tokens, cost, deadline): (i64, i64, i64, i64),
+) -> Result<DeliberationTaskBudget, PortError> {
+    DeliberationTaskBudget::new(
+        u32::try_from(threads).map_err(|_| integrity_failure())?,
+        u64::try_from(tokens).map_err(|_| integrity_failure())?,
+        u64::try_from(cost).map_err(|_| integrity_failure())?,
+        Timestamp::from_unix_seconds(deadline),
+    )
+    .map_err(|_| integrity_failure())
+}
+
+fn insert_budget_row(
+    transaction: &Transaction<'_>,
+    task_id: &TaskId,
+    budget: DeliberationTaskBudget,
+    reservation: DeliberationBudgetReservation,
+) -> Result<(), PortError> {
+    if reservation.thread_count() > budget.max_threads()
+        || reservation.token_count() > budget.max_tokens()
+        || reservation.cost_microunits() > budget.max_cost_microunits()
+    {
+        return Err(conflict());
+    }
+    transaction
+        .execute(
+            "INSERT INTO deliberation_task_budgets (
+                task_id, max_threads, max_tokens, max_cost_microunits,
+                deadline_unix_seconds, reserved_threads, reserved_tokens,
+                reserved_cost_microunits
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                task_id.as_str(),
+                i64::from(budget.max_threads()),
+                to_i64(budget.max_tokens())?,
+                to_i64(budget.max_cost_microunits())?,
+                budget.deadline().unix_seconds(),
+                i64::from(reservation.thread_count()),
+                to_i64(reservation.token_count())?,
+                to_i64(reservation.cost_microunits())?,
+            ],
+        )
+        .map_err(sqlite_error_to_port)?;
+    Ok(())
 }
 
 pub(crate) fn reserve_task_budget(
@@ -66,25 +122,9 @@ pub(crate) fn reserve_task_budget(
     {
         return Err(conflict());
     }
-    transaction
-        .execute(
-            "INSERT OR IGNORE INTO deliberation_task_budgets (
-                task_id, max_threads, max_tokens, max_cost_microunits,
-                deadline_unix_seconds, reserved_threads, reserved_tokens,
-                reserved_cost_microunits
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                task_id.as_str(),
-                max_threads,
-                max_tokens,
-                max_cost,
-                budget.deadline().unix_seconds(),
-                i64::from(historical.thread_count()),
-                to_i64(historical.token_count())?,
-                to_i64(historical.cost_microunits())?,
-            ],
-        )
-        .map_err(sqlite_error_to_port)?;
+    if !exists {
+        insert_budget_row(transaction, task_id, budget, historical)?;
+    }
 
     let exact: bool = transaction
         .query_row(
@@ -172,6 +212,39 @@ fn historical_reservation(
         reservation = reservation.checked_add(fact.record().budget_reservation())?;
     }
     Ok(reservation)
+}
+
+fn historical_budget_authority(
+    transaction: &Transaction<'_>,
+    task_id: &TaskId,
+) -> Result<Option<DeliberationTaskBudget>, PortError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT
+                json_extract(events.payload_json, '$.taskBudget.maxThreads'),
+                json_extract(events.payload_json, '$.taskBudget.maxTokens'),
+                json_extract(events.payload_json, '$.taskBudget.maxCostMicrounits'),
+                json_extract(events.payload_json, '$.taskBudget.deadlineUnixSeconds')
+             FROM deliberation_records
+             JOIN events ON events.event_id = deliberation_records.event_id
+             WHERE deliberation_records.task_id = ?1
+             ORDER BY deliberation_records.sequence",
+        )
+        .map_err(sqlite_error_to_port)?;
+    let rows = statement
+        .query_map([task_id.as_str()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .map_err(sqlite_error_to_port)?;
+    let mut authority = None;
+    for row in rows {
+        let budget = budget_from_row(row.map_err(sqlite_error_to_port)?)?;
+        if authority.is_some_and(|existing| existing != budget) {
+            return Err(integrity_failure());
+        }
+        authority = Some(budget);
+    }
+    Ok(authority)
 }
 
 fn to_i64(value: u64) -> Result<i64, PortError> {

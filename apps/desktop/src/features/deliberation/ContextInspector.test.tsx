@@ -29,7 +29,9 @@ describe("ContextInspector", () => {
     expect(within(dialog).getByText("sha256:source-content")).toBeVisible();
     expect(within(dialog).getByText("Lines 4–9")).toBeVisible();
     expect(within(dialog).getByText("Redacted", { exact: true })).toBeVisible();
-    expect(within(dialog).getByText("redaction-report-1")).toBeVisible();
+    const redactionRecords = within(dialog).getAllByText("redaction-report-1");
+    expect(redactionRecords).toHaveLength(2);
+    redactionRecords.forEach((record) => expect(record).toBeVisible());
     expect(within(dialog).getByText("Stale evidence", { exact: false })).toBeVisible();
 
     const result = await axe.run(container, {
@@ -90,6 +92,7 @@ function packageFixture(): ContextPackageDto {
     members: [
       {
         memberId: "member-1",
+        content: "pub struct [REDACTED]",
         source: {
           projectId: "project-1",
           revision: "commit-1",
@@ -100,6 +103,9 @@ function packageFixture(): ContextPackageDto {
         symbol: "SecretBoundary",
         freshness: "stale",
         disclosure: { kind: "redacted", stableReportId: "redaction-report-1" },
+        policyDecisionIds: ["policy-decision:item-1"],
+        provenance: ["artifact:source-1"],
+        redactionReportIds: ["redaction-report-1"],
       },
     ],
   };

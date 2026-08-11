@@ -4,18 +4,21 @@ use std::sync::{Arc, Mutex};
 use local_agent_terminal_bootstrap::{
     ApprovalId, Bootstrap, CancelToolExecutionRequestDto, CommandErrorDto,
     ConfirmDiscardWorkspaceRequestDto, ContextPackageDto, CreateTaskWorkspaceRequestDto,
-    DeliberationRuntime, DeliberationWorkspaceDto, GetApprovalRequestDto,
-    GetContextPackageRequestDto, GetDeliberationWorkspaceRequestDto, LocalDiagnosticDto,
-    OnboardRepositoryRequestDto, PlanApprovalResolutionDto, ProjectSnapshot,
+    DeliberationResumeActionDto, DeliberationRuntime, DeliberationWorkspaceDto,
+    GetApprovalRequestDto, GetContextPackageRequestDto, GetDeliberationWorkspaceRequestDto,
+    LocalDiagnosticDto, OnboardRepositoryRequestDto, PlanApprovalResolutionDto, ProjectSnapshot,
     RecoveryCandidateRequestDto, ResolveDisplayedPlanApprovalRequestDto,
-    ResolveToolApprovalRequestDto, Sha256Digest, StartupConfig, StartupStatusDto,
-    StopAllToolsReceiptDto, TaskSnapshot, ToolActivityDto, ToolApprovalRequestDto,
-    ToolApprovalResolutionDto, ToolCancellationReceiptDto, ToolRuntime, WorkspaceDashboardDto,
-    WorkspaceDashboardRequestDto, WorkspaceRuntime,
+    ResolveToolApprovalRequestDto, ResumeDeliberationRequestDto, Sha256Digest, StartupConfig,
+    StartupStatusDto, StopAllToolsReceiptDto, TaskSnapshot, ToolActivityDto,
+    ToolApprovalRequestDto, ToolApprovalResolutionDto, ToolCancellationReceiptDto, ToolRuntime,
+    WorkspaceDashboardDto, WorkspaceDashboardRequestDto, WorkspaceRuntime,
 };
 use tauri::Manager;
 
-struct ManagedBootstrap(Mutex<Bootstrap>);
+struct ManagedBootstrap {
+    bootstrap: Mutex<Bootstrap>,
+    trusted_config: Option<StartupConfig>,
+}
 
 impl ManagedBootstrap {
     fn resolve_with(resolve: impl FnOnce() -> Option<PathBuf>) -> Self {
@@ -23,22 +26,34 @@ impl ManagedBootstrap {
             .map(config)
             .map(Bootstrap::production)
             .unwrap_or_else(Bootstrap::configuration_unavailable);
-        Self(Mutex::new(bootstrap))
+        Self {
+            bootstrap: Mutex::new(bootstrap),
+            trusted_config: None,
+        }
+    }
+
+    fn from_config(config: StartupConfig) -> Self {
+        Self {
+            bootstrap: Mutex::new(Bootstrap::production(config.clone())),
+            trusted_config: Some(config),
+        }
     }
 
     fn status(&self) -> StartupStatusDto {
-        match self.0.lock() {
+        match self.bootstrap.lock() {
             Ok(bootstrap) => bootstrap.status().clone(),
             Err(_) => Bootstrap::internal_state_unavailable().status().clone(),
         }
     }
 
     fn retry_with(&self, resolve: impl FnOnce() -> Option<PathBuf>) -> StartupStatusDto {
-        match self.0.lock() {
-            Ok(mut bootstrap) => match resolve() {
-                Some(app_data_dir) => bootstrap
-                    .reconfigure_production(config(app_data_dir))
-                    .clone(),
+        let next_config = self
+            .trusted_config
+            .clone()
+            .or_else(|| resolve().map(config));
+        match self.bootstrap.lock() {
+            Ok(mut bootstrap) => match next_config {
+                Some(config) => bootstrap.reconfigure_production(config).clone(),
                 None => {
                     *bootstrap = Bootstrap::configuration_unavailable();
                     bootstrap.status().clone()
@@ -49,7 +64,7 @@ impl ManagedBootstrap {
     }
 
     fn diagnostics(&self) -> Vec<LocalDiagnosticDto> {
-        match self.0.lock() {
+        match self.bootstrap.lock() {
             Ok(bootstrap) => bootstrap.local_diagnostics().to_vec(),
             Err(_) => Bootstrap::internal_state_unavailable()
                 .local_diagnostics()
@@ -62,7 +77,7 @@ impl ManagedBootstrap {
         operation: impl FnOnce(&WorkspaceRuntime) -> Result<T, CommandErrorDto>,
     ) -> Result<T, CommandErrorDto> {
         let bootstrap = self
-            .0
+            .bootstrap
             .lock()
             .map_err(|_| CommandErrorDto::internal_state_unavailable())?;
         let runtime = bootstrap
@@ -76,7 +91,7 @@ impl ManagedBootstrap {
         operation: impl FnOnce(Arc<ToolRuntime>) -> Result<T, CommandErrorDto>,
     ) -> Result<T, CommandErrorDto> {
         let runtime = self
-            .0
+            .bootstrap
             .lock()
             .map_err(|_| CommandErrorDto::internal_state_unavailable())?
             .tool_runtime_handle()
@@ -89,7 +104,7 @@ impl ManagedBootstrap {
         operation: impl FnOnce(Arc<DeliberationRuntime>) -> Result<T, CommandErrorDto>,
     ) -> Result<T, CommandErrorDto> {
         let runtime = self
-            .0
+            .bootstrap
             .lock()
             .map_err(|_| CommandErrorDto::internal_state_unavailable())?
             .deliberation_runtime_handle()
@@ -262,6 +277,26 @@ fn get_deliberation_workspace_from_state(
 }
 
 #[tauri::command]
+fn resume_deliberation(
+    request: ResumeDeliberationRequestDto,
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<DeliberationResumeActionDto, CommandErrorDto> {
+    resume_deliberation_from_state(request, &state)
+}
+
+fn resume_deliberation_from_state(
+    request: ResumeDeliberationRequestDto,
+    state: &ManagedBootstrap,
+) -> Result<DeliberationResumeActionDto, CommandErrorDto> {
+    validate_opaque_id(&request.task_id)?;
+    state.with_deliberation_runtime(|runtime| {
+        runtime
+            .resume_deliberation(&request.task_id)
+            .map_err(CommandErrorDto::from)
+    })
+}
+
+#[tauri::command]
 fn get_context_package(
     request: GetContextPackageRequestDto,
     state: tauri::State<'_, ManagedBootstrap>,
@@ -340,11 +375,21 @@ fn config(app_data_dir: PathBuf) -> StartupConfig {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    run_with_startup_config(None);
+}
+
+pub fn run_with_config(config: StartupConfig) {
+    run_with_startup_config(Some(config));
+}
+
+fn run_with_startup_config(mut trusted_config: Option<StartupConfig>) {
     tauri::Builder::default()
-        .setup(|app| {
-            app.manage(ManagedBootstrap::resolve_with(|| {
-                app.path().app_data_dir().ok()
-            }));
+        .setup(move |app| {
+            let managed = trusted_config.take().map_or_else(
+                || ManagedBootstrap::resolve_with(|| app.path().app_data_dir().ok()),
+                ManagedBootstrap::from_config,
+            );
+            app.manage(managed);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -363,6 +408,7 @@ pub fn run() {
             cancel_tool_execution,
             stop_all_tools,
             get_deliberation_workspace,
+            resume_deliberation,
             get_context_package,
             resolve_plan_approval
         ])
@@ -376,9 +422,9 @@ mod tests {
 
     use super::{
         get_context_package_from_state, get_deliberation_workspace_from_state,
-        resolve_plan_approval_from_state, GetContextPackageRequestDto,
-        GetDeliberationWorkspaceRequestDto, ManagedBootstrap,
-        ResolveDisplayedPlanApprovalRequestDto,
+        resolve_plan_approval_from_state, resume_deliberation_from_state,
+        GetContextPackageRequestDto, GetDeliberationWorkspaceRequestDto, ManagedBootstrap,
+        ResolveDisplayedPlanApprovalRequestDto, ResumeDeliberationRequestDto,
     };
     use local_agent_terminal_bootstrap::{
         CancelToolExecutionRequestDto, GetApprovalRequestDto, ResolveToolApprovalRequestDto,
@@ -416,7 +462,7 @@ mod tests {
         let managed = ManagedBootstrap::resolve_with(|| Some(parent.path().join("app-data")));
         assert_eq!(managed.status().state, StartupStateDto::Ready);
         assert!(catch_unwind(AssertUnwindSafe(|| {
-            let _guard = managed.0.lock().unwrap();
+            let _guard = managed.bootstrap.lock().unwrap();
             panic!("poison managed bootstrap");
         }))
         .is_err());
@@ -483,6 +529,21 @@ mod tests {
     }
 
     #[test]
+    fn trusted_startup_config_is_retained_across_retry() {
+        let parent = TempDir::new().unwrap();
+        let managed =
+            ManagedBootstrap::from_config(super::config(parent.path().join("configured-app-data")));
+
+        assert_eq!(managed.status().state, StartupStateDto::Ready);
+        assert_eq!(
+            managed
+                .retry_with(|| panic!("trusted retry must not re-resolve configuration"))
+                .state,
+            StartupStateDto::Ready
+        );
+    }
+
+    #[test]
     fn deliberation_command_requests_reject_replacement_payloads_and_unknown_fields() {
         assert!(
             serde_json::from_value::<GetDeliberationWorkspaceRequestDto>(serde_json::json!({
@@ -495,6 +556,13 @@ mod tests {
             serde_json::from_value::<GetContextPackageRequestDto>(serde_json::json!({
                 "packageId": "context-1",
                 "physicalPath": "D:\\repo\\secret.txt"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ResumeDeliberationRequestDto>(serde_json::json!({
+                "taskId": "task-1",
+                "providerPayload": { "model": "replacement" }
             }))
             .is_err()
         );
@@ -567,6 +635,15 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(package.code, "not_found");
+
+        let resume = resume_deliberation_from_state(
+            ResumeDeliberationRequestDto {
+                task_id: "task-missing".to_owned(),
+            },
+            &state,
+        )
+        .unwrap_err();
+        assert_eq!(resume.code, "unavailable");
 
         let approval = resolve_plan_approval_from_state(
             serde_json::from_value(serde_json::json!({

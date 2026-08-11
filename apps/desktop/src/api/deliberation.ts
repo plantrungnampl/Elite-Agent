@@ -133,6 +133,7 @@ export interface DeliberationWorkspaceDto {
 
 export interface ContextPackageMemberDto {
   memberId: string;
+  content: string;
   source: {
     projectId: string;
     revision: string;
@@ -146,6 +147,9 @@ export interface ContextPackageMemberDto {
     kind: "allowed" | "redacted" | "denied";
     stableReportId: string | null;
   };
+  policyDecisionIds: string[];
+  provenance: string[];
+  redactionReportIds: string[];
 }
 
 export interface ContextPackageDto {
@@ -178,6 +182,24 @@ export interface GetDeliberationWorkspaceRequestDto {
 export interface GetContextPackageRequestDto {
   packageId: string;
 }
+
+export interface ResumeDeliberationRequestDto {
+  taskId: string;
+}
+
+export type DeliberationResumeAction =
+  | "validate_intake"
+  | "build_initial_context"
+  | "await_independent_proposals"
+  | "publish_quorum"
+  | "persist_review_edges"
+  | "freeze_material_claims"
+  | "classify_material_claims"
+  | "synthesize_decision"
+  | "collect_final_objections"
+  | "close_objection_round"
+  | "await_plan_approval"
+  | "post_approval";
 
 export interface ResolvePlanApprovalRequestDto {
   approvalId: string;
@@ -220,6 +242,14 @@ export function getContextPackage(
   exactKeys(request, ["packageId"]);
   validOpaqueId(request.packageId, "packageId");
   return invoke<ContextPackageDto>("get_context_package", { request });
+}
+
+export function resumeDeliberation(
+  request: ResumeDeliberationRequestDto,
+): Promise<DeliberationResumeAction> {
+  exactKeys(request, ["taskId"]);
+  validOpaqueId(request.taskId, "taskId");
+  return invoke<DeliberationResumeAction>("resume_deliberation", { request });
 }
 
 export function resolvePlanApproval(

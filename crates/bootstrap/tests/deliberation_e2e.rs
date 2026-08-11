@@ -1,24 +1,17 @@
+#[path = "deliberation_e2e/assertions.rs"]
+mod deliberation_assertions;
 #[path = "deliberation_e2e/support.rs"]
 mod deliberation_support;
 #[allow(dead_code)]
 mod support;
-
-use std::{
-    fs,
-    io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
-    sync::{mpsc, Mutex},
-    thread,
-    time::Duration,
-};
-
 use git2::Repository;
 use local_agent_terminal_application::{
     canonical_plan_approval_payload, ActorId, AgentRunStore, ApprovalId, ArtifactWriteReservation,
-    BuildInitialContextRequest, Clock, ContextBuildPolicy, ContextPackageDraft, ContextQuery,
-    DeliberationArtifactRef, DeliberationBoundaryCheck, DeliberationBoundaryRecord,
-    DeliberationBoundaryStore, DeliberationCommandContext, DeliberationCommands,
-    DeliberationDispatchStore, DeliberationPhaseDispatchSet, DeliberationProposalDispatchPlan,
+    BuildInitialContextRequest, Clock, ContextBuildPolicy, ContextPackageContract,
+    ContextPackageDraft, ContextQuery, ContextRunReconstructibility, DeliberationArtifactRef,
+    DeliberationBoundaryCheck, DeliberationBoundaryRecord, DeliberationBoundaryStore,
+    DeliberationCommandContext, DeliberationCommands, DeliberationDispatchStore,
+    DeliberationPhaseDispatchSet, DeliberationProposalDispatchPlan,
     DeliberationRepositoryAuthority, DeliberationRunAssignment, DeliberationStore,
     DeliberationToolCatalog, DeliberationToolSchema, InitialDeliberationPhaseRequest,
     InspectRepository, PlanApprovalAction, PlanApprovalAuthorityBinding,
@@ -37,7 +30,7 @@ use local_agent_terminal_domain::{
     BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters,
     BoundRunConfig, ClaimVerification, ContextBudget, ContextPackageBinding,
     ContextPackageDescriptor, ContextPackageIdentity, ContextVersionSet, DecisionApproach,
-    DecisionPackage, DeliberationLimits, DeliberationTaskBudget, DisclosureKind, Dissent, EventId,
+    DecisionPackage, DeliberationLimits, DeliberationTaskBudget, Dissent, EventId,
     EvidenceCitation, EvidenceFreshness, FinalObjection, FinalObjectionSet, IndependentProposal,
     MaterialClaim, ObjectionSeverity, Phase, PolicyActor, RejectedApproach, ReviewEdge, ReviewPlan,
     RunId, Sha256Digest, SpecialistBudget, SpecialistRequest, TaskId, TaskRisk, Timestamp,
@@ -51,10 +44,19 @@ use local_agent_terminal_storage_files::{
     ContentAddressedArtifactReader, ContentAddressedArtifactStore, JournaledArtifactWriter,
 };
 use local_agent_terminal_storage_sqlite::SqliteStore;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
+    sync::{mpsc, Mutex},
+    thread,
+    time::Duration,
+};
 
+use deliberation_assertions::{assert_linked_policy, assert_role_package};
 use deliberation_support::{commit_context_sources, durable_workspace_bytes};
 use support::{WorkspaceFixture, PROJECT_ID, TASK_ID};
 
@@ -109,7 +111,10 @@ fn startup_composes_context_runtime_from_authoritative_adapters() {
 
     assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
     assert!(bootstrap.context_runtime().is_some());
-    assert!(bootstrap.deliberation_runtime().is_some());
+    let deliberation = bootstrap
+        .deliberation_runtime()
+        .expect("deliberation runtime");
+    assert!(deliberation.coordinator().is_some());
 }
 
 #[test]
@@ -189,6 +194,9 @@ fn real_source_policy_and_storage_block_secrets_before_index_and_bind_the_packag
     assert!(!durable_workspace_bytes(&fixture)
         .windows(SECRET_CANARY.len())
         .any(|window| { window == SECRET_CANARY.as_bytes() }));
+    assert!(!durable_workspace_bytes(&fixture)
+        .windows(b".env".len())
+        .any(|window| window == b".env"));
 }
 
 #[test]
@@ -292,6 +300,11 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
         openai.endpoint(),
         anthropic.endpoint(),
     ));
+    assert!(bootstrap
+        .deliberation_runtime()
+        .expect("configured deliberation runtime")
+        .preapproval_coordinator()
+        .is_some());
     let contexts = bootstrap.context_runtime().expect("context runtime");
     let lead = contexts
         .build_initial(
@@ -803,7 +816,7 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
     let plan_two = publish_deliberation_artifact(
         &fixture,
         "plan-2",
-        br#"{"round":2,"schema":"m4-plan.v1","selected":"openai-approach"}"#,
+        br#"{"confidence":"medium","cost":"bounded","dissent":["dissent-anthropic"],"estimatedCostMicrounits":4200,"estimatedDurationSeconds":180,"files":["crates/bootstrap/src/context_runtime.rs"],"rejected":["anthropic-alternative"],"risk":"medium","rollback":"revert exact commit","round":2,"schema":"m4-plan.v1","selected":"openai-approach","steps":["implement"],"tests":["cargo test"],"tools":["cargo"],"verificationProfile":"m4-complete-gate"}"#,
     );
     let decision_two = publish_deliberation_artifact(
         &fixture,
@@ -979,16 +992,59 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
     assert_eq!(workspace.phase, "Implementation");
     assert_eq!(workspace.private_proposal_count, 2);
     assert_eq!(workspace.published_proposal_ids.len(), 2);
+    assert_eq!(workspace.agents.len(), 2);
+    assert!(workspace.agents.iter().all(|agent| {
+        agent.context_package_id.is_some()
+            && agent.used_tokens > 0
+            && !agent.permissions.is_empty()
+            && agent.status == "succeeded"
+    }));
+    assert!(workspace.cards.iter().any(|card| {
+        card.summary == "openai independent proposal"
+            && card.kind == local_agent_terminal_application::DeliberationCardKindDto::Proposal
+    }));
+    assert!(workspace.cards.iter().any(|card| {
+        card.kind == local_agent_terminal_application::DeliberationCardKindDto::Decision
+            && card.summary.contains("m4-decision.v1")
+    }));
+    let thread = workspace.thread.as_ref().expect("specialist thread");
+    assert_eq!(thread.thread_id, "specialist-thread-1");
+    assert_eq!(thread.messages.len(), 1);
+    assert!(thread.summary.contains("repository invariants preserved"));
+    assert_eq!(workspace.evidence.len(), 4);
+    assert!(workspace.evidence.iter().any(|evidence| {
+        evidence.label == "claim-current-source"
+            && evidence.state == local_agent_terminal_application::EvidenceStateDto::Verified
+    }));
     let context_package = deliberation
         .context_package(LEAD_CONTEXT.package_id)
         .expect("content-bearing context package DTO");
     assert_eq!(context_package.members.len(), 2);
     assert_eq!(context_package.versions.tokenizer, "byte-token-v1");
     assert!(context_package.budget.used_input_tokens > 0);
+    assert!(context_package.members.iter().all(|member| {
+        !member.content.is_empty()
+            && !member.policy_decision_ids.is_empty()
+            && !member.provenance.is_empty()
+            && !member.source.path_identity.is_empty()
+    }));
+    let approval = workspace.approval.expect("resolved approval");
     assert_eq!(
-        workspace.approval.expect("resolved approval").status,
+        approval.status,
         local_agent_terminal_application::PlanApprovalStatusDto::Resolved
     );
+    assert_eq!(approval.selected_approach_id, "openai-approach");
+    assert_eq!(approval.rejected_alternatives.len(), 1);
+    assert_eq!(approval.agreement.len(), 1);
+    assert_eq!(
+        approval.affected_files,
+        ["crates/bootstrap/src/context_runtime.rs"]
+    );
+    assert_eq!(approval.planned_tools, ["cargo"]);
+    assert_eq!(approval.verification_profile, "m4-complete-gate");
+    assert_eq!(approval.rollback_plan, "revert exact commit");
+    assert_eq!(approval.estimated_cost_microunits, Some(4_200));
+    assert_eq!(approval.estimated_duration_seconds, Some(180));
     assert_eq!(
         fixture
             .database()
@@ -1904,132 +1960,37 @@ fn context_package(task_id: TaskId, role: &RolePackageSpec) -> ContextPackageDra
             ContextBudget::new(16_384, 4_096).expect("budget"),
         )
         .expect("descriptor"),
-    }
-}
-
-fn assert_role_package(
-    package: &local_agent_terminal_domain::ContextPackageBinding,
-    role: &RolePackageSpec,
-    revision: &str,
-) {
-    assert_eq!(package.descriptor().package_id(), role.package_id);
-    assert_eq!(package.descriptor().agent_id(), role.agent_id);
-    assert_eq!(package.descriptor().role(), role.role);
-    assert_eq!(package.descriptor().objective(), role.objective);
-    assert_eq!(
-        package.descriptor().agent_manifest_artifact_id().as_str(),
-        role.manifest_artifact_id
-    );
-    assert_eq!(
-        package
-            .descriptor()
-            .effective_content_artifact_id()
-            .as_str(),
-        role.context_artifact_id
-    );
-    assert_eq!(
-        package.policy().policy_snapshot_digest().as_str(),
-        POLICY_DIGEST
-    );
-    assert_eq!(package.members().len(), 2);
-    assert!(package.members().iter().all(|member| {
-        member.citation().source().revision() == revision
-            && member.citation().freshness() == EvidenceFreshness::Current
-            && member.disclosure().kind() == DisclosureKind::Allowed
-            && member.citation().source().path_identity() != ".env"
-    }));
-    assert!(package
-        .policy()
-        .decision_ids()
-        .windows(2)
-        .all(|pair| pair[0] < pair[1]));
-}
-
-fn assert_linked_policy(
-    connection: &Connection,
-    role: &RolePackageSpec,
-    expected_actions: [i64; 4],
-    expected_redacted_rules: i64,
-    expected_denials: i64,
-) {
-    let actions = [
-        "context.index_metadata",
-        "context.index_content",
-        "context.retrieve_item",
-        "context.final_package",
-    ];
-    for (action, expected) in actions.into_iter().zip(expected_actions) {
-        let count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*)
-                 FROM context_package_policy_decisions links
-                 JOIN policy_decisions decisions ON decisions.id = links.policy_decision_id
-                 WHERE links.package_id = ?1 AND decisions.action = ?2",
-                params![role.package_id, action],
-                |row| row.get(0),
-            )
-            .expect("linked action count");
-        assert_eq!(count, expected, "{} action {action}", role.role);
-    }
-    let redacted_rules: i64 = connection
-        .query_row(
-            "SELECT COUNT(*)
-             FROM context_package_policy_decisions links
-             JOIN policy_decisions decisions ON decisions.id = links.policy_decision_id
-             WHERE links.package_id = ?1
-               AND json_extract(decisions.matched_rules_json, '$.redactions[0]') = 'secret_scanner'",
-            [role.package_id],
-            |row| row.get(0),
-        )
-        .expect("linked redaction count");
-    let denials: i64 = connection
-        .query_row(
-            "SELECT COUNT(*)
-             FROM context_package_policy_decisions links
-             JOIN policy_decisions decisions ON decisions.id = links.policy_decision_id
-             WHERE links.package_id = ?1 AND decisions.effect = 'deny'",
-            [role.package_id],
-            |row| row.get(0),
-        )
-        .expect("linked denial count");
-    let manifest_is_exact: bool = connection
-        .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM artifacts
-                WHERE id = ?1 AND task_id = ?2 AND artifact_type = 'manifest'
-                  AND content_hash = ?3 AND availability = 'available'
-             )",
-            params![role.manifest_artifact_id, TASK_ID, role.manifest_digest],
-            |row| row.get(0),
-        )
-        .expect("manifest binding");
-    let package_is_exact: bool = connection
-        .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM context_packages
-                WHERE id = ?1 AND task_id = ?2 AND agent_id = ?3 AND role = ?4
-                  AND objective = ?5 AND manifest_artifact_id = ?6
-                  AND effective_content_artifact_id = ?7 AND policy_snapshot_digest = ?8
-             )",
-            params![
-                role.package_id,
-                TASK_ID,
-                role.agent_id,
-                role.role,
-                role.objective,
-                role.manifest_artifact_id,
-                role.context_artifact_id,
-                POLICY_DIGEST,
+        contract: ContextPackageContract {
+            task_scope: vec!["src/**".to_owned()],
+            policy_constraints: vec!["read-only-preapproval".to_owned()],
+            shared_summary: format!("{} shared task summary", role.role),
+            accepted_decisions: Vec::new(),
+            unresolved_objections: vec!["objection-pending".to_owned()],
+            active_thread_messages: Vec::new(),
+            permissions: vec!["context.query".to_owned()],
+            protocol_capabilities: vec![
+                "context/query".to_owned(),
+                "specialist/request".to_owned(),
             ],
-            |row| row.get(0),
-        )
-        .expect("package binding");
-    assert_eq!(
-        redacted_rules, expected_redacted_rules,
-        "{} redactions",
-        role.role
-    );
-    assert_eq!(denials, expected_denials, "{} denials", role.role);
-    assert!(manifest_is_exact, "{} manifest", role.role);
-    assert!(package_is_exact, "{} package", role.role);
+            reconstructibility: ContextRunReconstructibility {
+                run_config_artifact_id: format!("run-config-{}", role.agent_id),
+                adapter_version: "adapter-1".to_owned(),
+                provider_id: if role.agent_id == "core_adapter" {
+                    "openai"
+                } else {
+                    "anthropic"
+                }
+                .to_owned(),
+                model_id: "fixture-model".to_owned(),
+                generation_parameters_digest: digest_bytes(b"{}").as_str().to_owned(),
+                response_schema_version: "message.v1".to_owned(),
+                manifest_digest: role.manifest_digest.to_owned(),
+                executable_digest: digest_bytes(role.agent_id.as_bytes()).as_str().to_owned(),
+                connection_binding_digest: digest_bytes(role.connection_id.as_bytes())
+                    .as_str()
+                    .to_owned(),
+                authoritative_receipt_unix_seconds: 1_786_435_200,
+            },
+        },
+    }
 }

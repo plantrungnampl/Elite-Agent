@@ -16,10 +16,11 @@ use local_agent_terminal_agent_runtime::{
     DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_RUN_DEADLINE_SECS,
 };
 use local_agent_terminal_application::{
-    AgentArtifactStore, AgentContextQueryRequest, AgentContextQueryResponse, AgentMessageArtifact,
-    AgentRequestAudit, AgentRequestAuditDecision, AgentRequestHandler, AgentRequestKind,
-    AgentRunStore, AgentRuntime, AgentSpecialistCommit, AgentSpecialistRequest,
-    AgentSpecialistResponse, Clock, PortError, Retryability, SafeErrorClassification,
+    ActorId, AgentArtifactStore, AgentContextQueryRequest, AgentContextQueryResponse,
+    AgentFamilyKey, AgentMessageArtifact, AgentRequestAudit, AgentRequestAuditDecision,
+    AgentRequestHandler, AgentRequestKind, AgentRunStore, AgentRuntime, AgentSpecialistCommit,
+    AgentSpecialistRequest, AgentSpecialistResponse, Clock, DeliberationRunAssignment, PortError,
+    Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     AgentDescriptor, AgentRunLimits, AgentRunSnapshot, AgentRunStatus, AgentRunTerminal,

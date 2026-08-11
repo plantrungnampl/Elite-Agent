@@ -253,7 +253,7 @@ impl DeliberationRecord {
                 ..DeliberationBudgetReservation::default()
             },
             Self::SpecialistRequest { request, .. } => DeliberationBudgetReservation {
-                thread_count: 0,
+                thread_count: 1,
                 token_count: request.budget().max_tokens(),
                 cost_microunits: request.budget().max_cost_microunits(),
             },

@@ -1383,13 +1383,13 @@ fn approval_request(
     )
     .unwrap();
     let policy_decision_id = database
-        .record(RecordedPolicyDecision {
-            decision: PolicyDecision {
+        .record(RecordedPolicyDecision::exact(
+            PolicyDecision {
                 draft: decision,
                 operation_digest: digest('9'),
             },
-            recorded_at: evaluated_at,
-        })
+            evaluated_at,
+        ))
         .unwrap();
     let bound = bind_tool_approval_payload(
         ToolApprovalPayloadV1 {
@@ -1508,13 +1508,13 @@ fn record_file_write_policy(
     .unwrap();
     let operation_digest = digest('e');
     let decision_id = database
-        .record(RecordedPolicyDecision {
-            decision: PolicyDecision {
+        .record(RecordedPolicyDecision::exact(
+            PolicyDecision {
                 draft,
                 operation_digest: operation_digest.clone(),
             },
-            recorded_at: evaluated_at,
-        })
+            evaluated_at,
+        ))
         .unwrap();
     FileWritePolicyBinding {
         decision_id: decision_id.as_str().to_owned(),

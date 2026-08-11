@@ -207,7 +207,10 @@ fn allow_publishes_before_pre_effect_ready() {
         events.into_inner().unwrap(),
         ["publish", "authority", "clock", "evaluate", "record"]
     );
-    assert_eq!(records.into_inner().unwrap()[0].recorded_at, evaluated_at);
+    assert_eq!(
+        records.into_inner().unwrap()[0].recorded_at(),
+        evaluated_at
+    );
     assert_eq!(ready.execution_id(), &execution_id);
     assert_eq!(
         ready.request_artifact_id().as_str(),

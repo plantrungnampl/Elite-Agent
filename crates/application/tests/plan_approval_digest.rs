@@ -258,13 +258,13 @@ fn resolution_emits_only_declared_workflow_transitions() {
         ),
         (
             PlanApprovalAction::Reopen,
-            "plan.revision.requested",
-            Phase::Synthesis,
+            "plan.discussion.reopened",
+            Phase::CrossReview,
         ),
         (
             PlanApprovalAction::AddOrReplaceAgent,
-            "plan.revision.requested",
-            Phase::Synthesis,
+            "plan.roster_change.requested",
+            Phase::ContextBuild,
         ),
     ] {
         let binding = binding();

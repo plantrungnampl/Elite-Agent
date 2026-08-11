@@ -161,6 +161,15 @@ impl<'a> DeliberationCommands<'a> {
         context: DeliberationCommandContext,
         request: SpecialistRequest,
     ) -> Result<(), PortError> {
+        let command = self.prepare_specialist_request(context, request)?;
+        self.store.persist(command)
+    }
+
+    pub fn prepare_specialist_request(
+        &self,
+        context: DeliberationCommandContext,
+        request: SpecialistRequest,
+    ) -> Result<DeliberationPersistenceCommand, PortError> {
         let snapshot = self.authorize(&context, Phase::ParallelAnalysis)?;
         if snapshot.quorum.is_some()
             || snapshot.quorum_publication.is_some()
@@ -171,7 +180,7 @@ impl<'a> DeliberationCommands<'a> {
         {
             return Err(conflict());
         }
-        self.persist_authorized(
+        self.build_authorized(
             context.clone(),
             snapshot,
             DeliberationRecord::SpecialistRequest {
@@ -507,6 +516,18 @@ impl<'a> PersistDeliberationSynthesis<'a> {
         plan_artifact: DeliberationArtifactRef,
         plan_version: u64,
     ) -> Result<(), PortError> {
+        let command = self.prepare(context, decision, plan, plan_artifact, plan_version)?;
+        self.store.persist_synthesis(command)
+    }
+
+    pub fn prepare(
+        &self,
+        context: DeliberationCommandContext,
+        decision: DecisionPackage,
+        plan: DeliberationPlanDto,
+        plan_artifact: DeliberationArtifactRef,
+        plan_version: u64,
+    ) -> Result<DeliberationSynthesisCommand, PortError> {
         let persistence = DeliberationCommands::new(self.store).prepare_synthesis(
             context,
             decision,
@@ -515,7 +536,7 @@ impl<'a> PersistDeliberationSynthesis<'a> {
         )?;
         let command = DeliberationSynthesisCommand { persistence, plan };
         command.validate()?;
-        self.store.persist_synthesis(command)
+        Ok(command)
     }
 }
 

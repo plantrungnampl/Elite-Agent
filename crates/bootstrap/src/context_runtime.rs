@@ -145,7 +145,7 @@ impl ContextRuntime {
         .prepare(request)?;
         let policy_decisions = decisions.records()?;
         if policy_decisions.iter().any(|record| {
-            let decision_id = PolicyDecisionId::from_decision(&record.decision);
+            let decision_id = PolicyDecisionId::from_decision(record.decision());
             !package
                 .policy_decision_ids()
                 .iter()
@@ -164,7 +164,7 @@ impl ContextRuntime {
         prepared: AgentContextQueryCommit,
     ) -> Result<ContextPackageBinding, PortError> {
         for decision in &prepared.policy_decisions {
-            let expected = PolicyDecisionId::from_decision(&decision.decision);
+            let expected = PolicyDecisionId::from_decision(decision.decision());
             if self.database.record(decision.clone())? != expected {
                 return Err(integrity_failure());
             }
@@ -270,7 +270,7 @@ impl BufferedPolicyDecisionStore {
 
 impl PolicyDecisionStore for BufferedPolicyDecisionStore {
     fn record(&self, decision: RecordedPolicyDecision) -> Result<PolicyDecisionId, PortError> {
-        let decision_id = PolicyDecisionId::from_decision(&decision.decision);
+        let decision_id = PolicyDecisionId::from_decision(decision.decision());
         let mut decisions = self.decisions.lock().map_err(|_| unavailable())?;
         if let Some((_, existing)) = decisions.iter().find(|(id, _)| id == &decision_id) {
             if existing != &decision {

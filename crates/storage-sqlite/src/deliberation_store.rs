@@ -1,15 +1,18 @@
 use std::str::FromStr;
 
 use local_agent_terminal_application::{
-    recover_deliberation, ArtifactRootReader, CanonicalDeliberationFact, DeliberationArtifactRef,
+    recover_deliberation, AgentSpecialistDispatchCommand, AgentSpecialistDispatchStore,
+    ArtifactRootReader, CanonicalDeliberationFact, DeliberationArtifactRef,
     DeliberationPersistenceCommand, DeliberationRecord, DeliberationRecoveryInput,
-    DeliberationSnapshot, DeliberationStore, PortError, Retryability, SafeErrorClassification,
+    DeliberationSnapshot, DeliberationStore, DeliberationSynthesisCommand,
+    DeliberationSynthesisStore, PortError, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     ArtifactId, Condition, FencingToken, OperationState, Phase, Sequence, Sha256Digest, TaskId,
     WorkflowState, WorkspaceVersion,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use sha2::{Digest, Sha256};
 
 use crate::agent_store::{
     load_deliberation_run_assignments, read_available_artifact, validate_available_artifact,
@@ -43,81 +46,318 @@ impl DeliberationStore for SqliteStore {
     fn persist(&self, command: DeliberationPersistenceCommand) -> Result<(), PortError> {
         command.validate()?;
         let artifact_reader = configured_artifact_reader(self)?;
-        let event = command.append().events.first().ok_or_else(invalid_input)?;
-        let sequence = command
-            .expected_task_version()
-            .checked_add(1)
-            .ok_or_else(invalid_input)?;
-        let fact = CanonicalDeliberationFact::issue(
-            command.task_id().clone(),
-            event.event_id.clone(),
-            sequence,
-            event.actor_id.clone(),
-            command.record().clone(),
-        )?;
-        let canonical_json =
-            String::from_utf8(fact.canonical_bytes().to_vec()).map_err(|_| integrity_failure())?;
-        let primary_artifact = primary_artifact(command.record());
         let mut connection = self.connection().map_err(open_error_to_port)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
-        validate_record_artifacts(
-            &transaction,
-            artifact_reader,
-            command.task_id(),
-            command.record(),
-        )?;
-
-        if let Some(existing) = load_record_identity(&transaction, event.event_id.as_str())? {
-            let expected = RecordIdentity {
-                task_id: command.task_id().as_str().to_owned(),
-                sequence: i64::try_from(sequence).map_err(|_| invalid_input())?,
-                record_type: event.event_type.as_str().to_owned(),
-                primary_artifact_id: primary_artifact.artifact_id().as_str().to_owned(),
-                canonical_json,
-                canonical_digest: fact.content_digest().as_str().to_owned(),
-                created_at: event.created_at.clone(),
-            };
-            if existing == expected
-                && event_matches(&transaction, command.task_id(), sequence, event)?
-            {
-                return Ok(());
-            }
-            return Err(conflict());
-        }
-        if event_exists(&transaction, event.event_id.as_str())? {
-            return Err(conflict());
-        }
-
-        reserve_task_budget(
-            &transaction,
-            command.task_id(),
-            command.task_budget(),
-            command.budget_reservation(),
-        )?;
-        append_in_transaction(&transaction, command.append())?;
-        transaction
-            .execute(
-                "INSERT INTO deliberation_records (
-                    event_id, task_id, sequence, record_type, primary_artifact_id,
-                    canonical_record_json, canonical_record_digest, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    event.event_id.as_str(),
-                    command.task_id().as_str(),
-                    i64::try_from(sequence).map_err(|_| invalid_input())?,
-                    event.event_type.as_str(),
-                    primary_artifact.artifact_id().as_str(),
-                    canonical_json,
-                    fact.content_digest().as_str(),
-                    event.created_at,
-                ],
-            )
-            .map_err(sqlite_error_to_port)?;
-        persist_record_projections(&transaction, command.task_id(), command.record(), event)?;
+        persist_command_in_transaction(&transaction, artifact_reader, &command)?;
         transaction.commit().map_err(sqlite_error_to_port)
     }
+}
+
+impl DeliberationSynthesisStore for SqliteStore {
+    fn persist_synthesis(&self, command: DeliberationSynthesisCommand) -> Result<(), PortError> {
+        command.validate()?;
+        let artifact_reader = configured_artifact_reader(self)?;
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error_to_port)?;
+        persist_command_in_transaction(&transaction, artifact_reader, command.persistence())?;
+        persist_synthesis_plan(&transaction, &command)?;
+        transaction.commit().map_err(sqlite_error_to_port)
+    }
+}
+
+impl AgentSpecialistDispatchStore for SqliteStore {
+    fn persist_specialist_dispatch(
+        &self,
+        command: AgentSpecialistDispatchCommand,
+    ) -> Result<(), PortError> {
+        command.validate()?;
+        let artifact_reader = configured_artifact_reader(self)?;
+        let mut connection = self.connection().map_err(open_error_to_port)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error_to_port)?;
+        validate_available_artifact(
+            &transaction,
+            artifact_reader,
+            command.context_package().artifact_id(),
+            command.persistence().task_id(),
+            Some(command.context_package().content_digest().as_str()),
+            Some(command.context_package().size_bytes()),
+        )?;
+        persist_command_in_transaction(&transaction, artifact_reader, command.persistence())?;
+        persist_specialist_dispatch(&transaction, &command)?;
+        transaction.commit().map_err(sqlite_error_to_port)
+    }
+
+    fn specialist_dispatch_exists(
+        &self,
+        task_id: &TaskId,
+        request_id: &str,
+    ) -> Result<bool, PortError> {
+        let connection = self.connection().map_err(open_error_to_port)?;
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM deliberation_specialist_dispatches dispatch
+                    JOIN deliberation_specialist_threads thread
+                      ON thread.thread_id = dispatch.thread_id
+                    JOIN artifacts package
+                      ON package.id = dispatch.context_package_artifact_id
+                    WHERE dispatch.task_id = ?1 AND dispatch.request_id = ?2
+                      AND dispatch.status = 'reserved'
+                      AND thread.task_id = dispatch.task_id
+                      AND thread.parent_run_id = dispatch.parent_run_id
+                      AND thread.specialist_run_id = dispatch.specialist_run_id
+                      AND thread.specialist_agent_id = dispatch.specialist_agent_id
+                      AND thread.context_package_artifact_id = dispatch.context_package_artifact_id
+                      AND package.availability = 'available'
+                 )",
+                params![task_id.as_str(), request_id],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_error_to_port)
+    }
+}
+
+fn persist_specialist_dispatch(
+    transaction: &Transaction<'_>,
+    command: &AgentSpecialistDispatchCommand,
+) -> Result<(), PortError> {
+    let event = command
+        .persistence()
+        .append()
+        .events
+        .first()
+        .ok_or_else(invalid_input)?;
+    let DeliberationRecord::SpecialistRequest { request, .. } = command.persistence().record()
+    else {
+        return Err(invalid_input());
+    };
+    let assignment = command.assignment();
+    let context_package_id = command.context_package().artifact_id().as_str();
+    transaction
+        .execute(
+            "INSERT INTO deliberation_specialist_threads (
+                thread_id, task_id, parent_run_id, specialist_run_id, specialist_agent_id,
+                context_package_artifact_id, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT DO NOTHING",
+            params![
+                command.thread_id(),
+                command.persistence().task_id().as_str(),
+                request.requesting_run().as_str(),
+                assignment.run_id().as_str(),
+                assignment.agent_id(),
+                context_package_id,
+                event.created_at,
+            ],
+        )
+        .map_err(sqlite_error_to_port)?;
+    let exact_thread: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM deliberation_specialist_threads
+                WHERE thread_id = ?1 AND task_id = ?2 AND parent_run_id = ?3
+                  AND specialist_run_id = ?4 AND specialist_agent_id = ?5
+                  AND context_package_artifact_id = ?6 AND created_at = ?7
+             )",
+            params![
+                command.thread_id(),
+                command.persistence().task_id().as_str(),
+                request.requesting_run().as_str(),
+                assignment.run_id().as_str(),
+                assignment.agent_id(),
+                context_package_id,
+                event.created_at,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error_to_port)?;
+    if !exact_thread {
+        return Err(conflict());
+    }
+    transaction
+        .execute(
+            "INSERT INTO deliberation_specialist_dispatches (
+                event_id, request_id, task_id, parent_run_id, specialist_run_id,
+                specialist_agent_id, specialist_actor_id, family_key, thread_id,
+                context_package_artifact_id, status, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'reserved', ?11)
+             ON CONFLICT DO NOTHING",
+            params![
+                event.event_id.as_str(),
+                request.request_id(),
+                command.persistence().task_id().as_str(),
+                request.requesting_run().as_str(),
+                assignment.run_id().as_str(),
+                assignment.agent_id(),
+                assignment.actor_id().as_str(),
+                assignment.family().as_str(),
+                command.thread_id(),
+                context_package_id,
+                event.created_at,
+            ],
+        )
+        .map_err(sqlite_error_to_port)?;
+    let exact_dispatch: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM deliberation_specialist_dispatches
+                WHERE event_id = ?1 AND request_id = ?2 AND task_id = ?3
+                  AND parent_run_id = ?4 AND specialist_run_id = ?5
+                  AND specialist_agent_id = ?6 AND specialist_actor_id = ?7
+                  AND family_key = ?8 AND thread_id = ?9
+                  AND context_package_artifact_id = ?10 AND status = 'reserved'
+                  AND created_at = ?11
+             )",
+            params![
+                event.event_id.as_str(),
+                request.request_id(),
+                command.persistence().task_id().as_str(),
+                request.requesting_run().as_str(),
+                assignment.run_id().as_str(),
+                assignment.agent_id(),
+                assignment.actor_id().as_str(),
+                assignment.family().as_str(),
+                command.thread_id(),
+                context_package_id,
+                event.created_at,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error_to_port)?;
+    if exact_dispatch {
+        Ok(())
+    } else {
+        Err(conflict())
+    }
+}
+
+fn persist_command_in_transaction(
+    transaction: &Transaction<'_>,
+    artifact_reader: &dyn ArtifactRootReader,
+    command: &DeliberationPersistenceCommand,
+) -> Result<(), PortError> {
+    let event = command.append().events.first().ok_or_else(invalid_input)?;
+    let sequence = command
+        .expected_task_version()
+        .checked_add(1)
+        .ok_or_else(invalid_input)?;
+    let fact = CanonicalDeliberationFact::issue(
+        command.task_id().clone(),
+        event.event_id.clone(),
+        sequence,
+        event.actor_id.clone(),
+        command.record().clone(),
+    )?;
+    let canonical_json =
+        String::from_utf8(fact.canonical_bytes().to_vec()).map_err(|_| integrity_failure())?;
+    let primary_artifact = primary_artifact(command.record());
+    validate_record_artifacts(
+        transaction,
+        artifact_reader,
+        command.task_id(),
+        command.record(),
+    )?;
+    if let Some(existing) = load_record_identity(transaction, event.event_id.as_str())? {
+        let expected = RecordIdentity {
+            task_id: command.task_id().as_str().to_owned(),
+            sequence: i64::try_from(sequence).map_err(|_| invalid_input())?,
+            record_type: event.event_type.as_str().to_owned(),
+            primary_artifact_id: primary_artifact.artifact_id().as_str().to_owned(),
+            canonical_json,
+            canonical_digest: fact.content_digest().as_str().to_owned(),
+            created_at: event.created_at.clone(),
+        };
+        if existing == expected && event_matches(transaction, command.task_id(), sequence, event)? {
+            return Ok(());
+        }
+        return Err(conflict());
+    }
+    if event_exists(transaction, event.event_id.as_str())? {
+        return Err(conflict());
+    }
+    reserve_task_budget(
+        transaction,
+        command.task_id(),
+        command.task_budget(),
+        command.budget_reservation(),
+    )?;
+    append_in_transaction(transaction, command.append())?;
+    transaction
+        .execute(
+            "INSERT INTO deliberation_records (
+                event_id, task_id, sequence, record_type, primary_artifact_id,
+                canonical_record_json, canonical_record_digest, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                event.event_id.as_str(),
+                command.task_id().as_str(),
+                i64::try_from(sequence).map_err(|_| invalid_input())?,
+                event.event_type.as_str(),
+                primary_artifact.artifact_id().as_str(),
+                canonical_json,
+                fact.content_digest().as_str(),
+                event.created_at,
+            ],
+        )
+        .map_err(sqlite_error_to_port)?;
+    persist_record_projections(transaction, command.task_id(), command.record(), event)
+}
+
+fn persist_synthesis_plan(
+    transaction: &Transaction<'_>,
+    command: &DeliberationSynthesisCommand,
+) -> Result<(), PortError> {
+    let event = command
+        .persistence()
+        .append()
+        .events
+        .first()
+        .ok_or_else(invalid_input)?;
+    let plan_json = serde_json::to_string(command.plan()).map_err(|_| integrity_failure())?;
+    let plan_digest = format!("sha256:{:x}", Sha256::digest(plan_json.as_bytes()));
+    let existing: Option<(String, String, String)> = transaction
+        .query_row(
+            "SELECT task_id, plan_json, plan_digest
+             FROM deliberation_synthesis_plans WHERE event_id = ?1",
+            [event.event_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_error_to_port)?;
+    let expected = (
+        command.persistence().task_id().as_str().to_owned(),
+        plan_json.clone(),
+        plan_digest.clone(),
+    );
+    if let Some(existing) = existing {
+        return if existing == expected {
+            Ok(())
+        } else {
+            Err(conflict())
+        };
+    }
+    transaction
+        .execute(
+            "INSERT INTO deliberation_synthesis_plans (
+                event_id, task_id, plan_json, plan_digest, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                event.event_id.as_str(),
+                command.persistence().task_id().as_str(),
+                plan_json,
+                plan_digest,
+                event.created_at,
+            ],
+        )
+        .map_err(sqlite_error_to_port)?;
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]

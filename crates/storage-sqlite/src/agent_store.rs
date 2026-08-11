@@ -17,6 +17,49 @@ use sha2::{Digest, Sha256};
 use crate::event_store::{open_error_to_port, sqlite_error_to_port};
 use crate::SqliteStore;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredAgentRunUsage {
+    pub used_tokens: u64,
+    pub cost_microunits: u64,
+}
+
+impl SqliteStore {
+    pub fn agent_run_usage(&self, run_id: &RunId) -> Result<StoredAgentRunUsage, PortError> {
+        let connection = self.connection().map_err(open_error_to_port)?;
+        let raw: (Option<i64>, Option<i64>, Option<i64>) = connection
+            .query_row(
+                "SELECT
+                    COALESCE(
+                        json_extract(core_usage_json, '$.inputTokens')
+                          + json_extract(core_usage_json, '$.outputTokens'),
+                        json_extract(provider_usage_json, '$.inputTokens')
+                          + json_extract(provider_usage_json, '$.outputTokens'),
+                        0
+                    ),
+                    COALESCE(
+                        json_extract(core_usage_json, '$.costMicrounits'),
+                        json_extract(provider_usage_json, '$.costMicrounits'),
+                        estimated_cost_microunits,
+                        0
+                    ),
+                    estimated_cost_microunits
+                 FROM agent_runs WHERE id = ?1",
+                [run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?
+            .ok_or_else(not_found)?;
+        let used_tokens = u64::try_from(raw.0.unwrap_or(0)).map_err(|_| integrity_failure())?;
+        let cost_microunits =
+            u64::try_from(raw.1.or(raw.2).unwrap_or(0)).map_err(|_| integrity_failure())?;
+        Ok(StoredAgentRunUsage {
+            used_tokens,
+            cost_microunits,
+        })
+    }
+}
+
 const MANIFEST_ARTIFACT_KIND: &str = "manifest";
 const CONTEXT_ARTIFACT_KIND: &str = "content";
 const RUN_CONFIG_ARTIFACT_KIND: &str = "run-config";

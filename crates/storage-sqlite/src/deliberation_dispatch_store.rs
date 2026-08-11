@@ -17,6 +17,7 @@ impl DeliberationDispatchStore for SqliteStore {
         self.persist_dispatch_set(
             plan.task_id(),
             "ParallelAnalysis",
+            0,
             plan.task_budget(),
             plan.budget_reservation()?,
             plan.bindings(),
@@ -31,6 +32,7 @@ impl DeliberationDispatchStore for SqliteStore {
         self.persist_dispatch_set(
             dispatch_set.task_id(),
             phase_name(dispatch_set.phase()),
+            dispatch_set.authority().round(),
             dispatch_set.task_budget(),
             dispatch_set.budget_reservation()?,
             dispatch_set.bindings(),
@@ -43,6 +45,7 @@ impl SqliteStore {
         &self,
         task_id: &local_agent_terminal_domain::TaskId,
         phase: &str,
+        round: u32,
         budget: local_agent_terminal_domain::DeliberationTaskBudget,
         reservation: local_agent_terminal_application::DeliberationBudgetReservation,
         bindings: &[DeliberationDispatchBinding],
@@ -59,43 +62,66 @@ impl SqliteStore {
         )?;
         let existing = bindings
             .iter()
-            .map(|binding| dispatch_reservation_matches(&transaction, task_id, phase, binding))
+            .map(|binding| {
+                dispatch_reservation_matches(&transaction, task_id, phase, round, binding)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let existing_count = existing.iter().filter(|matches| **matches).count();
-        if existing_count == bindings.len() {
+        let persisted_set_count = dispatch_set_count(&transaction, task_id, phase, round)?;
+        if existing_count == bindings.len() && persisted_set_count == bindings.len() {
             transaction.commit().map_err(sqlite_error_to_port)?;
             return Ok(());
         }
-        if existing_count != 0 {
+        if existing_count != 0 || persisted_set_count != 0 {
             return Err(conflict());
         }
 
         reserve_task_budget(&transaction, task_id, budget, reservation)?;
         for binding in bindings {
-            insert_dispatch_reservation(&transaction, task_id, phase, binding)?;
+            insert_dispatch_reservation(&transaction, task_id, phase, round, binding)?;
         }
         transaction.commit().map_err(sqlite_error_to_port)
     }
+}
+
+fn dispatch_set_count(
+    transaction: &Transaction<'_>,
+    task_id: &local_agent_terminal_domain::TaskId,
+    phase: &str,
+    round: u32,
+) -> Result<usize, PortError> {
+    let count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM deliberation_dispatch_reservations
+             WHERE task_id = ?1 AND phase = ?2 AND dispatch_round = ?3",
+            params![task_id.as_str(), phase, i64::from(round)],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error_to_port)?;
+    usize::try_from(count).map_err(|_| conflict())
 }
 
 fn dispatch_reservation_matches(
     transaction: &Transaction<'_>,
     task_id: &local_agent_terminal_domain::TaskId,
     phase: &str,
+    round: u32,
     binding: &DeliberationDispatchBinding,
 ) -> Result<bool, PortError> {
     let request = binding.request();
     let existing: Option<bool> = transaction
         .query_row(
-            "SELECT task_id = ?2 AND phase = ?3 AND agent_id = ?4 AND family_key = ?5
-                    AND max_tokens = ?6 AND estimated_cost_microunits = ?7
-                    AND deadline_unix_seconds = ?8 AND run_config_artifact_id = ?9
-                    AND connection_binding_digest = ?10
+            "SELECT task_id = ?2 AND phase = ?3 AND dispatch_round = ?4
+                    AND agent_id = ?5 AND family_key = ?6
+                    AND max_tokens = ?7 AND estimated_cost_microunits = ?8
+                    AND deadline_unix_seconds = ?9 AND run_config_artifact_id = ?10
+                    AND connection_binding_digest = ?11
              FROM deliberation_dispatch_reservations WHERE run_id = ?1",
             params![
                 request.run_id.as_str(),
                 task_id.as_str(),
                 phase,
+                i64::from(round),
                 request.agent_id,
                 binding.family().as_str(),
                 to_i64(request.run_config.limits.max_output_tokens)?,
@@ -119,6 +145,7 @@ fn insert_dispatch_reservation(
     transaction: &Transaction<'_>,
     task_id: &local_agent_terminal_domain::TaskId,
     phase: &str,
+    round: u32,
     binding: &DeliberationDispatchBinding,
 ) -> Result<(), PortError> {
     let request = binding.request();
@@ -127,8 +154,8 @@ fn insert_dispatch_reservation(
             "INSERT INTO deliberation_dispatch_reservations (
                 run_id, task_id, phase, agent_id, family_key, max_tokens,
                 estimated_cost_microunits, deadline_unix_seconds,
-                run_config_artifact_id, connection_binding_digest
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                run_config_artifact_id, connection_binding_digest, dispatch_round
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 request.run_id.as_str(),
                 task_id.as_str(),
@@ -140,6 +167,7 @@ fn insert_dispatch_reservation(
                 request.run_config.limits.deadline.unix_seconds(),
                 request.run_config.run_config_artifact_id.as_str(),
                 request.connection.binding_digest.as_str(),
+                i64::from(round),
             ],
         )
         .map_err(sqlite_error_to_port)?;

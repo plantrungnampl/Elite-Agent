@@ -13,11 +13,12 @@ use local_agent_terminal_application::{
     AgentContextQueryRequest, AgentContextQueryResponse, AgentDescriptor, AgentFamilyKey,
     AgentMessageArtifact, AgentRequestAudit, AgentRequestAuditDecision, AgentRequestHandler,
     AgentRequestKind, AgentRunReceipt, AgentRunStatus, AgentRunStore, AgentRuntime,
-    AgentSpecialistCommit, AgentSpecialistRequest, AgentSpecialistResponse, ArtifactId,
-    ArtifactRef, ArtifactStore, ArtifactWriteReservation, BoundAgentConnection,
-    BoundAgentRunRequest, BoundEffectiveContext, CancelAgentRun, CanonicalJsonRequest, Clock,
-    ContextBudget, ContextBuildPolicy, ContextPackageDescriptor, ContextPackageDraft,
-    ContextPackageIdentity, ContextQuery, ContextVersionSet, DeliberationArtifactRef,
+    AgentSpecialistCommit, AgentSpecialistDispatchCommand, AgentSpecialistDispatchStore,
+    AgentSpecialistRequest, AgentSpecialistResponse, ArtifactId, ArtifactRef, ArtifactStore,
+    ArtifactWriteReservation, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
+    CancelAgentRun, CanonicalJsonRequest, Clock, ContextBudget, ContextBuildPolicy,
+    ContextPackageContract, ContextPackageDescriptor, ContextPackageDraft, ContextPackageIdentity,
+    ContextQuery, ContextRunReconstructibility, ContextVersionSet, DeliberationArtifactRef,
     DeliberationBudget, DeliberationCommandContext, DeliberationCommands,
     DeliberationRunAssignment, DeliberationStore, EventId, PolicyActor, PortError, ProjectId,
     ReservedArtifact, ResourceClass, Retryability, RiskLevel, RunId, SafeErrorClassification,
@@ -620,7 +621,70 @@ impl AgentRequestHandler for DurableAgentRequestHandler {
                         policy_snapshot_digest: snapshot.request.context.policy_snapshot_digest,
                         evaluated_at: observed_at,
                     },
-                    package: ContextPackageDraft { descriptor },
+                    package: ContextPackageDraft {
+                        descriptor,
+                        contract: ContextPackageContract {
+                            task_scope: request.scopes.clone(),
+                            policy_constraints: vec!["read-only-preapproval".to_owned()],
+                            shared_summary: snapshot.request.context.objective.clone(),
+                            accepted_decisions: Vec::new(),
+                            unresolved_objections: Vec::new(),
+                            active_thread_messages: Vec::new(),
+                            permissions: vec!["context.query".to_owned()],
+                            protocol_capabilities: vec![
+                                "context/query".to_owned(),
+                                "specialist/request".to_owned(),
+                            ],
+                            reconstructibility: ContextRunReconstructibility {
+                                run_config_artifact_id: snapshot
+                                    .request
+                                    .run_config
+                                    .run_config_artifact_id
+                                    .as_str()
+                                    .to_owned(),
+                                adapter_version: snapshot
+                                    .request
+                                    .run_config
+                                    .adapter_version
+                                    .clone(),
+                                provider_id: snapshot.request.run_config.provider_id.clone(),
+                                model_id: snapshot.request.run_config.model_id.clone(),
+                                generation_parameters_digest: snapshot
+                                    .request
+                                    .run_config
+                                    .generation_parameters
+                                    .digest
+                                    .as_str()
+                                    .to_owned(),
+                                response_schema_version: snapshot
+                                    .request
+                                    .run_config
+                                    .response_schema_version
+                                    .clone(),
+                                manifest_digest: snapshot
+                                    .request
+                                    .run_config
+                                    .manifest_digest
+                                    .as_str()
+                                    .to_owned(),
+                                executable_digest: snapshot
+                                    .request
+                                    .run_config
+                                    .executable_digest
+                                    .as_ref()
+                                    .ok_or_else(integrity_failure)?
+                                    .as_str()
+                                    .to_owned(),
+                                connection_binding_digest: snapshot
+                                    .request
+                                    .connection
+                                    .binding_digest
+                                    .as_str()
+                                    .to_owned(),
+                                authoritative_receipt_unix_seconds: observed_at.unix_seconds(),
+                            },
+                        },
+                    },
                 })?;
         if request.cancellation.is_cancelled() {
             return Err(conflict());
@@ -745,12 +809,13 @@ impl AgentRequestHandler for DurableAgentRequestHandler {
         let mut budget =
             DeliberationBudget::new(request.max_tokens, 1).map_err(|_| invalid_input())?;
         match authorize_specialist(&specialist, &candidates, &mut budget, observed_at) {
-            Ok(_) => Ok(specialist_response(
+            Ok(assignment) => Ok(specialist_response(
                 request,
                 true,
                 "specialist_approved",
                 Some(AgentSpecialistCommit {
                     request: specialist,
+                    assignment,
                 }),
             )),
             Err(denial) => Ok(specialist_response(
@@ -868,7 +933,10 @@ impl DurableAgentRequestHandler {
         prepared: AgentSpecialistCommit,
         artifact: local_agent_terminal_application::CanonicalEvidenceRef,
     ) -> Result<(), PortError> {
-        let request = prepared.request;
+        let AgentSpecialistCommit {
+            request,
+            assignment,
+        } = prepared;
         let snapshot = self.database.load(request.task_id())?;
         let artifact = DeliberationArtifactRef::new(
             artifact.artifact_id,
@@ -880,9 +948,16 @@ impl DurableAgentRequestHandler {
             .iter()
             .any(|existing| existing.request() == &request && existing.artifact() == &artifact)
         {
-            return Ok(());
+            return if self
+                .database
+                .specialist_dispatch_exists(request.task_id(), request.request_id())?
+            {
+                Ok(())
+            } else {
+                Err(conflict())
+            };
         }
-        let assignment = snapshot
+        let requesting_assignment = snapshot
             .run_assignments
             .iter()
             .find(|assignment| assignment.run_id() == request.requesting_run())
@@ -907,13 +982,38 @@ impl DurableAgentRequestHandler {
             snapshot.task_version,
             snapshot.task_state,
             budget,
-            assignment.actor_id().clone(),
-            artifact,
+            requesting_assignment.actor_id().clone(),
+            artifact.clone(),
             event_id,
             format!("{}:specialist", request.task_id().as_str()),
             occurred_at,
         )?;
-        DeliberationCommands::new(&self.database).request_specialist(context, request)
+        let thread_id = format!(
+            "thread-specialist-{}",
+            stable_digest(&format!(
+                "{}:{}:{}",
+                request.task_id().as_str(),
+                request.request_id(),
+                assignment.run_id().as_str(),
+            ))
+        );
+        let context_package = crate::agent_specialist_context::publish_specialist_context_package(
+            &self.database,
+            self.artifacts.as_ref(),
+            &request,
+            &assignment,
+            &thread_id,
+            &artifact,
+        )?;
+        let persistence = DeliberationCommands::new(&self.database)
+            .prepare_specialist_request(context, request)?;
+        self.database
+            .persist_specialist_dispatch(AgentSpecialistDispatchCommand::new(
+                persistence,
+                assignment,
+                thread_id,
+                context_package,
+            )?)
     }
 
     fn bound_run(
@@ -1494,12 +1594,13 @@ mod tests {
             .request_specialist(request)
             .expect("specialist decision");
         assert!(response.accepted);
+        let repeated_commit = response.prepared_commit.clone();
         handler
             .persist_audit(AgentRequestAudit {
                 run_id: run_request.run_id,
                 task_id: run_request.task_id,
-                connection_id: connection_binding.connection_id,
-                connection_binding_digest: connection_binding.binding_digest,
+                connection_id: connection_binding.connection_id.clone(),
+                connection_binding_digest: connection_binding.binding_digest.clone(),
                 request_id: "specialist-accepted".to_owned(),
                 kind: AgentRequestKind::SpecialistRequest,
                 request_digest: digest_bytes(b"specialist request"),
@@ -1511,20 +1612,76 @@ mod tests {
                 specialist_commit: response.prepared_commit.take(),
             })
             .expect("specialist audit commit");
+        handler
+            .persist_audit(AgentRequestAudit {
+                run_id: RunId::new("run-parent").expect("run id"),
+                task_id: TaskId::new("task-1").expect("task id"),
+                connection_id: "connection-parent".to_owned(),
+                connection_binding_digest: connection_digest(&connection_binding)
+                    .expect("connection digest"),
+                request_id: "specialist-accepted".to_owned(),
+                kind: AgentRequestKind::SpecialistRequest,
+                request_digest: digest_bytes(b"specialist request"),
+                decision: AgentRequestAuditDecision::Accepted,
+                reason_code: None,
+                deadline: Timestamp::from_unix_seconds(2_000_000_000),
+                fence: AgentRequestAuditFence::new(),
+                context_commit: None,
+                specialist_commit: repeated_commit,
+            })
+            .expect("idempotent specialist audit commit");
 
         let snapshot = database
             .load(&TaskId::new("task-1").expect("task id"))
             .expect("deliberation snapshot");
         assert_eq!(snapshot.specialist_requests().len(), 1);
-        let reserved: (i64, i64) = connection
+        let reserved: (i64, i64, i64) = connection
             .query_row(
-                "SELECT reserved_tokens, reserved_cost_microunits
+                "SELECT reserved_threads, reserved_tokens, reserved_cost_microunits
                  FROM deliberation_task_budgets WHERE task_id = 'task-1'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("budget reservation");
-        assert_eq!(reserved, (100, 100));
+        assert_eq!(reserved, (1, 100, 100));
+        let dispatch: (String, String, String, String, String) = connection
+            .query_row(
+                "SELECT specialist_run_id, specialist_agent_id, family_key, thread_id,
+                        context_package_artifact_id
+                 FROM deliberation_specialist_dispatches
+                 WHERE request_id = 'specialist-accepted'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("durable specialist dispatch");
+        assert!(dispatch.0.starts_with("specialist-"));
+        assert_eq!(dispatch.1, "agent-specialist");
+        assert_eq!(
+            dispatch.2,
+            AgentFamilyKey::from_provider_model("provider-specialist", "model-specialist")
+                .expect("family")
+                .as_str()
+        );
+        assert!(dispatch.3.starts_with("thread-specialist-"));
+        assert!(dispatch.4.starts_with("specialist-context-"));
+        let thread_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM deliberation_specialist_threads
+                 WHERE thread_id = ?1 AND task_id = 'task-1'
+                   AND specialist_run_id = ?2 AND context_package_artifact_id = ?3",
+                params![dispatch.3, dispatch.0, dispatch.4],
+                |row| row.get(0),
+            )
+            .expect("durable direct thread");
+        assert_eq!(thread_count, 1);
     }
 
     #[test]

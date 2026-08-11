@@ -219,10 +219,13 @@ impl<'a> ToolRuntime<'a> {
             return Err(integrity_failure());
         }
         let expected_decision_id = PolicyDecisionId::from_decision(&disclosure.decision);
-        let policy_decision_id = self.policy_decisions.record(RecordedPolicyDecision {
-            decision: disclosure.decision.clone(),
-            recorded_at: evaluated_at,
-        })?;
+        let policy_decision_id =
+            self.policy_decisions
+                .record(RecordedPolicyDecision::disclosure(
+                    disclosure.decision.clone(),
+                    evaluated_at,
+                    channel,
+                ))?;
         if policy_decision_id != expected_decision_id {
             return Err(integrity_failure());
         }

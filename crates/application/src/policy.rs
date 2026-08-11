@@ -68,8 +68,49 @@ impl PolicyRequestBindingDigest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedPolicyDecision {
-    pub decision: PolicyDecision,
-    pub recorded_at: Timestamp,
+    decision: PolicyDecision,
+    recorded_at: Timestamp,
+    resource_persistence: PolicyResourcePersistence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyResourcePersistence {
+    Exact,
+    Disclosure(DisclosureChannel),
+}
+
+impl RecordedPolicyDecision {
+    pub const fn exact(decision: PolicyDecision, recorded_at: Timestamp) -> Self {
+        Self {
+            decision,
+            recorded_at,
+            resource_persistence: PolicyResourcePersistence::Exact,
+        }
+    }
+
+    pub const fn disclosure(
+        decision: PolicyDecision,
+        recorded_at: Timestamp,
+        channel: DisclosureChannel,
+    ) -> Self {
+        Self {
+            decision,
+            recorded_at,
+            resource_persistence: PolicyResourcePersistence::Disclosure(channel),
+        }
+    }
+
+    pub const fn decision(&self) -> &PolicyDecision {
+        &self.decision
+    }
+
+    pub const fn recorded_at(&self) -> Timestamp {
+        self.recorded_at
+    }
+
+    pub const fn resource_persistence(&self) -> PolicyResourcePersistence {
+        self.resource_persistence
+    }
 }
 
 pub trait PolicyEvaluator: Send + Sync {
@@ -90,6 +131,12 @@ pub enum DisclosureChannel {
     Artifact,
     Summary,
     FinalSerializedPayload,
+}
+
+impl DisclosureChannel {
+    pub const fn as_str(self) -> &'static str {
+        disclosure_channel_name(self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

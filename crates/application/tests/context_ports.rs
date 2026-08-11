@@ -8,8 +8,9 @@ use local_agent_terminal_application::{
     ContextArtifactPublisher, ContextArtifactReader, ContextArtifactRef, ContextBuildPolicy,
     ContextChunkRecord, ContextClassificationOutcome, ContextEvidenceAssemblyItem,
     ContextIndexProvenance, ContextIndexProvenanceRehydration, ContextPackageAssembler,
-    ContextPackageDraft, ContextPackagePersistence, ContextPackageRecord, ContextPolicyDecisionRef,
-    ContextQuery, ContextRetrievalAuthority, ContextSourceClassification, ContextSourceClassifier,
+    ContextPackageContract, ContextPackageDraft, ContextPackagePersistence, ContextPackageRecord,
+    ContextPolicyDecisionRef, ContextQuery, ContextRetrievalAuthority,
+    ContextRunReconstructibility, ContextSourceClassification, ContextSourceClassifier,
     ContextSourceRecord, ContextStore, DisclosureChannel, DisclosurePolicyEvaluator,
     DisclosureRequest, ImmutableContextArtifact, PolicyApprovedDisclosure, PolicyDecision,
     PolicyDecisionId, PolicyDecisionStore, PortError, QueryContext, QueryContextRequest,
@@ -46,6 +47,7 @@ impl ContextPackageAssembler for TestContextPackageAssembler<'_> {
     fn assemble(
         &self,
         mut descriptor: ContextPackageDescriptor,
+        _contract: ContextPackageContract,
         policy: ContextBuildPolicy,
         items: Vec<ContextEvidenceAssemblyItem>,
         mut policy_decision_ids: Vec<String>,
@@ -96,12 +98,13 @@ impl ContextPackageAssembler for TestContextPackageAssembler<'_> {
             return Err(failure(SafeErrorClassification::IntegrityFailure));
         }
         let final_decision = PolicyDecisionId::from_decision(&disclosure.decision);
-        let recorded =
-            self.decisions
-                .record(local_agent_terminal_application::RecordedPolicyDecision {
-                    decision: disclosure.decision,
-                    recorded_at: policy.evaluated_at,
-                })?;
+        let recorded = self.decisions.record(
+            local_agent_terminal_application::RecordedPolicyDecision::disclosure(
+                disclosure.decision,
+                policy.evaluated_at,
+                DisclosureChannel::FinalContextPackage,
+            ),
+        )?;
         let bytes = disclosure
             .effective_bytes
             .ok_or_else(|| failure(SafeErrorClassification::PermissionDenied))?;
@@ -425,7 +428,7 @@ impl PolicyDecisionStore for Decisions {
         &self,
         decision: local_agent_terminal_application::RecordedPolicyDecision,
     ) -> Result<PolicyDecisionId, PortError> {
-        let id = PolicyDecisionId::from_decision(&decision.decision);
+        let id = PolicyDecisionId::from_decision(decision.decision());
         let mut state = self.state.lock().unwrap();
         state.calls.push(format!("record-policy:{}", id.as_str()));
         state.decisions.push(id.clone());
@@ -1413,6 +1416,7 @@ fn build_request() -> BuildInitialContextRequest {
                 ContextBudget::new(4_096, 1_024).unwrap(),
             )
             .unwrap(),
+            contract: context_contract(),
         },
     }
 }
@@ -1433,6 +1437,31 @@ fn source_metadata(language: Option<&str>, logical_id: &str) -> SourceIndexMetad
 
 fn digest(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
+}
+
+fn context_contract() -> ContextPackageContract {
+    ContextPackageContract {
+        task_scope: vec!["src/**".to_owned()],
+        policy_constraints: vec!["read-only".to_owned()],
+        shared_summary: "bounded summary".to_owned(),
+        accepted_decisions: Vec::new(),
+        unresolved_objections: Vec::new(),
+        active_thread_messages: Vec::new(),
+        permissions: vec!["context.query".to_owned()],
+        protocol_capabilities: vec!["context/query".to_owned()],
+        reconstructibility: ContextRunReconstructibility {
+            run_config_artifact_id: "run-config-1".to_owned(),
+            adapter_version: "adapter-1".to_owned(),
+            provider_id: "provider-1".to_owned(),
+            model_id: "model-1".to_owned(),
+            generation_parameters_digest: digest(b"generation").as_str().to_owned(),
+            response_schema_version: "message.v1".to_owned(),
+            manifest_digest: digest(b"manifest").as_str().to_owned(),
+            executable_digest: digest(b"executable").as_str().to_owned(),
+            connection_binding_digest: digest(b"connection").as_str().to_owned(),
+            authoritative_receipt_unix_seconds: 1_787_000_000,
+        },
+    }
 }
 
 fn failure(classification: SafeErrorClassification) -> PortError {

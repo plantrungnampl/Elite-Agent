@@ -1,9 +1,9 @@
 use std::sync::Mutex;
 
 use local_agent_terminal_application::{
-    ContextBuildPolicy, DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest,
-    PolicyApprovedDisclosure, PolicyDecision, PolicyDecisionId, PolicyDecisionStore, PortError,
-    SafeErrorClassification,
+    ContextBuildPolicy, ContextPackageContract, ContextRunReconstructibility, DisclosureChannel,
+    DisclosurePolicyEvaluator, DisclosureRequest, PolicyApprovedDisclosure, PolicyDecision,
+    PolicyDecisionId, PolicyDecisionStore, PortError, SafeErrorClassification,
 };
 use local_agent_terminal_context_engine::{
     ByteTokenV1, ContextPackageBuildRequest, ContextPackageBuilder, ContextPackageItem,
@@ -24,8 +24,8 @@ fn byte_token_v1_counts_utf8_bytes_and_never_spends_response_reserve() {
     assert_eq!(ByteTokenV1::units("🦀"), 4);
 
     let allocation =
-        RoleBudgetAllocation::new("verifier", ContextBudget::new(1_000, 250).unwrap()).unwrap();
-    assert_eq!(allocation.input_limit(), 750);
+        RoleBudgetAllocation::new("verifier", ContextBudget::new(3_000, 250).unwrap()).unwrap();
+    assert_eq!(allocation.input_limit(), 2_750);
     assert!(allocation.total_segment_limit() <= allocation.input_limit());
 
     let oversized = vec![ContextPackageItem::new(
@@ -43,14 +43,15 @@ fn byte_token_v1_counts_utf8_bytes_and_never_spends_response_reserve() {
     let decisions = RecordingDecisions::default();
     let package = ContextPackageBuilder::new(&scanner, &decisions)
         .build(ContextPackageBuildRequest {
-            descriptor: descriptor("verifier", 1_000, 250),
+            descriptor: descriptor("verifier", 3_000, 250),
+            contract: contract(),
             policy: policy(),
             items: oversized,
         })
         .unwrap();
 
-    assert!(package.bytes().len() as u64 <= 750);
-    assert!(package.used_input_units() <= 750);
+    assert!(package.bytes().len() as u64 <= allocation.input_limit());
+    assert!(package.used_input_units() <= allocation.input_limit());
 }
 
 #[test]
@@ -115,6 +116,7 @@ fn package_bytes_digest_relations_and_citations_are_stable_and_complete() {
     let first = builder
         .build(ContextPackageBuildRequest {
             descriptor: descriptor("verifier", 8_192, 2_048),
+            contract: contract(),
             policy: policy(),
             items: vec![allowed.clone(), redacted.clone()],
         })
@@ -122,6 +124,7 @@ fn package_bytes_digest_relations_and_citations_are_stable_and_complete() {
     let second = builder
         .build(ContextPackageBuildRequest {
             descriptor: descriptor("verifier", 8_192, 2_048),
+            contract: contract(),
             policy: policy(),
             items: vec![redacted, allowed],
         })
@@ -159,6 +162,20 @@ fn package_bytes_digest_relations_and_citations_are_stable_and_complete() {
     let value: serde_json::Value = serde_json::from_slice(first.bytes()).unwrap();
     assert_eq!(value["schema"], "context-package.v1");
     assert_eq!(value["versions"]["tokenizer"], "byte-token-v1");
+    assert_eq!(value["task"]["scope"][0], "src/**");
+    assert_eq!(value["task"]["risk"], "medium");
+    assert_eq!(value["task"]["phase"], "ContextBuild");
+    assert_eq!(value["sharedSummary"], "bounded shared summary");
+    assert_eq!(value["acceptedDecisions"][0], "decision-use-rust");
+    assert_eq!(value["unresolvedObjections"][0], "objection-cost");
+    assert_eq!(value["activeThreadMessages"][0], "thread-review-request");
+    assert_eq!(value["permissions"][0], "context.query");
+    assert_eq!(value["protocolCapabilities"][0], "context/query");
+    assert_eq!(value["reconstructibility"]["providerId"], "provider-openai");
+    assert_eq!(
+        value["reconstructibility"]["authoritativeReceiptUnixSeconds"],
+        1_787_000_000_i64
+    );
     assert_eq!(value["items"][0]["memberId"], "member-a");
     assert_eq!(value["items"][0]["redactionReportIds"][0], "report-1");
     assert_eq!(value["items"][0]["provenance"].as_array().unwrap().len(), 2);
@@ -179,6 +196,7 @@ fn final_serialized_payload_is_disclosed_before_the_build_returns() {
     let package = ContextPackageBuilder::new(&scanner, &decisions)
         .build(ContextPackageBuildRequest {
             descriptor: descriptor("lead", 4_096, 1_024),
+            contract: contract(),
             policy: policy(),
             items: vec![ContextPackageItem::new(
                 "task-summary",
@@ -230,6 +248,7 @@ fn keeps_retrieval_rank_when_only_one_item_fits_the_segment_budget() {
     let package = ContextPackageBuilder::new(&scanner, &decisions)
         .build(ContextPackageBuildRequest {
             descriptor: descriptor("lead", 4_096, 1_024),
+            contract: contract(),
             policy: policy(),
             items: vec![high_ranked, low_ranked],
         })
@@ -247,6 +266,7 @@ fn rejects_final_disclosure_that_rewrites_the_canonical_package() {
     let result =
         ContextPackageBuilder::new(&scanner, &decisions).build(ContextPackageBuildRequest {
             descriptor: descriptor("lead", 4_096, 1_024),
+            contract: contract(),
             policy: policy(),
             items: vec![ContextPackageItem::new(
                 "task-summary",
@@ -349,7 +369,7 @@ impl PolicyDecisionStore for RecordingDecisions {
         &self,
         decision: local_agent_terminal_application::RecordedPolicyDecision,
     ) -> Result<PolicyDecisionId, PortError> {
-        let id = PolicyDecisionId::from_decision(&decision.decision);
+        let id = PolicyDecisionId::from_decision(decision.decision());
         self.ids.lock().unwrap().push(id.clone());
         Ok(id)
     }
@@ -389,6 +409,31 @@ fn policy() -> ContextBuildPolicy {
         purpose: "build bounded context".to_owned(),
         policy_snapshot_digest: digest(b"policy"),
         evaluated_at: Timestamp::from_unix_seconds(1_787_000_000),
+    }
+}
+
+fn contract() -> ContextPackageContract {
+    ContextPackageContract {
+        task_scope: vec!["src/**".to_owned()],
+        policy_constraints: vec!["read-only".to_owned()],
+        shared_summary: "bounded shared summary".to_owned(),
+        accepted_decisions: vec!["decision-use-rust".to_owned()],
+        unresolved_objections: vec!["objection-cost".to_owned()],
+        active_thread_messages: vec!["thread-review-request".to_owned()],
+        permissions: vec!["context.query".to_owned()],
+        protocol_capabilities: vec!["context/query".to_owned()],
+        reconstructibility: ContextRunReconstructibility {
+            run_config_artifact_id: "run-config-1".to_owned(),
+            adapter_version: "adapter-1".to_owned(),
+            provider_id: "provider-openai".to_owned(),
+            model_id: "model-1".to_owned(),
+            generation_parameters_digest: digest(b"generation").as_str().to_owned(),
+            response_schema_version: "message.v1".to_owned(),
+            manifest_digest: digest(b"manifest").as_str().to_owned(),
+            executable_digest: digest(b"executable").as_str().to_owned(),
+            connection_binding_digest: digest(b"connection").as_str().to_owned(),
+            authoritative_receipt_unix_seconds: 1_787_000_000,
+        },
     }
 }
 

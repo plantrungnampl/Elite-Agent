@@ -12,7 +12,11 @@ use local_agent_terminal_domain::{
     SpecialistRequest, TaskId, Timestamp,
 };
 
-use crate::{PortError, PreparedContextPackage, RecordedPolicyDecision};
+use crate::{
+    DeliberationArtifactRef, DeliberationPersistenceCommand, DeliberationRecord,
+    DeliberationRunAssignment, PortError, PreparedContextPackage, RecordedPolicyDecision,
+    Retryability, SafeErrorClassification,
+};
 
 #[derive(Clone, Default)]
 pub struct AgentRequestCancellation {
@@ -235,6 +239,84 @@ pub struct AgentSpecialistResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSpecialistCommit {
     pub request: SpecialistRequest,
+    pub assignment: DeliberationRunAssignment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSpecialistDispatchCommand {
+    persistence: DeliberationPersistenceCommand,
+    assignment: DeliberationRunAssignment,
+    thread_id: String,
+    context_package: DeliberationArtifactRef,
+}
+
+impl AgentSpecialistDispatchCommand {
+    pub fn new(
+        persistence: DeliberationPersistenceCommand,
+        assignment: DeliberationRunAssignment,
+        thread_id: impl Into<String>,
+        context_package: DeliberationArtifactRef,
+    ) -> Result<Self, PortError> {
+        let command = Self {
+            persistence,
+            assignment,
+            thread_id: thread_id.into(),
+            context_package,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    pub fn persistence(&self) -> &DeliberationPersistenceCommand {
+        &self.persistence
+    }
+
+    pub fn assignment(&self) -> &DeliberationRunAssignment {
+        &self.assignment
+    }
+
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    pub fn context_package(&self) -> &DeliberationArtifactRef {
+        &self.context_package
+    }
+
+    pub fn validate(&self) -> Result<(), PortError> {
+        self.persistence.validate()?;
+        self.context_package.validate()?;
+        let DeliberationRecord::SpecialistRequest { request, artifact } = self.persistence.record()
+        else {
+            return Err(invalid_input());
+        };
+        if self.thread_id.trim().is_empty()
+            || self.thread_id.len() > 256
+            || self.thread_id.contains('\0')
+            || self.assignment.run_id() == request.requesting_run()
+            || self.assignment.agent_id() != self.assignment.actor_id().as_str()
+            || self.context_package == *artifact
+            || request
+                .required_context()
+                .contains(self.context_package.artifact_id())
+        {
+            return Err(invalid_input());
+        }
+        Ok(())
+    }
+}
+
+pub trait AgentSpecialistDispatchStore: Send + Sync {
+    fn persist_specialist_dispatch(
+        &self,
+        command: AgentSpecialistDispatchCommand,
+    ) -> Result<(), PortError>;
+
+    fn specialist_dispatch_exists(
+        &self,
+        task_id: &TaskId,
+        request_id: &str,
+    ) -> Result<bool, PortError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,4 +372,11 @@ pub trait AgentRequestHandler: Send + Sync {
     /// `try_begin_commit` immediately before the durable transaction and `finish_commit` after it.
     /// This makes commit claim and runtime revocation mutually exclusive.
     fn persist_audit(&self, audit: AgentRequestAudit) -> Result<(), PortError>;
+}
+
+fn invalid_input() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::InvalidInput,
+        Retryability::NonRetryable,
+    )
 }

@@ -4,6 +4,7 @@ mod agent_store;
 mod approval_store;
 mod artifact_journal;
 mod context_store;
+mod deliberation_boundary_store;
 mod deliberation_budget_store;
 mod deliberation_dispatch_store;
 mod deliberation_store;
@@ -28,7 +29,7 @@ use local_agent_terminal_application::{
 };
 use rusqlite::Connection;
 
-pub use agent_store::canonical_agent_run_config_artifact;
+pub use agent_store::{canonical_agent_run_config_artifact, StoredAgentRunUsage};
 pub use context_store::StoredContextPackageView;
 pub use health::{artifact_root_health, ArtifactRootIssue, DatabaseHealth, DatabaseIssue};
 pub use lease_store::CoreSystemRunRequest;

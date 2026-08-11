@@ -6,12 +6,13 @@ use std::sync::Arc;
 use local_agent_terminal_application::{
     BuildInitialContext, BuildInitialContextRequest, ContextArtifactKind, ContextArtifactPublisher,
     ContextArtifactRef, ContextBuildPolicy, ContextClassificationOutcome, ContextLogicalIdentity,
-    ContextPackageDraft, ContextQuery, ContextSourceClassification, ContextSourceClassifier,
-    ContextSourceRecord, ContextSourceState, ContextStore, DisclosureChannel,
-    DisclosurePolicyEvaluator, DisclosureRequest, ImmutableContextArtifact,
-    PolicyApprovedDisclosure, PolicyDecision, PortError, RepositoryContextSource, Retryability,
-    SafeErrorClassification, SourceClassificationRequest, SourceIndexMetadata, SourceSnapshot,
-    SourceSnapshotItem, SourceSnapshotRequest, SourceStateTransition,
+    ContextPackageContract, ContextPackageDraft, ContextQuery, ContextRunReconstructibility,
+    ContextSourceClassification, ContextSourceClassifier, ContextSourceRecord, ContextSourceState,
+    ContextStore, DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest,
+    ImmutableContextArtifact, PolicyApprovedDisclosure, PolicyDecision, PortError,
+    RepositoryContextSource, Retryability, SafeErrorClassification, SourceClassificationRequest,
+    SourceIndexMetadata, SourceSnapshot, SourceSnapshotItem, SourceSnapshotRequest,
+    SourceStateTransition,
 };
 use local_agent_terminal_context_engine::ContextPackageBuilder;
 use local_agent_terminal_domain::{
@@ -639,6 +640,7 @@ fn build_request() -> BuildInitialContextRequest {
                 ContextBudget::new(4_096, 1_024).unwrap(),
             )
             .unwrap(),
+            contract: context_contract(),
         },
     }
 }
@@ -670,6 +672,31 @@ fn count(connection: &Connection, table: &str) -> i64 {
 
 fn digest(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
+}
+
+fn context_contract() -> ContextPackageContract {
+    ContextPackageContract {
+        task_scope: vec!["src/**".to_owned()],
+        policy_constraints: vec!["read-only".to_owned()],
+        shared_summary: "bounded summary".to_owned(),
+        accepted_decisions: Vec::new(),
+        unresolved_objections: Vec::new(),
+        active_thread_messages: Vec::new(),
+        permissions: vec!["context.query".to_owned()],
+        protocol_capabilities: vec!["context/query".to_owned()],
+        reconstructibility: ContextRunReconstructibility {
+            run_config_artifact_id: "run-config-1".to_owned(),
+            adapter_version: "adapter-1".to_owned(),
+            provider_id: "provider-1".to_owned(),
+            model_id: "model-1".to_owned(),
+            generation_parameters_digest: digest(b"generation").as_str().to_owned(),
+            response_schema_version: "message.v1".to_owned(),
+            manifest_digest: digest(b"manifest").as_str().to_owned(),
+            executable_digest: digest(b"executable").as_str().to_owned(),
+            connection_binding_digest: digest(b"connection").as_str().to_owned(),
+            authoritative_receipt_unix_seconds: 1_787_000_000,
+        },
+    }
 }
 
 fn failure(classification: SafeErrorClassification) -> PortError {

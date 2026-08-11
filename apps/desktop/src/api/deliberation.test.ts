@@ -7,9 +7,11 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 import {
   getContextPackage,
   getDeliberationWorkspace,
+  resumeDeliberation,
   resolvePlanApproval,
   type GetContextPackageRequestDto,
   type GetDeliberationWorkspaceRequestDto,
+  type ResumeDeliberationRequestDto,
   type ResolvePlanApprovalRequestDto,
 } from "./deliberation";
 
@@ -18,7 +20,7 @@ describe("deliberation Tauri API", () => {
     invoke.mockReset().mockResolvedValue({});
   });
 
-  it("uses only the three narrow commands and immutable inputs", async () => {
+  it("uses only narrow commands and immutable inputs", async () => {
     const workspace = { taskId: "task-1" };
     const context = { packageId: "context-1" };
     const resolution = {
@@ -29,11 +31,13 @@ describe("deliberation Tauri API", () => {
     };
 
     await getDeliberationWorkspace(workspace);
+    await resumeDeliberation(workspace);
     await getContextPackage(context);
     await resolvePlanApproval(resolution);
 
     expect(invoke.mock.calls).toEqual([
       ["get_deliberation_workspace", { request: workspace }],
+      ["resume_deliberation", { request: workspace }],
       ["get_context_package", { request: context }],
       ["resolve_plan_approval", { request: resolution }],
     ]);
@@ -52,6 +56,12 @@ describe("deliberation Tauri API", () => {
         physicalPath: "D:\\repo\\secret.txt",
       } as unknown as GetContextPackageRequestDto),
     ).toThrow("exactly: packageId");
+    expect(() =>
+      resumeDeliberation({
+        taskId: "task-1",
+        providerPayload: { model: "replacement" },
+      } as unknown as ResumeDeliberationRequestDto),
+    ).toThrow("exactly: taskId");
     expect(() =>
       resolvePlanApproval({
         approvalId: "approval-1",
@@ -86,6 +96,7 @@ describe("deliberation Tauri API", () => {
 
   it("rejects malformed IDs, digest, task version, and action", () => {
     expect(() => getDeliberationWorkspace({ taskId: "../task" })).toThrow();
+    expect(() => resumeDeliberation({ taskId: "../task" })).toThrow();
     expect(() => getContextPackage({ packageId: "context/1" })).toThrow();
     expect(() =>
       resolvePlanApproval({

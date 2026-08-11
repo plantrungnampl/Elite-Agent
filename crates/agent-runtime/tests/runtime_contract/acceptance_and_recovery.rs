@@ -897,7 +897,16 @@ impl AgentRequestHandler for RecordingRequestHandler {
                 )
                 .unwrap()
             })
-            .map(|request| AgentSpecialistCommit { request });
+            .map(|request| AgentSpecialistCommit {
+                assignment: DeliberationRunAssignment::new(
+                    RunId::new(format!("specialist-{}", request.request_id())).unwrap(),
+                    "agent-specialist",
+                    AgentFamilyKey::new("fixture-specialist-family").unwrap(),
+                    ActorId::new("agent-specialist").unwrap(),
+                )
+                .unwrap(),
+                request,
+            });
         let response = AgentSpecialistResponse {
             run_id: request.run_id,
             task_id: request.task_id,

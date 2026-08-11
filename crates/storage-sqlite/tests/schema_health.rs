@@ -107,14 +107,14 @@ fn first_startup_applies_schema_and_records_checksum() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(latest, (8, migration_checksum()));
+    assert_eq!(latest, (9, migration_checksum()));
     assert_eq!(
         connection
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        8
+        9
     );
     assert_eq!(
         connection
@@ -155,7 +155,7 @@ fn first_startup_applies_schema_and_records_checksum() {
 }
 
 #[test]
-fn exact_prior_v1_database_upgrades_to_v8_without_losing_data() {
+fn exact_prior_v1_database_upgrades_to_v9_without_losing_data() {
     let directory = TempDirectory::new();
     let path = directory.0.join("state.sqlite3");
     let mut connection = Connection::open(&path).unwrap();
@@ -182,7 +182,7 @@ fn exact_prior_v1_database_upgrades_to_v8_without_losing_data() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        8
+        9
     );
     assert!(connection
         .execute("UPDATE tasks SET fencing_epoch = 0 WHERE id = 'task-1'", [])
@@ -215,7 +215,7 @@ fn exact_prior_v2_database_upgrades_without_rewriting_its_checksum() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        8
+        9
     );
     assert_eq!(
         connection
@@ -241,7 +241,7 @@ fn exact_prior_v2_database_upgrades_without_rewriting_its_checksum() {
 }
 
 #[test]
-fn exact_deployed_v3_database_upgrades_to_v8_and_preserves_v3_checksum() {
+fn exact_deployed_v3_database_upgrades_to_v9_and_preserves_v3_checksum() {
     let directory = TempDirectory::new();
     let path = directory.0.join("state.sqlite3");
     let mut connection = Connection::open(&path).unwrap();
@@ -258,7 +258,7 @@ fn exact_deployed_v3_database_upgrades_to_v8_and_preserves_v3_checksum() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        8
+        9
     );
     assert_eq!(
         connection
@@ -291,7 +291,7 @@ fn exact_deployed_v3_database_upgrades_to_v8_and_preserves_v3_checksum() {
 }
 
 #[test]
-fn exact_deployed_v4_database_upgrades_to_v8_and_preserves_v4_checksum() {
+fn exact_deployed_v4_database_upgrades_to_v9_and_preserves_v4_checksum() {
     let directory = TempDirectory::new();
     let path = directory.0.join("state.sqlite3");
     let mut connection = Connection::open(&path).unwrap();
@@ -308,7 +308,7 @@ fn exact_deployed_v4_database_upgrades_to_v8_and_preserves_v4_checksum() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        8
+        9
     );
     assert_eq!(
         connection
@@ -359,7 +359,7 @@ fn exact_deployed_v5_database_adds_context_hardening_without_rewriting_v5() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        8
+        9
     );
     assert_eq!(
         connection
@@ -417,7 +417,7 @@ fn exact_deployed_v6_database_adds_private_run_outputs_without_rewriting_v6() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        8
+        9
     );
     assert_eq!(
         connection
@@ -466,7 +466,7 @@ fn exact_deployed_v7_database_adds_deliberation_budgets_without_rewriting_v7() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        8
+        9
     );
     assert_eq!(
         connection
@@ -739,7 +739,7 @@ fn malformed_deployed_v3_observed_write_fails_closed_without_mutation() {
 
 #[test]
 fn later_startup_rejects_changed_or_unsupported_schema() {
-    for version in 1..=8 {
+    for version in 1..=9 {
         let mismatch_directory = TempDirectory::new();
         let mismatch_path = mismatch_directory.0.join("state.sqlite3");
         SqliteStore::open(&mismatch_path).unwrap();
@@ -766,7 +766,7 @@ fn later_startup_rejects_changed_or_unsupported_schema() {
              (version, name, applied_at, application_version, checksum)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                9,
+                10,
                 "future",
                 "2026-07-26T00:00:00Z",
                 "9.0.0",
@@ -777,8 +777,8 @@ fn later_startup_rejects_changed_or_unsupported_schema() {
     assert!(matches!(
         SqliteStore::open(&unsupported_path),
         Err(OpenError::UnsupportedSchema {
-            found: 9,
-            supported: 8
+            found: 10,
+            supported: 9
         })
     ));
 }
@@ -1393,7 +1393,7 @@ fn startup_rejects_unknown_nonempty_database_without_mutating_it() {
         SqliteStore::open(&path),
         Err(OpenError::UnsupportedSchema {
             found: 0,
-            supported: 8
+            supported: 9
         })
     ));
 

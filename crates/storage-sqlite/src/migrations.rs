@@ -3,7 +3,7 @@ use std::fmt;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-const SUPPORTED_SCHEMA_VERSION: i64 = 8;
+const SUPPORTED_SCHEMA_VERSION: i64 = 9;
 const NORMATIVE_SQL: &str =
     include_str!("../../../docs/multi-agent-terminal-design/schemas/sqlite-v1.sql");
 const V1_ADAPTER_HARDENING_SQL: &str = r#"
@@ -508,6 +508,158 @@ BEGIN
 END;
 "#;
 
+const V9_DELIBERATION_DISPATCH_ROUNDS_SQL: &str = r#"
+ALTER TABLE deliberation_dispatch_reservations
+ADD COLUMN dispatch_round INTEGER NOT NULL DEFAULT 0 CHECK (dispatch_round BETWEEN 0 AND 64);
+
+DROP INDEX deliberation_dispatch_reservations_task;
+CREATE INDEX deliberation_dispatch_reservations_task
+ON deliberation_dispatch_reservations(task_id, phase, dispatch_round, run_id);
+
+CREATE TABLE deliberation_repository_baselines (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
+    head TEXT NOT NULL,
+    index_digest TEXT NOT NULL,
+    status_digest TEXT NOT NULL,
+    captured_at TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE deliberation_repository_boundary_records (
+    id INTEGER PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+    phase TEXT NOT NULL,
+    expected_head TEXT NOT NULL,
+    expected_index_digest TEXT NOT NULL,
+    expected_status_digest TEXT NOT NULL,
+    observed_head TEXT NOT NULL,
+    observed_index_digest TEXT NOT NULL,
+    observed_status_digest TEXT NOT NULL,
+    blocked INTEGER NOT NULL CHECK (blocked IN (0, 1)),
+    observed_at TEXT NOT NULL,
+    UNIQUE (
+        task_id, phase, expected_head, expected_index_digest, expected_status_digest,
+        observed_head, observed_index_digest, observed_status_digest
+    )
+) STRICT;
+
+CREATE TABLE deliberation_synthesis_plans (
+    event_id TEXT PRIMARY KEY REFERENCES deliberation_records(event_id) ON DELETE RESTRICT,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+    plan_json TEXT NOT NULL CHECK (json_valid(plan_json)),
+    plan_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE deliberation_specialist_threads (
+    thread_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+    parent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE RESTRICT,
+    specialist_run_id TEXT NOT NULL UNIQUE,
+    specialist_agent_id TEXT NOT NULL,
+    context_package_artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE deliberation_specialist_dispatches (
+    event_id TEXT PRIMARY KEY REFERENCES deliberation_records(event_id) ON DELETE RESTRICT,
+    request_id TEXT NOT NULL,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+    parent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE RESTRICT,
+    specialist_run_id TEXT NOT NULL UNIQUE,
+    specialist_agent_id TEXT NOT NULL,
+    specialist_actor_id TEXT NOT NULL,
+    family_key TEXT NOT NULL,
+    thread_id TEXT NOT NULL UNIQUE
+        REFERENCES deliberation_specialist_threads(thread_id) ON DELETE RESTRICT,
+    context_package_artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (status = 'reserved'),
+    created_at TEXT NOT NULL,
+    UNIQUE (task_id, parent_run_id, request_id)
+) STRICT;
+
+CREATE TABLE deliberation_context_package_invalidations (
+    context_package_id TEXT NOT NULL REFERENCES context_packages(id) ON DELETE RESTRICT,
+    boundary_record_id INTEGER NOT NULL
+        REFERENCES deliberation_repository_boundary_records(id) ON DELETE RESTRICT,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+    reason TEXT NOT NULL CHECK (reason = 'repository_fingerprint_changed'),
+    invalidated_at TEXT NOT NULL,
+    PRIMARY KEY (context_package_id, boundary_record_id)
+) STRICT;
+
+CREATE TRIGGER deliberation_repository_baselines_update_forbidden
+BEFORE UPDATE ON deliberation_repository_baselines
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT, 'deliberation repository baselines are immutable');
+END;
+
+CREATE TRIGGER deliberation_repository_baselines_delete_forbidden
+BEFORE DELETE ON deliberation_repository_baselines
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT, 'deliberation repository baselines are immutable');
+END;
+
+CREATE TRIGGER deliberation_repository_boundary_records_update_forbidden
+BEFORE UPDATE ON deliberation_repository_boundary_records
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT, 'deliberation repository boundary records are immutable');
+END;
+
+CREATE TRIGGER deliberation_repository_boundary_records_delete_forbidden
+BEFORE DELETE ON deliberation_repository_boundary_records
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT, 'deliberation repository boundary records are immutable');
+END;
+
+CREATE TRIGGER deliberation_synthesis_plans_update_forbidden
+BEFORE UPDATE ON deliberation_synthesis_plans
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT, 'deliberation synthesis plans are immutable');
+END;
+
+CREATE TRIGGER deliberation_synthesis_plans_delete_forbidden
+BEFORE DELETE ON deliberation_synthesis_plans
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT, 'deliberation synthesis plans are immutable');
+END;
+
+CREATE TRIGGER deliberation_specialist_threads_update_forbidden
+BEFORE UPDATE ON deliberation_specialist_threads
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT, 'deliberation specialist threads are immutable');
+END;
+
+CREATE TRIGGER deliberation_specialist_threads_delete_forbidden
+BEFORE DELETE ON deliberation_specialist_threads
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT, 'deliberation specialist threads are immutable');
+END;
+
+CREATE TRIGGER deliberation_specialist_dispatches_update_forbidden
+BEFORE UPDATE ON deliberation_specialist_dispatches
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT, 'deliberation specialist dispatches are immutable');
+END;
+
+CREATE TRIGGER deliberation_specialist_dispatches_delete_forbidden
+BEFORE DELETE ON deliberation_specialist_dispatches
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT, 'deliberation specialist dispatches are immutable');
+END;
+
+CREATE TRIGGER deliberation_context_package_invalidations_update_forbidden
+BEFORE UPDATE ON deliberation_context_package_invalidations
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT, 'deliberation context package invalidations are immutable');
+END;
+
+CREATE TRIGGER deliberation_context_package_invalidations_delete_forbidden
+BEFORE DELETE ON deliberation_context_package_invalidations
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT, 'deliberation context package invalidations are immutable');
+END;
+"#;
+
 #[derive(Debug)]
 pub enum OpenError {
     Database(rusqlite::Error),
@@ -570,6 +722,10 @@ impl From<rusqlite::Error> for OpenError {
 }
 
 pub fn migration_checksum() -> String {
+    checksum(V9_DELIBERATION_DISPATCH_ROUNDS_SQL)
+}
+
+fn v8_migration_checksum() -> String {
     checksum(V8_DELIBERATION_TASK_BUDGETS_SQL)
 }
 
@@ -645,72 +801,21 @@ pub(crate) fn validate_or_migrate(connection: &mut Connection) -> Result<(), Ope
             supported: SUPPORTED_SCHEMA_VERSION,
         });
     };
-    match version {
-        1 => {
-            validate_checksum(connection, 1, v1_migration_checksum())?;
-            apply_upgrade_migrations(connection, version)?;
-        }
-        2 => {
-            validate_checksum(connection, 1, v1_migration_checksum())?;
-            validate_checksum(connection, 2, v2_migration_checksum())?;
-            apply_upgrade_migrations(connection, version)?;
-        }
-        3 => {
-            validate_checksum(connection, 1, v1_migration_checksum())?;
-            validate_checksum(connection, 2, v2_migration_checksum())?;
-            validate_checksum(connection, 3, v3_migration_checksum())?;
-            apply_upgrade_migrations(connection, version)?;
-        }
-        4 => {
-            validate_checksum(connection, 1, v1_migration_checksum())?;
-            validate_checksum(connection, 2, v2_migration_checksum())?;
-            validate_checksum(connection, 3, v3_migration_checksum())?;
-            validate_checksum(connection, 4, v4_migration_checksum())?;
-            apply_upgrade_migrations(connection, version)?;
-        }
-        5 => {
-            validate_checksum(connection, 1, v1_migration_checksum())?;
-            validate_checksum(connection, 2, v2_migration_checksum())?;
-            validate_checksum(connection, 3, v3_migration_checksum())?;
-            validate_checksum(connection, 4, v4_migration_checksum())?;
-            validate_checksum(connection, 5, v5_migration_checksum())?;
-            apply_upgrade_migrations(connection, version)?;
-        }
-        6 => {
-            validate_checksum(connection, 1, v1_migration_checksum())?;
-            validate_checksum(connection, 2, v2_migration_checksum())?;
-            validate_checksum(connection, 3, v3_migration_checksum())?;
-            validate_checksum(connection, 4, v4_migration_checksum())?;
-            validate_checksum(connection, 5, v5_migration_checksum())?;
-            validate_checksum(connection, 6, v6_migration_checksum())?;
-            apply_upgrade_migrations(connection, version)?;
-        }
-        7 => {
-            validate_checksum(connection, 1, v1_migration_checksum())?;
-            validate_checksum(connection, 2, v2_migration_checksum())?;
-            validate_checksum(connection, 3, v3_migration_checksum())?;
-            validate_checksum(connection, 4, v4_migration_checksum())?;
-            validate_checksum(connection, 5, v5_migration_checksum())?;
-            validate_checksum(connection, 6, v6_migration_checksum())?;
-            validate_checksum(connection, 7, v7_migration_checksum())?;
-            apply_upgrade_migrations(connection, version)?;
-        }
-        SUPPORTED_SCHEMA_VERSION => {
-            validate_checksum(connection, 1, v1_migration_checksum())?;
-            validate_checksum(connection, 2, v2_migration_checksum())?;
-            validate_checksum(connection, 3, v3_migration_checksum())?;
-            validate_checksum(connection, 4, v4_migration_checksum())?;
-            validate_checksum(connection, 5, v5_migration_checksum())?;
-            validate_checksum(connection, 6, v6_migration_checksum())?;
-            validate_checksum(connection, 7, v7_migration_checksum())?;
-            validate_checksum(connection, 8, migration_checksum())?;
-        }
-        _ => {
-            return Err(OpenError::UnsupportedSchema {
-                found: version,
-                supported: SUPPORTED_SCHEMA_VERSION,
-            });
-        }
+    if !(1..=SUPPORTED_SCHEMA_VERSION).contains(&version) {
+        return Err(OpenError::UnsupportedSchema {
+            found: version,
+            supported: SUPPORTED_SCHEMA_VERSION,
+        });
+    }
+    for installed_version in 1..=version {
+        validate_checksum(
+            connection,
+            installed_version,
+            checksum_for_version(installed_version),
+        )?;
+    }
+    if version < SUPPORTED_SCHEMA_VERSION {
+        apply_upgrade_migrations(connection, version)?;
     }
     validate_foreign_keys(connection)
 }
@@ -885,6 +990,18 @@ fn apply_initial_migration(connection: &mut Connection) -> Result<(), OpenError>
             8,
             "deliberation_task_budgets_v8",
             env!("CARGO_PKG_VERSION"),
+            v8_migration_checksum()
+        ],
+    )?;
+    transaction.execute_batch(V9_DELIBERATION_DISPATCH_ROUNDS_SQL)?;
+    transaction.execute(
+        "INSERT INTO schema_migrations (
+            version, name, applied_at, application_version, checksum
+         ) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4)",
+        params![
+            9,
+            "deliberation_dispatch_rounds_v9",
+            env!("CARGO_PKG_VERSION"),
             migration_checksum()
         ],
     )?;
@@ -894,200 +1011,67 @@ fn apply_initial_migration(connection: &mut Connection) -> Result<(), OpenError>
 
 fn apply_upgrade_migrations(connection: &mut Connection, version: i64) -> Result<(), OpenError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for (next_version, name, sql, checksum) in match version {
-        1 => vec![
-            (
-                2,
-                "adapter_hardening_v2",
-                V2_UPGRADE_SQL,
-                v2_migration_checksum(),
-            ),
-            (
-                3,
-                "policy_tool_hardening_v3",
-                V3_POLICY_TOOL_HARDENING_SQL,
-                v3_migration_checksum(),
-            ),
-            (
-                4,
-                "tool_execution_lifecycle_v4",
-                V4_TOOL_EXECUTION_LIFECYCLE_SQL,
-                v4_migration_checksum(),
-            ),
-            (
-                5,
-                "pre_effect_terminal_v5",
-                V5_PRE_EFFECT_TERMINAL_SQL,
-                v5_migration_checksum(),
-            ),
-            (
-                6,
-                "context_hardening_v6",
-                V6_CONTEXT_HARDENING_SQL,
-                v6_migration_checksum(),
-            ),
-            (
-                7,
-                "private_agent_run_outputs_v7",
-                V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
-                v7_migration_checksum(),
-            ),
-            (
-                8,
-                "deliberation_task_budgets_v8",
-                V8_DELIBERATION_TASK_BUDGETS_SQL,
-                migration_checksum(),
-            ),
-        ],
-        2 => vec![
-            (
-                3,
-                "policy_tool_hardening_v3",
-                V3_POLICY_TOOL_HARDENING_SQL,
-                v3_migration_checksum(),
-            ),
-            (
-                4,
-                "tool_execution_lifecycle_v4",
-                V4_TOOL_EXECUTION_LIFECYCLE_SQL,
-                v4_migration_checksum(),
-            ),
-            (
-                5,
-                "pre_effect_terminal_v5",
-                V5_PRE_EFFECT_TERMINAL_SQL,
-                v5_migration_checksum(),
-            ),
-            (
-                6,
-                "context_hardening_v6",
-                V6_CONTEXT_HARDENING_SQL,
-                v6_migration_checksum(),
-            ),
-            (
-                7,
-                "private_agent_run_outputs_v7",
-                V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
-                v7_migration_checksum(),
-            ),
-            (
-                8,
-                "deliberation_task_budgets_v8",
-                V8_DELIBERATION_TASK_BUDGETS_SQL,
-                migration_checksum(),
-            ),
-        ],
-        3 => vec![
-            (
-                4,
-                "tool_execution_lifecycle_v4",
-                V4_TOOL_EXECUTION_LIFECYCLE_SQL,
-                v4_migration_checksum(),
-            ),
-            (
-                5,
-                "pre_effect_terminal_v5",
-                V5_PRE_EFFECT_TERMINAL_SQL,
-                v5_migration_checksum(),
-            ),
-            (
-                6,
-                "context_hardening_v6",
-                V6_CONTEXT_HARDENING_SQL,
-                v6_migration_checksum(),
-            ),
-            (
-                7,
-                "private_agent_run_outputs_v7",
-                V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
-                v7_migration_checksum(),
-            ),
-            (
-                8,
-                "deliberation_task_budgets_v8",
-                V8_DELIBERATION_TASK_BUDGETS_SQL,
-                migration_checksum(),
-            ),
-        ],
-        4 => vec![
-            (
-                5,
-                "pre_effect_terminal_v5",
-                V5_PRE_EFFECT_TERMINAL_SQL,
-                v5_migration_checksum(),
-            ),
-            (
-                6,
-                "context_hardening_v6",
-                V6_CONTEXT_HARDENING_SQL,
-                v6_migration_checksum(),
-            ),
-            (
-                7,
-                "private_agent_run_outputs_v7",
-                V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
-                v7_migration_checksum(),
-            ),
-            (
-                8,
-                "deliberation_task_budgets_v8",
-                V8_DELIBERATION_TASK_BUDGETS_SQL,
-                migration_checksum(),
-            ),
-        ],
-        5 => vec![
-            (
-                6,
-                "context_hardening_v6",
-                V6_CONTEXT_HARDENING_SQL,
-                v6_migration_checksum(),
-            ),
-            (
-                7,
-                "private_agent_run_outputs_v7",
-                V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
-                v7_migration_checksum(),
-            ),
-            (
-                8,
-                "deliberation_task_budgets_v8",
-                V8_DELIBERATION_TASK_BUDGETS_SQL,
-                migration_checksum(),
-            ),
-        ],
-        6 => vec![
-            (
-                7,
-                "private_agent_run_outputs_v7",
-                V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
-                v7_migration_checksum(),
-            ),
-            (
-                8,
-                "deliberation_task_budgets_v8",
-                V8_DELIBERATION_TASK_BUDGETS_SQL,
-                migration_checksum(),
-            ),
-        ],
-        7 => vec![(
+    let migrations = [
+        (2, "adapter_hardening_v2", V2_UPGRADE_SQL),
+        (3, "policy_tool_hardening_v3", V3_POLICY_TOOL_HARDENING_SQL),
+        (
+            4,
+            "tool_execution_lifecycle_v4",
+            V4_TOOL_EXECUTION_LIFECYCLE_SQL,
+        ),
+        (5, "pre_effect_terminal_v5", V5_PRE_EFFECT_TERMINAL_SQL),
+        (6, "context_hardening_v6", V6_CONTEXT_HARDENING_SQL),
+        (
+            7,
+            "private_agent_run_outputs_v7",
+            V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
+        ),
+        (
             8,
             "deliberation_task_budgets_v8",
             V8_DELIBERATION_TASK_BUDGETS_SQL,
-            migration_checksum(),
-        )],
-        _ => Vec::new(),
-    } {
+        ),
+        (
+            9,
+            "deliberation_dispatch_rounds_v9",
+            V9_DELIBERATION_DISPATCH_ROUNDS_SQL,
+        ),
+    ];
+    for (next_version, name, sql) in migrations
+        .into_iter()
+        .filter(|(next_version, _, _)| *next_version > version)
+    {
         transaction.execute_batch(sql)?;
         transaction.execute(
             "INSERT INTO schema_migrations (
                 version, name, applied_at, application_version, checksum
              ) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4)",
-            params![next_version, name, env!("CARGO_PKG_VERSION"), checksum],
+            params![
+                next_version,
+                name,
+                env!("CARGO_PKG_VERSION"),
+                checksum_for_version(next_version)
+            ],
         )?;
     }
     validate_foreign_keys(&transaction)?;
     transaction.commit()?;
     Ok(())
+}
+
+fn checksum_for_version(version: i64) -> String {
+    match version {
+        1 => v1_migration_checksum(),
+        2 => v2_migration_checksum(),
+        3 => v3_migration_checksum(),
+        4 => v4_migration_checksum(),
+        5 => v5_migration_checksum(),
+        6 => v6_migration_checksum(),
+        7 => v7_migration_checksum(),
+        8 => v8_migration_checksum(),
+        9 => migration_checksum(),
+        _ => String::new(),
+    }
 }
 
 fn v1_migration_sql() -> String {

@@ -935,13 +935,13 @@ fn policy_decision(effect: PolicyEffect, operation_digest: Sha256Digest) -> Reco
         None,
     )
     .unwrap();
-    RecordedPolicyDecision {
-        decision: PolicyDecision {
+    RecordedPolicyDecision::exact(
+        PolicyDecision {
             draft,
             operation_digest,
         },
-        recorded_at: Timestamp::from_unix_seconds(1_790_000_001),
-    }
+        Timestamp::from_unix_seconds(1_790_000_001),
+    )
 }
 
 fn digest(character: char) -> Sha256Digest {

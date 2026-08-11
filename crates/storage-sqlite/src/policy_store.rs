@@ -1,6 +1,6 @@
 use local_agent_terminal_application::{
-    PolicyDecisionId, PolicyDecisionStore, PortError, RecordedPolicyDecision, Retryability,
-    SafeErrorClassification,
+    PolicyDecisionId, PolicyDecisionStore, PolicyResourcePersistence, PortError,
+    RecordedPolicyDecision, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     ActorLocality, CapabilityRef, PolicyEffect, ResourceClass, TaskRisk,
@@ -29,21 +29,21 @@ type PersistedPolicyDecision = (
 
 impl PolicyDecisionStore for SqliteStore {
     fn record(&self, recorded: RecordedPolicyDecision) -> Result<PolicyDecisionId, PortError> {
-        let request = recorded.decision.draft.request();
+        let decision = recorded.decision();
+        let request = decision.draft.request();
         let actor_json = actor_json(request);
-        let resource_json = resource_json(request);
+        let resource_json = recorded_resource_json(request, recorded.resource_persistence())?;
         let actor_binding_digest = digest_json(&actor_json)?;
         let matched_rules_json = json!({
-            "policyVersion": recorded.decision.draft.policy_version().get(),
-            "ruleIds": recorded.decision.draft.rule_ids(),
-            "redactions": recorded.decision.draft.redactions(),
+            "policyVersion": decision.draft.policy_version().get(),
+            "ruleIds": decision.draft.rule_ids(),
+            "redactions": decision.draft.redactions(),
         });
         let created_at = timestamp(
             &self.connection().map_err(open_error_to_port)?,
-            recorded.recorded_at.unix_seconds(),
+            recorded.recorded_at().unix_seconds(),
         )?;
-        let expires_at = recorded
-            .decision
+        let expires_at = decision
             .draft
             .expires_at()
             .map(|value| {
@@ -51,8 +51,8 @@ impl PolicyDecisionStore for SqliteStore {
                 timestamp(&connection, value.unix_seconds())
             })
             .transpose()?;
-        let decision_id = PolicyDecisionId::from_decision(&recorded.decision);
-        let effect = effect_name(recorded.decision.draft.effect());
+        let decision_id = PolicyDecisionId::from_decision(decision);
+        let effect = effect_name(decision.draft.effect());
 
         let mut connection = self.connection().map_err(open_error_to_port)?;
         let transaction = connection
@@ -78,7 +78,7 @@ impl PolicyDecisionStore for SqliteStore {
                     effect,
                     matched_rules_json.to_string(),
                     request.policy_snapshot_digest.as_str(),
-                    recorded.decision.operation_digest.as_str(),
+                    decision.operation_digest.as_str(),
                     created_at,
                     expires_at,
                 ],
@@ -90,10 +90,7 @@ impl PolicyDecisionStore for SqliteStore {
                         resource_digest, purpose, workflow_phase, effect, matched_rules_json,
                         policy_snapshot_digest, expires_at
                  FROM policy_decisions WHERE id = ?1 AND operation_digest = ?2",
-                params![
-                    decision_id.as_str(),
-                    recorded.decision.operation_digest.as_str()
-                ],
+                params![decision_id.as_str(), decision.operation_digest.as_str()],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -173,6 +170,33 @@ pub(crate) fn resource_json(request: &local_agent_terminal_domain::PolicyRequest
             TaskRisk::Critical => "critical",
         },
     })
+}
+
+fn recorded_resource_json(
+    request: &local_agent_terminal_domain::PolicyRequest,
+    persistence: PolicyResourcePersistence,
+) -> Result<Value, PortError> {
+    let mut resource = resource_json(request);
+    let PolicyResourcePersistence::Disclosure(channel) = persistence else {
+        return Ok(resource);
+    };
+    resource["capability"] = disclosure_capability_json(&request.resource.capability)?;
+    resource["disclosureChannel"] = Value::String(channel.as_str().to_owned());
+    Ok(resource)
+}
+
+fn disclosure_capability_json(capability: &CapabilityRef) -> Result<Value, PortError> {
+    match capability {
+        CapabilityRef::Source(_) | CapabilityRef::Worktree(_) => Ok(json!({
+            "kind": match capability {
+                CapabilityRef::Source(_) => "source",
+                CapabilityRef::Worktree(_) => "worktree",
+                _ => unreachable!(),
+            },
+            "identityDigest": digest_json(&capability_json(capability))?,
+        })),
+        CapabilityRef::Artifact(_) | CapabilityRef::Toolchain(_) => Ok(capability_json(capability)),
+    }
 }
 
 fn capability_json(capability: &CapabilityRef) -> Value {

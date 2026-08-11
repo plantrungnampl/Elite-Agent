@@ -148,10 +148,9 @@ impl<'a> ToolExecutionOrchestration<'a> {
         let expected_decision_id = PolicyDecisionId::from_decision(&decision);
         let effect = decision.draft.effect();
         let policy_expires_at = decision.draft.expires_at();
-        let recorded_decision_id = self.policy_decisions.record(RecordedPolicyDecision {
-            decision,
-            recorded_at: evaluated_at,
-        })?;
+        let recorded_decision_id = self
+            .policy_decisions
+            .record(RecordedPolicyDecision::exact(decision, evaluated_at))?;
         if recorded_decision_id != expected_decision_id {
             return Err(integrity_failure());
         }

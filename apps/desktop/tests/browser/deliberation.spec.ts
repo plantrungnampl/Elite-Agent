@@ -33,7 +33,10 @@ test("supports keyboard context inspection and a digest-bound plan decision", as
   const dialog = page.getByRole("dialog", { name: "Context inspector" });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText("Redacted", { exact: true })).toBeVisible();
-  await expect(dialog.getByText("redaction-report-1")).toBeVisible();
+  const redactionRecords = dialog.getByText("redaction-report-1");
+  await expect(redactionRecords).toHaveCount(2);
+  await expect(redactionRecords.nth(0)).toBeVisible();
+  await expect(redactionRecords.nth(1)).toBeVisible();
   for (let index = 0; index < 6; index += 1) {
     await page.keyboard.press("Tab");
     expect(await dialog.evaluate((element) => element.contains(document.activeElement))).toBe(
@@ -323,6 +326,7 @@ function contextFixture() {
     members: [
       {
         memberId: "member-1",
+        content: "pub struct [REDACTED]",
         source: {
           projectId: "project-1",
           revision: "commit-1",
@@ -333,6 +337,9 @@ function contextFixture() {
         symbol: "SecretBoundary",
         freshness: "current",
         disclosure: { kind: "redacted", stableReportId: "redaction-report-1" },
+        policyDecisionIds: ["policy-decision:item-1"],
+        provenance: ["artifact:source-1"],
+        redactionReportIds: ["redaction-report-1"],
       },
     ],
   };

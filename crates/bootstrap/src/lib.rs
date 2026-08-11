@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod agent_runtime;
+mod agent_specialist_context;
 mod context_runtime;
 mod deliberation_runtime;
 mod logging;
@@ -18,12 +19,13 @@ pub use context_runtime::ContextRuntime;
 pub use deliberation_runtime::DeliberationRuntime;
 pub use local_agent_terminal_application::{
     ApprovalId, CancelToolExecutionRequestDto, CommandErrorDto, ConfirmDiscardWorkspaceRequestDto,
-    ContextPackageDto, CreateTaskWorkspaceRequestDto, DeliberationWorkspaceDto,
-    GetApprovalRequestDto, GetContextPackageRequestDto, GetDeliberationWorkspaceRequestDto,
-    LocalDiagnosticDto, OnboardRepositoryRequestDto, PlanApprovalResolutionDto,
-    PlanApprovalResolutionStatusDto, ProjectSnapshot, RecoveryCandidateRequestDto,
-    ResolveDisplayedPlanApprovalRequestDto, ResolveToolApprovalRequestDto, Sha256Digest,
-    StartupStateDto, StartupStatusDto, StopAllToolsReceiptDto, TaskSnapshot, ToolActivityDto,
+    ContextPackageDto, CreateTaskWorkspaceRequestDto, DeliberationResumeActionDto,
+    DeliberationWorkspaceDto, GetApprovalRequestDto, GetContextPackageRequestDto,
+    GetDeliberationWorkspaceRequestDto, LocalDiagnosticDto, OnboardRepositoryRequestDto,
+    PlanApprovalResolutionDto, PlanApprovalResolutionStatusDto, ProjectSnapshot,
+    RecoveryCandidateRequestDto, ResolveDisplayedPlanApprovalRequestDto,
+    ResolveToolApprovalRequestDto, ResumeDeliberationRequestDto, Sha256Digest, StartupStateDto,
+    StartupStatusDto, StopAllToolsReceiptDto, TaskSnapshot, ToolActivityDto,
     ToolApprovalDecisionDto, ToolApprovalRequestDto, ToolApprovalResolutionDto,
     ToolCancellationReceiptDto, ToolRuntimeAvailabilityDto, WorkspaceDashboardDto,
     WorkspaceDashboardRequestDto,

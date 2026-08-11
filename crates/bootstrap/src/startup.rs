@@ -31,6 +31,7 @@ use crate::workspace_runtime::{
     fence_stale_leases, reconcile_workspace_after_fencing, WorkspaceRuntime,
 };
 
+#[derive(Clone)]
 pub struct StartupConfig {
     pub app_data_dir: PathBuf,
     pub trusted_workspace_root: PathBuf,
@@ -660,6 +661,7 @@ fn start(
         Arc::clone(&artifacts),
         deliberation_repositories,
         context.policy_snapshot_digest().clone(),
+        agent_runtime.clone(),
     );
 
     Ok(StartupRuntimes {

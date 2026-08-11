@@ -2,14 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use local_agent_terminal_application::{
     AssembledContextPackage, ContextArtifactKind, ContextBuildPolicy, ContextEvidenceAssemblyItem,
-    ContextPackageAssembler, DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest,
-    ImmutableContextArtifact, PolicyDecisionId, PolicyDecisionStore, PortError,
+    ContextPackageAssembler, ContextPackageContract, DisclosureChannel, DisclosurePolicyEvaluator,
+    DisclosureRequest, ImmutableContextArtifact, PolicyDecisionId, PolicyDecisionStore, PortError,
     RecordedPolicyDecision, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     CapabilityRef, ContextPackageDescriptor, ContextPackageMember, Disclosure, DisclosureKind,
     EvidenceCitation, EvidenceFreshness, PolicyAction, PolicyEffect, PolicyRequest, PolicyResource,
-    Sha256Digest,
+    Sha256Digest, TaskRisk,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -79,6 +79,7 @@ impl ContextPackageItem {
 
 pub struct ContextPackageBuildRequest {
     pub descriptor: ContextPackageDescriptor,
+    pub contract: ContextPackageContract,
     pub policy: ContextBuildPolicy,
     pub items: Vec<ContextPackageItem>,
 }
@@ -106,6 +107,7 @@ impl<'a> ContextPackageBuilder<'a> {
         if request.descriptor.task_id() != &request.policy.task_id
             || request.descriptor.agent_id() != request.policy.actor.agent_id
             || request.descriptor.versions().tokenizer() != "byte-token-v1"
+            || !valid_contract(&request.contract)
         {
             return Err(invalid());
         }
@@ -132,8 +134,12 @@ impl<'a> ContextPackageBuilder<'a> {
         }
 
         let raw_bytes = loop {
-            let bytes =
-                canonical_budgeted_package_bytes(&request.descriptor, &request.policy, &retained)?;
+            let bytes = canonical_budgeted_package_bytes(
+                &request.descriptor,
+                &request.contract,
+                &request.policy,
+                &retained,
+            )?;
             if u64::try_from(bytes.len()).map_err(|_| budget_exceeded())?
                 <= allocation.input_limit()
             {
@@ -181,10 +187,13 @@ impl<'a> ContextPackageBuilder<'a> {
             return Err(permission());
         }
         let expected_final_id = PolicyDecisionId::from_decision(&disclosure.decision);
-        let final_policy_decision_id = self.policy_decisions.record(RecordedPolicyDecision {
-            decision: disclosure.decision,
-            recorded_at: request.policy.evaluated_at,
-        })?;
+        let final_policy_decision_id =
+            self.policy_decisions
+                .record(RecordedPolicyDecision::disclosure(
+                    disclosure.decision,
+                    request.policy.evaluated_at,
+                    DisclosureChannel::FinalContextPackage,
+                ))?;
         if final_policy_decision_id != expected_final_id {
             return Err(integrity());
         }
@@ -293,6 +302,7 @@ impl ContextPackageAssembler for ContextPackageBuilder<'_> {
     fn assemble(
         &self,
         descriptor: ContextPackageDescriptor,
+        contract: ContextPackageContract,
         policy: ContextBuildPolicy,
         items: Vec<ContextEvidenceAssemblyItem>,
         mut policy_decision_ids: Vec<String>,
@@ -326,6 +336,7 @@ impl ContextPackageAssembler for ContextPackageBuilder<'_> {
             .collect::<Result<Vec<_>, _>>()?;
         let built = self.build(ContextPackageBuildRequest {
             descriptor,
+            contract,
             policy,
             items,
         })?;
@@ -360,7 +371,39 @@ struct SerializedPackage<'a> {
     versions: SerializedVersions<'a>,
     budget: SerializedBudget,
     policy_snapshot_digest: &'a str,
+    task: SerializedTask<'a>,
+    policy_constraints: &'a [String],
+    shared_summary: &'a str,
+    accepted_decisions: &'a [String],
+    unresolved_objections: &'a [String],
+    active_thread_messages: &'a [String],
+    permissions: &'a [String],
+    protocol_capabilities: &'a [String],
+    reconstructibility: SerializedReconstructibility<'a>,
     items: Vec<SerializedItem<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SerializedTask<'a> {
+    scope: &'a [String],
+    risk: &'static str,
+    phase: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SerializedReconstructibility<'a> {
+    run_config_artifact_id: &'a str,
+    adapter_version: &'a str,
+    provider_id: &'a str,
+    model_id: &'a str,
+    generation_parameters_digest: &'a str,
+    response_schema_version: &'a str,
+    manifest_digest: &'a str,
+    executable_digest: &'a str,
+    connection_binding_digest: &'a str,
+    authoritative_receipt_unix_seconds: i64,
 }
 
 #[derive(Serialize)]
@@ -425,6 +468,7 @@ struct SerializedDisclosure<'a> {
 
 fn canonical_package_bytes(
     descriptor: &ContextPackageDescriptor,
+    contract: &ContextPackageContract,
     policy: &ContextBuildPolicy,
     items: &[ContextPackageItem],
     used_input_tokens: u64,
@@ -455,6 +499,32 @@ fn canonical_package_bytes(
             used_input_tokens,
         },
         policy_snapshot_digest: policy.policy_snapshot_digest.as_str(),
+        task: SerializedTask {
+            scope: &contract.task_scope,
+            risk: task_risk_name(policy.task_risk),
+            phase: &policy.workflow_phase,
+        },
+        policy_constraints: &contract.policy_constraints,
+        shared_summary: &contract.shared_summary,
+        accepted_decisions: &contract.accepted_decisions,
+        unresolved_objections: &contract.unresolved_objections,
+        active_thread_messages: &contract.active_thread_messages,
+        permissions: &contract.permissions,
+        protocol_capabilities: &contract.protocol_capabilities,
+        reconstructibility: SerializedReconstructibility {
+            run_config_artifact_id: &contract.reconstructibility.run_config_artifact_id,
+            adapter_version: &contract.reconstructibility.adapter_version,
+            provider_id: &contract.reconstructibility.provider_id,
+            model_id: &contract.reconstructibility.model_id,
+            generation_parameters_digest: &contract.reconstructibility.generation_parameters_digest,
+            response_schema_version: &contract.reconstructibility.response_schema_version,
+            manifest_digest: &contract.reconstructibility.manifest_digest,
+            executable_digest: &contract.reconstructibility.executable_digest,
+            connection_binding_digest: &contract.reconstructibility.connection_binding_digest,
+            authoritative_receipt_unix_seconds: contract
+                .reconstructibility
+                .authoritative_receipt_unix_seconds,
+        },
         items: canonical_items
             .into_iter()
             .map(SerializedItem::from)
@@ -466,12 +536,14 @@ fn canonical_package_bytes(
 
 fn canonical_budgeted_package_bytes(
     descriptor: &ContextPackageDescriptor,
+    contract: &ContextPackageContract,
     policy: &ContextBuildPolicy,
     items: &[ContextPackageItem],
 ) -> Result<Vec<u8>, PortError> {
     let mut used_input_tokens = 0;
     for _ in 0..8 {
-        let bytes = canonical_package_bytes(descriptor, policy, items, used_input_tokens)?;
+        let bytes =
+            canonical_package_bytes(descriptor, contract, policy, items, used_input_tokens)?;
         let next = u64::try_from(bytes.len()).map_err(|_| budget_exceeded())?;
         if next == used_input_tokens {
             return Ok(bytes);
@@ -545,6 +617,50 @@ fn digest(bytes: &[u8]) -> Sha256Digest {
 
 fn valid_label(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 1_024 && !value.contains('\0')
+}
+
+fn valid_contract(contract: &ContextPackageContract) -> bool {
+    let lists = [
+        contract.task_scope.as_slice(),
+        contract.policy_constraints.as_slice(),
+        contract.permissions.as_slice(),
+        contract.protocol_capabilities.as_slice(),
+    ];
+    let reconstructibility = &contract.reconstructibility;
+    lists.iter().all(|values| {
+        !values.is_empty()
+            && values.iter().all(|value| valid_label(value))
+            && values.windows(2).all(|pair| pair[0] != pair[1])
+    }) && valid_label(&contract.shared_summary)
+        && contract
+            .accepted_decisions
+            .iter()
+            .chain(contract.unresolved_objections.iter())
+            .chain(contract.active_thread_messages.iter())
+            .all(|value| valid_label(value))
+        && [
+            reconstructibility.run_config_artifact_id.as_str(),
+            reconstructibility.adapter_version.as_str(),
+            reconstructibility.provider_id.as_str(),
+            reconstructibility.model_id.as_str(),
+            reconstructibility.generation_parameters_digest.as_str(),
+            reconstructibility.response_schema_version.as_str(),
+            reconstructibility.manifest_digest.as_str(),
+            reconstructibility.executable_digest.as_str(),
+            reconstructibility.connection_binding_digest.as_str(),
+        ]
+        .iter()
+        .all(|value| valid_label(value))
+        && reconstructibility.authoritative_receipt_unix_seconds > 0
+}
+
+const fn task_risk_name(risk: TaskRisk) -> &'static str {
+    match risk {
+        TaskRisk::Low => "low",
+        TaskRisk::Medium => "medium",
+        TaskRisk::High => "high",
+        TaskRisk::Critical => "critical",
+    }
 }
 
 fn invalid() -> PortError {

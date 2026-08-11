@@ -47,7 +47,11 @@ impl SqliteStore {
                         a.content_hash, a.storage_key, a.size_bytes
                  FROM context_packages c
                  JOIN artifacts a ON a.id = c.effective_content_artifact_id
-                  WHERE c.id = ?1 AND a.availability = 'available'",
+                  WHERE c.id = ?1 AND a.availability = 'available'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM deliberation_context_package_invalidations invalidation
+                        WHERE invalidation.context_package_id = c.id
+                    )",
                 [package_id],
                 |row| {
                     Ok((

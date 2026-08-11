@@ -999,6 +999,34 @@ pub struct ContextBuildPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextPackageDraft {
     pub descriptor: ContextPackageDescriptor,
+    pub contract: ContextPackageContract,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextPackageContract {
+    pub task_scope: Vec<String>,
+    pub policy_constraints: Vec<String>,
+    pub shared_summary: String,
+    pub accepted_decisions: Vec<String>,
+    pub unresolved_objections: Vec<String>,
+    pub active_thread_messages: Vec<String>,
+    pub permissions: Vec<String>,
+    pub protocol_capabilities: Vec<String>,
+    pub reconstructibility: ContextRunReconstructibility,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextRunReconstructibility {
+    pub run_config_artifact_id: String,
+    pub adapter_version: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub generation_parameters_digest: String,
+    pub response_schema_version: String,
+    pub manifest_digest: String,
+    pub executable_digest: String,
+    pub connection_binding_digest: String,
+    pub authoritative_receipt_unix_seconds: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1069,6 +1097,7 @@ pub trait ContextPackageAssembler: Send + Sync {
     fn assemble(
         &self,
         descriptor: ContextPackageDescriptor,
+        contract: ContextPackageContract,
         policy: ContextBuildPolicy,
         items: Vec<ContextEvidenceAssemblyItem>,
         policy_decision_ids: Vec<String>,
@@ -1576,10 +1605,11 @@ fn disclose_bytes(
     }
     let expected_decision_id = PolicyDecisionId::from_decision(&disclosure.decision);
     let operation_digest = disclosure.decision.operation_digest.clone();
-    let decision_id = policy_decisions.record(RecordedPolicyDecision {
-        decision: disclosure.decision.clone(),
-        recorded_at: policy.evaluated_at,
-    })?;
+    let decision_id = policy_decisions.record(RecordedPolicyDecision::disclosure(
+        disclosure.decision.clone(),
+        policy.evaluated_at,
+        channel,
+    ))?;
     if decision_id != expected_decision_id {
         return Err(integrity_failure());
     }
@@ -1642,6 +1672,7 @@ fn prepare_package(
     let expected_task_id = draft.descriptor.task_id().clone();
     let assembled = assembler.assemble(
         draft.descriptor,
+        draft.contract,
         policy.clone(),
         items,
         decision_ids

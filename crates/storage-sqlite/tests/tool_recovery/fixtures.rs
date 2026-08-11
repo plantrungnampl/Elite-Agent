@@ -190,13 +190,13 @@ fn record_exact_policy_with_expiry(
     )
     .unwrap();
     store
-        .record(RecordedPolicyDecision {
-            decision: PolicyDecision {
+        .record(RecordedPolicyDecision::exact(
+            PolicyDecision {
                 draft,
                 operation_digest: digest_char(digest_marker),
             },
-            recorded_at: evaluated_at,
-        })
+            evaluated_at,
+        ))
         .unwrap()
 }
 

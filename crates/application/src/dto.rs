@@ -21,6 +21,12 @@ pub struct GetDeliberationWorkspaceRequestDto {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResumeDeliberationRequestDto {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GetContextPackageRequestDto {
     pub package_id: String,
 }
@@ -110,11 +116,15 @@ pub struct ContextPackageBudgetDto {
 #[serde(rename_all = "camelCase")]
 pub struct ContextPackageMemberDto {
     pub member_id: String,
+    pub content: String,
     pub source: ContextPackageSourceDto,
     pub line_range: Option<ContextLineRangeDto>,
     pub symbol: Option<String>,
     pub freshness: ContextFreshnessDto,
     pub disclosure: ContextDisclosureDto,
+    pub policy_decision_ids: Vec<String>,
+    pub provenance: Vec<String>,
+    pub redaction_report_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -395,6 +405,23 @@ pub enum DeliberationRecoveryActionDto {
     WaitForTerminal,
     AwaitExplicitResolution,
     Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliberationResumeActionDto {
+    ValidateIntake,
+    BuildInitialContext,
+    AwaitIndependentProposals,
+    PublishQuorum,
+    PersistReviewEdges,
+    FreezeMaterialClaims,
+    ClassifyMaterialClaims,
+    SynthesizeDecision,
+    CollectFinalObjections,
+    CloseObjectionRound,
+    AwaitPlanApproval,
+    PostApproval,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -843,10 +870,11 @@ fn disclose_text(
         return Err(integrity_failure());
     }
     let expected_decision_id = PolicyDecisionId::from_decision(&disclosure.decision);
-    let decision_id = policy_decisions.record(RecordedPolicyDecision {
-        decision: disclosure.decision.clone(),
-        recorded_at: evaluated_at,
-    })?;
+    let decision_id = policy_decisions.record(RecordedPolicyDecision::disclosure(
+        disclosure.decision.clone(),
+        evaluated_at,
+        DisclosureChannel::Summary,
+    ))?;
     if decision_id != expected_decision_id {
         return Err(integrity_failure());
     }

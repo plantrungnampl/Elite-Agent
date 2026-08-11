@@ -199,11 +199,18 @@ function ContextMember({ member }: { member: ContextPackageMemberDto }) {
           }
         />
         <Detail label="Symbol" value={member.symbol ?? "None"} />
+        <Detail label="Effective content" value={member.content} />
         <Detail
           label="Redaction report"
           value={member.disclosure.stableReportId ?? "None"}
         />
       </dl>
+      <h4>Item policy decisions</h4>
+      <TextList values={member.policyDecisionIds} empty="No item policy decisions recorded." />
+      <h4>Provenance</h4>
+      <TextList values={member.provenance} empty="No item provenance recorded." />
+      <h4>Redaction records</h4>
+      <TextList values={member.redactionReportIds} empty="No item redaction records." />
     </li>
   );
 }

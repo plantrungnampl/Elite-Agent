@@ -6,10 +6,12 @@ use std::sync::Mutex;
 
 use local_agent_terminal_application::{
     canonical_plan_approval_payload, ApprovalId, CanonicalDeliberationFact,
-    DeliberationArtifactRef, DeliberationCommandContext, DeliberationCommands,
-    DeliberationDispatchBinding, DeliberationDispatchStore, DeliberationPersistenceCommand,
-    DeliberationProposalDispatchPlan, DeliberationRecord, DeliberationRunAssignment,
-    DeliberationSnapshot, DeliberationStore, PlanApprovalAuthorityBinding,
+    DeliberationArtifactRef, DeliberationBoundaryCheck, DeliberationBoundaryStore,
+    DeliberationCommandContext, DeliberationCommands, DeliberationDispatchBinding,
+    DeliberationDispatchStore, DeliberationPersistenceCommand, DeliberationPhaseDispatchAuthority,
+    DeliberationPhaseDispatchSet, DeliberationPlanDto, DeliberationProposalDispatchPlan,
+    DeliberationRecord, DeliberationRunAssignment, DeliberationSnapshot, DeliberationStore,
+    DeliberationSynthesisStore, PersistDeliberationSynthesis, PlanApprovalAuthorityBinding,
     PlanApprovalAuthorityProvider, PlanApprovalBindingInput, PlanApprovalPathScopeV1,
     PlanApprovalState, PlanApprovalStore, PortError, PreparePlanApprovalRequestInput,
     SafeErrorClassification,
@@ -19,9 +21,10 @@ use local_agent_terminal_domain::{
     BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig,
     ClaimVerification, DecisionApproach, DecisionPackage, DeliberationLimits,
     DeliberationTaskBudget, EventId, EvidenceCitation, EvidenceFreshness, FinalObjection,
-    FinalObjectionSet, IndependentProposal, LineRange, MaterialClaim, ObjectionSeverity, ProjectId,
-    ReviewEdge, ReviewPlan, RunId, Sha256Digest, SourceIdentity, SpecialistBudget,
-    SpecialistRequest, TaskId, Timestamp, TrustTier, VerificationMethod,
+    FinalObjectionSet, GitObjectId, IndependentProposal, LineRange, MaterialClaim,
+    ObjectionSeverity, Phase, ProjectId, ReviewEdge, ReviewPlan, RunId, Sha256Digest,
+    SourceIdentity, SpecialistBudget, SpecialistRequest, TaskId, Timestamp, TrustTier,
+    VerificationMethod, WorkspaceFingerprint,
 };
 use local_agent_terminal_storage_files::{
     ContentAddressedArtifactReader, ContentAddressedArtifactStore,
@@ -243,10 +246,50 @@ impl Drop for TestDatabase {
 fn sqlite_store_exposes_the_application_deliberation_port() {
     fn accepts(_: &dyn DeliberationStore) {}
     fn accepts_dispatch(_: &dyn DeliberationDispatchStore) {}
+    fn accepts_boundary(_: &dyn DeliberationBoundaryStore) {}
+    fn accepts_synthesis(_: &dyn DeliberationSynthesisStore) {}
 
     let database = TestDatabase::new();
     accepts(&database.store());
     accepts_dispatch(&database.store());
+    accepts_boundary(&database.store());
+    accepts_synthesis(&database.store());
+}
+
+#[test]
+fn repository_boundary_is_idempotent_and_invalidates_task_context_packages() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let baseline = workspace_fingerprint('a');
+    let changed = workspace_fingerprint('b');
+
+    let accepted = store
+        .compare_and_persist_boundary(DeliberationBoundaryCheck::new(
+            TaskId::new("task-1").unwrap(),
+            Phase::ParallelAnalysis,
+            baseline,
+        ))
+        .unwrap();
+    assert!(!accepted.blocked);
+    let blocked_check =
+        DeliberationBoundaryCheck::new(TaskId::new("task-1").unwrap(), Phase::CrossReview, changed);
+    let blocked = store
+        .compare_and_persist_boundary(blocked_check.clone())
+        .unwrap();
+    let repeated = store.compare_and_persist_boundary(blocked_check).unwrap();
+
+    assert!(blocked.blocked);
+    assert_eq!(repeated, blocked);
+    assert!(store.context_package_view("context-1").unwrap().is_none());
+    let connection = database.connection();
+    assert_eq!(
+        count(&connection, "deliberation_repository_boundary_records"),
+        2
+    );
+    assert_eq!(
+        count(&connection, "deliberation_context_package_invalidations"),
+        2
+    );
 }
 
 #[test]
@@ -301,6 +344,71 @@ fn dispatch_reservations_are_atomic_idempotent_and_task_bounded() {
         error.safe_classification(),
         SafeErrorClassification::Conflict
     );
+}
+
+#[test]
+fn phase_dispatch_rejects_an_all_new_set_for_the_same_task_phase() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let budget =
+        DeliberationTaskBudget::new(4, 32_000, 400, Timestamp::from_unix_seconds(2_000_000_000))
+            .unwrap();
+    let first = phase_dispatch_set("run-phase-a", 1, budget);
+    let replacement = phase_dispatch_set("run-phase-b", 2, budget);
+
+    store.compare_and_persist_phase_binding_set(&first).unwrap();
+    let error = store
+        .compare_and_persist_phase_binding_set(&replacement)
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(
+        count(&database.connection(), "deliberation_dispatch_reservations"),
+        1
+    );
+}
+
+#[test]
+fn explicit_reopened_round_persists_as_a_distinct_bounded_dispatch_set() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let budget =
+        DeliberationTaskBudget::new(4, 32_000, 400, Timestamp::from_unix_seconds(2_000_000_000))
+            .unwrap();
+
+    store
+        .compare_and_persist_phase_binding_set(&phase_dispatch_set_for_round(
+            "run-round-1",
+            1,
+            1,
+            budget,
+        ))
+        .unwrap();
+    store
+        .compare_and_persist_phase_binding_set(&phase_dispatch_set_for_round(
+            "run-round-2",
+            2,
+            2,
+            budget,
+        ))
+        .unwrap();
+
+    let connection = database.connection();
+    assert_eq!(count(&connection, "deliberation_dispatch_reservations"), 2);
+    let rounds: String = connection
+        .query_row(
+            "SELECT group_concat(dispatch_round, ',') FROM (
+                SELECT dispatch_round FROM deliberation_dispatch_reservations
+                ORDER BY dispatch_round
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rounds, "1,2");
 }
 
 #[test]
@@ -360,7 +468,7 @@ fn specialist_persistence_cannot_reuse_tokens_and_cost_reserved_by_dispatch() {
 }
 
 #[test]
-fn first_v8_budget_authority_seeds_reservations_from_v7_deliberation_records() {
+fn budget_authority_seeds_reservations_from_historical_deliberation_records() {
     let database = TestDatabase::new();
     let store = database.store();
     let budget =
@@ -399,6 +507,24 @@ fn first_v8_budget_authority_seeds_reservations_from_v7_deliberation_records() {
         .unwrap();
     drop(connection);
 
+    assert_eq!(
+        store
+            .deliberation_task_budget(&TaskId::new("task-1").unwrap())
+            .unwrap(),
+        Some(budget)
+    );
+
+    let recovered_reservation: (i64, i64, i64) = database
+        .connection()
+        .query_row(
+            "SELECT reserved_threads, reserved_tokens, reserved_cost_microunits
+             FROM deliberation_task_budgets WHERE task_id = 'task-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(recovered_reservation, (1, 5_000, 50));
+
     store
         .compare_and_persist_proposal_binding_set(&dispatch_plan(
             "run-dispatch-after-v7-a",
@@ -416,7 +542,7 @@ fn first_v8_budget_authority_seeds_reservations_from_v7_deliberation_records() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(reserved, (0, 21_000, 250));
+    assert_eq!(reserved, (1, 21_000, 250));
 }
 
 #[test]
@@ -721,14 +847,21 @@ fn private_receipts_replay_without_messages_then_quorum_publishes_atomically_and
     let snapshot = reopened.load(&TaskId::new("task-1").unwrap()).unwrap();
     let decision_one = database.publish("decision-draft-1", b"decision draft one");
     let plan_one = database.publish("plan-1", b"plan one");
-    DeliberationCommands::new(&reopened)
-        .synthesize(
+    let synthesis = PersistDeliberationSynthesis::new(&reopened)
+        .prepare(
             command_context(&snapshot, "core", decision_one.clone(), "event-decision-1"),
             decision("plan-1", claim(true)),
+            plan_dto(),
             plan_one,
             1,
         )
         .unwrap();
+    reopened.persist_synthesis(synthesis.clone()).unwrap();
+    reopened.persist_synthesis(synthesis).unwrap();
+    assert_eq!(
+        count(&database.connection(), "deliberation_synthesis_plans"),
+        1
+    );
     let snapshot = reopened.load(&TaskId::new("task-1").unwrap()).unwrap();
     DeliberationCommands::new(&reopened)
         .record_objection_set(
@@ -805,10 +938,11 @@ fn private_receipts_replay_without_messages_then_quorum_publishes_atomically_and
         .unwrap();
     let snapshot = reopened.load(&TaskId::new("task-1").unwrap()).unwrap();
     let plan_two = database.publish("plan-2", b"plan two");
-    DeliberationCommands::new(&reopened)
-        .synthesize(
+    PersistDeliberationSynthesis::new(&reopened)
+        .execute(
             command_context(&snapshot, "core", decision_two, "event-decision-2"),
             decision("plan-2", claim(true)),
+            plan_dto(),
             plan_two.clone(),
             2,
         )
@@ -1003,6 +1137,34 @@ fn task_budget() -> DeliberationTaskBudget {
     .unwrap()
 }
 
+fn workspace_fingerprint(character: char) -> WorkspaceFingerprint {
+    WorkspaceFingerprint::new(
+        GitObjectId::new(character.to_string().repeat(40)).unwrap(),
+        digest(format!("index-{character}").as_bytes()).as_str(),
+        digest(format!("status-{character}").as_bytes()).as_str(),
+    )
+    .unwrap()
+}
+
+fn plan_dto() -> DeliberationPlanDto {
+    DeliberationPlanDto {
+        selected_approach_id: "selected-approach".to_owned(),
+        rejected_alternatives: Vec::new(),
+        verified_claim_ids: vec!["claim-a".to_owned()],
+        inconclusive_claim_ids: Vec::new(),
+        dissent_ids: Vec::new(),
+        affected_files: vec!["crates/application/src/deliberation/commands.rs".to_owned()],
+        implementation_steps: vec!["Persist the complete synthesis atomically".to_owned()],
+        planned_tools: vec!["cargo.test".to_owned()],
+        verification_profile: "m4-task-10".to_owned(),
+        rollback_plan: "Revert the local source commit".to_owned(),
+        risk: "medium".to_owned(),
+        estimated_cost_microunits: Some(100),
+        estimated_duration_seconds: Some(30),
+        confidence: 90,
+    }
+}
+
 fn proposal(number: u8) -> IndependentProposal {
     IndependentProposal::new(
         TaskId::new("task-1").unwrap(),
@@ -1137,6 +1299,67 @@ fn dispatch_plan(
         budget,
     )
     .unwrap()
+}
+
+fn phase_dispatch_set(
+    run_id: &str,
+    number: u8,
+    budget: DeliberationTaskBudget,
+) -> DeliberationPhaseDispatchSet {
+    build_phase_dispatch_set(run_id, number, None, budget)
+}
+
+fn phase_dispatch_set_for_round(
+    run_id: &str,
+    number: u8,
+    round: u32,
+    budget: DeliberationTaskBudget,
+) -> DeliberationPhaseDispatchSet {
+    build_phase_dispatch_set(run_id, number, Some(round), budget)
+}
+
+fn build_phase_dispatch_set(
+    run_id: &str,
+    number: u8,
+    round: Option<u32>,
+    budget: DeliberationTaskBudget,
+) -> DeliberationPhaseDispatchSet {
+    let mut request = bound_run_request(number, connection_binding_digest(number));
+    request.run_id = RunId::new(run_id).unwrap();
+    request.idempotency_key = format!("dispatch:{run_id}");
+    let assignment = DeliberationRunAssignment::new(
+        RunId::new(run_id).unwrap(),
+        format!("agent-{number}"),
+        AgentFamilyKey::from_provider_model(
+            &format!("provider-{number}"),
+            &format!("model-{number}"),
+        )
+        .unwrap(),
+        ActorId::new(format!("agent-{number}")).unwrap(),
+    )
+    .unwrap();
+    let binding = DeliberationDispatchBinding::new(request, assignment.clone(), 100).unwrap();
+    let task_id = TaskId::new("task-1").unwrap();
+    let limits = DeliberationLimits::new(2, 2, 8, 2).unwrap();
+    let authority = match round {
+        Some(round) => DeliberationPhaseDispatchAuthority::for_round(
+            task_id,
+            Phase::CrossReview,
+            round,
+            vec![assignment],
+            limits,
+            budget,
+        ),
+        None => DeliberationPhaseDispatchAuthority::new(
+            task_id,
+            Phase::CrossReview,
+            vec![assignment],
+            limits,
+            budget,
+        ),
+    }
+    .unwrap();
+    DeliberationPhaseDispatchSet::new(vec![binding], authority).unwrap()
 }
 
 fn connection_binding_digest(number: u8) -> Sha256Digest {

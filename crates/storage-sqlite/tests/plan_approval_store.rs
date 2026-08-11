@@ -34,12 +34,16 @@ struct TestDatabase {
 
 struct MutableAuthority {
     current: Mutex<PlanApprovalCurrentAuthority>,
+    calls: AtomicU64,
+    repository_mutation_on_call: Mutex<Option<(u64, Sha256Digest)>>,
 }
 
 impl MutableAuthority {
     fn new(current: PlanApprovalCurrentAuthority) -> Self {
         Self {
             current: Mutex::new(current),
+            calls: AtomicU64::new(0),
+            repository_mutation_on_call: Mutex::new(None),
         }
     }
 
@@ -50,6 +54,10 @@ impl MutableAuthority {
     fn set_policy_snapshot_digest(&self, policy_snapshot_digest: Sha256Digest) {
         self.current.lock().unwrap().policy_snapshot_digest = policy_snapshot_digest;
     }
+
+    fn mutate_repository_on_call(&self, call: u64, repository_fingerprint: Sha256Digest) {
+        *self.repository_mutation_on_call.lock().unwrap() = Some((call, repository_fingerprint));
+    }
 }
 
 impl PlanApprovalCurrentAuthoritySource for MutableAuthority {
@@ -57,6 +65,13 @@ impl PlanApprovalCurrentAuthoritySource for MutableAuthority {
         &self,
         _task_id: &TaskId,
     ) -> Result<PlanApprovalCurrentAuthority, PortError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let mutation = self.repository_mutation_on_call.lock().unwrap().clone();
+        if let Some((mutation_call, repository_fingerprint)) = mutation {
+            if call == mutation_call {
+                self.current.lock().unwrap().repository_fingerprint = repository_fingerprint;
+            }
+        }
         Ok(self.current.lock().unwrap().clone())
     }
 }
@@ -119,6 +134,11 @@ impl TestDatabase {
     fn set_policy_snapshot_digest(&self, policy_snapshot_digest: Sha256Digest) {
         self.authority
             .set_policy_snapshot_digest(policy_snapshot_digest);
+    }
+
+    fn mutate_repository_on_authority_call(&self, call: u64, repository_fingerprint: Sha256Digest) {
+        self.authority
+            .mutate_repository_on_call(call, repository_fingerprint);
     }
 
     fn connection(&self) -> Connection {
@@ -324,11 +344,23 @@ fn concurrent_plan_resolution_has_exactly_one_terminal_winner() {
 }
 
 #[test]
-fn change_actions_round_trip_and_return_the_task_to_synthesis() {
-    for action in [
-        PlanApprovalAction::Revise,
-        PlanApprovalAction::Reopen,
-        PlanApprovalAction::AddOrReplaceAgent,
+fn change_actions_round_trip_with_distinct_events_and_phases() {
+    for (action, expected_phase, expected_event_type) in [
+        (
+            PlanApprovalAction::Revise,
+            "Synthesis",
+            "plan.revision.requested",
+        ),
+        (
+            PlanApprovalAction::Reopen,
+            "CrossReview",
+            "plan.discussion.reopened",
+        ),
+        (
+            PlanApprovalAction::AddOrReplaceAgent,
+            "ContextBuild",
+            "plan.roster_change.requested",
+        ),
     ] {
         let database = TestDatabase::new();
         let store = database.store();
@@ -354,13 +386,13 @@ fn change_actions_round_trip_and_return_the_task_to_synthesis() {
                     row.get::<_, String>(0)
                 })
                 .unwrap(),
-            "Synthesis"
+            expected_phase
         );
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM events WHERE event_type = 'plan.revision.requested'",
-                    [],
+                    "SELECT COUNT(*) FROM events WHERE event_type = ?1",
+                    [expected_event_type],
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
@@ -409,6 +441,21 @@ fn invalidation_is_atomic_terminal_and_durable() {
 fn live_repository_change_rejects_resolution_across_reopen_without_mutation() {
     let database = TestDatabase::new();
     database.set_repository_fingerprint(digest(b"repository changed"));
+
+    let error = ResolvePlanApproval::new(&database.store(), &WithinWindow)
+        .execute(resolve_input(&database, PlanApprovalAction::Approve))
+        .unwrap_err();
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_pending_without_terminal_event(&database);
+}
+
+#[test]
+fn repository_change_after_transaction_check_rolls_back_resolution() {
+    let database = TestDatabase::new();
+    database.mutate_repository_on_authority_call(3, digest(b"repository changed during commit"));
 
     let error = ResolvePlanApproval::new(&database.store(), &WithinWindow)
         .execute(resolve_input(&database, PlanApprovalAction::Approve))
