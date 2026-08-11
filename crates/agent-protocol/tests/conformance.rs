@@ -38,6 +38,13 @@ fn shared_harness_drives_every_case_through_a_deferred_peer() {
     assert_eq!(calls.cancelled, vec![ConformanceScenario::Cancelled]);
     assert_eq!(calls.connection_losses, vec![ConformanceScenario::Crashed]);
     assert_eq!(
+        calls.request_responses,
+        vec![
+            "agent:conformance-context".to_owned(),
+            "agent:conformance-specialist".to_owned(),
+        ]
+    );
+    assert_eq!(
         calls.raw_frames,
         vec![
             ConformanceScenario::Malformed,
@@ -142,6 +149,7 @@ struct Calls {
     cancelled: Vec<ConformanceScenario>,
     connection_losses: Vec<ConformanceScenario>,
     raw_frames: Vec<ConformanceScenario>,
+    request_responses: Vec<String>,
 }
 
 impl ScriptedFactory {
@@ -175,6 +183,7 @@ impl ScriptedFactory {
             cancelled: calls.cancelled.clone(),
             connection_losses: calls.connection_losses.clone(),
             raw_frames: calls.raw_frames.clone(),
+            request_responses: calls.request_responses.clone(),
         }
     }
 }
@@ -303,6 +312,17 @@ fn emit_scenario(
 ) -> Result<(), ProtocolError> {
     match scenario {
         ConformanceScenario::Happy => {
+            let context_id = "agent:conformance-context";
+            let context_response = sink.request(context_query(run_id, context_id))?;
+            expect_context_response(&context_response, context_id)?;
+            let specialist_id = "agent:conformance-specialist";
+            let specialist_response = sink.request(specialist_request(run_id, specialist_id))?;
+            expect_specialist_response(&specialist_response, specialist_id)?;
+            calls
+                .lock()
+                .map_err(|_| ProtocolError::InternalAgentFailure)?
+                .request_responses
+                .extend([context_id.to_owned(), specialist_id.to_owned()]);
             sink.receive(stream_delta(run_id, 1))?;
             sink.request(terminal(run_id, "agent:conformance-complete"))?;
         }
@@ -441,6 +461,71 @@ fn heartbeat(connection_id: &str, sequence: u64) -> ProtocolFrame {
         "method": "agent.heartbeat",
         "params": { "connectionId": connection_id, "sequence": sequence }
     }))
+}
+
+fn context_query(run_id: &str, id: &str) -> ProtocolFrame {
+    decode(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "context.query",
+        "params": {
+            "runId": run_id,
+            "queryId": "query-conformance",
+            "query": "More context",
+            "scopes": ["repository"],
+            "maxItems": 1,
+            "maxTokens": 1
+        }
+    }))
+}
+
+fn specialist_request(run_id: &str, id: &str) -> ProtocolFrame {
+    decode(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "specialist.request",
+        "params": {
+            "runId": run_id,
+            "capability": "review",
+            "reason": "Need review",
+            "requiredContext": ["artifact-context-1"]
+        }
+    }))
+}
+
+fn expect_context_response(response: &ProtocolFrame, expected: &str) -> Result<(), ProtocolError> {
+    let value = serde_json::to_value(response).map_err(|_| ProtocolError::InvalidRequest)?;
+    if value.get("id").and_then(serde_json::Value::as_str) == Some(expected)
+        && value.pointer("/result/supplementId").is_some()
+        && value.pointer("/result/contentDigest").is_some()
+        && value.pointer("/result/items").is_some()
+        && value.pointer("/result/provenance").is_some()
+        && value.pointer("/result/redactions").is_some()
+        && value.pointer("/result/policyDecisionIds").is_some()
+    {
+        Ok(())
+    } else {
+        Err(ProtocolError::InvalidRequest)
+    }
+}
+
+fn expect_specialist_response(
+    response: &ProtocolFrame,
+    expected: &str,
+) -> Result<(), ProtocolError> {
+    let value = serde_json::to_value(response).map_err(|_| ProtocolError::InvalidRequest)?;
+    if value.get("id").and_then(serde_json::Value::as_str) == Some(expected)
+        && value
+            .pointer("/result/requestId")
+            .and_then(serde_json::Value::as_str)
+            == Some(expected)
+        && value.pointer("/result/accepted").is_some()
+        && value.pointer("/result/reasonCode").is_some()
+    {
+        Ok(())
+    } else {
+        Err(ProtocolError::InvalidRequest)
+    }
 }
 
 fn terminal(run_id: &str, id: &str) -> ProtocolFrame {

@@ -547,17 +547,49 @@ impl PeerEventSink for ConformanceSink {
         }
     }
 
-    fn request(&self, frame: ProtocolFrame) -> Result<ProtocolFrame, ProtocolError> {
-        let disposition = self.receive(frame.clone())?;
+    fn request(&self, request_frame: ProtocolFrame) -> Result<ProtocolFrame, ProtocolError> {
+        let disposition = self.receive(request_frame.clone())?;
         if !matches!(disposition, InboundDisposition::Request(_)) {
             return Err(ProtocolError::InvalidRequest);
         }
-        let response = success_response(
-            frame_request_id(
-                &serde_json::to_value(&frame).map_err(|_| ProtocolError::InvalidRequest)?,
+        let value =
+            serde_json::to_value(&request_frame).map_err(|_| ProtocolError::InvalidRequest)?;
+        let request_id = frame_request_id(&value)?;
+        let response = match request_frame {
+            ProtocolFrame::ContextQueryRequest(_) => success_response(
+                request_id,
+                json!({
+                    "supplementId": "ctx-conformance-supplement",
+                    "contentDigest": "sha256:ea7792a26f405e2ae9c6f49ca93bbe6076ceac0a1fc53d83426c7d7f2d9377e4",
+                    "items": ["artifact-context-1"],
+                    "provenance": [],
+                    "redactions": [],
+                    "policyDecisionIds": ["policy-conformance-1"]
+                }),
             )?,
-            json!({ "accepted": true }),
-        )?;
+            ProtocolFrame::SpecialistRequest(_) => success_response(
+                request_id,
+                json!({
+                    "requestId": request_id,
+                    "accepted": true,
+                    "reasonCode": "specialist_approved"
+                }),
+            )?,
+            ProtocolFrame::RunCompleteRequest(_) => {
+                success_response(request_id, json!({ "accepted": true }))?
+            }
+            ProtocolFrame::ToolRequest(_) => frame(json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32600,
+                    "message": "request rejected",
+                    "data": { "category": "policy_denied", "retryable": false }
+                }
+            }))?,
+            _ => return Err(ProtocolError::InvalidRequest),
+        };
+        validate_conformance_response(&value, &response)?;
         self.outbound(response.clone())?;
         Ok(response)
     }
@@ -566,6 +598,72 @@ impl PeerEventSink for ConformanceSink {
         self.close_connection()?;
         self.record_error(ProtocolError::InternalAgentFailure)?;
         Ok(())
+    }
+}
+
+fn validate_conformance_response(
+    request: &Value,
+    response: &ProtocolFrame,
+) -> Result<(), ProtocolError> {
+    let response = serde_json::to_value(response).map_err(|_| ProtocolError::InvalidRequest)?;
+    if response.get("id").and_then(Value::as_str) != request.get("id").and_then(Value::as_str) {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    match request.get("method").and_then(Value::as_str) {
+        Some("context.query")
+            if response
+                .pointer("/result/supplementId")
+                .and_then(Value::as_str)
+                .is_some()
+                && response
+                    .pointer("/result/contentDigest")
+                    .and_then(Value::as_str)
+                    .is_some()
+                && response
+                    .pointer("/result/items")
+                    .and_then(Value::as_array)
+                    .is_some()
+                && response
+                    .pointer("/result/provenance")
+                    .and_then(Value::as_array)
+                    .is_some()
+                && response
+                    .pointer("/result/redactions")
+                    .and_then(Value::as_array)
+                    .is_some()
+                && response
+                    .pointer("/result/policyDecisionIds")
+                    .and_then(Value::as_array)
+                    .is_some() =>
+        {
+            Ok(())
+        }
+        Some("specialist.request")
+            if response
+                .pointer("/result/requestId")
+                .and_then(Value::as_str)
+                == request.get("id").and_then(Value::as_str)
+                && response
+                    .pointer("/result/accepted")
+                    .and_then(Value::as_bool)
+                    .is_some()
+                && response
+                    .pointer("/result/reasonCode")
+                    .and_then(Value::as_str)
+                    .is_some() =>
+        {
+            Ok(())
+        }
+        Some("tool.request") if response.pointer("/error/data/category").is_some() => Ok(()),
+        Some("agent.run.complete")
+            if response
+                .pointer("/result/accepted")
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            Ok(())
+        }
+        _ => Err(ProtocolError::InvalidRequest),
     }
 }
 

@@ -36,7 +36,8 @@ mod workspace;
 
 pub use agent::{
     AgentArtifactStore, AgentContextQueryRequest, AgentContextQueryResponse, AgentMessageArtifact,
-    AgentRequestHandler, AgentRunStore, AgentRuntime, AgentSpecialistRequest,
+    AgentRequestAudit, AgentRequestAuditDecision, AgentRequestAuditFence, AgentRequestCancellation,
+    AgentRequestHandler, AgentRequestKind, AgentRunStore, AgentRuntime, AgentSpecialistRequest,
     AgentSpecialistResponse,
 };
 pub use append_events::AppendEvents;

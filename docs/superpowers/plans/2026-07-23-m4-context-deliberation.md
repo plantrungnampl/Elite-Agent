@@ -340,21 +340,21 @@ git commit -m "feat: build policy safe context packages"
 - Modify: `crates/bootstrap/src/agent_runtime.rs`
 - Modify: `crates/bootstrap/tests/agent_recovery.rs`
 
-- [ ] **Step 1 - Write failing runtime request-routing tests**
+- [x] **Step 1 - Write failing runtime request-routing tests**
 
 Replace the M3 blanket denial only for negotiated `context/query` and `specialist/request` frames. Verify run/task/connection/request ownership, capability negotiation, unique IDs, item/token/request/deadline limits, exact one typed response, durable audit before success, and isolation across concurrent runs.
 
 Keep `tool/request` policy-denied. Reject notification misuse, wrong origin, stale run, cross-task references, unrequested artifacts, over-budget requests, conflicting duplicates, response-after-terminal, and handler errors without leaking payload bytes.
 
-- [ ] **Step 2 - Add handler ports and per-run counters**
+- [x] **Step 2 - Add handler ports and per-run counters**
 
 Inject `AgentRequestHandler` into `ProtocolAgentRuntime`. Provide a default deny handler so existing M3 construction remains safe. Count context/specialist requests under the bound run limits and persist accepted/rejected request artifacts/events through the handler before responding.
 
-- [ ] **Step 3 - Extend deterministic peers and conformance**
+- [x] **Step 3 - Extend deterministic peers and conformance**
 
 Add scripted context-query and specialist-request peers, including malicious cross-task, overflow, duplicate, slow, and crashing cases. The shared harness must prove every request gets exactly one typed response and no request can manufacture a workflow event.
 
-- [ ] **Step 4 - Verify and commit**
+- [x] **Step 4 - Verify and commit**
 
 ```powershell
 cargo fmt --all -- --check

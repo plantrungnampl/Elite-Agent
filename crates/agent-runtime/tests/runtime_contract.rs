@@ -12,11 +12,13 @@ use local_agent_terminal_agent_protocol::{
     ProtocolTrustTier, RunAcceptance, RunCancel, RunStart,
 };
 use local_agent_terminal_agent_runtime::{
-    MaliciousScript, ProtocolAgentRuntime, Script, ScriptLog, ScriptedPeer,
+    MaliciousScript, ProtocolAgentRuntime, RequestScript, Script, ScriptLog, ScriptedPeer,
     DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_RUN_DEADLINE_SECS,
 };
 use local_agent_terminal_application::{
-    AgentArtifactStore, AgentMessageArtifact, AgentRunStore, AgentRuntime, Clock, PortError,
+    AgentArtifactStore, AgentContextQueryRequest, AgentContextQueryResponse, AgentMessageArtifact,
+    AgentRequestAudit, AgentRequestAuditDecision, AgentRequestHandler, AgentRequestKind,
+    AgentRunStore, AgentRuntime, AgentSpecialistRequest, AgentSpecialistResponse, Clock, PortError,
     Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
@@ -836,6 +838,1151 @@ fn every_agent_originated_request_receives_one_typed_response() {
 }
 
 #[test]
+fn negotiated_context_and_specialist_requests_are_bound_audited_and_typed() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    descriptor.capabilities.tool_requests = true;
+    descriptor.capabilities.specialist_requests = true;
+    let peer = Arc::new(ScriptedPeer::new(Script::Requesting, descriptor));
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let runtime = runtime_with_request_handler(
+        Arc::clone(&store),
+        artifacts,
+        clock,
+        Arc::clone(&peer),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_context_queries = 1;
+    request.run_config.limits.max_specialist_requests = 1;
+    runtime.start_run(request).unwrap();
+
+    peer.drive().unwrap();
+
+    let values = peer
+        .request_responses()
+        .iter()
+        .map(|response| serde_json::to_value(response).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(values.len(), 3);
+    assert_eq!(
+        values[0].pointer("/result/supplementId").unwrap(),
+        "supplement-query-1"
+    );
+    assert_eq!(
+        values[0].pointer("/result/contentDigest").unwrap(),
+        CONTEXT_DIGEST
+    );
+    assert_eq!(values[0].pointer("/result/items/0").unwrap(), "item-1");
+    assert_eq!(
+        values[1]
+            .pointer("/error/data/category")
+            .and_then(serde_json::Value::as_str),
+        Some("policy_denied")
+    );
+    assert_eq!(values[2].pointer("/result/accepted").unwrap(), true);
+    assert_eq!(
+        values[2].pointer("/result/reasonCode").unwrap(),
+        "specialist_approved"
+    );
+
+    let context_requests = handler.context_requests();
+    assert_eq!(context_requests.len(), 1);
+    assert_eq!(context_requests[0].run_id, run_id("run-1"));
+    assert_eq!(context_requests[0].task_id, task_id("task-1"));
+    assert_eq!(context_requests[0].connection_id, "connection-1");
+    assert_eq!(
+        context_requests[0].connection_binding_digest,
+        digest(CONNECTION_BINDING_DIGEST)
+    );
+    assert_eq!(context_requests[0].phase, "analysis");
+
+    let specialist_requests = handler.specialist_requests();
+    assert_eq!(specialist_requests.len(), 1);
+    assert_eq!(specialist_requests[0].run_id, run_id("run-1"));
+    assert_eq!(specialist_requests[0].task_id, task_id("task-1"));
+    assert_eq!(specialist_requests[0].connection_id, "connection-1");
+    assert_eq!(specialist_requests[0].phase, "analysis");
+
+    let audits = handler.audits();
+    assert_eq!(audits.len(), 2);
+    assert_eq!(audits[0].kind, AgentRequestKind::ContextQuery);
+    assert_eq!(audits[0].decision, AgentRequestAuditDecision::Accepted);
+    assert_eq!(audits[1].kind, AgentRequestKind::SpecialistRequest);
+    assert_eq!(audits[1].decision, AgentRequestAuditDecision::Accepted);
+    assert!(audits.iter().all(|audit| {
+        audit.run_id == run_id("run-1")
+            && audit.task_id == task_id("task-1")
+            && audit.connection_id == "connection-1"
+            && audit.connection_binding_digest == digest(CONNECTION_BINDING_DIGEST)
+            && audit.reason_code.is_none()
+    }));
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+    assert_eq!(store.terminal_count(), 0);
+}
+
+#[test]
+fn request_budgets_reject_without_calling_the_handler_and_are_audited() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    descriptor.capabilities.tool_requests = true;
+    descriptor.capabilities.specialist_requests = true;
+    let peer = Arc::new(ScriptedPeer::new(Script::Requesting, descriptor));
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let runtime = runtime_with_request_handler(
+        Arc::clone(&store),
+        artifacts,
+        clock,
+        Arc::clone(&peer),
+        Arc::clone(&handler),
+    );
+    runtime.start_run(run_request("run-1", None)).unwrap();
+
+    peer.drive().unwrap();
+
+    let values = peer
+        .request_responses()
+        .iter()
+        .map(|response| serde_json::to_value(response).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(values.len(), 3);
+    assert_eq!(
+        values[0].pointer("/error/data/category").unwrap(),
+        "request_limit_exceeded"
+    );
+    assert_eq!(
+        values[1].pointer("/error/data/category").unwrap(),
+        "policy_denied"
+    );
+    assert_eq!(
+        values[2].pointer("/error/data/category").unwrap(),
+        "request_limit_exceeded"
+    );
+    assert!(handler.context_requests().is_empty());
+    assert!(handler.specialist_requests().is_empty());
+    assert_eq!(
+        handler
+            .audits()
+            .iter()
+            .map(|audit| (audit.kind, audit.decision, audit.reason_code.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                AgentRequestKind::ContextQuery,
+                AgentRequestAuditDecision::Rejected,
+                Some("request_limit_exceeded")
+            ),
+            (
+                AgentRequestKind::SpecialistRequest,
+                AgentRequestAuditDecision::Rejected,
+                Some("request_limit_exceeded")
+            )
+        ]
+    );
+}
+
+#[test]
+fn handler_failure_returns_a_safe_typed_error_without_payload_leakage() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    descriptor.capabilities.tool_requests = true;
+    descriptor.capabilities.specialist_requests = true;
+    let peer = Arc::new(ScriptedPeer::new(Script::Requesting, descriptor));
+    let handler = Arc::new(RecordingRequestHandler::failing_context());
+    let runtime = runtime_with_request_handler(
+        Arc::clone(&store),
+        artifacts,
+        clock,
+        Arc::clone(&peer),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_context_queries = 1;
+    request.run_config.limits.max_specialist_requests = 1;
+    runtime.start_run(request).unwrap();
+
+    peer.drive().unwrap();
+
+    let context = serde_json::to_value(&peer.request_responses()[0]).unwrap();
+    assert_eq!(
+        context.pointer("/error/data/category").unwrap(),
+        "handler_failed"
+    );
+    let encoded = serde_json::to_string(&context).unwrap();
+    assert!(!encoded.contains("sensitive handler payload"));
+    assert_eq!(handler.audits().len(), 2);
+    assert_eq!(
+        handler.audits()[0].reason_code.as_deref(),
+        Some("handler_failed")
+    );
+}
+
+#[test]
+fn handler_response_is_rejected_when_identity_or_item_budget_does_not_match() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    descriptor.capabilities.tool_requests = true;
+    descriptor.capabilities.specialist_requests = true;
+    let peer = Arc::new(ScriptedPeer::new(Script::Requesting, descriptor));
+    let handler = Arc::new(RecordingRequestHandler::invalid_context_response());
+    let runtime = runtime_with_request_handler(
+        store,
+        artifacts,
+        clock,
+        Arc::clone(&peer),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_context_queries = 1;
+    request.run_config.limits.max_specialist_requests = 1;
+    runtime.start_run(request).unwrap();
+
+    peer.drive().unwrap();
+
+    let context = serde_json::to_value(&peer.request_responses()[0]).unwrap();
+    assert_eq!(
+        context.pointer("/error/data/category").unwrap(),
+        "invalid_handler_response"
+    );
+    assert_eq!(
+        handler.audits()[0].reason_code.as_deref(),
+        Some("invalid_handler_response")
+    );
+}
+
+#[test]
+fn accepted_handler_result_is_not_disclosed_when_durable_audit_fails() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let handler = Arc::new(RecordingRequestHandler::failing_audit());
+    let runtime = runtime_with_protocol_peer_and_handler(
+        Arc::clone(&store),
+        artifacts,
+        clock,
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_context_queries = 1;
+    runtime.start_run(request).unwrap();
+
+    let response = peer
+        .request(
+            0,
+            context_query_frame("agent:audit-failure", "run-1", "query-audit", 1),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(response)
+            .unwrap()
+            .pointer("/error/data/category")
+            .unwrap(),
+        "internal_error"
+    );
+    assert_eq!(handler.context_requests().len(), 1);
+    assert!(handler.audits().is_empty());
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
+}
+
+#[test]
+fn initial_request_clock_failure_returns_one_typed_error_and_poisoned_state_recovers() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let runtime = runtime_with_protocol_peer_and_handler(
+        store.clone(),
+        artifacts,
+        clock.clone(),
+        peer.clone(),
+        handler,
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_context_queries = 1;
+    runtime.start_run(request).unwrap();
+    clock.fail();
+
+    let response = peer
+        .request(
+            0,
+            context_query_frame("agent:clock-initial", "run-1", "query-clock-initial", 1),
+        )
+        .unwrap();
+
+    assert_eq!(
+        serde_json::to_value(response)
+            .unwrap()
+            .pointer("/error/data/category")
+            .unwrap(),
+        "internal_error"
+    );
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+    clock.recover();
+    assert_eq!(runtime.check_timeouts().unwrap(), vec![run_id("run-1")]);
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
+}
+
+#[test]
+fn response_clock_failure_after_accepted_audit_interrupts_the_run() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let handler = Arc::new(RecordingRequestHandler::failing_clock_after_audit(
+        Arc::clone(&clock),
+    ));
+    let runtime = runtime_with_protocol_peer_and_handler(
+        Arc::clone(&store),
+        artifacts,
+        clock,
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_context_queries = 1;
+    runtime.start_run(request).unwrap();
+
+    let result = peer.request(
+        0,
+        context_query_frame("agent:clock-failure", "run-1", "query-clock", 1),
+    );
+
+    let response = result.unwrap();
+    assert_eq!(
+        serde_json::to_value(response)
+            .unwrap()
+            .pointer("/error/data/category")
+            .unwrap(),
+        "internal_error"
+    );
+    assert_eq!(handler.audits().len(), 1);
+    assert_eq!(
+        handler.audits()[0].decision,
+        AgentRequestAuditDecision::Accepted
+    );
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
+}
+
+#[test]
+fn handler_response_cannot_disclose_path_like_values_through_opaque_references() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let handler = Arc::new(RecordingRequestHandler::leaking_context_response());
+    let runtime = runtime_with_protocol_peer_and_handler(
+        store,
+        artifacts,
+        clock,
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_context_queries = 1;
+    runtime.start_run(request).unwrap();
+
+    let response = peer
+        .request(
+            0,
+            context_query_frame("agent:leaking-query", "run-1", "query-leak", 1),
+        )
+        .unwrap();
+    let encoded = serde_json::to_string(&response).unwrap();
+
+    assert_eq!(
+        serde_json::to_value(response)
+            .unwrap()
+            .pointer("/error/data/category")
+            .unwrap(),
+        "invalid_handler_response"
+    );
+    assert!(!encoded.contains("private"));
+    assert_eq!(handler.audits().len(), 1);
+}
+
+#[test]
+fn request_routing_rejects_cross_run_ownership_and_keeps_runs_isolated() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let runtime = runtime_with_protocol_peer_and_handler(
+        Arc::clone(&store),
+        artifacts,
+        clock,
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut first = run_request("run-1", None);
+    first.run_config.limits.max_context_queries = 1;
+    let mut second = run_request("run-2", None);
+    second.task_id = task_id("task-2");
+    second.context.task_id = task_id("task-2");
+    second.run_config.task_id = task_id("task-2");
+    second.idempotency_key = "task-2:reviewer:run-2".to_owned();
+    second.run_config.limits.max_context_queries = 1;
+    runtime.start_run(first).unwrap();
+    runtime.start_run(second).unwrap();
+
+    let response = peer
+        .request(
+            0,
+            context_query_frame("agent:cross-run", "run-2", "query-cross-run", 1),
+        )
+        .unwrap();
+    let value = serde_json::to_value(response).unwrap();
+
+    assert_eq!(
+        value.pointer("/error/data/category").unwrap(),
+        "request_ownership_mismatch"
+    );
+    assert!(handler.context_requests().is_empty());
+    let audits = handler.audits();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].run_id, run_id("run-1"));
+    assert_eq!(audits[0].task_id, task_id("task-1"));
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+    assert_eq!(store.status("run-2"), Some(AgentRunStatus::Running));
+}
+
+#[test]
+fn concurrent_runs_have_independent_request_counters() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let runtime = runtime_with_protocol_peer_and_handler(
+        store,
+        artifacts,
+        clock,
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut first = run_request("run-1", None);
+    first.run_config.limits.max_context_queries = 1;
+    let mut second = run_request("run-2", None);
+    second.run_config.limits.max_context_queries = 1;
+    runtime.start_run(first).unwrap();
+    runtime.start_run(second).unwrap();
+
+    let first_response = peer
+        .request(
+            0,
+            context_query_frame("agent:run-1-query", "run-1", "query-run-1", 1),
+        )
+        .unwrap();
+    let second_response = peer
+        .request(
+            1,
+            context_query_frame("agent:run-2-query", "run-2", "query-run-2", 1),
+        )
+        .unwrap();
+
+    assert!(serde_json::to_value(first_response)
+        .unwrap()
+        .pointer("/result/supplementId")
+        .is_some());
+    assert!(serde_json::to_value(second_response)
+        .unwrap()
+        .pointer("/result/supplementId")
+        .is_some());
+    assert_eq!(
+        handler
+            .audits()
+            .iter()
+            .map(|audit| audit.run_id.clone())
+            .collect::<Vec<_>>(),
+        [run_id("run-1"), run_id("run-2")]
+    );
+}
+
+#[test]
+fn request_routing_rejects_duplicate_query_ids_and_context_token_overflow() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let runtime = runtime_with_protocol_peer_and_handler(
+        store,
+        artifacts,
+        clock,
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_context_queries = 3;
+    runtime.start_run(request).unwrap();
+
+    let accepted = peer
+        .request(
+            0,
+            context_query_frame("agent:query-1", "run-1", "query-1", 1),
+        )
+        .unwrap();
+    let duplicate = peer
+        .request(
+            0,
+            context_query_frame("agent:query-2", "run-1", "query-1", 1),
+        )
+        .unwrap();
+    let overflow = peer
+        .request(
+            0,
+            context_query_frame("agent:query-3", "run-1", "query-3", 1_025),
+        )
+        .unwrap();
+
+    assert_eq!(
+        serde_json::to_value(accepted)
+            .unwrap()
+            .pointer("/result/supplementId")
+            .unwrap(),
+        "supplement-query-1"
+    );
+    assert_eq!(
+        serde_json::to_value(duplicate)
+            .unwrap()
+            .pointer("/error/data/category")
+            .unwrap(),
+        "duplicate_query_id"
+    );
+    assert_eq!(
+        serde_json::to_value(overflow)
+            .unwrap()
+            .pointer("/error/data/category")
+            .unwrap(),
+        "context_token_limit_exceeded"
+    );
+    assert_eq!(handler.context_requests().len(), 1);
+    assert_eq!(handler.audits().len(), 3);
+}
+
+#[test]
+fn request_routing_returns_typed_errors_for_duplicate_rpc_id_wrong_origin_and_terminal_run() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let runtime = runtime_with_protocol_peer_and_handler(
+        Arc::clone(&store),
+        artifacts,
+        clock,
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_context_queries = 4;
+    runtime.start_run(request).unwrap();
+
+    peer.request(
+        0,
+        context_query_frame("agent:duplicate-rpc", "run-1", "query-1", 1),
+    )
+    .unwrap();
+    let duplicate = peer
+        .request(
+            0,
+            context_query_frame("agent:duplicate-rpc", "run-1", "query-2", 1),
+        )
+        .unwrap();
+    let wrong_origin = peer
+        .request(
+            0,
+            context_query_frame("core:wrong-origin", "run-1", "query-3", 1),
+        )
+        .unwrap();
+    peer.request(0, threaded_terminal("run-1")).unwrap();
+    let after_terminal = peer
+        .request(
+            0,
+            context_query_frame("agent:after-terminal", "run-1", "query-4", 1),
+        )
+        .unwrap();
+
+    for (response, category) in [
+        (duplicate, "conflicting_duplicate"),
+        (wrong_origin, "invalid_request_origin"),
+        (after_terminal, "run_not_active"),
+    ] {
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value.pointer("/error/data/category").unwrap(), category);
+    }
+    assert_eq!(handler.context_requests().len(), 1);
+    assert_eq!(handler.audits().len(), 4);
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Succeeded));
+}
+
+#[test]
+fn request_routing_rejects_context_after_the_bound_run_deadline() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let runtime = runtime_with_protocol_peer_and_handler(
+        store,
+        artifacts,
+        Arc::clone(&clock),
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_context_queries = 1;
+    runtime.start_run(request).unwrap();
+    clock.advance(301);
+
+    let response = peer
+        .request(
+            0,
+            context_query_frame("agent:late-query", "run-1", "query-late", 1),
+        )
+        .unwrap();
+    let value = serde_json::to_value(response).unwrap();
+
+    assert_eq!(
+        value.pointer("/error/data/category").unwrap(),
+        "request_deadline_exceeded"
+    );
+    assert!(handler.context_requests().is_empty());
+    assert_eq!(
+        handler.audits()[0].reason_code.as_deref(),
+        Some("request_deadline_exceeded")
+    );
+}
+
+#[test]
+fn slow_context_handler_cannot_disclose_success_after_the_run_deadline() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let (handler, handler_gate) = RecordingRequestHandler::blocking_context();
+    let handler = Arc::new(handler);
+    let runtime = runtime_with_protocol_peer_and_handler(
+        store,
+        artifacts,
+        Arc::clone(&clock),
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_context_queries = 1;
+    runtime.start_run(request).unwrap();
+
+    let request_peer = peer.clone();
+    let request_thread = thread::spawn(move || {
+        request_peer.request(
+            0,
+            context_query_frame("agent:slow-query", "run-1", "query-slow", 1),
+        )
+    });
+    handler_gate.wait_until_entered();
+    clock.advance(301);
+    let response = request_thread.join().unwrap().unwrap();
+    handler_gate.release();
+    let value = serde_json::to_value(response).unwrap();
+
+    assert_eq!(
+        value.pointer("/error/data/category").unwrap(),
+        "request_deadline_exceeded"
+    );
+    let audits = handler.audits();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].decision, AgentRequestAuditDecision::Rejected);
+}
+
+#[test]
+fn slow_context_handler_does_not_block_another_run_on_the_same_connection() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let (handler, handler_gate) = RecordingRequestHandler::blocking_context();
+    let handler = Arc::new(handler);
+    let runtime = runtime_with_protocol_peer_and_handler(
+        store,
+        artifacts,
+        clock,
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut first = run_request("run-1", None);
+    first.run_config.limits.max_context_queries = 1;
+    let mut second = run_request("run-2", None);
+    second.run_config.limits.max_context_queries = 1;
+    runtime.start_run(first).unwrap();
+    runtime.start_run(second).unwrap();
+
+    let blocked_peer = peer.clone();
+    let blocked = thread::spawn(move || {
+        blocked_peer.request(
+            0,
+            context_query_frame("agent:blocked", "run-1", "query-slow", 1),
+        )
+    });
+    assert!(handler_gate.wait_until_entered_for(Duration::from_secs(1)));
+    let independent_peer = peer.clone();
+    let (independent_sender, independent_receiver) = mpsc::channel();
+    let independent_thread = thread::spawn(move || {
+        let _ = independent_sender.send(independent_peer.request(
+            1,
+            context_query_frame("agent:independent", "run-2", "query-fast", 1),
+        ));
+    });
+    let independent = match independent_receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(result) => result.unwrap(),
+        Err(error) => {
+            handler_gate.release();
+            panic!(
+                "independent run was blocked: {error}; requests={:?}; audits={:?}",
+                handler
+                    .context_requests()
+                    .iter()
+                    .map(|request| request.query_id.as_str())
+                    .collect::<Vec<_>>(),
+                handler.audits()
+            );
+        }
+    };
+    handler_gate.release();
+    blocked.join().unwrap().unwrap();
+    independent_thread.join().unwrap();
+
+    assert!(serde_json::to_value(independent)
+        .unwrap()
+        .pointer("/result/supplementId")
+        .is_some());
+}
+
+#[test]
+fn late_specialist_worker_is_revoked_before_it_can_commit_or_audit_success() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.specialist_requests = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let (handler, specialist_gate) = RecordingRequestHandler::blocking_specialist();
+    let handler = Arc::new(handler);
+    let runtime = runtime_with_protocol_peer_and_handler(
+        store.clone(),
+        artifacts,
+        clock.clone(),
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_specialist_requests = 1;
+    request.run_config.limits.deadline = Timestamp::from_unix_seconds(1_800_000_300);
+    runtime.start_run(request).unwrap();
+
+    let request_peer = peer.clone();
+    let (response_sender, response_receiver) = mpsc::channel();
+    let request_thread = thread::spawn(move || {
+        let _ = response_sender.send(request_peer.request(
+            0,
+            specialist_request_frame("agent:specialist-slow", "run-1", &["artifact-context-1"]),
+        ));
+    });
+    assert!(specialist_gate.wait_until_entered_for(Duration::from_secs(1)));
+    clock.advance(301);
+
+    let response = match response_receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(response) => response.unwrap(),
+        Err(error) => {
+            specialist_gate.release();
+            request_thread.join().unwrap();
+            panic!("specialist request exceeded its deadline: {error}");
+        }
+    };
+    assert!(handler.specialist_requests()[0].cancellation.is_cancelled());
+    assert_eq!(handler.audits().len(), 1);
+    assert_eq!(
+        handler.audits()[0].decision,
+        AgentRequestAuditDecision::Rejected
+    );
+    specialist_gate.release();
+    assert!(handler.wait_for_specialist_return(Duration::from_secs(1)));
+    request_thread.join().unwrap();
+
+    assert_eq!(
+        serde_json::to_value(response)
+            .unwrap()
+            .pointer("/error/data/category")
+            .unwrap(),
+        "request_deadline_exceeded"
+    );
+    assert_eq!(handler.specialist_commits(), 0);
+    assert_eq!(handler.audits().len(), 1);
+}
+
+#[test]
+fn blocked_audit_is_revoked_at_deadline_and_cannot_commit_after_release() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let (handler, audit_gate) = RecordingRequestHandler::blocking_audit();
+    let handler = Arc::new(handler);
+    let runtime = runtime_with_protocol_peer_and_handler(
+        store.clone(),
+        artifacts,
+        clock.clone(),
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_context_queries = 1;
+    request.run_config.limits.deadline = Timestamp::from_unix_seconds(1_800_000_300);
+    runtime.start_run(request).unwrap();
+
+    let request_peer = peer.clone();
+    let (response_sender, response_receiver) = mpsc::channel();
+    let request_thread = thread::spawn(move || {
+        let _ = response_sender.send(request_peer.request(
+            0,
+            context_query_frame("agent:audit-slow", "run-1", "query-audit", 1),
+        ));
+    });
+    assert!(audit_gate.wait_until_entered_for(Duration::from_secs(1)));
+    clock.advance(301);
+
+    let response = match response_receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(response) => response.unwrap(),
+        Err(error) => {
+            audit_gate.release();
+            request_thread.join().unwrap();
+            panic!("audit blocked the request past its deadline: {error}");
+        }
+    };
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
+    assert!(handler.audits().is_empty());
+    audit_gate.release();
+    assert!(handler.wait_for_audit_return(Duration::from_secs(1)));
+    request_thread.join().unwrap();
+
+    assert_eq!(
+        serde_json::to_value(response)
+            .unwrap()
+            .pointer("/error/data/category")
+            .unwrap(),
+        "internal_error"
+    );
+    assert!(handler.audits().is_empty());
+}
+
+#[test]
+fn claimed_audit_commit_finishes_before_the_runtime_responds() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let (handler, audit_commit_gate) = RecordingRequestHandler::blocking_audit_commit();
+    let handler = Arc::new(handler);
+    let runtime = runtime_with_protocol_peer_and_handler(
+        store.clone(),
+        artifacts,
+        clock.clone(),
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_context_queries = 1;
+    request.run_config.limits.deadline = Timestamp::from_unix_seconds(1_800_000_300);
+    runtime.start_run(request).unwrap();
+
+    let request_peer = peer.clone();
+    let (response_sender, response_receiver) = mpsc::channel();
+    let request_thread = thread::spawn(move || {
+        let _ = response_sender.send(request_peer.request(
+            0,
+            context_query_frame("agent:audit-commit", "run-1", "query-audit", 1),
+        ));
+    });
+    assert!(audit_commit_gate.wait_until_entered_for(Duration::from_secs(1)));
+    clock.advance(301);
+
+    assert!(matches!(
+        response_receiver.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert!(handler.audits().is_empty());
+    audit_commit_gate.release();
+    assert!(handler.wait_for_audit_return(Duration::from_secs(1)));
+    let response = response_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    request_thread.join().unwrap();
+
+    assert!(serde_json::to_value(response)
+        .unwrap()
+        .pointer("/result/supplementId")
+        .is_some());
+    assert_eq!(handler.audits().len(), 1);
+    assert_eq!(
+        handler.audits()[0].decision,
+        AgentRequestAuditDecision::Accepted
+    );
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+}
+
+#[test]
+fn specialist_request_rejects_context_not_bound_to_the_parent_run() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.specialist_requests = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let runtime = runtime_with_protocol_peer_and_handler(
+        store,
+        artifacts,
+        clock,
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_specialist_requests = 1;
+    runtime.start_run(request).unwrap();
+
+    let response = peer
+        .request(
+            0,
+            specialist_request_frame(
+                "agent:specialist-unbound",
+                "run-1",
+                &["artifact-other-task"],
+            ),
+        )
+        .unwrap();
+    let value = serde_json::to_value(response).unwrap();
+
+    assert_eq!(value.pointer("/result/accepted").unwrap(), false);
+    assert_eq!(
+        value.pointer("/result/reasonCode").unwrap(),
+        "unrequested_context"
+    );
+    assert_eq!(handler.specialist_requests().len(), 1);
+    assert_eq!(
+        handler.specialist_requests()[0].deadline,
+        Timestamp::from_unix_seconds(1_800_000_300)
+    );
+    assert_eq!(handler.audits().len(), 1);
+    assert_eq!(
+        handler.audits()[0].reason_code.as_deref(),
+        Some("unrequested_context")
+    );
+}
+
+#[test]
+fn specialist_request_requires_context_bound_to_the_parent_run() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.specialist_requests = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let runtime = runtime_with_protocol_peer_and_handler(
+        store,
+        artifacts,
+        clock,
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_specialist_requests = 1;
+    runtime.start_run(request).unwrap();
+
+    let response = peer
+        .request(
+            0,
+            specialist_request_frame("agent:specialist-empty", "run-1", &[]),
+        )
+        .unwrap();
+    let value = serde_json::to_value(response).unwrap();
+
+    assert_eq!(
+        value.pointer("/error/data/category").unwrap(),
+        "missing_required_context"
+    );
+    assert!(handler.specialist_requests().is_empty());
+    assert_eq!(handler.audits().len(), 1);
+}
+
+#[test]
+fn specialist_handler_reason_is_allowlisted_before_disclosure() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.specialist_requests = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let handler = Arc::new(RecordingRequestHandler::leaking_specialist_response());
+    let runtime = runtime_with_protocol_peer_and_handler(
+        store,
+        artifacts,
+        clock,
+        peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut request = run_request("run-1", None);
+    request.run_config.limits.max_specialist_requests = 1;
+    runtime.start_run(request).unwrap();
+
+    let response = peer
+        .request(
+            0,
+            specialist_request_frame("agent:specialist-leak", "run-1", &["artifact-context-1"]),
+        )
+        .unwrap();
+    let encoded = serde_json::to_string(&response).unwrap();
+
+    assert_eq!(
+        serde_json::to_value(response)
+            .unwrap()
+            .pointer("/error/data/category")
+            .unwrap(),
+        "invalid_handler_response"
+    );
+    assert!(!encoded.contains("private"));
+}
+
+#[test]
+fn deterministic_request_peers_cover_context_specialist_overflow_duplicate_and_cross_run() {
+    for (script, context_limit, specialist_limit, expected_responses) in [
+        (RequestScript::ContextQuery, 1, 0, 1),
+        (RequestScript::SpecialistRequest, 0, 1, 1),
+        (RequestScript::ContextOverflow, 1, 0, 1),
+        (RequestScript::DuplicateContextQuery, 2, 0, 2),
+        (RequestScript::CrossRun, 1, 0, 1),
+    ] {
+        let store = Arc::new(RecordingStore::default());
+        let artifacts = Arc::new(RecordingArtifacts::default());
+        let clock = Arc::new(ManualClock::new(1_800_000_000));
+        let mut descriptor = peer_descriptor();
+        descriptor.capabilities.context_query = true;
+        descriptor.capabilities.specialist_requests = true;
+        let peer = Arc::new(ScriptedPeer::new(
+            Script::RequestingScenario(script),
+            descriptor,
+        ));
+        let handler = Arc::new(RecordingRequestHandler::default());
+        let runtime = runtime_with_request_handler(
+            Arc::clone(&store),
+            artifacts,
+            clock,
+            Arc::clone(&peer),
+            Arc::clone(&handler),
+        );
+        let mut request = run_request("run-1", None);
+        request.run_config.limits.max_context_queries = context_limit;
+        request.run_config.limits.max_specialist_requests = specialist_limit;
+        runtime.start_run(request).unwrap();
+
+        peer.drive().unwrap();
+
+        let responses = peer.request_responses();
+        assert_eq!(responses.len(), expected_responses, "script {script:?}");
+        assert_eq!(store.terminal_count(), 0, "script {script:?}");
+        match script {
+            RequestScript::ContextQuery => {
+                assert_eq!(handler.context_requests().len(), 1);
+                assert!(serde_json::to_value(&responses[0])
+                    .unwrap()
+                    .pointer("/result/supplementId")
+                    .is_some());
+            }
+            RequestScript::SpecialistRequest => {
+                assert_eq!(handler.specialist_requests().len(), 1);
+                assert_eq!(
+                    serde_json::to_value(&responses[0])
+                        .unwrap()
+                        .pointer("/result/accepted")
+                        .unwrap(),
+                    true
+                );
+            }
+            RequestScript::ContextOverflow => assert_eq!(
+                serde_json::to_value(&responses[0])
+                    .unwrap()
+                    .pointer("/error/data/category")
+                    .unwrap(),
+                "context_token_limit_exceeded"
+            ),
+            RequestScript::DuplicateContextQuery => assert_eq!(
+                serde_json::to_value(&responses[1])
+                    .unwrap()
+                    .pointer("/error/data/category")
+                    .unwrap(),
+                "duplicate_query_id"
+            ),
+            RequestScript::CrossRun => {
+                assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+                assert_eq!(
+                    serde_json::to_value(&responses[0])
+                        .unwrap()
+                        .pointer("/error/data/category")
+                        .unwrap(),
+                    "request_ownership_mismatch"
+                );
+                assert_eq!(handler.audits().len(), 1);
+            }
+        }
+    }
+}
+
+#[test]
 fn output_limit_persists_failure_and_triggers_peer_cancellation() {
     let store = Arc::new(RecordingStore::default());
     let clock = Arc::new(ManualClock::new(1_800_000_000));
@@ -1548,6 +2695,28 @@ struct AcceptanceGate {
     changed: Condvar,
 }
 
+#[derive(Default)]
+struct CompletionSignal {
+    completed: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl CompletionSignal {
+    fn complete(&self) {
+        *self.completed.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+
+    fn wait(&self, timeout: Duration) -> bool {
+        let completed = self.completed.lock().unwrap();
+        let (completed, _) = self
+            .changed
+            .wait_timeout_while(completed, timeout, |completed| !*completed)
+            .unwrap();
+        *completed
+    }
+}
+
 impl AcceptanceGate {
     fn new() -> Self {
         Self {
@@ -1570,6 +2739,15 @@ impl AcceptanceGate {
         while !state.entered {
             state = self.changed.wait(state).unwrap();
         }
+    }
+
+    fn wait_until_entered_for(&self, timeout: Duration) -> bool {
+        let state = self.state.lock().unwrap();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.entered)
+            .unwrap();
+        state.entered
     }
 
     fn release(&self) {
@@ -1852,7 +3030,13 @@ impl MultiRunPeer {
     }
 
     fn connection_lost(&self, index: usize) -> Result<(), ProtocolError> {
-        Arc::clone(&self.sinks.lock().unwrap()[index]).connection_lost()
+        let sink = Arc::clone(&self.sinks.lock().unwrap()[index]);
+        sink.connection_lost()
+    }
+
+    fn request(&self, index: usize, frame: ProtocolFrame) -> Result<ProtocolFrame, ProtocolError> {
+        let sink = Arc::clone(&self.sinks.lock().unwrap()[index]);
+        sink.request(frame)
     }
 }
 
@@ -1922,6 +3106,45 @@ fn threaded_terminal(run_id: &str) -> ProtocolFrame {
     }))
 }
 
+fn context_query_frame(
+    request_id: &str,
+    run_id: &str,
+    query_id: &str,
+    max_tokens: u64,
+) -> ProtocolFrame {
+    decode_protocol_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "context.query",
+        "params": {
+            "runId": run_id,
+            "queryId": query_id,
+            "query": "More context",
+            "scopes": ["repository"],
+            "maxItems": 1,
+            "maxTokens": max_tokens
+        }
+    }))
+}
+
+fn specialist_request_frame(
+    request_id: &str,
+    run_id: &str,
+    required_context: &[&str],
+) -> ProtocolFrame {
+    decode_protocol_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "specialist.request",
+        "params": {
+            "runId": run_id,
+            "capability": "review",
+            "reason": "Need review",
+            "requiredContext": required_context
+        }
+    }))
+}
+
 fn decode_protocol_frame(value: serde_json::Value) -> ProtocolFrame {
     NdjsonCodec::default()
         .decode(&serde_json::to_vec(&value).unwrap())
@@ -1948,6 +3171,44 @@ fn runtime_with_artifacts(
         artifacts,
         clock,
         vec![agent_registration(protocol_peer)],
+    )
+    .unwrap()
+}
+
+fn runtime_with_request_handler(
+    store: Arc<RecordingStore>,
+    artifacts: Arc<RecordingArtifacts>,
+    clock: Arc<ManualClock>,
+    peer: Arc<ScriptedPeer>,
+    handler: Arc<RecordingRequestHandler>,
+) -> ProtocolAgentRuntime {
+    let protocol_peer: Arc<dyn ProtocolPeer> = peer;
+    let request_handler: Arc<dyn AgentRequestHandler> = handler;
+    ProtocolAgentRuntime::new_with_request_handler(
+        store,
+        artifacts,
+        clock,
+        vec![agent_registration(protocol_peer)],
+        request_handler,
+    )
+    .unwrap()
+}
+
+fn runtime_with_protocol_peer_and_handler(
+    store: Arc<RecordingStore>,
+    artifacts: Arc<RecordingArtifacts>,
+    clock: Arc<ManualClock>,
+    peer: Arc<MultiRunPeer>,
+    handler: Arc<RecordingRequestHandler>,
+) -> ProtocolAgentRuntime {
+    let protocol_peer: Arc<dyn ProtocolPeer> = peer;
+    let request_handler: Arc<dyn AgentRequestHandler> = handler;
+    ProtocolAgentRuntime::new_with_request_handler(
+        store,
+        artifacts,
+        clock,
+        vec![agent_registration(protocol_peer)],
+        request_handler,
     )
     .unwrap()
 }
@@ -2094,6 +3355,262 @@ fn run_request_with_deadline(run: &str, deadline: i64) -> BoundAgentRunRequest {
     let mut request = run_request(run, None);
     request.run_config.limits.deadline = Timestamp::from_unix_seconds(deadline);
     request
+}
+
+#[derive(Default)]
+struct RecordingRequestHandler {
+    context_requests: Mutex<Vec<AgentContextQueryRequest>>,
+    specialist_requests: Mutex<Vec<AgentSpecialistRequest>>,
+    audits: Mutex<Vec<AgentRequestAudit>>,
+    fail_context: bool,
+    fail_audit: bool,
+    invalid_context_response: bool,
+    context_gate: Option<Arc<AcceptanceGate>>,
+    specialist_gate: Option<Arc<AcceptanceGate>>,
+    specialist_return: Option<Arc<CompletionSignal>>,
+    specialist_commits: Mutex<usize>,
+    audit_gate: Option<Arc<AcceptanceGate>>,
+    audit_commit_gate: Option<Arc<AcceptanceGate>>,
+    audit_return: Option<Arc<CompletionSignal>>,
+    blocking_query_id: Option<String>,
+    leaking_context_response: bool,
+    leaking_specialist_response: bool,
+    fail_clock_after_audit: Option<Arc<ManualClock>>,
+}
+
+impl RecordingRequestHandler {
+    fn failing_context() -> Self {
+        Self {
+            fail_context: true,
+            ..Self::default()
+        }
+    }
+
+    fn failing_audit() -> Self {
+        Self {
+            fail_audit: true,
+            ..Self::default()
+        }
+    }
+
+    fn invalid_context_response() -> Self {
+        Self {
+            invalid_context_response: true,
+            ..Self::default()
+        }
+    }
+
+    fn leaking_context_response() -> Self {
+        Self {
+            leaking_context_response: true,
+            ..Self::default()
+        }
+    }
+
+    fn leaking_specialist_response() -> Self {
+        Self {
+            leaking_specialist_response: true,
+            ..Self::default()
+        }
+    }
+
+    fn failing_clock_after_audit(clock: Arc<ManualClock>) -> Self {
+        Self {
+            fail_clock_after_audit: Some(clock),
+            ..Self::default()
+        }
+    }
+
+    fn blocking_context() -> (Self, Arc<AcceptanceGate>) {
+        let gate = Arc::new(AcceptanceGate::new());
+        (
+            Self {
+                context_gate: Some(Arc::clone(&gate)),
+                blocking_query_id: Some("query-slow".to_owned()),
+                ..Self::default()
+            },
+            gate,
+        )
+    }
+
+    fn blocking_specialist() -> (Self, Arc<AcceptanceGate>) {
+        let gate = Arc::new(AcceptanceGate::new());
+        (
+            Self {
+                specialist_gate: Some(Arc::clone(&gate)),
+                specialist_return: Some(Arc::new(CompletionSignal::default())),
+                ..Self::default()
+            },
+            gate,
+        )
+    }
+
+    fn blocking_audit() -> (Self, Arc<AcceptanceGate>) {
+        let gate = Arc::new(AcceptanceGate::new());
+        (
+            Self {
+                audit_gate: Some(Arc::clone(&gate)),
+                audit_return: Some(Arc::new(CompletionSignal::default())),
+                ..Self::default()
+            },
+            gate,
+        )
+    }
+
+    fn blocking_audit_commit() -> (Self, Arc<AcceptanceGate>) {
+        let gate = Arc::new(AcceptanceGate::new());
+        (
+            Self {
+                audit_commit_gate: Some(Arc::clone(&gate)),
+                audit_return: Some(Arc::new(CompletionSignal::default())),
+                ..Self::default()
+            },
+            gate,
+        )
+    }
+
+    fn specialist_commits(&self) -> usize {
+        *self.specialist_commits.lock().unwrap()
+    }
+
+    fn wait_for_specialist_return(&self, timeout: Duration) -> bool {
+        self.specialist_return
+            .as_ref()
+            .expect("specialist return signal")
+            .wait(timeout)
+    }
+
+    fn wait_for_audit_return(&self, timeout: Duration) -> bool {
+        self.audit_return
+            .as_ref()
+            .expect("audit return signal")
+            .wait(timeout)
+    }
+
+    fn context_requests(&self) -> Vec<AgentContextQueryRequest> {
+        self.context_requests.lock().unwrap().clone()
+    }
+
+    fn specialist_requests(&self) -> Vec<AgentSpecialistRequest> {
+        self.specialist_requests.lock().unwrap().clone()
+    }
+
+    fn audits(&self) -> Vec<AgentRequestAudit> {
+        self.audits.lock().unwrap().clone()
+    }
+}
+
+impl AgentRequestHandler for RecordingRequestHandler {
+    fn query_context(
+        &self,
+        request: AgentContextQueryRequest,
+    ) -> Result<AgentContextQueryResponse, PortError> {
+        self.context_requests.lock().unwrap().push(request.clone());
+        if self.blocking_query_id.as_deref() == Some(request.query_id.as_str()) {
+            let gate = self.context_gate.as_ref().expect("blocking query gate");
+            gate.block();
+        }
+        if self.fail_context {
+            return Err(PortError::failure(
+                SafeErrorClassification::Internal,
+                Retryability::NonRetryable,
+            ));
+        }
+        let mut response = AgentContextQueryResponse {
+            run_id: request.run_id,
+            task_id: request.task_id,
+            query_id: request.query_id.clone(),
+            supplement_id: format!("supplement-{}", request.query_id),
+            content_digest: digest(CONTEXT_DIGEST),
+            item_ids: vec!["item-1".to_owned()],
+            token_count: 1,
+            policy_decision_ids: vec!["policy-1".to_owned()],
+        };
+        if self.invalid_context_response {
+            response.task_id = task_id("task-2");
+            response.item_ids.push("item-2".to_owned());
+        }
+        if self.leaking_context_response {
+            response.supplement_id = r"C:\private\source.txt".to_owned();
+        }
+        Ok(response)
+    }
+
+    fn request_specialist(
+        &self,
+        request: AgentSpecialistRequest,
+    ) -> Result<AgentSpecialistResponse, PortError> {
+        self.specialist_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        if let Some(gate) = &self.specialist_gate {
+            gate.block();
+        }
+        if request.cancellation.is_cancelled() {
+            self.specialist_return
+                .as_ref()
+                .expect("specialist return signal")
+                .complete();
+            return Err(internal_failure());
+        }
+        *self.specialist_commits.lock().unwrap() += 1;
+        let accepted = request.required_context_ids.iter().all(|artifact_id| {
+            matches!(
+                artifact_id.as_str(),
+                "artifact-context-1" | "artifact-context-manifest-1"
+            )
+        });
+        let response = AgentSpecialistResponse {
+            run_id: request.run_id,
+            task_id: request.task_id,
+            request_id: request.request_id,
+            accepted,
+            reason_code: if self.leaking_specialist_response {
+                r"C:\private\source.txt"
+            } else if accepted {
+                "specialist_approved"
+            } else {
+                "unrequested_context"
+            }
+            .to_owned(),
+        };
+        if let Some(returned) = &self.specialist_return {
+            returned.complete();
+        }
+        Ok(response)
+    }
+
+    fn persist_audit(&self, audit: AgentRequestAudit) -> Result<(), PortError> {
+        if self.fail_audit {
+            return Err(PortError::failure(
+                SafeErrorClassification::Internal,
+                Retryability::NonRetryable,
+            ));
+        }
+        if let Some(gate) = &self.audit_gate {
+            gate.block();
+        }
+        let fence = audit.fence.clone();
+        if !fence.try_begin_commit() {
+            if let Some(returned) = &self.audit_return {
+                returned.complete();
+            }
+            return Err(internal_failure());
+        }
+        if let Some(gate) = &self.audit_commit_gate {
+            gate.block();
+        }
+        self.audits.lock().unwrap().push(audit);
+        if let Some(clock) = &self.fail_clock_after_audit {
+            clock.fail();
+        }
+        fence.finish_commit();
+        if let Some(returned) = &self.audit_return {
+            returned.complete();
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]

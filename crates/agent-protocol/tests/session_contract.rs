@@ -125,6 +125,95 @@ fn enforces_connection_unique_request_ids_and_response_provenance() {
 }
 
 #[test]
+fn context_and_specialist_requests_receive_exactly_one_core_response() {
+    let mut session = ready_session();
+    start_run(&mut session, "run-1", 1, at(30));
+
+    let context = context_query("run-1", "agent:context-1", "query-1", 1);
+    assert!(matches!(
+        session.receive(context, at(0)),
+        Ok(InboundDisposition::Request(
+            ProtocolFrame::ContextQueryRequest(_)
+        ))
+    ));
+    let context_response = success_response(
+        "agent:context-1",
+        json!({
+            "supplementId": "supplement-1",
+            "contentDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "items": [],
+            "provenance": [],
+            "redactions": [],
+            "policyDecisionIds": []
+        }),
+    );
+    session
+        .outbound(context_response.clone(), at(0))
+        .expect("the core answers the pending context request once");
+    assert!(matches!(
+        session.outbound(context_response, at(0)),
+        Err(ProtocolError::InvalidRequest)
+    ));
+
+    let specialist = specialist_request("run-1", "agent:specialist-1", &[]);
+    assert!(matches!(
+        session.receive(specialist, at(0)),
+        Ok(InboundDisposition::Request(
+            ProtocolFrame::SpecialistRequest(_)
+        ))
+    ));
+    session
+        .outbound(
+            success_response(
+                "agent:specialist-1",
+                json!({
+                    "requestId": "agent:specialist-1",
+                    "accepted": false,
+                    "reasonCode": "budget_exhausted"
+                }),
+            ),
+            at(0),
+        )
+        .expect("the core answers the pending specialist request once");
+
+    assert!(matches!(
+        session.receive(
+            context_query("run-1", "core:wrong-origin", "query-wrong-origin", 1),
+            at(0),
+        ),
+        Err(ProtocolError::InvalidRequest)
+    ));
+    assert!(matches!(
+        session.receive(specialist_request("run-1", "agent:context-1", &[]), at(0),),
+        Err(ProtocolError::InvalidRequest)
+    ));
+}
+
+#[test]
+fn context_and_specialist_requests_are_rejected_after_run_terminal() {
+    let mut session = ready_session();
+    start_run(&mut session, "run-1", 1, at(30));
+    session
+        .receive(run_complete("run-1", "agent:complete-1", "done"), at(0))
+        .expect("the first terminal request is accepted");
+
+    assert!(matches!(
+        session.receive(
+            context_query("run-1", "agent:late-context", "query-late", 1),
+            at(0),
+        ),
+        Err(ProtocolError::InvalidRequest)
+    ));
+    assert!(matches!(
+        session.receive(
+            specialist_request("run-1", "agent:late-specialist", &[]),
+            at(0),
+        ),
+        Err(ProtocolError::InvalidRequest)
+    ));
+}
+
+#[test]
 fn enforces_method_ownership_and_never_responds_to_notifications() {
     let mut session = raw_session(capabilities());
     assert!(matches!(
@@ -618,6 +707,36 @@ fn tool_request(run_id: &str, id: &str) -> ProtocolFrame {
             "tool": "git.diff",
             "arguments": {},
             "reason": "Inspect the change"
+        }
+    }))
+}
+
+fn context_query(run_id: &str, id: &str, query_id: &str, max_tokens: u64) -> ProtocolFrame {
+    decode(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "context.query",
+        "params": {
+            "runId": run_id,
+            "queryId": query_id,
+            "query": "More context",
+            "scopes": ["repository"],
+            "maxItems": 1,
+            "maxTokens": max_tokens
+        }
+    }))
+}
+
+fn specialist_request(run_id: &str, id: &str, required_context: &[&str]) -> ProtocolFrame {
+    decode(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "specialist.request",
+        "params": {
+            "runId": run_id,
+            "capability": "review",
+            "reason": "Need review",
+            "requiredContext": required_context
         }
     }))
 }

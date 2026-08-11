@@ -17,9 +17,19 @@ pub enum Script {
     Critic,
     Verifier,
     Requesting,
+    RequestingScenario(RequestScript),
     Malicious(MaliciousScript),
     Slow,
     Crashing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestScript {
+    ContextQuery,
+    SpecialistRequest,
+    CrossRun,
+    ContextOverflow,
+    DuplicateContextQuery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +106,7 @@ impl ScriptedPeer {
             Script::Critic => self.emit_success(pending, "critic"),
             Script::Verifier => self.emit_success(pending, "verifier"),
             Script::Requesting => self.emit_requests(pending),
+            Script::RequestingScenario(script) => self.emit_request_scenario(pending, script),
             Script::Slow => {
                 *self
                     .inner
@@ -202,14 +213,14 @@ impl ScriptedPeer {
             MaliciousScript::DuplicateTerminal => {
                 let terminal = terminal(&pending, "succeeded", "done", "one")?;
                 self.acknowledge_terminal(&pending, terminal.clone())?;
-                expect_request_rejected(pending.sink.request(terminal))
+                self.record_request_response(pending.sink.request(terminal))
             }
             MaliciousScript::ConflictingTerminal => {
                 self.acknowledge_terminal(
                     &pending,
                     terminal(&pending, "succeeded", "done", "one")?,
                 )?;
-                expect_request_rejected(pending.sink.request(terminal(
+                self.record_request_response(pending.sink.request(terminal(
                     &pending,
                     "failed",
                     "different",
@@ -253,6 +264,63 @@ impl ScriptedPeer {
             .lock()
             .map_err(|_| ProtocolError::InternalAgentFailure)?
             .extend(responses);
+        Ok(())
+    }
+
+    fn emit_request_scenario(
+        &self,
+        pending: PendingRun,
+        script: RequestScript,
+    ) -> Result<(), ProtocolError> {
+        match script {
+            RequestScript::ContextQuery => {
+                self.record_request_response(pending.sink.request(context_query(&pending.run_id)?))
+            }
+            RequestScript::SpecialistRequest => self.record_request_response(
+                pending.sink.request(specialist_request(&pending.run_id)?),
+            ),
+            RequestScript::CrossRun => {
+                self.record_request_response(pending.sink.request(context_query_with(
+                    "agent:context-cross-run",
+                    "foreign-run",
+                    "query-cross-run",
+                    1,
+                )?))
+            }
+            RequestScript::ContextOverflow => {
+                self.record_request_response(pending.sink.request(context_query_with(
+                    "agent:context-overflow",
+                    &pending.run_id,
+                    "query-overflow",
+                    self.inner.descriptor.capabilities.max_context_tokens + 1,
+                )?))
+            }
+            RequestScript::DuplicateContextQuery => {
+                self.record_request_response(pending.sink.request(context_query_with(
+                    "agent:context-duplicate-1",
+                    &pending.run_id,
+                    "query-duplicate",
+                    1,
+                )?))?;
+                self.record_request_response(pending.sink.request(context_query_with(
+                    "agent:context-duplicate-2",
+                    &pending.run_id,
+                    "query-duplicate",
+                    1,
+                )?))
+            }
+        }
+    }
+
+    fn record_request_response(
+        &self,
+        response: Result<ProtocolFrame, ProtocolError>,
+    ) -> Result<(), ProtocolError> {
+        self.inner
+            .request_responses
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .push(response?);
         Ok(())
     }
 }
@@ -378,7 +446,14 @@ impl ConformancePeerFactory for ScriptedPeerFactory {
             .find(|(scenario, _)| *scenario == case.scenario)
             .map(|(_, peer)| peer.clone())
             .ok_or(ProtocolError::InternalAgentFailure)?;
-        peer.drive()
+        match peer.drive() {
+            Err(ProtocolError::InvalidRequest)
+                if case.scenario == ConformanceScenario::DuplicateTerminal =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
     }
 }
 
@@ -423,17 +498,26 @@ fn heartbeat(connection_id: &str, sequence: u64) -> Result<ProtocolFrame, Protoc
 }
 
 fn context_query(run_id: &str) -> Result<ProtocolFrame, ProtocolError> {
+    context_query_with("agent:context-1", run_id, "query-1", 1)
+}
+
+fn context_query_with(
+    request_id: &str,
+    run_id: &str,
+    query_id: &str,
+    max_tokens: u64,
+) -> Result<ProtocolFrame, ProtocolError> {
     decode(json!({
         "jsonrpc": "2.0",
-        "id": "agent:context-1",
+        "id": request_id,
         "method": "context.query",
         "params": {
             "runId": run_id,
-            "queryId": "query-1",
+            "queryId": query_id,
             "query": "More context",
             "scopes": ["repository"],
             "maxItems": 1,
-            "maxTokens": 1
+            "maxTokens": max_tokens
         }
     }))
 }
@@ -464,7 +548,7 @@ fn specialist_request(run_id: &str) -> Result<ProtocolFrame, ProtocolError> {
             "runId": run_id,
             "capability": "review",
             "reason": "Need review",
-            "requiredContext": []
+            "requiredContext": ["artifact-context-1"]
         }
     }))
 }
@@ -487,16 +571,6 @@ fn required_string(value: &Value, pointer: &str) -> Result<String, ProtocolError
 }
 
 fn expect_rejected(result: Result<InboundDisposition, ProtocolError>) -> Result<(), ProtocolError> {
-    if result.is_err() {
-        Ok(())
-    } else {
-        Err(ProtocolError::InternalAgentFailure)
-    }
-}
-
-fn expect_request_rejected(
-    result: Result<ProtocolFrame, ProtocolError>,
-) -> Result<(), ProtocolError> {
     if result.is_err() {
         Ok(())
     } else {

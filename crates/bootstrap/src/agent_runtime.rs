@@ -9,12 +9,14 @@ use local_agent_terminal_agent_runtime::{
     ProtocolTrustTier,
 };
 use local_agent_terminal_application::{
-    AgentArtifactStore, AgentCancellationReceipt, AgentDescriptor, AgentMessageArtifact,
-    AgentRunReceipt, AgentRunStore, AgentRuntime, ArtifactId, ArtifactRef, ArtifactStore,
-    ArtifactWriteReservation, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
-    CancelAgentRun, CanonicalJsonRequest, Clock, PortError, ProjectId, ReservedArtifact,
-    Retryability, SafeErrorClassification, Sha256Digest, TaskId, TaskQuery, TrustTier,
-    WorkspaceEvidenceStore,
+    AgentArtifactStore, AgentCancellationReceipt, AgentContextQueryRequest,
+    AgentContextQueryResponse, AgentDescriptor, AgentMessageArtifact, AgentRequestAudit,
+    AgentRequestAuditDecision, AgentRequestHandler, AgentRequestKind, AgentRunReceipt,
+    AgentRunStore, AgentRuntime, AgentSpecialistRequest, AgentSpecialistResponse, ArtifactId,
+    ArtifactRef, ArtifactStore, ArtifactWriteReservation, BoundAgentConnection,
+    BoundAgentRunRequest, BoundEffectiveContext, CancelAgentRun, CanonicalJsonRequest, Clock,
+    PortError, ProjectId, ReservedArtifact, Retryability, SafeErrorClassification, Sha256Digest,
+    TaskId, TaskQuery, TrustTier, WorkspaceEvidenceStore,
 };
 pub use local_agent_terminal_provider_openai::OpenAiApiKey;
 use local_agent_terminal_provider_openai::{OpenAiProviderConfig, OpenAiResponsesAdapter};
@@ -114,15 +116,20 @@ fn compose_runtime(
     peer: Arc<dyn ProtocolPeer>,
 ) -> Result<Arc<ComposedAgentRuntime>, PortError> {
     let database = database.with_artifact_reader(Arc::new(ContentAddressedArtifactReader));
+    let request_handler = Arc::new(DurableAgentRequestHandler {
+        database: database.clone(),
+        artifacts: Arc::clone(&artifacts),
+    });
     let durable_artifacts = Arc::new(DurableAgentArtifacts {
         database: database.clone(),
         artifacts,
     });
-    let runtime = Arc::new(ProtocolAgentRuntime::new(
+    let runtime = Arc::new(ProtocolAgentRuntime::new_with_request_handler(
         Arc::new(database.clone()) as Arc<dyn AgentRunStore>,
         durable_artifacts.clone() as Arc<dyn AgentArtifactStore>,
         Arc::new(database.clone()) as Arc<dyn Clock>,
         vec![(descriptor.clone(), connection.binding_digest.clone(), peer)],
+        request_handler as Arc<dyn AgentRequestHandler>,
     )?);
     Ok(Arc::new(ComposedAgentRuntime {
         database,
@@ -304,6 +311,89 @@ impl AgentRuntime for ComposedAgentRuntime {
 struct DurableAgentArtifacts {
     database: SqliteStore,
     artifacts: Arc<ContentAddressedArtifactStore>,
+}
+
+struct DurableAgentRequestHandler {
+    database: SqliteStore,
+    artifacts: Arc<ContentAddressedArtifactStore>,
+}
+
+impl AgentRequestHandler for DurableAgentRequestHandler {
+    fn query_context(
+        &self,
+        _request: AgentContextQueryRequest,
+    ) -> Result<AgentContextQueryResponse, PortError> {
+        Err(permission_denied())
+    }
+
+    fn request_specialist(
+        &self,
+        _request: AgentSpecialistRequest,
+    ) -> Result<AgentSpecialistResponse, PortError> {
+        Err(permission_denied())
+    }
+
+    fn persist_audit(&self, audit: AgentRequestAudit) -> Result<(), PortError> {
+        let fence = audit.fence.clone();
+        if fence.is_revoked() {
+            return Err(conflict());
+        }
+        let kind = match audit.kind {
+            AgentRequestKind::ContextQuery => "context-query",
+            AgentRequestKind::SpecialistRequest => "specialist-request",
+        };
+        let decision = match audit.decision {
+            AgentRequestAuditDecision::Accepted => "accepted",
+            AgentRequestAuditDecision::Rejected => "rejected",
+        };
+        let identity = format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}",
+            audit.run_id.as_str(),
+            audit.request_id,
+            audit.request_digest.as_str(),
+            audit.connection_binding_digest.as_str(),
+            kind,
+            decision,
+            audit.reason_code.as_deref().unwrap_or("none"),
+            audit.deadline.unix_seconds(),
+        );
+        let artifact_id =
+            ArtifactId::new(format!("agent-request-audit-{}", stable_digest(&identity)))
+                .map_err(|_| integrity_failure())?;
+        let value = json!({
+            "schema": "agent-request-audit.v1",
+            "runId": audit.run_id.as_str(),
+            "taskId": audit.task_id.as_str(),
+            "connectionId": audit.connection_id,
+            "connectionBindingDigest": audit.connection_binding_digest.as_str(),
+            "requestId": audit.request_id,
+            "kind": kind,
+            "requestDigest": audit.request_digest.as_str(),
+            "decision": decision,
+            "reasonCode": audit.reason_code,
+            "deadline": audit.deadline.unix_seconds(),
+        });
+        let request = CanonicalJsonRequest::new(
+            artifact_id.clone(),
+            project_id(&self.database, &audit.task_id)?,
+            Some(audit.task_id),
+            "agent-request-audit",
+            format!(
+                "agent-request-audits/{}.json",
+                stable_digest(artifact_id.as_str())
+            ),
+            "core",
+            "agent-runtime",
+            &value,
+            format!("agent-request-audit:{}", artifact_id.as_str()),
+        )?;
+        if !fence.try_begin_commit() {
+            return Err(conflict());
+        }
+        let result = publish_canonical_json(&self.database, self.artifacts.as_ref(), request);
+        fence.finish_commit();
+        result.map(|_| ())
+    }
 }
 
 impl AgentArtifactStore for DurableAgentArtifacts {
@@ -499,6 +589,13 @@ fn conflict() -> PortError {
     )
 }
 
+fn permission_denied() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::PermissionDenied,
+        Retryability::NonRetryable,
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn failing_runtime_for_test(path: &std::path::Path) -> Arc<ComposedAgentRuntime> {
     tests::failing_runtime_for_test(path)
@@ -517,12 +614,82 @@ mod tests {
     };
 
     use local_agent_terminal_agent_runtime::{ProtocolAgentRuntime, Script, ScriptedPeer};
+    use local_agent_terminal_application::AgentRequestAuditFence;
     use local_agent_terminal_application::StartupStateDto;
+    use local_agent_terminal_domain::{RunId, TaskId, Timestamp};
+    use rusqlite::params;
     use tempfile::TempDir;
 
     use crate::{Bootstrap, StartupConfig};
 
     use super::*;
+
+    #[test]
+    fn durable_request_audits_survive_restart_and_separate_rejection_reasons() {
+        let temporary = TempDir::new().expect("temporary state directory");
+        let database_path = temporary.path().join("state.sqlite3");
+        let artifact_path = temporary.path().join("artifacts");
+        let artifact_root = artifact_path.to_string_lossy().into_owned();
+        let database = SqliteStore::open(&database_path).expect("database");
+        let connection = rusqlite::Connection::open(&database_path).expect("sqlite connection");
+        connection
+            .execute(
+                "INSERT INTO projects (
+                    id, name, repository_path, repository_identity, created_at, updated_at,
+                    policy_profile_id, artifact_root_mode, artifact_root_path
+                 ) VALUES (?1, 'Audit project', 'D:/repo', 'repo-1', ?2, ?2,
+                    'default', 'application_data', ?3)",
+                params!["project-1", "2026-07-23T13:30:00Z", artifact_root,],
+            )
+            .expect("project row");
+        connection
+            .execute(
+                "INSERT INTO tasks (
+                    id, project_id, title, objective, phase, condition, operation_state,
+                    risk_level, base_branch, base_commit, created_at, updated_at
+                 ) VALUES (?1, 'project-1', 'Audit task', 'Verify durable audits',
+                    'ParallelAnalysis', 'Active', 'None', 'high', 'main', ?2, ?3, ?3)",
+                params!["task-1", "a".repeat(40), "2026-07-23T13:30:00Z",],
+            )
+            .expect("task row");
+        let handler = DurableAgentRequestHandler {
+            database,
+            artifacts: Arc::new(
+                ContentAddressedArtifactStore::open(&artifact_path).expect("artifact store"),
+            ),
+        };
+        for reason in ["policy_denied", "conflicting_duplicate"] {
+            handler
+                .persist_audit(AgentRequestAudit {
+                    run_id: RunId::new("run-1").expect("run id"),
+                    task_id: TaskId::new("task-1").expect("task id"),
+                    connection_id: "connection-1".to_owned(),
+                    connection_binding_digest: digest_bytes(b"connection"),
+                    request_id: "agent:request-1".to_owned(),
+                    kind: AgentRequestKind::ContextQuery,
+                    request_digest: digest_bytes(b"same request"),
+                    decision: AgentRequestAuditDecision::Rejected,
+                    reason_code: Some(reason.to_owned()),
+                    deadline: Timestamp::from_unix_seconds(1_800_000_300),
+                    fence: AgentRequestAuditFence::new(),
+                })
+                .expect("durable request audit");
+        }
+        drop(handler);
+        drop(connection);
+
+        SqliteStore::open(&database_path).expect("reopened database");
+        let connection = rusqlite::Connection::open(database_path).expect("reopened sqlite");
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM artifacts
+                 WHERE artifact_type = 'agent-request-audit' AND availability = 'available'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("audit artifact count");
+        assert_eq!(count, 2);
+    }
 
     #[test]
     fn shutdown_preserves_failed_cleanup_result_for_repeated_calls() {

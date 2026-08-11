@@ -1,9 +1,10 @@
 use local_agent_terminal_application::{
     AgentArtifactStore, AgentCancellationReceipt, AgentContextQueryRequest,
-    AgentContextQueryResponse, AgentDescriptor, AgentMessageArtifact, AgentRequestHandler,
-    AgentRunReceipt, AgentRunSnapshot, AgentRunStatus, AgentRunStore, AgentRunTerminal,
-    AgentRuntime, AgentSpecialistRequest, AgentSpecialistResponse, ArtifactId,
-    BoundAgentRunRequest, BoundEffectiveContext, CancelAgentRun, PortError, RunId,
+    AgentContextQueryResponse, AgentDescriptor, AgentMessageArtifact, AgentRequestAudit,
+    AgentRequestAuditFence, AgentRequestCancellation, AgentRequestHandler, AgentRunReceipt,
+    AgentRunSnapshot, AgentRunStatus, AgentRunStore, AgentRunTerminal, AgentRuntime,
+    AgentSpecialistRequest, AgentSpecialistResponse, ArtifactId, BoundAgentRunRequest,
+    BoundEffectiveContext, CancelAgentRun, PortError, RunId,
 };
 use local_agent_terminal_domain::Timestamp;
 
@@ -82,6 +83,8 @@ fn agent_ports_are_object_safe_and_keep_only_bound_values_at_the_boundary() {
             request: AgentContextQueryRequest,
         ) -> Result<AgentContextQueryResponse, PortError> {
             Ok(AgentContextQueryResponse {
+                run_id: request.run_id,
+                task_id: request.task_id,
                 query_id: request.query_id,
                 supplement_id: "supplement-1".to_owned(),
                 content_digest: local_agent_terminal_domain::Sha256Digest::new(format!(
@@ -90,6 +93,7 @@ fn agent_ports_are_object_safe_and_keep_only_bound_values_at_the_boundary() {
                 ))
                 .unwrap(),
                 item_ids: Vec::new(),
+                token_count: 0,
                 policy_decision_ids: Vec::new(),
             })
         }
@@ -99,10 +103,16 @@ fn agent_ports_are_object_safe_and_keep_only_bound_values_at_the_boundary() {
             request: AgentSpecialistRequest,
         ) -> Result<AgentSpecialistResponse, PortError> {
             Ok(AgentSpecialistResponse {
+                run_id: request.run_id,
+                task_id: request.task_id,
                 request_id: request.request_id,
                 accepted: false,
                 reason_code: "budget_exhausted".to_owned(),
             })
+        }
+
+        fn persist_audit(&self, _: AgentRequestAudit) -> Result<(), PortError> {
+            Ok(())
         }
     }
 
@@ -119,6 +129,43 @@ fn agent_ports_are_object_safe_and_keep_only_bound_values_at_the_boundary() {
     accepts_request_handler(&store);
 
     let _: AgentRunStatus = AgentRunStatus::Created;
+}
+
+#[test]
+fn request_cancellation_revokes_every_clone_without_exposing_mutable_state() {
+    let cancellation = AgentRequestCancellation::new();
+    let worker_view = cancellation.clone();
+
+    assert!(!worker_view.is_cancelled());
+    cancellation.revoke();
+
+    assert!(worker_view.is_cancelled());
+    assert_eq!(cancellation, worker_view);
+}
+
+#[test]
+fn audit_fence_revocation_is_visible_to_late_committers() {
+    let fence = AgentRequestAuditFence::new();
+    let late_committer = fence.clone();
+
+    assert!(!late_committer.is_revoked());
+    assert!(fence.revoke());
+
+    assert!(late_committer.is_revoked());
+    assert!(!late_committer.try_begin_commit());
+    assert_eq!(fence, late_committer);
+}
+
+#[test]
+fn audit_fence_commit_claim_prevents_late_revocation() {
+    let fence = AgentRequestAuditFence::new();
+    let runtime_view = fence.clone();
+
+    assert!(fence.try_begin_commit());
+    assert!(!runtime_view.revoke());
+    fence.finish_commit();
+
+    assert!(!runtime_view.is_revoked());
 }
 
 fn invalid_input() -> PortError {

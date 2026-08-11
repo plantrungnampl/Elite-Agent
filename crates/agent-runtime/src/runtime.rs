@@ -2,9 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, RecvTimeoutError},
         Arc, Condvar, Mutex,
     },
-    thread::{self, ThreadId},
+    thread::{self, JoinHandle, ThreadId},
     time::Duration,
 };
 
@@ -15,8 +16,10 @@ use local_agent_terminal_agent_protocol::{
     RunCancel, RunExecutionBinding, RunStart, SessionLimits, DEFAULT_MAX_FRAME_BYTES,
 };
 use local_agent_terminal_application::{
-    AgentArtifactStore, AgentMessageArtifact, AgentRunStore, AgentRuntime, Clock, PortError,
-    Retryability, SafeErrorClassification,
+    AgentArtifactStore, AgentContextQueryRequest, AgentContextQueryResponse, AgentMessageArtifact,
+    AgentRequestAudit, AgentRequestAuditDecision, AgentRequestAuditFence, AgentRequestCancellation,
+    AgentRequestHandler, AgentRequestKind, AgentRunStore, AgentRuntime, AgentSpecialistRequest,
+    AgentSpecialistResponse, Clock, PortError, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     AgentCancellationReceipt, AgentClaim, AgentDescriptor, AgentEvidenceRef, AgentRunMessage,
@@ -34,6 +37,8 @@ pub struct ProtocolAgentRuntime {
     store: Arc<dyn AgentRunStore>,
     artifacts: Arc<dyn AgentArtifactStore>,
     clock: Arc<dyn Clock>,
+    request_handler: Arc<dyn AgentRequestHandler>,
+    request_routing_enabled: bool,
     peers: BTreeMap<String, Arc<dyn ProtocolPeer>>,
     descriptors: BTreeMap<String, AgentDescriptor>,
     authoritative_connection_digests: BTreeMap<String, Sha256Digest>,
@@ -52,11 +57,43 @@ struct ActiveRun {
     slot: RunSlot,
     deadline: DateTime<Utc>,
     cancellation_deadline: Option<DateTime<Utc>>,
+    request_gate: Arc<Mutex<()>>,
+    cancellation: AgentRequestCancellation,
 }
 
 struct PendingCleanup {
     request: BoundAgentRunRequest,
     content_artifact_id: Option<ArtifactId>,
+}
+
+#[derive(Default)]
+struct RunRequestState {
+    context_queries: u64,
+    specialist_requests: u64,
+    context_query_ids: BTreeSet<String>,
+    request_ids: BTreeSet<String>,
+}
+
+struct DenyAgentRequestHandler;
+
+impl AgentRequestHandler for DenyAgentRequestHandler {
+    fn query_context(
+        &self,
+        _request: AgentContextQueryRequest,
+    ) -> Result<AgentContextQueryResponse, PortError> {
+        Err(permission_denied())
+    }
+
+    fn request_specialist(
+        &self,
+        _request: AgentSpecialistRequest,
+    ) -> Result<AgentSpecialistResponse, PortError> {
+        Err(permission_denied())
+    }
+
+    fn persist_audit(&self, _audit: AgentRequestAudit) -> Result<(), PortError> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -528,6 +565,34 @@ impl ProtocolAgentRuntime {
         clock: Arc<dyn Clock>,
         agents: Vec<(AgentDescriptor, Sha256Digest, Arc<dyn ProtocolPeer>)>,
     ) -> Result<Self, PortError> {
+        Self::build(
+            store,
+            artifacts,
+            clock,
+            agents,
+            Arc::new(DenyAgentRequestHandler),
+            false,
+        )
+    }
+
+    pub fn new_with_request_handler(
+        store: Arc<dyn AgentRunStore>,
+        artifacts: Arc<dyn AgentArtifactStore>,
+        clock: Arc<dyn Clock>,
+        agents: Vec<(AgentDescriptor, Sha256Digest, Arc<dyn ProtocolPeer>)>,
+        request_handler: Arc<dyn AgentRequestHandler>,
+    ) -> Result<Self, PortError> {
+        Self::build(store, artifacts, clock, agents, request_handler, true)
+    }
+
+    fn build(
+        store: Arc<dyn AgentRunStore>,
+        artifacts: Arc<dyn AgentArtifactStore>,
+        clock: Arc<dyn Clock>,
+        agents: Vec<(AgentDescriptor, Sha256Digest, Arc<dyn ProtocolPeer>)>,
+        request_handler: Arc<dyn AgentRequestHandler>,
+        request_routing_enabled: bool,
+    ) -> Result<Self, PortError> {
         let mut agent_ids = BTreeSet::new();
         let mut connection_ids = BTreeSet::new();
         let mut recovery_digests = BTreeSet::new();
@@ -562,6 +627,8 @@ impl ProtocolAgentRuntime {
             store,
             artifacts,
             clock,
+            request_handler,
+            request_routing_enabled,
             peers,
             descriptors,
             authoritative_connection_digests,
@@ -621,22 +688,36 @@ impl ProtocolAgentRuntime {
                     .cancellation_deadline
                     .is_some_and(|deadline| now.date_time >= deadline)
             {
+                run.cancellation.revoke();
+                let _request_guard = run.request_gate.lock().map_err(|_| internal_failure())?;
+                if !self.is_active(&run.request.run_id)? {
+                    continue;
+                }
+                let deadline_now = self.now()?;
+                if deadline_now.date_time < run.deadline
+                    && run
+                        .cancellation_deadline
+                        .is_none_or(|deadline| deadline_now.date_time < deadline)
+                {
+                    continue;
+                }
                 let _ = run
                     .session
                     .lock()
                     .map_err(|_| internal_failure())?
-                    .check_timeouts(now.date_time);
+                    .check_timeouts(deadline_now.date_time);
                 self.persist_runtime_terminal(
                     &run.request,
                     AgentRunStatus::Terminated,
                     "agent run deadline expired",
-                    now.timestamp,
+                    deadline_now.timestamp,
                 )?;
                 self.active_runs
                     .lock()
                     .map_err(|_| internal_failure())?
                     .remove(run.request.run_id.as_str());
                 run.slot.release();
+                drop(_request_guard);
                 if let Ok(frame) =
                     cancel_frame(&run.request.run_id, &self.request_id(), "deadline", 1)
                 {
@@ -731,6 +812,8 @@ impl ProtocolAgentRuntime {
 
         let deadline = timestamp_date_time(request.run_config.limits.deadline)?;
         let gate = Arc::new(SinkGate::new());
+        let request_gate = Arc::new(Mutex::new(()));
+        let cancellation = AgentRequestCancellation::new();
         let started = self.slots.start_handshake(&slot, || {
             let session = self.session(&request, &peer.descriptor(), now.date_time)?;
             let request_id = self.request_id();
@@ -774,6 +857,8 @@ impl ProtocolAgentRuntime {
                 store: Arc::clone(&self.store),
                 artifacts: Arc::clone(&self.artifacts),
                 clock: Arc::clone(&self.clock),
+                request_handler: Arc::clone(&self.request_handler),
+                request_routing_enabled: self.request_routing_enabled,
                 session: Arc::clone(&session),
                 peer: Arc::clone(&peer),
                 request: request.clone(),
@@ -782,6 +867,9 @@ impl ProtocolAgentRuntime {
                 slot: slot.clone(),
                 gate: Arc::clone(&gate),
                 slots: Arc::clone(&self.slots),
+                request_gate: Arc::clone(&request_gate),
+                cancellation: cancellation.clone(),
+                request_state: Mutex::new(RunRequestState::default()),
                 codec: NdjsonCodec::default(),
             };
             Ok::<_, PortError>((session, request_id, peer.start(run_start, Box::new(sink))))
@@ -862,6 +950,8 @@ impl ProtocolAgentRuntime {
                         slot: slot.clone(),
                         deadline,
                         cancellation_deadline: None,
+                        request_gate,
+                        cancellation,
                     },
                 );
             gate.ready()?;
@@ -895,6 +985,11 @@ impl ProtocolAgentRuntime {
             .get(request.run_id.as_str())
             .cloned()
             .ok_or_else(not_found)?;
+        active.cancellation.revoke();
+        let _request_guard = active.request_gate.lock().map_err(|_| internal_failure())?;
+        if !self.is_active(&request.run_id)? {
+            return Err(not_found());
+        }
         let now = self.now()?;
         let request_id = self.request_id();
         let frame = cancel_frame(
@@ -920,6 +1015,7 @@ impl ProtocolAgentRuntime {
                     i64::try_from(request.deadline_ms).map_err(|_| invalid_input())?,
                 ),
         );
+        drop(_request_guard);
         let acceptance = active
             .peer
             .cancel(RunCancel::try_from(frame).map_err(protocol_port_error)?)
@@ -1205,6 +1301,8 @@ struct RuntimeSink {
     store: Arc<dyn AgentRunStore>,
     artifacts: Arc<dyn AgentArtifactStore>,
     clock: Arc<dyn Clock>,
+    request_handler: Arc<dyn AgentRequestHandler>,
+    request_routing_enabled: bool,
     session: Arc<Mutex<ProtocolSession>>,
     peer: Arc<dyn ProtocolPeer>,
     request: BoundAgentRunRequest,
@@ -1213,6 +1311,9 @@ struct RuntimeSink {
     slot: RunSlot,
     gate: Arc<SinkGate>,
     slots: Arc<ConnectionSlots>,
+    request_gate: Arc<Mutex<()>>,
+    cancellation: AgentRequestCancellation,
+    request_state: Mutex<RunRequestState>,
     codec: NdjsonCodec,
 }
 
@@ -1249,55 +1350,696 @@ impl RuntimeSink {
 
     fn request_frame(&self, frame: ProtocolFrame) -> Result<ProtocolFrame, ProtocolError> {
         self.gate.wait_until_ready()?;
-        let now =
-            runtime_time(self.clock.as_ref()).map_err(|_| ProtocolError::InternalAgentFailure)?;
-        let received = self
-            .session
+        let request_guard = self
+            .request_gate
             .lock()
-            .map_err(|_| ProtocolError::InternalAgentFailure)?
-            .receive(frame.clone(), now.date_time);
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        let value = frame_value(&frame)?;
+        let id = required_string(&value, "/id")?;
+        let request_bytes =
+            serde_json::to_vec(&frame).map_err(|_| ProtocolError::InternalAgentFailure)?;
+        let request_digest = digest_bytes(&request_bytes);
+        let now = match runtime_time(self.clock.as_ref()) {
+            Ok(now) => now,
+            Err(_) => {
+                self.cancellation.revoke();
+                drop(request_guard);
+                self.slots
+                    .poison_connection(self.request.connection.binding_digest.as_str())
+                    .map_err(|_| ProtocolError::InternalAgentFailure)?;
+                return error_response(&id, "internal_error", false)
+                    .map_err(|_| ProtocolError::InternalAgentFailure);
+            }
+        };
+        if let Some(reason) = self.preflight_request(&frame, &id)? {
+            let response = self.request_error(&frame, &id, request_digest, reason);
+            return match response {
+                Ok(response) => Ok(response),
+                Err(error) => {
+                    drop(request_guard);
+                    self.fail_request(&id, error, now)
+                }
+            };
+        }
+
+        let received = match self.session.lock() {
+            Ok(mut session) => session.receive(frame.clone(), now.date_time),
+            Err(_) => {
+                drop(request_guard);
+                return self.fail_request(&id, ProtocolError::InternalAgentFailure, now);
+            }
+        };
         let disposition = match received {
             Ok(InboundDisposition::Request(frame)) => frame,
             Ok(_) => return Err(ProtocolError::InvalidRequest),
             Err(error) => {
-                self.handle_protocol_error(error, now)?;
-                return Err(error);
+                let reason = protocol_request_error_category(error);
+                let response = self.request_error(&frame, &id, request_digest, reason);
+                if error == ProtocolError::OutputLimitExceeded {
+                    let _ = self.handle_protocol_error(error, now);
+                    drop(request_guard);
+                    return response;
+                }
+                drop(request_guard);
+                return match response {
+                    Ok(response) => Ok(response),
+                    Err(audit_error) => self.fail_request(&id, audit_error, now),
+                };
             }
         };
-        let id = required_string(&frame_value(&frame)?, "/id")?;
-        let response = if matches!(disposition, ProtocolFrame::RunCompleteRequest(_)) {
-            let content = terminal_content(&frame)?;
-            let message_id = required_string(&frame_value(&frame)?, "/params/message/messageId")?;
-            let content_artifact_id = self
-                .artifacts
-                .publish_agent_message(&AgentMessageArtifact {
-                    task_id: self.request.task_id.clone(),
-                    run_id: self.request.run_id.clone(),
-                    message_id,
-                    content: content.into_bytes(),
-                })
-                .map_err(|_| ProtocolError::InternalAgentFailure)?;
-            let terminal =
-                terminal_from_frame(&frame, &self.request, content_artifact_id, now.timestamp)?;
-            self.store
-                .persist_terminal(&terminal)
-                .map_err(|_| ProtocolError::InternalAgentFailure)?;
-            self.active_runs
-                .lock()
-                .map_err(|_| ProtocolError::InternalAgentFailure)?
-                .remove(self.request.run_id.as_str());
-            self.slot.release();
-            success_response(&id, json!({ "accepted": true }))
-                .map_err(|_| ProtocolError::InternalAgentFailure)?
-        } else {
-            error_response(&id, "policy_denied", false)
-                .map_err(|_| ProtocolError::InternalAgentFailure)?
+        let routed = match disposition {
+            ProtocolFrame::RunCompleteRequest(_) => {
+                let content = terminal_content(&frame)?;
+                let message_id =
+                    required_string(&frame_value(&frame)?, "/params/message/messageId")?;
+                let content_artifact_id = self
+                    .artifacts
+                    .publish_agent_message(&AgentMessageArtifact {
+                        task_id: self.request.task_id.clone(),
+                        run_id: self.request.run_id.clone(),
+                        message_id,
+                        content: content.into_bytes(),
+                    })
+                    .map_err(|_| ProtocolError::InternalAgentFailure)?;
+                let terminal =
+                    terminal_from_frame(&frame, &self.request, content_artifact_id, now.timestamp)?;
+                self.store
+                    .persist_terminal(&terminal)
+                    .map_err(|_| ProtocolError::InternalAgentFailure)?;
+                self.active_runs
+                    .lock()
+                    .map_err(|_| ProtocolError::InternalAgentFailure)?
+                    .remove(self.request.run_id.as_str());
+                self.slot.release();
+                success_response(&id, json!({ "accepted": true }))
+                    .map_err(|_| ProtocolError::InternalAgentFailure)
+            }
+            ProtocolFrame::ContextQueryRequest(_) => {
+                self.route_context_query(&frame, &id, request_digest, now.timestamp)
+            }
+            ProtocolFrame::SpecialistRequest(_) => {
+                self.route_specialist_request(&frame, &id, request_digest, now.timestamp)
+            }
+            ProtocolFrame::ToolRequest(_) => error_response(&id, "policy_denied", false)
+                .map_err(|_| ProtocolError::InternalAgentFailure),
+            _ => return Err(ProtocolError::InvalidRequest),
         };
-        self.session
+        let response = match routed {
+            Ok(response) => response,
+            Err(error) => {
+                drop(request_guard);
+                return self.fail_request(&id, error, now);
+            }
+        };
+        let response_time = match runtime_time(self.clock.as_ref()) {
+            Ok(response_time) => response_time,
+            Err(_) => {
+                drop(request_guard);
+                return self.fail_request(&id, ProtocolError::InternalAgentFailure, now);
+            }
+        };
+        let outbound = match self.session.lock() {
+            Ok(mut session) => session.outbound(response.clone(), response_time.date_time),
+            Err(_) => {
+                drop(request_guard);
+                return self.fail_request(&id, ProtocolError::InternalAgentFailure, response_time);
+            }
+        };
+        if let Err(error) = outbound {
+            drop(request_guard);
+            return self.fail_request(&id, error, response_time);
+        }
+        Ok(response)
+    }
+
+    fn preflight_request(
+        &self,
+        frame: &ProtocolFrame,
+        request_id: &str,
+    ) -> Result<Option<&'static str>, ProtocolError> {
+        if !matches!(
+            frame,
+            ProtocolFrame::RunCompleteRequest(_)
+                | ProtocolFrame::ContextQueryRequest(_)
+                | ProtocolFrame::ToolRequest(_)
+                | ProtocolFrame::SpecialistRequest(_)
+        ) {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        if !request_id.starts_with("agent:") {
+            return Ok(Some("invalid_request_origin"));
+        }
+        let duplicate = !self
+            .request_state
             .lock()
             .map_err(|_| ProtocolError::InternalAgentFailure)?
-            .outbound(response.clone(), now.date_time)?;
+            .request_ids
+            .insert(request_id.to_owned());
+        if duplicate {
+            return Ok(Some("conflicting_duplicate"));
+        }
+        let value = frame_value(frame)?;
+        if required_string(&value, "/params/runId")? != self.request.run_id.as_str() {
+            return Ok(Some("request_ownership_mismatch"));
+        }
+        if !self
+            .active_runs
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .contains_key(self.request.run_id.as_str())
+        {
+            return Ok(Some("run_not_active"));
+        }
+        let capabilities = self.peer.descriptor().capabilities;
+        let negotiated = match frame {
+            ProtocolFrame::ContextQueryRequest(_) => capabilities.context_query,
+            ProtocolFrame::ToolRequest(_) => capabilities.tool_requests,
+            ProtocolFrame::SpecialistRequest(_) => capabilities.specialist_requests,
+            ProtocolFrame::RunCompleteRequest(_) => true,
+            _ => false,
+        };
+        if !negotiated {
+            return Ok(Some("capability_not_negotiated"));
+        }
+        Ok(None)
+    }
+
+    fn request_error(
+        &self,
+        frame: &ProtocolFrame,
+        request_id: &str,
+        request_digest: Sha256Digest,
+        reason: &str,
+    ) -> Result<ProtocolFrame, ProtocolError> {
+        match frame {
+            ProtocolFrame::ContextQueryRequest(_) => self.audited_error(
+                request_id,
+                AgentRequestKind::ContextQuery,
+                request_digest,
+                reason,
+            ),
+            ProtocolFrame::SpecialistRequest(_) => self.audited_error(
+                request_id,
+                AgentRequestKind::SpecialistRequest,
+                request_digest,
+                reason,
+            ),
+            ProtocolFrame::RunCompleteRequest(_) | ProtocolFrame::ToolRequest(_) => {
+                error_response(request_id, reason, false)
+                    .map_err(|_| ProtocolError::InternalAgentFailure)
+            }
+            _ => Err(ProtocolError::InvalidRequest),
+        }
+    }
+
+    fn fail_request(
+        &self,
+        request_id: &str,
+        error: ProtocolError,
+        now: RuntimeTime,
+    ) -> Result<ProtocolFrame, ProtocolError> {
+        let response = error_response(request_id, "internal_error", false)
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        let _ = self.handle_protocol_error(error, now);
         Ok(response)
+    }
+
+    fn route_context_query(
+        &self,
+        frame: &ProtocolFrame,
+        request_id: &str,
+        request_digest: Sha256Digest,
+        requested_at: Timestamp,
+    ) -> Result<ProtocolFrame, ProtocolError> {
+        let value = frame_value(frame)?;
+        let run_id = required_string(&value, "/params/runId")?;
+        if run_id != self.request.run_id.as_str() {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::ContextQuery,
+                request_digest,
+                "request_ownership_mismatch",
+            );
+        }
+        if !self.request_routing_enabled {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::ContextQuery,
+                request_digest,
+                "policy_denied",
+            );
+        }
+        if requested_at >= self.request.run_config.limits.deadline {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::ContextQuery,
+                request_digest,
+                "request_deadline_exceeded",
+            );
+        }
+        let query_id = required_string(&value, "/params/queryId")?;
+        let budget_error = {
+            let mut state = self
+                .request_state
+                .lock()
+                .map_err(|_| ProtocolError::InternalAgentFailure)?;
+            if state.context_query_ids.contains(&query_id) {
+                Some("duplicate_query_id")
+            } else {
+                let next = state.context_queries.checked_add(1);
+                if next
+                    .is_none_or(|count| count > self.request.run_config.limits.max_context_queries)
+                {
+                    Some("request_limit_exceeded")
+                } else {
+                    state.context_queries = next.expect("checked context request count");
+                    state.context_query_ids.insert(query_id.clone());
+                    None
+                }
+            }
+        };
+        if let Some(reason) = budget_error {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::ContextQuery,
+                request_digest,
+                reason,
+            );
+        }
+        let max_tokens = required_u64(&value, "/params/maxTokens")?;
+        if max_tokens > self.peer.descriptor().capabilities.max_context_tokens {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::ContextQuery,
+                request_digest,
+                "context_token_limit_exceeded",
+            );
+        }
+        let max_items = u32::try_from(required_u64(&value, "/params/maxItems")?)
+            .map_err(|_| ProtocolError::InvalidRequest)?;
+        let request = AgentContextQueryRequest {
+            run_id: self.request.run_id.clone(),
+            task_id: self.request.task_id.clone(),
+            connection_id: self.request.connection.connection_id.clone(),
+            connection_binding_digest: self.request.connection.binding_digest.clone(),
+            phase: self.request.phase.clone(),
+            query_id: query_id.clone(),
+            query: required_string(&value, "/params/query")?,
+            scopes: required_string_array(&value, "/params/scopes")?,
+            max_items,
+            max_tokens,
+            deadline: self.request.run_config.limits.deadline,
+            cancellation: self.cancellation.clone(),
+        };
+        if let Some(reason) = self.request_activity_error()? {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::ContextQuery,
+                request_digest,
+                reason,
+            );
+        }
+        let handler = Arc::clone(&self.request_handler);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name(format!("agent-context-{}", self.request.run_id.as_str()))
+            .spawn(move || {
+                let _ = result_sender.send(handler.query_context(request));
+            })
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        let response = match self.wait_for_handler(result_receiver, worker) {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                return self.audited_error(
+                    request_id,
+                    AgentRequestKind::ContextQuery,
+                    request_digest,
+                    handler_error_category(&error),
+                );
+            }
+            Err(HandlerWaitError::Rejected(reason)) => {
+                return self.audited_error(
+                    request_id,
+                    AgentRequestKind::ContextQuery,
+                    request_digest,
+                    reason,
+                );
+            }
+            Err(HandlerWaitError::Internal) => {
+                return Err(ProtocolError::InternalAgentFailure);
+            }
+        };
+        if !valid_context_response(&response, &self.request, &query_id, max_items, max_tokens) {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::ContextQuery,
+                request_digest,
+                "invalid_handler_response",
+            );
+        }
+        if let Some(reason) = self.request_activity_error()? {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::ContextQuery,
+                request_digest,
+                reason,
+            );
+        }
+        let response_frame = success_response(
+            request_id,
+            json!({
+                "supplementId": response.supplement_id,
+                "contentDigest": response.content_digest.as_str(),
+                "items": response.item_ids,
+                "provenance": [],
+                "redactions": [],
+                "policyDecisionIds": response.policy_decision_ids,
+            }),
+        )
+        .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        self.persist_request_audit(
+            request_id,
+            AgentRequestKind::ContextQuery,
+            request_digest,
+            AgentRequestAuditDecision::Accepted,
+            None,
+        )?;
+        Ok(response_frame)
+    }
+
+    fn route_specialist_request(
+        &self,
+        frame: &ProtocolFrame,
+        request_id: &str,
+        request_digest: Sha256Digest,
+        requested_at: Timestamp,
+    ) -> Result<ProtocolFrame, ProtocolError> {
+        let value = frame_value(frame)?;
+        let run_id = required_string(&value, "/params/runId")?;
+        if run_id != self.request.run_id.as_str() {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::SpecialistRequest,
+                request_digest,
+                "request_ownership_mismatch",
+            );
+        }
+        if !self.request_routing_enabled {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::SpecialistRequest,
+                request_digest,
+                "policy_denied",
+            );
+        }
+        if requested_at >= self.request.run_config.limits.deadline {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::SpecialistRequest,
+                request_digest,
+                "request_deadline_exceeded",
+            );
+        }
+        let over_budget = {
+            let mut state = self
+                .request_state
+                .lock()
+                .map_err(|_| ProtocolError::InternalAgentFailure)?;
+            let next = state.specialist_requests.checked_add(1);
+            if next
+                .is_none_or(|count| count > self.request.run_config.limits.max_specialist_requests)
+            {
+                true
+            } else {
+                state.specialist_requests = next.expect("checked specialist request count");
+                false
+            }
+        };
+        if over_budget {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::SpecialistRequest,
+                request_digest,
+                "request_limit_exceeded",
+            );
+        }
+        let required_context_ids = required_string_array(&value, "/params/requiredContext")?;
+        if required_context_ids.is_empty() || has_duplicate_strings(&required_context_ids) {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::SpecialistRequest,
+                request_digest,
+                if required_context_ids.is_empty() {
+                    "missing_required_context"
+                } else {
+                    "duplicate_context_reference"
+                },
+            );
+        }
+        let request = AgentSpecialistRequest {
+            run_id: self.request.run_id.clone(),
+            task_id: self.request.task_id.clone(),
+            connection_id: self.request.connection.connection_id.clone(),
+            connection_binding_digest: self.request.connection.binding_digest.clone(),
+            phase: self.request.phase.clone(),
+            request_id: request_id.to_owned(),
+            capability: required_string(&value, "/params/capability")?,
+            reason: required_string(&value, "/params/reason")?,
+            required_context_ids,
+            max_tokens: self.request.run_config.limits.max_output_tokens,
+            deadline: self.request.run_config.limits.deadline,
+            cancellation: self.cancellation.clone(),
+        };
+        if let Some(reason) = self.request_activity_error()? {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::SpecialistRequest,
+                request_digest,
+                reason,
+            );
+        }
+        let handler = Arc::clone(&self.request_handler);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name(format!("agent-specialist-{}", self.request.run_id.as_str()))
+            .spawn(move || {
+                let _ = result_sender.send(handler.request_specialist(request));
+            })
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        let response = match self.wait_for_handler(result_receiver, worker) {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                return self.audited_error(
+                    request_id,
+                    AgentRequestKind::SpecialistRequest,
+                    request_digest,
+                    handler_error_category(&error),
+                );
+            }
+            Err(HandlerWaitError::Rejected(reason)) => {
+                return self.audited_error(
+                    request_id,
+                    AgentRequestKind::SpecialistRequest,
+                    request_digest,
+                    reason,
+                );
+            }
+            Err(HandlerWaitError::Internal) => {
+                return Err(ProtocolError::InternalAgentFailure);
+            }
+        };
+        if response.run_id != self.request.run_id
+            || response.task_id != self.request.task_id
+            || response.request_id != request_id
+            || !valid_specialist_reason(response.accepted, &response.reason_code)
+        {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::SpecialistRequest,
+                request_digest,
+                "invalid_handler_response",
+            );
+        }
+        if let Some(reason) = self.request_activity_error()? {
+            return self.audited_error(
+                request_id,
+                AgentRequestKind::SpecialistRequest,
+                request_digest,
+                reason,
+            );
+        }
+        let decision = if response.accepted {
+            AgentRequestAuditDecision::Accepted
+        } else {
+            AgentRequestAuditDecision::Rejected
+        };
+        let audit_reason = (!response.accepted).then(|| response.reason_code.clone());
+        let response_frame = success_response(
+            request_id,
+            json!({
+                "requestId": response.request_id,
+                "accepted": response.accepted,
+                "reasonCode": response.reason_code,
+            }),
+        )
+        .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        self.persist_request_audit(
+            request_id,
+            AgentRequestKind::SpecialistRequest,
+            request_digest,
+            decision,
+            audit_reason,
+        )?;
+        Ok(response_frame)
+    }
+
+    fn audited_error(
+        &self,
+        request_id: &str,
+        kind: AgentRequestKind,
+        request_digest: Sha256Digest,
+        reason_code: &str,
+    ) -> Result<ProtocolFrame, ProtocolError> {
+        self.persist_request_audit(
+            request_id,
+            kind,
+            request_digest,
+            AgentRequestAuditDecision::Rejected,
+            Some(reason_code.to_owned()),
+        )?;
+        error_response(request_id, reason_code, false)
+            .map_err(|_| ProtocolError::InternalAgentFailure)
+    }
+
+    fn persist_request_audit(
+        &self,
+        request_id: &str,
+        kind: AgentRequestKind,
+        request_digest: Sha256Digest,
+        decision: AgentRequestAuditDecision,
+        reason_code: Option<String>,
+    ) -> Result<(), ProtocolError> {
+        let audit = AgentRequestAudit {
+            run_id: self.request.run_id.clone(),
+            task_id: self.request.task_id.clone(),
+            connection_id: self.request.connection.connection_id.clone(),
+            connection_binding_digest: self.request.connection.binding_digest.clone(),
+            request_id: request_id.to_owned(),
+            kind,
+            request_digest,
+            decision,
+            reason_code,
+            deadline: self.request.run_config.limits.deadline,
+            fence: AgentRequestAuditFence::new(),
+        };
+        let fence = audit.fence.clone();
+        let handler = Arc::clone(&self.request_handler);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name(format!("agent-audit-{}", self.request.run_id.as_str()))
+            .spawn(move || {
+                let _ = result_sender.send(handler.persist_audit(audit));
+            })
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        self.wait_for_audit(result_receiver, worker, fence)
+    }
+
+    fn request_activity_error(&self) -> Result<Option<&'static str>, ProtocolError> {
+        let now =
+            runtime_time(self.clock.as_ref()).map_err(|_| ProtocolError::InternalAgentFailure)?;
+        if now.timestamp >= self.request.run_config.limits.deadline {
+            self.cancellation.revoke();
+            return Ok(Some("request_deadline_exceeded"));
+        }
+        if self.cancellation.is_cancelled() {
+            return Ok(Some("request_cancelled"));
+        }
+        if !self
+            .active_runs
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .contains_key(self.request.run_id.as_str())
+        {
+            return Ok(Some("run_not_active"));
+        }
+        Ok(None)
+    }
+
+    fn wait_for_handler<T>(
+        &self,
+        receiver: mpsc::Receiver<Result<T, PortError>>,
+        worker: JoinHandle<()>,
+    ) -> Result<Result<T, PortError>, HandlerWaitError> {
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(result) => {
+                    worker.join().map_err(|_| HandlerWaitError::Internal)?;
+                    return Ok(result);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return match worker.join() {
+                        Ok(()) => Err(HandlerWaitError::Rejected("handler_failed")),
+                        Err(_) => Err(HandlerWaitError::Internal),
+                    };
+                }
+            }
+            let now = match runtime_time(self.clock.as_ref()) {
+                Ok(now) => now,
+                Err(_) => {
+                    self.cancellation.revoke();
+                    // Handler methods are a side-effect-free preparation boundary. A revoked late
+                    // worker may finish computation, but its result cannot be committed or exposed.
+                    drop(worker);
+                    return Err(HandlerWaitError::Internal);
+                }
+            };
+            if now.timestamp >= self.request.run_config.limits.deadline {
+                self.cancellation.revoke();
+                // See the side-effect-free handler contract on `AgentRequestHandler`.
+                drop(worker);
+                return Err(HandlerWaitError::Rejected("request_deadline_exceeded"));
+            }
+            if self.cancellation.is_cancelled() {
+                // See the side-effect-free handler contract on `AgentRequestHandler`.
+                drop(worker);
+                return Err(HandlerWaitError::Rejected("request_cancelled"));
+            }
+        }
+    }
+
+    fn wait_for_audit(
+        &self,
+        receiver: mpsc::Receiver<Result<(), PortError>>,
+        worker: JoinHandle<()>,
+        fence: AgentRequestAuditFence,
+    ) -> Result<(), ProtocolError> {
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(result) => {
+                    worker
+                        .join()
+                        .map_err(|_| ProtocolError::InternalAgentFailure)?;
+                    return result.map_err(|_| ProtocolError::InternalAgentFailure);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    let _ = worker.join();
+                    return Err(ProtocolError::InternalAgentFailure);
+                }
+            }
+            let expired = runtime_time(self.clock.as_ref())
+                .map(|now| now.timestamp >= self.request.run_config.limits.deadline)
+                .unwrap_or(true);
+            let should_abort = expired || self.cancellation.is_cancelled() || fence.is_revoked();
+            // If revocation loses, commit already won the fence. Preserve one coherent outcome
+            // by waiting for that transaction rather than publishing a conflicting response.
+            if should_abort && fence.revoke() {
+                // A late worker may finish preparation, but cannot commit after revocation wins.
+                drop(worker);
+                return Err(ProtocolError::InternalAgentFailure);
+            }
+        }
     }
 
     fn handle_protocol_error(
@@ -1326,10 +2068,6 @@ impl RuntimeSink {
             let _ = self.peer.cancel(cancel);
             return Ok(());
         }
-        self.session
-            .lock()
-            .map_err(|_| ProtocolError::InternalAgentFailure)?
-            .connection_lost();
         self.interrupt(now)
     }
 
@@ -1359,6 +2097,32 @@ fn interrupt_connection_state(
     expected_poison: Option<&ConnectionPoison>,
 ) -> Result<Vec<RunId>, PortError> {
     let cleanup = |cleanup: &ConnectionCleanup| {
+        let request_gates = active_runs
+            .lock()
+            .map_err(|_| internal_failure())?
+            .values()
+            .filter(|run| run.request.connection.binding_digest.as_str() == digest)
+            .map(|run| {
+                run.cancellation.revoke();
+                Arc::clone(&run.request_gate)
+            })
+            .collect::<Vec<_>>();
+        let _request_guards = request_gates
+            .iter()
+            .map(|gate| gate.lock().map_err(|_| internal_failure()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let session = sessions
+            .lock()
+            .map_err(|_| internal_failure())?
+            .get(digest)
+            .cloned();
+        let mut session_guard = session
+            .as_ref()
+            .map(|session| session.lock().map_err(|_| internal_failure()))
+            .transpose()?;
+        if let Some(session) = session_guard.as_mut() {
+            session.connection_lost();
+        }
         let interrupted = store.interrupt_connection(digest, at)?;
         active_runs
             .lock()
@@ -1412,10 +2176,6 @@ impl PeerEventSink for RuntimeSink {
                 return Err(ProtocolError::InternalAgentFailure);
             }
         };
-        self.session
-            .lock()
-            .map_err(|_| ProtocolError::InternalAgentFailure)?
-            .connection_lost();
         self.interrupt(now)
     }
 }
@@ -1425,6 +2185,11 @@ struct RuntimeTime {
     text: String,
     date_time: DateTime<Utc>,
     timestamp: Timestamp,
+}
+
+enum HandlerWaitError {
+    Rejected(&'static str),
+    Internal,
 }
 
 fn runtime_time(clock: &dyn Clock) -> Result<RuntimeTime, PortError> {
@@ -1483,6 +2248,17 @@ fn validate_request_peer(
         return Err(invalid_input());
     }
     Ok(())
+}
+
+fn protocol_request_error_category(error: ProtocolError) -> &'static str {
+    match error {
+        ProtocolError::OutputLimitExceeded => "output_limit_exceeded",
+        ProtocolError::Timeout => "request_deadline_exceeded",
+        ProtocolError::PolicyDenied => "policy_denied",
+        ProtocolError::ApprovalRequired => "approval_required",
+        ProtocolError::StaleFencingToken => "stale_fencing_token",
+        _ => "invalid_request",
+    }
 }
 
 fn trust_tier(value: TrustTier) -> ProtocolTrustTier {
@@ -1872,6 +2648,91 @@ fn required_string(value: &Value, pointer: &str) -> Result<String, ProtocolError
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or(ProtocolError::InvalidRequest)
+}
+
+fn required_u64(value: &Value, pointer: &str) -> Result<u64, ProtocolError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .ok_or(ProtocolError::InvalidRequest)
+}
+
+fn required_string_array(value: &Value, pointer: &str) -> Result<Vec<String>, ProtocolError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .ok_or(ProtocolError::InvalidRequest)?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .ok_or(ProtocolError::InvalidRequest)
+        })
+        .collect()
+}
+
+fn has_duplicate_strings(values: &[String]) -> bool {
+    let unique = values.iter().collect::<BTreeSet<_>>();
+    unique.len() != values.len()
+}
+
+fn valid_context_response(
+    response: &AgentContextQueryResponse,
+    request: &BoundAgentRunRequest,
+    query_id: &str,
+    max_items: u32,
+    max_tokens: u64,
+) -> bool {
+    response.run_id == request.run_id
+        && response.task_id == request.task_id
+        && response.query_id == query_id
+        && valid_opaque_reference(&response.supplement_id)
+        && response.token_count <= max_tokens
+        && u32::try_from(response.item_ids.len()).is_ok_and(|count| count <= max_items)
+        && response
+            .item_ids
+            .iter()
+            .all(|item| valid_opaque_reference(item))
+        && response
+            .policy_decision_ids
+            .iter()
+            .all(|decision| valid_opaque_reference(decision))
+        && !has_duplicate_strings(&response.item_ids)
+        && !has_duplicate_strings(&response.policy_decision_ids)
+}
+
+fn valid_opaque_reference(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn valid_specialist_reason(accepted: bool, reason: &str) -> bool {
+    if accepted {
+        reason == "specialist_approved"
+    } else {
+        matches!(
+            reason,
+            "budget_exhausted"
+                | "capability_unavailable"
+                | "handler_rejected"
+                | "policy_denied"
+                | "request_cancelled"
+                | "request_deadline_exceeded"
+                | "request_limit_exceeded"
+                | "unrequested_context"
+        )
+    }
+}
+
+fn handler_error_category(error: &PortError) -> &'static str {
+    if error.safe_classification() == SafeErrorClassification::PermissionDenied {
+        "policy_denied"
+    } else {
+        "handler_failed"
+    }
 }
 
 fn required_object_string(

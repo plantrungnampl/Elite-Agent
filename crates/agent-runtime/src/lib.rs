@@ -3,7 +3,9 @@
 mod fakes;
 mod runtime;
 
-pub use fakes::{MaliciousScript, Script, ScriptLog, ScriptedPeer, ScriptedPeerFactory};
+pub use fakes::{
+    MaliciousScript, RequestScript, Script, ScriptLog, ScriptedPeer, ScriptedPeerFactory,
+};
 pub use local_agent_terminal_agent_protocol::{
     ConnectionBinding, PeerDescriptor, ProtocolCapabilities, ProtocolPeer, ProtocolTrustTier,
 };
