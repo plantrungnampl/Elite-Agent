@@ -21,12 +21,13 @@ use local_agent_terminal_domain::{
     ActorId, AgentCancellationReceipt, AgentDescriptor, AgentFamilyKey, AgentRunLimits,
     AgentRunReceipt, ArtifactId, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
     BoundGenerationParameters, BoundRunConfig, CancelAgentRun, ClaimVerification, Condition,
-    DecisionApproach, DecisionPackage, DeliberationLimits, Dissent, EvidenceCitation,
-    EvidenceFreshness, FencingToken, FinalObjection, FinalObjectionSet, GitObjectId,
-    GuardEvaluations, GuardName, IndependentProposal, IndependentQuorum, MaterialClaim,
-    ObjectionSeverity, OperationState, Phase, ProjectId, RejectedApproach, ReviewEdge, ReviewPlan,
-    RunId, Sequence, Sha256Digest, SourceIdentity, TaskId, Timestamp, TrustTier,
-    VerificationMethod, WorkflowEvent, WorkflowState, WorkspaceFingerprint, WorkspaceVersion,
+    DecisionApproach, DecisionPackage, DeliberationLimits, DeliberationTaskBudget, Dissent,
+    EvidenceCitation, EvidenceFreshness, FencingToken, FinalObjection, FinalObjectionSet,
+    GitObjectId, GuardEvaluations, GuardName, IndependentProposal, IndependentQuorum,
+    MaterialClaim, ObjectionSeverity, OperationState, Phase, ProjectId, RejectedApproach,
+    ReviewEdge, ReviewPlan, RunId, Sequence, Sha256Digest, SourceIdentity, TaskId, Timestamp,
+    TrustTier, VerificationMethod, WorkflowEvent, WorkflowState, WorkspaceFingerprint,
+    WorkspaceVersion,
 };
 use local_agent_terminal_orchestration::{
     normative_preapproval_transitions, select_independent_agents, AgentEligibility,
@@ -157,21 +158,74 @@ fn proposal_dispatch_plan_requires_exact_two_heterogeneous_authorities() {
     let first = DeliberationDispatchBinding::new(
         bound_run_for("agent-a", "run-a"),
         dispatch_assignment("agent-a", "run-a", "family-a"),
+        100,
     )
     .unwrap();
     let duplicate_agent = DeliberationDispatchBinding::new(
         bound_run_for("agent-a", "run-b"),
         dispatch_assignment("agent-a", "run-b", "family-b"),
+        100,
     )
     .unwrap();
     let duplicate_family = DeliberationDispatchBinding::new(
         bound_run_for("agent-b", "run-b"),
         dispatch_assignment("agent-b", "run-b", "family-a"),
+        100,
     )
     .unwrap();
 
-    assert!(DeliberationProposalDispatchPlan::new(first.clone(), duplicate_agent).is_err());
-    assert!(DeliberationProposalDispatchPlan::new(first, duplicate_family).is_err());
+    assert!(
+        DeliberationProposalDispatchPlan::new(first.clone(), duplicate_agent, task_budget())
+            .is_err()
+    );
+    assert!(DeliberationProposalDispatchPlan::new(first, duplicate_family, task_budget()).is_err());
+}
+
+#[test]
+fn dispatch_reserves_declared_tokens_cost_and_deadline_before_runtime() {
+    let first = DeliberationDispatchBinding::new(
+        bound_run_for("agent-a", "run-a"),
+        dispatch_assignment("agent-a", "run-a", "family-a"),
+        100,
+    )
+    .unwrap();
+    let second = DeliberationDispatchBinding::new(
+        bound_run_for("agent-b", "run-b"),
+        dispatch_assignment("agent-b", "run-b", "family-b"),
+        100,
+    )
+    .unwrap();
+    let plan = DeliberationProposalDispatchPlan::new(first.clone(), second.clone(), task_budget())
+        .unwrap();
+    assert_eq!(plan.budget_reservation().unwrap().token_count(), 16_000);
+    assert_eq!(plan.budget_reservation().unwrap().cost_microunits(), 200);
+
+    let token_exhausted = DeliberationTaskBudget::new(
+        4,
+        15_999,
+        1_000,
+        Timestamp::from_unix_seconds(2_000_000_000),
+    )
+    .unwrap();
+    assert!(
+        DeliberationProposalDispatchPlan::new(first.clone(), second.clone(), token_exhausted)
+            .is_err()
+    );
+    let cost_exhausted =
+        DeliberationTaskBudget::new(4, 20_000, 199, Timestamp::from_unix_seconds(2_000_000_000))
+            .unwrap();
+    assert!(
+        DeliberationProposalDispatchPlan::new(first.clone(), second.clone(), cost_exhausted)
+            .is_err()
+    );
+    let deadline_exhausted = DeliberationTaskBudget::new(
+        4,
+        20_000,
+        1_000,
+        Timestamp::from_unix_seconds(1_700_000_000),
+    )
+    .unwrap();
+    assert!(DeliberationProposalDispatchPlan::new(first, second, deadline_exhausted).is_err());
 }
 
 #[test]
@@ -179,6 +233,7 @@ fn later_phase_dispatch_accepts_one_bounded_authority_and_rejects_over_budget_or
     let authorized = DeliberationDispatchBinding::new(
         bound_run_for("agent-a", "run-a"),
         dispatch_assignment("agent-a", "run-a", "family-a"),
+        100,
     )
     .unwrap();
     let limits = DeliberationLimits::new(1, 2, 8, 2).unwrap();
@@ -190,6 +245,7 @@ fn later_phase_dispatch_accepts_one_bounded_authority_and_rejects_over_budget_or
             dispatch_assignment("agent-b", "run-b", "family-a"),
         ],
         limits,
+        task_budget(),
     )
     .unwrap();
     let dispatch_set =
@@ -202,6 +258,7 @@ fn later_phase_dispatch_accepts_one_bounded_authority_and_rejects_over_budget_or
             DeliberationDispatchBinding::new(
                 bound_run_for("agent-b", "run-b"),
                 dispatch_assignment("agent-b", "run-b", "family-a"),
+                100,
             )
             .unwrap(),
         ],
@@ -211,6 +268,7 @@ fn later_phase_dispatch_accepts_one_bounded_authority_and_rejects_over_budget_or
     let unauthorized = DeliberationDispatchBinding::new(
         bound_run_for("agent-a", "run-a"),
         dispatch_assignment("agent-a", "run-a", "family-a"),
+        100,
     )
     .unwrap();
     let other_authority = DeliberationPhaseDispatchAuthority::new(
@@ -218,6 +276,7 @@ fn later_phase_dispatch_accepts_one_bounded_authority_and_rejects_over_budget_or
         Phase::CrossReview,
         vec![dispatch_assignment("agent-b", "run-b", "family-b")],
         limits,
+        task_budget(),
     )
     .unwrap();
     assert!(DeliberationPhaseDispatchSet::new(vec![unauthorized], other_authority).is_err());
@@ -251,6 +310,7 @@ fn one_coordinator_path_guards_every_dispatching_preplan_phase() {
                     vec![DeliberationDispatchBinding::new(
                         bound_run_for("agent-a", "run-a"),
                         dispatch_assignment("agent-a", "run-a", "family-a"),
+                        100,
                     )
                     .unwrap()],
                     DeliberationPhaseDispatchAuthority::new(
@@ -258,6 +318,7 @@ fn one_coordinator_path_guards_every_dispatching_preplan_phase() {
                         phase,
                         vec![dispatch_assignment("agent-a", "run-a", "family-a")],
                         DeliberationLimits::new(1, 2, 8, 2).unwrap(),
+                        task_budget(),
                     )
                     .unwrap(),
                 )
@@ -359,13 +420,16 @@ fn coordinator_rejects_write_capability_and_nonzero_tool_budget_before_durable_w
         DeliberationDispatchBinding::new(
             request,
             dispatch_assignment("agent-a", "run-a", "family-a"),
+            100,
         )
         .unwrap(),
         DeliberationDispatchBinding::new(
             bound_run_for("agent-b", "run-b"),
             dispatch_assignment("agent-b", "run-b", "family-b"),
+            100,
         )
         .unwrap(),
+        task_budget(),
     )
     .unwrap();
 
@@ -911,13 +975,16 @@ fn proposal_dispatch_plan() -> DeliberationProposalDispatchPlan {
         DeliberationDispatchBinding::new(
             bound_run_for("agent-a", "run-a"),
             dispatch_assignment("agent-a", "run-a", "family-a"),
+            100,
         )
         .unwrap(),
         DeliberationDispatchBinding::new(
             bound_run_for("agent-b", "run-b"),
             dispatch_assignment("agent-b", "run-b", "family-b"),
+            100,
         )
         .unwrap(),
+        task_budget(),
     )
     .unwrap()
 }
@@ -928,6 +995,16 @@ fn dispatch_assignment(agent: &str, run: &str, family_name: &str) -> Deliberatio
         agent,
         family(family_name),
         ActorId::new(agent).unwrap(),
+    )
+    .unwrap()
+}
+
+fn task_budget() -> DeliberationTaskBudget {
+    DeliberationTaskBudget::new(
+        64,
+        1_000_000,
+        1_000_000_000_000,
+        Timestamp::from_unix_seconds(2_000_000_000),
     )
     .unwrap()
 }
@@ -1252,6 +1329,7 @@ fn deliberation_context(
         task(),
         version,
         deliberation_state(phase, version),
+        task_budget(),
         ActorId::new("core").unwrap(),
         artifact,
         local_agent_terminal_domain::EventId::new(event_id).unwrap(),

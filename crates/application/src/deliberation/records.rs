@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use local_agent_terminal_domain::{
     reduce, ActorId, AgentFamilyKey, AgentRunSnapshot, ArtifactId, BoundAgentRunRequest,
-    DecisionPackage, DeliberationLimits, EventId, FinalObjectionSet, GuardEvaluations, GuardName,
-    IndependentProposal, IndependentQuorum, MaterialClaim, ObjectionSeverity, Phase, ReviewPlan,
-    RunId, Sha256Digest, SpecialistRequest, StreamId, TaskId, WorkflowEvent, WorkflowState,
-    WorkspaceFingerprint,
+    DecisionPackage, DeliberationLimits, DeliberationTaskBudget, EventId, FinalObjectionSet,
+    GuardEvaluations, GuardName, IndependentProposal, IndependentQuorum, MaterialClaim,
+    ObjectionSeverity, Phase, ReviewPlan, RunId, Sha256Digest, SpecialistRequest, StreamId, TaskId,
+    WorkflowEvent, WorkflowState, WorkspaceFingerprint,
 };
 
 use crate::{
@@ -22,6 +22,7 @@ pub struct DeliberationCommandContext {
     task_id: TaskId,
     expected_task_version: u64,
     expected_task_state: WorkflowState,
+    task_budget: DeliberationTaskBudget,
     actor_id: ActorId,
     record_artifact: DeliberationArtifactRef,
     event_id: EventId,
@@ -35,6 +36,7 @@ impl DeliberationCommandContext {
         task_id: TaskId,
         expected_task_version: u64,
         expected_task_state: WorkflowState,
+        task_budget: DeliberationTaskBudget,
         actor_id: ActorId,
         record_artifact: DeliberationArtifactRef,
         event_id: EventId,
@@ -45,6 +47,7 @@ impl DeliberationCommandContext {
             task_id,
             expected_task_version,
             expected_task_state,
+            task_budget,
             actor_id,
             record_artifact,
             event_id,
@@ -67,6 +70,10 @@ impl DeliberationCommandContext {
         self.expected_task_state
     }
 
+    pub const fn task_budget(&self) -> DeliberationTaskBudget {
+        self.task_budget
+    }
+
     fn validate(&self) -> Result<(), PortError> {
         if self.expected_task_version != self.expected_task_state.sequence().get() {
             return Err(invalid_input());
@@ -82,6 +89,55 @@ impl DeliberationCommandContext {
             event_id: self.event_id.clone(),
             correlation_id: self.correlation_id.clone(),
             occurred_at: self.occurred_at.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeliberationBudgetReservation {
+    thread_count: u32,
+    token_count: u64,
+    cost_microunits: u64,
+}
+
+impl DeliberationBudgetReservation {
+    pub const fn thread_count(self) -> u32 {
+        self.thread_count
+    }
+
+    pub const fn token_count(self) -> u64 {
+        self.token_count
+    }
+
+    pub const fn cost_microunits(self) -> u64 {
+        self.cost_microunits
+    }
+
+    pub fn checked_add(self, additional: Self) -> Result<Self, PortError> {
+        Ok(Self {
+            thread_count: self
+                .thread_count
+                .checked_add(additional.thread_count)
+                .ok_or_else(conflict)?,
+            token_count: self
+                .token_count
+                .checked_add(additional.token_count)
+                .ok_or_else(conflict)?,
+            cost_microunits: self
+                .cost_microunits
+                .checked_add(additional.cost_microunits)
+                .ok_or_else(conflict)?,
+        })
+    }
+
+    fn validate_within(self, budget: DeliberationTaskBudget) -> Result<(), PortError> {
+        if self.thread_count > budget.max_threads()
+            || self.token_count > budget.max_tokens()
+            || self.cost_microunits > budget.max_cost_microunits()
+        {
+            Err(conflict())
+        } else {
+            Ok(())
         }
     }
 }
@@ -190,6 +246,21 @@ pub enum DeliberationRecord {
 }
 
 impl DeliberationRecord {
+    pub fn budget_reservation(&self) -> DeliberationBudgetReservation {
+        match self {
+            Self::ThreadSummary { .. } => DeliberationBudgetReservation {
+                thread_count: 1,
+                ..DeliberationBudgetReservation::default()
+            },
+            Self::SpecialistRequest { request, .. } => DeliberationBudgetReservation {
+                thread_count: 0,
+                token_count: request.budget().max_tokens(),
+                cost_microunits: request.budget().max_cost_microunits(),
+            },
+            _ => DeliberationBudgetReservation::default(),
+        }
+    }
+
     pub fn validate(&self, task_id: &TaskId) -> Result<(), PortError> {
         match self {
             Self::PrivateProposal {
@@ -393,6 +464,8 @@ impl DeliberationRecord {
         &self,
         task_id: &TaskId,
         canonical_record_digest: &Sha256Digest,
+        task_budget: DeliberationTaskBudget,
+        reservation: DeliberationBudgetReservation,
     ) -> serde_json::Value {
         let artifact = self.primary_artifact();
         let mut payload = serde_json::json!({
@@ -402,6 +475,17 @@ impl DeliberationRecord {
             "artifactId": artifact.artifact_id.as_str(),
             "artifactDigest": artifact.content_digest.as_str(),
             "artifactSizeBytes": artifact.size_bytes,
+            "taskBudget": {
+                "maxThreads": task_budget.max_threads(),
+                "maxTokens": task_budget.max_tokens(),
+                "maxCostMicrounits": task_budget.max_cost_microunits(),
+                "deadlineUnixSeconds": task_budget.deadline().unix_seconds(),
+            },
+            "budgetReservation": {
+                "threads": reservation.thread_count(),
+                "tokens": reservation.token_count(),
+                "costMicrounits": reservation.cost_microunits(),
+            },
         });
         if let Self::QuorumPublication {
             review_artifact, ..
@@ -552,6 +636,8 @@ pub struct DeliberationPersistenceCommand {
     task_id: TaskId,
     expected_task_version: u64,
     expected_task_state: WorkflowState,
+    task_budget: DeliberationTaskBudget,
+    budget_reservation: DeliberationBudgetReservation,
     actor_id: ActorId,
     event_authority: EventAuthority,
     record: DeliberationRecord,
@@ -571,6 +657,14 @@ impl DeliberationPersistenceCommand {
         self.expected_task_state
     }
 
+    pub const fn task_budget(&self) -> DeliberationTaskBudget {
+        self.task_budget
+    }
+
+    pub const fn budget_reservation(&self) -> DeliberationBudgetReservation {
+        self.budget_reservation
+    }
+
     pub fn record(&self) -> &DeliberationRecord {
         &self.record
     }
@@ -584,7 +678,12 @@ impl DeliberationPersistenceCommand {
         if self.expected_task_version != self.expected_task_state.sequence().get()
             || self.expected_task_state.phase() != self.record.expected_phase()
             || self.actor_id != self.event_authority.actor_id
+            || self.budget_reservation != self.record.budget_reservation()
         {
+            return Err(conflict());
+        }
+        self.budget_reservation.validate_within(self.task_budget)?;
+        if parse_policy_timestamp(&self.event_authority.occurred_at)? > self.task_budget.deadline() {
             return Err(conflict());
         }
         let expected = build_append(
@@ -593,6 +692,8 @@ impl DeliberationPersistenceCommand {
             &self.expected_task_state,
             &self.event_authority,
             &self.record,
+            self.task_budget,
+            self.budget_reservation,
         )?;
         if self.append != expected {
             return Err(conflict());

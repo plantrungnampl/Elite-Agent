@@ -2,7 +2,8 @@
 #[cfg(test)]
 mod authority_tests {
     use local_agent_terminal_domain::{
-        Condition, FencingToken, OperationState, Sequence, WorkspaceVersion,
+        Condition, DeliberationTaskBudget, FencingToken, OperationState, Sequence, Timestamp,
+        WorkspaceVersion,
     };
 
     use super::*;
@@ -34,11 +35,30 @@ mod authority_tests {
             correlation_id: "correlation-1".to_owned(),
             occurred_at: "2026-08-09T00:00:00Z".to_owned(),
         };
-        let append = build_append(&task_id, 7, &state, &authority, &record).unwrap();
+        let task_budget = DeliberationTaskBudget::new(
+            4,
+            4_096,
+            20_000,
+            Timestamp::from_unix_seconds(1_800_000_000),
+        )
+        .unwrap();
+        let budget_reservation = record.budget_reservation();
+        let append = build_append(
+            &task_id,
+            7,
+            &state,
+            &authority,
+            &record,
+            task_budget,
+            budget_reservation,
+        )
+        .unwrap();
         let command = DeliberationPersistenceCommand {
             task_id: task_id.clone(),
             expected_task_version: 7,
             expected_task_state: state,
+            task_budget,
+            budget_reservation,
             actor_id: authority.actor_id.clone(),
             event_authority: authority.clone(),
             record: record.clone(),

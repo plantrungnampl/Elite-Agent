@@ -2122,6 +2122,7 @@ dependencies = [
  "local-agent-terminal-agent-protocol",
  "local-agent-terminal-agent-runtime",
  "local-agent-terminal-application",
+ "local-agent-terminal-context-engine",
  "local-agent-terminal-domain",
  "local-agent-terminal-storage-files",
  "rusqlite",

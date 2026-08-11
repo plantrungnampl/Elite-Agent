@@ -12,11 +12,12 @@ use local_agent_terminal_application::{
 };
 use local_agent_terminal_domain::{
     ActorId, AgentFamilyKey, ArtifactId, ClaimVerification, Condition, DecisionApproach,
-    DecisionPackage, DeliberationBudget, DeliberationLimits, Dissent, EventId, EvidenceCitation,
-    EvidenceFreshness, FencingToken, GitObjectId, IndependentProposal, IndependentQuorum,
-    LineRange, MaterialClaim, OperationState, ProjectId, RejectedApproach, ReviewEdge, ReviewPlan,
-    RunId, Sequence, Sha256Digest, SourceIdentity, SpecialistBudget, SpecialistRequest, TaskId,
-    Timestamp, VerificationMethod, WorkflowState, WorkspaceFingerprint, WorkspaceVersion,
+    DecisionPackage, DeliberationBudget, DeliberationLimits, DeliberationTaskBudget, Dissent,
+    EventId, EvidenceCitation, EvidenceFreshness, FencingToken, GitObjectId, IndependentProposal,
+    IndependentQuorum, LineRange, MaterialClaim, OperationState, ProjectId, RejectedApproach,
+    ReviewEdge, ReviewPlan, RunId, Sequence, Sha256Digest, SourceIdentity, SpecialistBudget,
+    SpecialistRequest, TaskId, Timestamp, VerificationMethod, WorkflowState, WorkspaceFingerprint,
+    WorkspaceVersion,
 };
 use local_agent_terminal_orchestration::{
     assign_bounded_reviews, authorize_specialist, classify_material_claims,
@@ -61,7 +62,7 @@ fn specialist_request_is_bounded_and_denial_is_typed() {
         "security",
         "Review the risk.",
         vec![artifact("thread-context")],
-        SpecialistBudget::new(50, Timestamp::from_unix_seconds(100)).unwrap(),
+        SpecialistBudget::new(50, 500, Timestamp::from_unix_seconds(100)).unwrap(),
     )
     .unwrap();
     let candidates = vec![eligible(
@@ -521,6 +522,13 @@ fn synthesis_context() -> DeliberationCommandContext {
         task(),
         6,
         synthesis_state(),
+        DeliberationTaskBudget::new(
+            4,
+            100_000,
+            10_000,
+            Timestamp::from_unix_seconds(2_000_000_000),
+        )
+        .unwrap(),
         ActorId::new("core").unwrap(),
         deliberation_artifact("decision-draft", '5'),
         EventId::new("event-decision-draft").unwrap(),

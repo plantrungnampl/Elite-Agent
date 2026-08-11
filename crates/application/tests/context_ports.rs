@@ -1,25 +1,157 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+};
 
 use local_agent_terminal_application::{
-    BuildInitialContext, BuildInitialContextRequest, ContextArtifactKind, ContextArtifactPublisher,
-    ContextArtifactReader, ContextArtifactRef, ContextBuildPolicy, ContextChunkRecord,
-    ContextClassificationOutcome, ContextIndexProvenance, ContextIndexProvenanceRehydration,
+    AssembledContextPackage, BuildInitialContext, BuildInitialContextRequest, ContextArtifactKind,
+    ContextArtifactPublisher, ContextArtifactReader, ContextArtifactRef, ContextBuildPolicy,
+    ContextChunkRecord, ContextClassificationOutcome, ContextEvidenceAssemblyItem,
+    ContextIndexProvenance, ContextIndexProvenanceRehydration, ContextPackageAssembler,
     ContextPackageDraft, ContextPackagePersistence, ContextPackageRecord, ContextPolicyDecisionRef,
-    ContextQuery, ContextSourceClassification, ContextSourceClassifier, ContextSourceRecord,
-    ContextStore, DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest,
-    ImmutableContextArtifact, PolicyApprovedDisclosure, PolicyDecision, PolicyDecisionId,
-    PolicyDecisionStore, PortError, QueryContext, QueryContextRequest, RepositoryContextSource,
-    RetrievedContextItem, Retryability, SafeErrorClassification, SourceClassificationRequest,
-    SourceIndexMetadata, SourceSnapshot, SourceSnapshotItem, SourceSnapshotRequest,
-    SourceStateTransition,
+    ContextQuery, ContextRetrievalAuthority, ContextSourceClassification, ContextSourceClassifier,
+    ContextSourceRecord, ContextStore, DisclosureChannel, DisclosurePolicyEvaluator,
+    DisclosureRequest, ImmutableContextArtifact, PolicyApprovedDisclosure, PolicyDecision,
+    PolicyDecisionId, PolicyDecisionStore, PortError, QueryContext, QueryContextRequest,
+    RepositoryContextSource, RetrievedContextItem, Retryability, SafeErrorClassification,
+    SourceClassificationRequest, SourceIndexMetadata, SourceSnapshot, SourceSnapshotItem,
+    SourceSnapshotRequest, SourceStateTransition,
 };
 use local_agent_terminal_domain::{
-    combine_policy_rules, ActorLocality, ArtifactId, ContextBudget, ContextPackageDescriptor,
-    ContextPackageIdentity, ContextVersionSet, MatchedPolicyRule, PolicyEffect, PolicyRuleId,
-    PolicyVersion, ProjectId, ResourceClass, Sha256Digest, SourceIdentity, TaskId, TaskRisk,
-    Timestamp, TrustTier,
+    combine_policy_rules, ActorLocality, ArtifactId, CapabilityRef, ContextBudget,
+    ContextPackageDescriptor, ContextPackageIdentity, ContextVersionSet, MatchedPolicyRule,
+    PolicyAction, PolicyEffect, PolicyRequest, PolicyResource, PolicyRuleId, PolicyVersion,
+    ProjectId, ResourceClass, Sha256Digest, SourceIdentity, TaskId, TaskRisk, Timestamp, TrustTier,
 };
 use sha2::{Digest, Sha256};
+
+struct TestContextPackageAssembler<'a> {
+    disclosures: &'a dyn DisclosurePolicyEvaluator,
+    decisions: &'a dyn PolicyDecisionStore,
+}
+
+struct CurrentAuthority;
+
+impl ContextRetrievalAuthority for CurrentAuthority {
+    fn verify_current(
+        &self,
+        _task_id: &TaskId,
+        _items: &[RetrievedContextItem],
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
+impl ContextPackageAssembler for TestContextPackageAssembler<'_> {
+    fn assemble(
+        &self,
+        mut descriptor: ContextPackageDescriptor,
+        policy: ContextBuildPolicy,
+        items: Vec<ContextEvidenceAssemblyItem>,
+        mut policy_decision_ids: Vec<String>,
+    ) -> Result<AssembledContextPackage, PortError> {
+        let value = serde_json::json!({
+            "schema": "context-package.v1",
+            "version": 1,
+            "packageId": descriptor.package_id(),
+            "taskId": descriptor.task_id().as_str(),
+            "items": items.iter().map(|item| serde_json::json!({
+                "memberId": item.member.member_id(),
+                "content": item.content,
+            })).collect::<Vec<_>>(),
+        });
+        let raw_bytes = serde_json_canonicalizer::to_vec(&value).unwrap();
+        let original_digest = digest(&raw_bytes);
+        let policy_request = PolicyRequest {
+            task_id: policy.task_id.clone(),
+            actor: policy.actor.clone(),
+            action: PolicyAction::new("context.final_package").unwrap(),
+            resource: PolicyResource {
+                capability: CapabilityRef::artifact(
+                    descriptor.effective_content_artifact_id().clone(),
+                )
+                .unwrap(),
+                content_digest: original_digest.clone(),
+                resource_class: policy.resource_class,
+            },
+            task_risk: policy.task_risk,
+            workflow_phase: policy.workflow_phase,
+            purpose: policy.purpose,
+            policy_snapshot_digest: policy.policy_snapshot_digest,
+            evaluated_at: policy.evaluated_at,
+        };
+        let disclosure = self.disclosures.disclose(DisclosureRequest {
+            policy_request: policy_request.clone(),
+            channel: DisclosureChannel::FinalContextPackage,
+            bytes: raw_bytes.clone(),
+        })?;
+        if disclosure.channel != DisclosureChannel::FinalContextPackage
+            || disclosure.original_digest != original_digest
+            || disclosure.decision.draft.request() != &policy_request
+            || !matches!(
+                disclosure.decision.draft.effect(),
+                PolicyEffect::Allow | PolicyEffect::AllowWithRedaction
+            )
+        {
+            return Err(failure(SafeErrorClassification::IntegrityFailure));
+        }
+        let final_decision = PolicyDecisionId::from_decision(&disclosure.decision);
+        let recorded =
+            self.decisions
+                .record(local_agent_terminal_application::RecordedPolicyDecision {
+                    decision: disclosure.decision,
+                    recorded_at: policy.evaluated_at,
+                })?;
+        let bytes = disclosure
+            .effective_bytes
+            .ok_or_else(|| failure(SafeErrorClassification::PermissionDenied))?;
+        let content_digest = disclosure
+            .effective_digest
+            .ok_or_else(|| failure(SafeErrorClassification::IntegrityFailure))?;
+        if recorded != final_decision || bytes != raw_bytes || content_digest != original_digest {
+            return Err(failure(SafeErrorClassification::IntegrityFailure));
+        }
+        let used_input_tokens = u64::try_from(bytes.len()).unwrap();
+        descriptor.consume_input_tokens(used_input_tokens).unwrap();
+        policy_decision_ids.extend(
+            items
+                .iter()
+                .flat_map(|item| item.policy_decision_ids.iter().cloned()),
+        );
+        policy_decision_ids.sort();
+        policy_decision_ids.dedup();
+        policy_decision_ids.push(final_decision.as_str().to_owned());
+        policy_decision_ids.sort();
+        policy_decision_ids.dedup();
+        let provenance = items
+            .iter()
+            .flat_map(|item| item.provenance.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let redaction_report_ids = items
+            .iter()
+            .flat_map(|item| item.redaction_report_ids.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Ok(AssembledContextPackage {
+            artifact: ImmutableContextArtifact {
+                artifact_id: descriptor.effective_content_artifact_id().clone(),
+                task_id: descriptor.task_id().clone(),
+                kind: ContextArtifactKind::ContextPackage,
+                bytes,
+                content_digest,
+            },
+            descriptor,
+            members: items.into_iter().map(|item| item.member).collect(),
+            policy_decision_ids,
+            provenance,
+            redaction_report_ids,
+            used_input_tokens,
+        })
+    }
+}
 
 #[derive(Default)]
 struct RecordingState {
@@ -471,7 +603,7 @@ fn denied_source_records_accept_only_explicit_stable_redacted_identity() {
 }
 
 #[test]
-fn final_manifest_is_core_owned_canonical_complete_and_scanned_before_publish() {
+fn final_content_package_is_canonical_budgeted_and_scanned_before_publish() {
     let item = SourceSnapshotItem {
         document_id: "document-member-1".to_owned(),
         updated_at: "2026-08-09T00:00:00Z".to_owned(),
@@ -504,76 +636,21 @@ fn final_manifest_is_core_owned_canonical_complete_and_scanned_before_publish() 
         .iter()
         .find(|artifact| artifact.kind == ContextArtifactKind::ContextPackage)
         .unwrap();
-    let manifest: serde_json::Value = serde_json::from_slice(&artifact.bytes).unwrap();
+    let content_package: serde_json::Value = serde_json::from_slice(&artifact.bytes).unwrap();
     assert_eq!(
-        serde_json_canonicalizer::to_vec(&manifest).unwrap(),
+        serde_json_canonicalizer::to_vec(&content_package).unwrap(),
         artifact.bytes
     );
-    assert_eq!(manifest["schema"], "context-package-manifest");
-    assert_eq!(manifest["version"], 1);
-    assert_eq!(manifest["artifactId"], "artifact-package-1");
-    assert_eq!(manifest["descriptor"]["packageId"], "package-1");
-    assert_eq!(manifest["descriptor"]["taskId"], "task-1");
-    assert_eq!(manifest["descriptor"]["objective"], "analyze repository");
+    assert_eq!(content_package["schema"], "context-package.v1");
+    assert_eq!(content_package["version"], 1);
+    assert_eq!(content_package["packageId"], "package-1");
+    assert_eq!(content_package["taskId"], "task-1");
+    assert_eq!(content_package["items"][0]["memberId"], "member-1");
+    assert_eq!(content_package["items"][0]["content"], "allowed source");
     assert_eq!(
-        manifest["descriptor"]["versions"]["promptTemplate"],
-        "prompt.v1"
+        package.descriptor().budget().used_input_tokens(),
+        u64::try_from(artifact.bytes.len()).unwrap()
     );
-    assert_eq!(
-        manifest["descriptor"]["versions"]["retrievalPipeline"],
-        "retrieval.v1"
-    );
-    assert_eq!(
-        manifest["descriptor"]["versions"]["tokenizer"],
-        "tokenizer.v1"
-    );
-    assert_eq!(manifest["descriptor"]["budget"]["maxTokens"], 4_096);
-    assert_eq!(
-        manifest["descriptor"]["budget"]["reservedResponseTokens"],
-        1_024
-    );
-    assert_eq!(manifest["descriptor"]["budget"]["usedInputTokens"], 0);
-    assert_eq!(manifest["members"][0]["memberId"], "member-1");
-    assert_eq!(manifest["members"][0]["taskId"], "task-1");
-    assert_eq!(
-        manifest["members"][0]["citation"]["source"]["projectId"],
-        "project-1"
-    );
-    assert_eq!(
-        manifest["members"][0]["citation"]["source"]["revision"],
-        "commit-1"
-    );
-    assert_eq!(
-        manifest["members"][0]["citation"]["source"]["pathIdentity"],
-        "src/lib.rs"
-    );
-    assert_eq!(
-        manifest["members"][0]["citation"]["source"]["contentHash"],
-        digest(b"allowed source").as_str()
-    );
-    assert_eq!(manifest["members"][0]["citation"]["range"]["start"], 2);
-    assert_eq!(manifest["members"][0]["citation"]["range"]["end"], 7);
-    assert_eq!(manifest["members"][0]["citation"]["symbol"], "entry");
-    assert_eq!(manifest["members"][0]["citation"]["freshness"], "current");
-    assert_eq!(manifest["members"][0]["disclosure"]["kind"], "allowed");
-    assert!(manifest["members"][0]["disclosure"]["stableReportId"].is_null());
-    assert_eq!(
-        manifest["policy"]["policySnapshotDigest"],
-        digest(b"policy").as_str()
-    );
-    let mut expected_item_decisions: Vec<_> = state.decisions[..state.decisions.len() - 1]
-        .iter()
-        .map(PolicyDecisionId::as_str)
-        .collect();
-    expected_item_decisions.sort_unstable();
-    assert_eq!(
-        manifest["policy"]["itemDecisionIds"],
-        serde_json::json!(expected_item_decisions)
-    );
-    assert!(!artifact
-        .bytes
-        .windows(state.decisions.last().unwrap().as_str().len())
-        .any(|bytes| { bytes == state.decisions.last().unwrap().as_str().as_bytes() }));
     assert_eq!(
         &digest(&artifact.bytes),
         package.artifact().content_digest()
@@ -715,10 +792,25 @@ fn query_context_scans_each_retrieved_item_and_the_final_package() {
     let decisions = Decisions {
         state: Arc::clone(&state),
     };
+    let assembler = TestContextPackageAssembler {
+        disclosures: &policy,
+        decisions: &decisions,
+    };
     let build = build_request();
 
-    let package = QueryContext::new(&store, &publisher, &publisher, &policy, &decisions)
-        .execute(QueryContextRequest {
+    let packages_before_prepare = state.lock().unwrap().packages.len();
+    let artifacts_before_prepare = state.lock().unwrap().artifacts.len();
+    let query = QueryContext::new(
+        &store,
+        &publisher,
+        &publisher,
+        &policy,
+        &decisions,
+        &assembler,
+        &CurrentAuthority,
+    );
+    let prepared = query
+        .prepare(QueryContextRequest {
             query: ContextQuery {
                 task_id: TaskId::new("task-1").unwrap(),
                 query_id: "query-1".to_owned(),
@@ -730,6 +822,12 @@ fn query_context_scans_each_retrieved_item_and_the_final_package() {
             package: build.package,
         })
         .unwrap();
+    {
+        let state = state.lock().unwrap();
+        assert_eq!(state.packages.len(), packages_before_prepare);
+        assert_eq!(state.artifacts.len(), artifacts_before_prepare);
+    }
+    let package = query.commit(prepared).unwrap();
 
     let state = state.lock().unwrap();
     assert_eq!(package.members().len(), 1);
@@ -1090,22 +1188,32 @@ fn retrieved_item_provenance_rejects_substitution_before_new_disclosure() {
     let decisions = Decisions {
         state: Arc::clone(&state),
     };
+    let assembler = TestContextPackageAssembler {
+        disclosures: &policy,
+        decisions: &decisions,
+    };
     let request = build_request();
-    assert!(
-        QueryContext::new(&store, &publisher, &publisher, &policy, &decisions)
-            .execute(QueryContextRequest {
-                query: ContextQuery {
-                    task_id: TaskId::new("task-1").unwrap(),
-                    query_id: "query-hostile".to_owned(),
-                    terms: vec!["query".to_owned()],
-                    max_items: 4,
-                    max_tokens: 1_024,
-                },
-                policy: request.policy,
-                package: request.package,
-            })
-            .is_err()
-    );
+    assert!(QueryContext::new(
+        &store,
+        &publisher,
+        &publisher,
+        &policy,
+        &decisions,
+        &assembler,
+        &CurrentAuthority,
+    )
+    .execute(QueryContextRequest {
+        query: ContextQuery {
+            task_id: TaskId::new("task-1").unwrap(),
+            query_id: "query-hostile".to_owned(),
+            terms: vec!["query".to_owned()],
+            max_items: 4,
+            max_tokens: 1_024,
+        },
+        policy: request.policy,
+        package: request.package,
+    })
+    .is_err());
 }
 
 fn service(
@@ -1131,8 +1239,14 @@ fn service(
     let decisions = Box::leak(Box::new(Decisions {
         state: Arc::clone(&state),
     }));
+    let assembler = Box::leak(Box::new(TestContextPackageAssembler {
+        disclosures: policy,
+        decisions,
+    }));
     (
-        BuildInitialContext::new(source, classifier, store, publisher, policy, decisions),
+        BuildInitialContext::new(
+            source, classifier, store, publisher, policy, decisions, assembler,
+        ),
         state,
     )
 }
@@ -1160,8 +1274,14 @@ fn service_with_final_redaction(
     let decisions = Box::leak(Box::new(Decisions {
         state: Arc::clone(&state),
     }));
+    let assembler = Box::leak(Box::new(TestContextPackageAssembler {
+        disclosures: policy,
+        decisions,
+    }));
     (
-        BuildInitialContext::new(source, classifier, store, publisher, policy, decisions),
+        BuildInitialContext::new(
+            source, classifier, store, publisher, policy, decisions, assembler,
+        ),
         state,
     )
 }
@@ -1189,8 +1309,14 @@ fn service_with_failing_package_transaction(
     let decisions = Box::leak(Box::new(Decisions {
         state: Arc::clone(&state),
     }));
+    let assembler = Box::leak(Box::new(TestContextPackageAssembler {
+        disclosures: policy,
+        decisions,
+    }));
     (
-        BuildInitialContext::new(source, classifier, store, publisher, policy, decisions),
+        BuildInitialContext::new(
+            source, classifier, store, publisher, policy, decisions, assembler,
+        ),
         state,
     )
 }
@@ -1223,8 +1349,14 @@ fn service_with_metadata_options(
     let decisions = Box::leak(Box::new(Decisions {
         state: Arc::clone(&state),
     }));
+    let assembler = Box::leak(Box::new(TestContextPackageAssembler {
+        disclosures: policy,
+        decisions,
+    }));
     (
-        BuildInitialContext::new(source, classifier, store, publisher, policy, decisions),
+        BuildInitialContext::new(
+            source, classifier, store, publisher, policy, decisions, assembler,
+        ),
         state,
     )
 }
@@ -1301,6 +1433,10 @@ fn source_metadata(language: Option<&str>, logical_id: &str) -> SourceIndexMetad
 
 fn digest(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
+}
+
+fn failure(classification: SafeErrorClassification) -> PortError {
+    PortError::failure(classification, Retryability::NonRetryable)
 }
 
 fn _safe_error() -> PortError {

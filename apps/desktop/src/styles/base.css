@@ -784,6 +784,18 @@ thead th {
   margin-block-end: 0;
 }
 
+@media (max-width: 72rem) {
+  .task-load-form,
+  .deliberation-workspace-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .shared-room,
+  .plan-approval-panel {
+    grid-column: auto;
+  }
+}
+
 @media (max-width: 36rem) {
   .shell {
     inline-size: min(calc(100% - 2 * var(--space-4)), 72rem);
@@ -825,18 +837,11 @@ thead th {
     inline-size: 100%;
   }
 
-  .deliberation-workspace-grid,
   .approval-overview,
   .approval-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .shared-room,
-  .plan-approval-panel {
-    grid-column: auto;
-  }
-
-  .task-load-form,
   .detail-grid div {
     grid-template-columns: minmax(0, 1fr);
   }

@@ -25,7 +25,8 @@ use local_agent_terminal_application::{
     PlanApprovalAuthorityProvider, PlanApprovalBindingInput, PlanApprovalCurrentAuthority,
     PlanApprovalCurrentAuthoritySource, PlanApprovalPathScopeV1, PreparePlanApprovalRequestInput,
     QueryContextRequest, RepositoryContextSource, RepositoryGateway, ReservedArtifact,
-    ResolvePlanApproval, ResolvePlanApprovalInput, SourceSnapshotRequest,
+    ResolvePlanApproval, ResolvePlanApprovalInput, ResolvePlanApprovalRequestDto,
+    SafeErrorClassification, SourceSnapshotRequest,
 };
 use local_agent_terminal_bootstrap::{
     AnthropicApiKey, AnthropicBootstrapConfig, Bootstrap, OpenAiApiKey, OpenAiBootstrapConfig,
@@ -36,11 +37,11 @@ use local_agent_terminal_domain::{
     BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters,
     BoundRunConfig, ClaimVerification, ContextBudget, ContextPackageBinding,
     ContextPackageDescriptor, ContextPackageIdentity, ContextVersionSet, DecisionApproach,
-    DecisionPackage, DeliberationLimits, DisclosureKind, Dissent, EventId, EvidenceCitation,
-    EvidenceFreshness, FinalObjection, FinalObjectionSet, IndependentProposal, MaterialClaim,
-    ObjectionSeverity, Phase, PolicyActor, RejectedApproach, ReviewEdge, ReviewPlan, RunId,
-    Sha256Digest, SpecialistBudget, SpecialistRequest, TaskId, TaskRisk, Timestamp, TrustTier,
-    VerificationMethod, WorkflowState, WorkspaceFingerprint,
+    DecisionPackage, DeliberationLimits, DeliberationTaskBudget, DisclosureKind, Dissent, EventId,
+    EvidenceCitation, EvidenceFreshness, FinalObjection, FinalObjectionSet, IndependentProposal,
+    MaterialClaim, ObjectionSeverity, Phase, PolicyActor, RejectedApproach, ReviewEdge, ReviewPlan,
+    RunId, Sha256Digest, SpecialistBudget, SpecialistRequest, TaskId, TaskRisk, Timestamp,
+    TrustTier, VerificationMethod, WorkflowState, WorkspaceFingerprint,
 };
 use local_agent_terminal_orchestration::{
     normative_preapproval_transitions, PreApprovalCoordinator, PrePlanOperation,
@@ -108,6 +109,7 @@ fn startup_composes_context_runtime_from_authoritative_adapters() {
 
     assert_eq!(bootstrap.status().state, StartupStateDto::Ready);
     assert!(bootstrap.context_runtime().is_some());
+    assert!(bootstrap.deliberation_runtime().is_some());
 }
 
 #[test]
@@ -230,6 +232,45 @@ fn two_role_specific_packages_bind_exact_policy_redaction_and_provenance() {
 }
 
 #[test]
+fn context_query_revalidates_live_repository_authority_before_disclosure() {
+    let fixture = WorkspaceFixture::new();
+    commit_context_sources(&fixture, SECRET_CANARY);
+    let source = GitRepositoryContextSource::new(fixture.locator.clone(), CAPTURED_AT)
+        .expect("context source");
+    let revision = Repository::open(&fixture.source)
+        .expect("repository")
+        .head()
+        .expect("head")
+        .target()
+        .expect("head target")
+        .to_string();
+    let repository_fingerprint = source.repository_fingerprint().expect("fingerprint");
+    let bootstrap = Bootstrap::new(context_startup_config(&fixture));
+    let runtime = bootstrap.context_runtime().expect("context runtime");
+    runtime
+        .build_initial(
+            fixture.locator.clone(),
+            CAPTURED_AT,
+            context_request(revision, repository_fingerprint, &LEAD_CONTEXT),
+        )
+        .expect("initial context");
+    fs::write(
+        fixture.source.join("src/allowed.rs"),
+        b"pub fn bounded_context() -> bool { false }\n",
+    )
+    .expect("mutate tracked source");
+
+    let error = runtime
+        .query(query_request(&VERIFIER_CONTEXT))
+        .expect_err("stale index must fail before disclosure");
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+}
+
+#[test]
 fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
     let fixture = WorkspaceFixture::new();
     commit_context_sources(&fixture, SECRET_CANARY);
@@ -272,7 +313,7 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
     };
     let boundaries = ExactBoundaryStore::new(fingerprint);
     let tools = EmptyToolCatalog;
-    let dispatches = RecordingDispatchStore::default();
+    let dispatches = RecordingDispatchStore::new(&database);
     let agents = bootstrap
         .agent_runtime_handle()
         .expect("two-provider runtime");
@@ -314,13 +355,16 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
         local_agent_terminal_application::DeliberationDispatchBinding::new(
             openai_request.clone(),
             proposal_assignment(&openai_request),
+            1_000,
         )
         .expect("OpenAI dispatch"),
         local_agent_terminal_application::DeliberationDispatchBinding::new(
             anthropic_request.clone(),
             proposal_assignment(&anthropic_request),
+            1_000,
         )
         .expect("Anthropic dispatch"),
+        deliberation_task_budget(),
     )
     .expect("heterogeneous dispatch plan");
     let context_build = database.load(&task_id).expect("context build snapshot");
@@ -409,7 +453,7 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
         "repository-analysis",
         "verify repository invariants for the selected proposal",
         vec![lead_artifact.artifact_id().clone()],
-        SpecialistBudget::new(128, Timestamp::from_unix_seconds(2_000_000_000))
+        SpecialistBudget::new(128, 1_280, Timestamp::from_unix_seconds(2_000_000_000))
             .expect("specialist budget"),
     )
     .expect("bounded specialist request");
@@ -850,8 +894,8 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
         task_version: approval_snapshot.task_version + 1,
         workspace_version: approval_snapshot.task_state.workspace_version().get(),
         fencing_epoch: approval_snapshot.task_state.fencing_token().get() + 1,
-        requested_at: "2026-08-11T08:00:00Z".to_owned(),
-        expires_at: "2026-08-11T08:15:00Z".to_owned(),
+        requested_at: "2026-01-01T00:00:00Z".to_owned(),
+        expires_at: "2099-01-01T00:00:00Z".to_owned(),
     };
     let approval_authority = FixedPlanApprovalAuthority {
         binding: PlanApprovalAuthorityBinding::issue(approval_binding.clone())
@@ -913,19 +957,38 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
             .phase(),
         Phase::AwaitingPlanApproval
     );
-    let exact_resolution = ResolvePlanApprovalInput {
-        approval_id: approval.approval_id().clone(),
-        displayed_digest: approval.operation_digest().clone(),
+    let exact_resolution = ResolvePlanApprovalRequestDto {
+        approval_id: approval.approval_id().as_str().to_owned(),
+        displayed_digest: approval.operation_digest().as_str().to_owned(),
         expected_task_version: awaiting.task_version,
-        actor_id: ActorId::new("approver-1").expect("approver actor"),
+        actor_id: "approver-1".to_owned(),
         action: PlanApprovalAction::Approve,
     };
-    ResolvePlanApproval::new(&approval_store, &ApprovalClock)
-        .execute(exact_resolution.clone())
+    let deliberation = bootstrap
+        .deliberation_runtime()
+        .expect("production deliberation runtime");
+    deliberation
+        .resolve_plan_approval(exact_resolution.clone())
         .expect("exact plan approval");
-    assert!(ResolvePlanApproval::new(&approval_store, &ApprovalClock)
-        .execute(exact_resolution)
+    assert!(deliberation
+        .resolve_plan_approval(exact_resolution)
         .is_err());
+    let workspace = deliberation
+        .workspace(TASK_ID)
+        .expect("authoritative deliberation workspace DTO");
+    assert_eq!(workspace.phase, "Implementation");
+    assert_eq!(workspace.private_proposal_count, 2);
+    assert_eq!(workspace.published_proposal_ids.len(), 2);
+    let context_package = deliberation
+        .context_package(LEAD_CONTEXT.package_id)
+        .expect("content-bearing context package DTO");
+    assert_eq!(context_package.members.len(), 2);
+    assert_eq!(context_package.versions.tokenizer, "byte-token-v1");
+    assert!(context_package.budget.used_input_tokens > 0);
+    assert_eq!(
+        workspace.approval.expect("resolved approval").status,
+        local_agent_terminal_application::PlanApprovalStatusDto::Resolved
+    );
     assert_eq!(
         fixture
             .database()
@@ -1128,12 +1191,19 @@ impl DeliberationBoundaryStore for ExactBoundaryStore {
     }
 }
 
-#[derive(Default)]
-struct RecordingDispatchStore {
+struct RecordingDispatchStore<'a> {
+    durable: &'a SqliteStore,
     proposal_runs: Mutex<Vec<RunId>>,
 }
 
-impl RecordingDispatchStore {
+impl<'a> RecordingDispatchStore<'a> {
+    fn new(durable: &'a SqliteStore) -> Self {
+        Self {
+            durable,
+            proposal_runs: Mutex::new(Vec::new()),
+        }
+    }
+
     fn proposal_count(&self) -> usize {
         self.proposal_runs
             .lock()
@@ -1142,12 +1212,14 @@ impl RecordingDispatchStore {
     }
 }
 
-impl DeliberationDispatchStore for RecordingDispatchStore {
+impl DeliberationDispatchStore for RecordingDispatchStore<'_> {
     fn compare_and_persist_proposal_binding_set(
         &self,
         plan: &DeliberationProposalDispatchPlan,
     ) -> Result<(), local_agent_terminal_application::PortError> {
         plan.validate()?;
+        self.durable
+            .compare_and_persist_proposal_binding_set(plan)?;
         let mut runs = self.proposal_runs.lock().map_err(|_| unavailable())?;
         runs.extend(
             plan.bindings()
@@ -1161,11 +1233,8 @@ impl DeliberationDispatchStore for RecordingDispatchStore {
         &self,
         dispatch_set: &DeliberationPhaseDispatchSet,
     ) -> Result<(), local_agent_terminal_application::PortError> {
-        if dispatch_set.bindings().is_empty() {
-            Err(unavailable())
-        } else {
-            Ok(())
-        }
+        self.durable
+            .compare_and_persist_phase_binding_set(dispatch_set)
     }
 }
 
@@ -1449,6 +1518,7 @@ fn command_context(
         snapshot.task_id.clone(),
         snapshot.task_version,
         snapshot.task_state,
+        deliberation_task_budget(),
         actor,
         artifact,
         EventId::new(event_id).expect("event id"),
@@ -1456,6 +1526,16 @@ fn command_context(
         "2026-08-11T08:02:00Z",
     )
     .expect("command context")
+}
+
+fn deliberation_task_budget() -> DeliberationTaskBudget {
+    DeliberationTaskBudget::new(
+        8,
+        10_000,
+        100_000,
+        Timestamp::from_unix_seconds(2_000_000_000),
+    )
+    .expect("task budget")
 }
 
 fn independent_proposal(

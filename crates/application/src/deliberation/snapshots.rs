@@ -765,6 +765,23 @@ pub(crate) struct RecoveredDeliberationState {
 }
 
 impl DeliberationSnapshot {
+    fn budget_reservation(&self) -> Result<DeliberationBudgetReservation, PortError> {
+        let thread_count = u32::try_from(self.thread_summaries.len()).map_err(|_| conflict())?;
+        self.specialist_requests.iter().try_fold(
+            DeliberationBudgetReservation {
+                thread_count,
+                ..DeliberationBudgetReservation::default()
+            },
+            |reservation, existing| {
+                reservation.checked_add(DeliberationBudgetReservation {
+                    thread_count: 0,
+                    token_count: existing.request.budget().max_tokens(),
+                    cost_microunits: existing.request.budget().max_cost_microunits(),
+                })
+            },
+        )
+    }
+
     pub(crate) fn from_recovery(recovered: RecoveredDeliberationState) -> Result<Self, PortError> {
         let claims = recovered
             .verification_sets
@@ -938,7 +955,14 @@ impl DeliberationSnapshot {
                 && self.task_state.phase() <= Phase::ParallelAnalysis)
             || self
                 .supported_history_phase()
-                .is_some_and(|phase| phase != self.task_state.phase())
+                .is_some_and(|phase| {
+                    phase != self.task_state.phase()
+                        && !(phase == Phase::AwaitingPlanApproval
+                            && matches!(
+                                self.task_state.phase(),
+                                Phase::Synthesis | Phase::Implementation | Phase::Cancelled
+                            ))
+                })
             || !self.has_valid_quorum_publication()
             || !self.has_valid_phase_neutral_history()
             || !self.has_valid_decision_history()

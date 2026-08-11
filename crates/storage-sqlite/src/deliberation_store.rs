@@ -14,6 +14,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use crate::agent_store::{
     load_deliberation_run_assignments, read_available_artifact, validate_available_artifact,
 };
+use crate::deliberation_budget_store::reserve_task_budget;
 use crate::event_store::{append_in_transaction, open_error_to_port, sqlite_error_to_port};
 use crate::SqliteStore;
 
@@ -89,6 +90,12 @@ impl DeliberationStore for SqliteStore {
             return Err(conflict());
         }
 
+        reserve_task_budget(
+            &transaction,
+            command.task_id(),
+            command.task_budget(),
+            command.budget_reservation(),
+        )?;
         append_in_transaction(&transaction, command.append())?;
         transaction
             .execute(

@@ -9,10 +9,10 @@ use std::{
 use local_agent_terminal_domain::{
     AgentCancellationReceipt, AgentDescriptor, AgentRunReceipt, AgentRunSnapshot, AgentRunTerminal,
     ArtifactId, BoundAgentRunRequest, BoundEffectiveContext, CancelAgentRun, RunId, Sha256Digest,
-    TaskId, Timestamp,
+    SpecialistRequest, TaskId, Timestamp,
 };
 
-use crate::PortError;
+use crate::{PortError, PreparedContextPackage, RecordedPolicyDecision};
 
 #[derive(Clone, Default)]
 pub struct AgentRequestCancellation {
@@ -194,7 +194,16 @@ pub struct AgentContextQueryResponse {
     pub content_digest: Sha256Digest,
     pub item_ids: Vec<String>,
     pub token_count: u64,
+    pub provenance: Vec<String>,
+    pub redactions: Vec<String>,
     pub policy_decision_ids: Vec<String>,
+    pub prepared_commit: Option<AgentContextQueryCommit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentContextQueryCommit {
+    pub package: PreparedContextPackage,
+    pub policy_decisions: Vec<RecordedPolicyDecision>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +229,12 @@ pub struct AgentSpecialistResponse {
     pub request_id: String,
     pub accepted: bool,
     pub reason_code: String,
+    pub prepared_commit: Option<AgentSpecialistCommit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSpecialistCommit {
+    pub request: SpecialistRequest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +262,8 @@ pub struct AgentRequestAudit {
     pub reason_code: Option<String>,
     pub deadline: Timestamp,
     pub fence: AgentRequestAuditFence,
+    pub context_commit: Option<AgentContextQueryCommit>,
+    pub specialist_commit: Option<AgentSpecialistCommit>,
 }
 
 pub trait AgentRequestHandler: Send + Sync {

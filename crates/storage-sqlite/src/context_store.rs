@@ -15,6 +15,97 @@ use crate::agent_store::{validate_available_artifact, validate_available_artifac
 use crate::event_store::{open_error_to_port, sqlite_error_to_port};
 use crate::SqliteStore;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredContextPackageView {
+    pub package_id: String,
+    pub task_id: String,
+    pub agent_id: String,
+    pub role: String,
+    pub objective: String,
+    pub artifact_id: String,
+    pub policy_snapshot_digest: String,
+    pub prompt_template_version: String,
+    pub retrieval_pipeline_version: String,
+    pub artifact: local_agent_terminal_application::ArtifactRef,
+    pub policy_decision_ids: Vec<String>,
+}
+
+impl SqliteStore {
+    pub fn context_package_view(
+        &self,
+        package_id: &str,
+    ) -> Result<Option<StoredContextPackageView>, PortError> {
+        if package_id.trim().is_empty() {
+            return Err(invalid_input());
+        }
+        let connection = self.connection().map_err(open_error_to_port)?;
+        let row = connection
+            .query_row(
+                "SELECT c.id, c.task_id, c.agent_id, c.role, c.objective,
+                        c.effective_content_artifact_id, c.policy_snapshot_digest,
+                        c.prompt_template_version, c.retrieval_pipeline_version,
+                        a.content_hash, a.storage_key, a.size_bytes
+                 FROM context_packages c
+                 JOIN artifacts a ON a.id = c.effective_content_artifact_id
+                  WHERE c.id = ?1 AND a.availability = 'available'",
+                [package_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, i64>(11)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?;
+        let Some((
+            package_id,
+            task_id,
+            agent_id,
+            role,
+            objective,
+            artifact_id,
+            policy_snapshot_digest,
+            prompt_template_version,
+            retrieval_pipeline_version,
+            content_hash,
+            storage_key,
+            size_bytes,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let size_bytes = u64::try_from(size_bytes).map_err(|_| integrity_failure())?;
+        Ok(Some(StoredContextPackageView {
+            policy_decision_ids: load_policy_links(&connection, &package_id)?,
+            package_id,
+            task_id,
+            agent_id,
+            role,
+            objective,
+            artifact_id,
+            policy_snapshot_digest,
+            prompt_template_version,
+            retrieval_pipeline_version,
+            artifact: local_agent_terminal_application::ArtifactRef {
+                content_hash,
+                storage_key,
+                size_bytes,
+            },
+        }))
+    }
+}
+
 type PersistedSourceIdentity = (
     String,
     String,

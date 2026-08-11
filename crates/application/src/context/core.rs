@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use local_agent_terminal_domain::{
     ArtifactId, CapabilityRef, ContextPackageArtifact, ContextPackageBinding,
-    ContextPackageDescriptor, ContextPackageMember, Disclosure, DisclosureKind, EvidenceFreshness,
-    LineRange, PolicyAction, PolicyActor, PolicyEffect, PolicyRequest, PolicyResource, ProjectId,
+    ContextPackageDescriptor, ContextPackageMember, Disclosure, DisclosureKind, LineRange,
+    PolicyAction, PolicyActor, PolicyEffect, PolicyRequest, PolicyResource, ProjectId,
     ResourceClass, Sha256Digest, SourceIdentity, TaskId, TaskRisk, Timestamp,
 };
 use serde::{Deserialize, Serialize};
@@ -1015,6 +1015,74 @@ pub struct QueryContextRequest {
     pub package: ContextPackageDraft,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextEvidenceAssemblyItem {
+    pub member: ContextPackageMember,
+    pub content: String,
+    pub policy_decision_ids: Vec<String>,
+    pub provenance: Vec<String>,
+    pub redaction_report_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssembledContextPackage {
+    pub descriptor: ContextPackageDescriptor,
+    pub artifact: ImmutableContextArtifact,
+    pub members: Vec<ContextPackageMember>,
+    pub policy_decision_ids: Vec<String>,
+    pub provenance: Vec<String>,
+    pub redaction_report_ids: Vec<String>,
+    pub used_input_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedContextPackage {
+    artifact: ImmutableContextArtifact,
+    persistence: ContextPackagePersistence,
+    provenance: Vec<String>,
+    redaction_report_ids: Vec<String>,
+}
+
+impl PreparedContextPackage {
+    pub fn binding(&self) -> &ContextPackageBinding {
+        &self.persistence.package.binding
+    }
+
+    pub fn artifact(&self) -> &ImmutableContextArtifact {
+        &self.artifact
+    }
+
+    pub fn policy_decision_ids(&self) -> &[PolicyDecisionId] {
+        &self.persistence.policy_decision_ids
+    }
+
+    pub fn provenance(&self) -> &[String] {
+        &self.provenance
+    }
+
+    pub fn redaction_report_ids(&self) -> &[String] {
+        &self.redaction_report_ids
+    }
+}
+
+pub trait ContextPackageAssembler: Send + Sync {
+    fn assemble(
+        &self,
+        descriptor: ContextPackageDescriptor,
+        policy: ContextBuildPolicy,
+        items: Vec<ContextEvidenceAssemblyItem>,
+        policy_decision_ids: Vec<String>,
+    ) -> Result<AssembledContextPackage, PortError>;
+}
+
+pub trait ContextRetrievalAuthority: Send + Sync {
+    fn verify_current(
+        &self,
+        task_id: &TaskId,
+        items: &[RetrievedContextItem],
+    ) -> Result<(), PortError>;
+}
+
 pub struct BuildInitialContext<'a> {
     source: &'a dyn RepositoryContextSource,
     classifier: &'a dyn ContextSourceClassifier,
@@ -1022,6 +1090,7 @@ pub struct BuildInitialContext<'a> {
     artifacts: &'a dyn ContextArtifactPublisher,
     disclosures: &'a dyn DisclosurePolicyEvaluator,
     policy_decisions: &'a dyn PolicyDecisionStore,
+    assembler: &'a dyn ContextPackageAssembler,
 }
 
 impl<'a> BuildInitialContext<'a> {
@@ -1032,6 +1101,7 @@ impl<'a> BuildInitialContext<'a> {
         artifacts: &'a dyn ContextArtifactPublisher,
         disclosures: &'a dyn DisclosurePolicyEvaluator,
         policy_decisions: &'a dyn PolicyDecisionStore,
+        assembler: &'a dyn ContextPackageAssembler,
     ) -> Self {
         Self {
             source,
@@ -1040,6 +1110,7 @@ impl<'a> BuildInitialContext<'a> {
             artifacts,
             disclosures,
             policy_decisions,
+            assembler,
         }
     }
 
@@ -1054,26 +1125,25 @@ impl<'a> BuildInitialContext<'a> {
         let snapshot = self.source.snapshot(request.snapshot.clone())?;
         validate_snapshot(&request.snapshot, &snapshot)?;
 
-        let mut members = Vec::new();
+        let mut items = Vec::new();
         let mut decision_ids = Vec::new();
         for item in snapshot.items {
-            if let Some(member) = self.persist_allowed_item(
+            if let Some(item) = self.persist_allowed_item(
                 &request.snapshot.task_id,
                 &request.policy,
                 item,
                 &mut decision_ids,
             )? {
-                members.push(member);
+                items.push(item);
             }
         }
         finalize_package(
             self.store,
             self.artifacts,
-            self.disclosures,
-            self.policy_decisions,
+            self.assembler,
             request.policy,
             request.package,
-            members,
+            items,
             decision_ids,
         )
     }
@@ -1084,7 +1154,8 @@ impl<'a> BuildInitialContext<'a> {
         policy: &ContextBuildPolicy,
         item: SourceSnapshotItem,
         decision_ids: &mut Vec<PolicyDecisionId>,
-    ) -> Result<Option<ContextPackageMember>, PortError> {
+    ) -> Result<Option<ContextEvidenceAssemblyItem>, PortError> {
+        let decision_start = decision_ids.len();
         validate_source_content(&item.identity, &item.content)?;
         item.metadata.validate()?;
         let original_artifact = ContextArtifactRef::new(
@@ -1205,6 +1276,7 @@ impl<'a> BuildInitialContext<'a> {
             content_policy,
         )?;
 
+        let assembly_content = String::from_utf8(content.bytes.clone()).map_err(|_| invalid_input())?;
         self.artifacts.publish(ImmutableContextArtifact {
             artifact_id: classification.evidence().artifact_id.clone(),
             task_id: task_id.clone(),
@@ -1247,7 +1319,7 @@ impl<'a> BuildInitialContext<'a> {
         } else {
             content.disclosure
         };
-        ContextPackageMember::new(
+        let member = ContextPackageMember::new(
             &effective_candidate.member_id,
             task_id.clone(),
             local_agent_terminal_domain::EvidenceCitation::new(
@@ -1259,8 +1331,26 @@ impl<'a> BuildInitialContext<'a> {
             .map_err(|_| invalid_input())?,
             disclosure,
         )
-        .map(Some)
-        .map_err(|_| invalid_input())
+        .map_err(|_| invalid_input())?;
+        let redaction_report_ids = member
+            .disclosure()
+            .stable_report_id()
+            .map(|report| vec![report.to_owned()])
+            .unwrap_or_default();
+        Ok(Some(ContextEvidenceAssemblyItem {
+            member,
+            content: assembly_content,
+            policy_decision_ids: decision_ids[decision_start..]
+                .iter()
+                .map(|decision| decision.as_str().to_owned())
+                .collect(),
+            provenance: vec![format!(
+                "repository:{}:{}",
+                item.identity.revision(),
+                item.identity.path_identity()
+            )],
+            redaction_report_ids,
+        }))
     }
 
     fn persist_source_record(
@@ -1295,6 +1385,8 @@ pub struct QueryContext<'a> {
     artifact_reader: &'a dyn ContextArtifactReader,
     disclosures: &'a dyn DisclosurePolicyEvaluator,
     policy_decisions: &'a dyn PolicyDecisionStore,
+    assembler: &'a dyn ContextPackageAssembler,
+    authority: &'a dyn ContextRetrievalAuthority,
 }
 
 impl<'a> QueryContext<'a> {
@@ -1304,6 +1396,8 @@ impl<'a> QueryContext<'a> {
         artifact_reader: &'a dyn ContextArtifactReader,
         disclosures: &'a dyn DisclosurePolicyEvaluator,
         policy_decisions: &'a dyn PolicyDecisionStore,
+        assembler: &'a dyn ContextPackageAssembler,
+        authority: &'a dyn ContextRetrievalAuthority,
     ) -> Self {
         Self {
             store,
@@ -1311,6 +1405,8 @@ impl<'a> QueryContext<'a> {
             artifact_reader,
             disclosures,
             policy_decisions,
+            assembler,
+            authority,
         }
     }
 
@@ -1318,16 +1414,26 @@ impl<'a> QueryContext<'a> {
         &self,
         request: QueryContextRequest,
     ) -> Result<ContextPackageBinding, PortError> {
+        let prepared = self.prepare(request)?;
+        self.commit(prepared)
+    }
+
+    pub fn prepare(&self, request: QueryContextRequest) -> Result<PreparedContextPackage, PortError> {
         validate_package_task(&request.package, &request.query.task_id)?;
         if request.policy.task_id != request.query.task_id {
             return Err(invalid_input());
         }
-        let mut members = Vec::new();
+        let mut items = Vec::new();
         let mut decisions = Vec::new();
-        for item in self.store.query(request.query.clone())? {
+        let retrieved = self.store.query(request.query.clone())?;
+        self.authority
+            .verify_current(&request.query.task_id, &retrieved)?;
+        for item in retrieved {
             item.validate(&request.query.task_id)?;
-            decisions.push(item.provenance.index_metadata().decision_id().clone());
-            decisions.push(item.provenance.index_content().decision_id().clone());
+            let mut item_decisions = vec![
+                item.provenance.index_metadata().decision_id().clone(),
+                item.provenance.index_content().decision_id().clone(),
+            ];
             let bytes = self.artifact_reader.read(&item.artifact)?;
             validate_artifact_content(&item.artifact, &bytes)?;
             let disclosure = disclose_source(
@@ -1339,10 +1445,16 @@ impl<'a> QueryContext<'a> {
                 DisclosureChannel::RetrievedItem,
                 bytes,
             )?;
-            decisions.push(disclosure.decision_id);
+            item_decisions.push(disclosure.decision_id);
+            decisions.extend(item_decisions.iter().cloned());
             let Some(disclosed) = disclosure.disclosed else {
                 continue;
             };
+            let provenance = format!(
+                "repository:{}:{}",
+                item.identity.revision(),
+                item.identity.path_identity()
+            );
             let citation = local_agent_terminal_domain::EvidenceCitation::new(
                 item.identity,
                 item.line_range,
@@ -1350,26 +1462,43 @@ impl<'a> QueryContext<'a> {
                 local_agent_terminal_domain::EvidenceFreshness::Current,
             )
             .map_err(|_| invalid_input())?;
-            members.push(
-                ContextPackageMember::new(
+            let member = ContextPackageMember::new(
                     &item.member_id,
                     request.query.task_id.clone(),
                     citation,
                     disclosed.disclosure,
                 )
-                .map_err(|_| invalid_input())?,
-            );
+                .map_err(|_| invalid_input())?;
+            let redaction_report_ids = member
+                .disclosure()
+                .stable_report_id()
+                .map(|report| vec![report.to_owned()])
+                .unwrap_or_default();
+            items.push(ContextEvidenceAssemblyItem {
+                member,
+                content: String::from_utf8(disclosed.bytes).map_err(|_| invalid_input())?,
+                policy_decision_ids: item_decisions
+                    .iter()
+                    .map(|decision| decision.as_str().to_owned())
+                    .collect(),
+                provenance: vec![provenance],
+                redaction_report_ids,
+            });
         }
-        finalize_package(
-            self.store,
-            self.artifacts,
-            self.disclosures,
-            self.policy_decisions,
+        prepare_package(
+            self.assembler,
             request.policy,
             request.package,
-            members,
+            items,
             decisions,
         )
+    }
+
+    pub fn commit(
+        &self,
+        prepared: PreparedContextPackage,
+    ) -> Result<ContextPackageBinding, PortError> {
+        commit_prepared_package(self.store, self.artifacts, prepared)
     }
 }
 
@@ -1489,40 +1618,55 @@ fn disclose_bytes(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn finalize_package(
     store: &dyn ContextStore,
     artifacts: &dyn ContextArtifactPublisher,
-    disclosures: &dyn DisclosurePolicyEvaluator,
-    policy_decisions: &dyn PolicyDecisionStore,
+    assembler: &dyn ContextPackageAssembler,
     policy: ContextBuildPolicy,
     draft: ContextPackageDraft,
-    members: Vec<ContextPackageMember>,
-    mut decision_ids: Vec<PolicyDecisionId>,
+    items: Vec<ContextEvidenceAssemblyItem>,
+    decision_ids: Vec<PolicyDecisionId>,
 ) -> Result<ContextPackageBinding, PortError> {
-    normalize_decision_ids(&mut decision_ids);
-    let manifest_bytes = canonical_context_package_manifest(
-        &draft,
-        members.clone(),
-        &policy.policy_snapshot_digest,
-        decision_ids.clone(),
+    let prepared = prepare_package(assembler, policy, draft, items, decision_ids)?;
+    commit_prepared_package(store, artifacts, prepared)
+}
+
+fn prepare_package(
+    assembler: &dyn ContextPackageAssembler,
+    policy: ContextBuildPolicy,
+    draft: ContextPackageDraft,
+    items: Vec<ContextEvidenceAssemblyItem>,
+    decision_ids: Vec<PolicyDecisionId>,
+) -> Result<PreparedContextPackage, PortError> {
+    let expected_artifact_id = draft.descriptor.effective_content_artifact_id().clone();
+    let expected_task_id = draft.descriptor.task_id().clone();
+    let assembled = assembler.assemble(
+        draft.descriptor,
+        policy.clone(),
+        items,
+        decision_ids
+            .iter()
+            .map(|decision| decision.as_str().to_owned())
+            .collect(),
     )?;
-    let manifest_digest = digest(&manifest_bytes)?;
-    let final_disclosure = disclose_bytes(
-        disclosures,
-        policy_decisions,
-        &policy,
-        CapabilityRef::artifact(draft.descriptor.effective_content_artifact_id().clone())
-            .map_err(|_| invalid_input())?,
-        policy.resource_class,
-        DisclosureChannel::FinalContextPackage,
-        manifest_bytes.clone(),
-    )?;
-    decision_ids.push(final_disclosure.decision_id);
-    let final_disclosure = final_disclosure.disclosed.ok_or_else(permission_denied)?;
-    if final_disclosure.bytes != manifest_bytes || final_disclosure.digest != manifest_digest {
+    if assembled.artifact.artifact_id != expected_artifact_id
+        || assembled.artifact.task_id != expected_task_id
+        || assembled.artifact.kind != ContextArtifactKind::ContextPackage
+        || assembled.artifact.content_digest != digest(&assembled.artifact.bytes)?
+        || assembled.descriptor.effective_content_artifact_id() != &expected_artifact_id
+        || assembled.descriptor.task_id() != &expected_task_id
+        || assembled.used_input_tokens
+            != u64::try_from(assembled.artifact.bytes.len()).map_err(|_| integrity_failure())?
+        || assembled.descriptor.budget().used_input_tokens() != assembled.used_input_tokens
+    {
         return Err(integrity_failure());
     }
+    let mut decision_ids = assembled
+        .policy_decision_ids
+        .iter()
+        .cloned()
+        .map(PolicyDecisionId::from_persisted)
+        .collect::<Result<Vec<_>, _>>()?;
     normalize_decision_ids(&mut decision_ids);
     let policy_set = PolicyDecisionSet::new(
         policy.policy_snapshot_digest,
@@ -1533,20 +1677,18 @@ fn finalize_package(
     )
     .map_err(|_| integrity_failure())?;
     let artifact = ContextPackageArtifact::new(
-        draft.descriptor.effective_content_artifact_id().clone(),
-        manifest_digest.clone(),
-        manifest_digest.clone(),
+        expected_artifact_id,
+        assembled.artifact.content_digest.clone(),
+        assembled.artifact.content_digest.clone(),
     )
     .map_err(|_| integrity_failure())?;
-    let binding = ContextPackageBinding::new(draft.descriptor, policy_set, artifact, members)
-        .map_err(|_| integrity_failure())?;
-    artifacts.publish(ImmutableContextArtifact {
-        artifact_id: binding.descriptor().effective_content_artifact_id().clone(),
-        task_id: binding.descriptor().task_id().clone(),
-        kind: ContextArtifactKind::ContextPackage,
-        bytes: manifest_bytes,
-        content_digest: manifest_digest,
-    })?;
+    let binding = ContextPackageBinding::new(
+        assembled.descriptor,
+        policy_set,
+        artifact,
+        assembled.members,
+    )
+    .map_err(|_| integrity_failure())?;
     let persistence = ContextPackagePersistence {
         package: ContextPackageRecord {
             binding: binding.clone(),
@@ -1554,7 +1696,22 @@ fn finalize_package(
         policy_decision_ids: decision_ids,
     };
     validate_package_persistence(&persistence)?;
-    store.persist_package_with_policy_decisions(persistence)?;
+    Ok(PreparedContextPackage {
+        artifact: assembled.artifact,
+        persistence,
+        provenance: assembled.provenance,
+        redaction_report_ids: assembled.redaction_report_ids,
+    })
+}
+
+fn commit_prepared_package(
+    store: &dyn ContextStore,
+    artifacts: &dyn ContextArtifactPublisher,
+    prepared: PreparedContextPackage,
+) -> Result<ContextPackageBinding, PortError> {
+    let binding = prepared.persistence.package.binding.clone();
+    artifacts.publish(prepared.artifact)?;
+    store.persist_package_with_policy_decisions(prepared.persistence)?;
     Ok(binding)
 }
 
@@ -1643,194 +1800,6 @@ fn validate_package_task(package: &ContextPackageDraft, task_id: &TaskId) -> Res
         Ok(())
     } else {
         Err(invalid_input())
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ContextPackageManifestV1<'a> {
-    schema: &'static str,
-    version: u8,
-    artifact_id: &'a str,
-    descriptor: ManifestDescriptor<'a>,
-    members: Vec<ManifestMember<'a>>,
-    policy: ManifestPolicy<'a>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ManifestDescriptor<'a> {
-    package_id: &'a str,
-    task_id: &'a str,
-    agent_id: &'a str,
-    role: &'a str,
-    objective: &'a str,
-    agent_manifest_artifact_id: &'a str,
-    effective_content_artifact_id: &'a str,
-    created_at_unix_seconds: i64,
-    versions: ManifestVersions<'a>,
-    budget: ManifestBudget,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ManifestVersions<'a> {
-    prompt_template: &'a str,
-    retrieval_pipeline: &'a str,
-    tokenizer: &'a str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ManifestBudget {
-    max_tokens: u64,
-    reserved_response_tokens: u64,
-    used_input_tokens: u64,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ManifestMember<'a> {
-    member_id: &'a str,
-    task_id: &'a str,
-    citation: ManifestCitation<'a>,
-    disclosure: ManifestDisclosure<'a>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ManifestCitation<'a> {
-    source: ManifestSource<'a>,
-    range: Option<ManifestRange>,
-    symbol: Option<&'a str>,
-    freshness: &'static str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ManifestSource<'a> {
-    project_id: &'a str,
-    revision: &'a str,
-    path_identity: &'a str,
-    content_hash: &'a str,
-}
-
-#[derive(Serialize)]
-struct ManifestRange {
-    start: u32,
-    end: u32,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ManifestDisclosure<'a> {
-    kind: &'static str,
-    stable_report_id: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ManifestPolicy<'a> {
-    policy_snapshot_digest: &'a str,
-    item_decision_ids: Vec<&'a str>,
-}
-
-fn canonical_context_package_manifest(
-    draft: &ContextPackageDraft,
-    mut members: Vec<ContextPackageMember>,
-    policy_snapshot_digest: &Sha256Digest,
-    mut item_decision_ids: Vec<PolicyDecisionId>,
-) -> Result<Vec<u8>, PortError> {
-    if members
-        .iter()
-        .any(|member| member.task_id() != draft.descriptor.task_id())
-    {
-        return Err(integrity_failure());
-    }
-    members.sort_by(|left, right| left.member_id().cmp(right.member_id()));
-    if members
-        .windows(2)
-        .any(|pair| pair[0].member_id() == pair[1].member_id() && pair[0] != pair[1])
-    {
-        return Err(integrity_failure());
-    }
-    members.dedup();
-    item_decision_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    item_decision_ids.dedup();
-
-    let descriptor = &draft.descriptor;
-    let versions = descriptor.versions();
-    let budget = descriptor.budget();
-    let manifest = ContextPackageManifestV1 {
-        schema: "context-package-manifest",
-        version: 1,
-        artifact_id: descriptor.effective_content_artifact_id().as_str(),
-        descriptor: ManifestDescriptor {
-            package_id: descriptor.package_id(),
-            task_id: descriptor.task_id().as_str(),
-            agent_id: descriptor.agent_id(),
-            role: descriptor.role(),
-            objective: descriptor.objective(),
-            agent_manifest_artifact_id: descriptor.agent_manifest_artifact_id().as_str(),
-            effective_content_artifact_id: descriptor.effective_content_artifact_id().as_str(),
-            created_at_unix_seconds: descriptor.created_at().unix_seconds(),
-            versions: ManifestVersions {
-                prompt_template: versions.prompt_template(),
-                retrieval_pipeline: versions.retrieval_pipeline(),
-                tokenizer: versions.tokenizer(),
-            },
-            budget: ManifestBudget {
-                max_tokens: budget.max_tokens(),
-                reserved_response_tokens: budget.reserved_response_tokens(),
-                used_input_tokens: budget.used_input_tokens(),
-            },
-        },
-        members: members.iter().map(ManifestMember::from).collect(),
-        policy: ManifestPolicy {
-            policy_snapshot_digest: policy_snapshot_digest.as_str(),
-            item_decision_ids: item_decision_ids
-                .iter()
-                .map(PolicyDecisionId::as_str)
-                .collect(),
-        },
-    };
-    let value = serde_json::to_value(manifest).map_err(|_| integrity_failure())?;
-    serde_json_canonicalizer::to_vec(&value).map_err(|_| integrity_failure())
-}
-
-impl<'a> From<&'a ContextPackageMember> for ManifestMember<'a> {
-    fn from(member: &'a ContextPackageMember) -> Self {
-        let citation = member.citation();
-        let source = citation.source();
-        Self {
-            member_id: member.member_id(),
-            task_id: member.task_id().as_str(),
-            citation: ManifestCitation {
-                source: ManifestSource {
-                    project_id: source.project_id().as_str(),
-                    revision: source.revision(),
-                    path_identity: source.path_identity(),
-                    content_hash: source.content_hash().as_str(),
-                },
-                range: citation.range().map(|range| ManifestRange {
-                    start: range.start(),
-                    end: range.end(),
-                }),
-                symbol: citation.symbol(),
-                freshness: match citation.freshness() {
-                    EvidenceFreshness::Current => "current",
-                    EvidenceFreshness::Stale => "stale",
-                },
-            },
-            disclosure: ManifestDisclosure {
-                kind: match member.disclosure().kind() {
-                    DisclosureKind::Allowed => "allowed",
-                    DisclosureKind::Redacted => "redacted",
-                    DisclosureKind::Denied => "denied",
-                },
-                stable_report_id: member.disclosure().stable_report_id(),
-            },
-        }
     }
 }
 

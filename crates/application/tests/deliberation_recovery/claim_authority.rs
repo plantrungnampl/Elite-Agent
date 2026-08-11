@@ -1019,7 +1019,7 @@ fn specialist_request() -> SpecialistRequest {
             ArtifactId::new("context-2").unwrap(),
             ArtifactId::new("context-1").unwrap(),
         ],
-        SpecialistBudget::new(512, Timestamp::from_unix_seconds(1_800_000_000)).unwrap(),
+        SpecialistBudget::new(512, 5_120, Timestamp::from_unix_seconds(1_800_000_000)).unwrap(),
     )
     .unwrap()
 }

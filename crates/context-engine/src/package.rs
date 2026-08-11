@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use local_agent_terminal_application::{
-    ContextArtifactKind, ContextBuildPolicy, DisclosureChannel, DisclosurePolicyEvaluator,
-    DisclosureRequest, ImmutableContextArtifact, PolicyDecisionId, PolicyDecisionStore, PortError,
+    AssembledContextPackage, ContextArtifactKind, ContextBuildPolicy, ContextEvidenceAssemblyItem,
+    ContextPackageAssembler, DisclosureChannel, DisclosurePolicyEvaluator, DisclosureRequest,
+    ImmutableContextArtifact, PolicyDecisionId, PolicyDecisionStore, PortError,
     RecordedPolicyDecision, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
@@ -131,7 +132,8 @@ impl<'a> ContextPackageBuilder<'a> {
         }
 
         let raw_bytes = loop {
-            let bytes = canonical_package_bytes(&request.descriptor, &request.policy, &retained)?;
+            let bytes =
+                canonical_budgeted_package_bytes(&request.descriptor, &request.policy, &retained)?;
             if u64::try_from(bytes.len()).map_err(|_| budget_exceeded())?
                 <= allocation.input_limit()
             {
@@ -217,6 +219,11 @@ impl<'a> ContextPackageBuilder<'a> {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut descriptor = request.descriptor.clone();
+        let used_input_units = u64::try_from(bytes.len()).map_err(|_| budget_exceeded())?;
+        descriptor
+            .consume_input_tokens(used_input_units)
+            .map_err(|_| budget_exceeded())?;
         let artifact = ImmutableContextArtifact {
             artifact_id: request.descriptor.effective_content_artifact_id().clone(),
             task_id: request.policy.task_id,
@@ -225,7 +232,8 @@ impl<'a> ContextPackageBuilder<'a> {
             content_digest: content_digest.clone(),
         };
         Ok(BuiltContextPackage {
-            used_input_units: u64::try_from(bytes.len()).map_err(|_| budget_exceeded())?,
+            descriptor,
+            used_input_units,
             bytes,
             content_digest,
             artifact,
@@ -237,6 +245,7 @@ impl<'a> ContextPackageBuilder<'a> {
 }
 
 pub struct BuiltContextPackage {
+    descriptor: ContextPackageDescriptor,
     bytes: Vec<u8>,
     content_digest: Sha256Digest,
     artifact: ImmutableContextArtifact,
@@ -247,6 +256,10 @@ pub struct BuiltContextPackage {
 }
 
 impl BuiltContextPackage {
+    pub fn descriptor(&self) -> &ContextPackageDescriptor {
+        &self.descriptor
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -273,6 +286,61 @@ impl BuiltContextPackage {
 
     pub fn members(&self) -> &[ContextPackageMember] {
         &self.members
+    }
+}
+
+impl ContextPackageAssembler for ContextPackageBuilder<'_> {
+    fn assemble(
+        &self,
+        descriptor: ContextPackageDescriptor,
+        policy: ContextBuildPolicy,
+        items: Vec<ContextEvidenceAssemblyItem>,
+        mut policy_decision_ids: Vec<String>,
+    ) -> Result<AssembledContextPackage, PortError> {
+        let provenance = items
+            .iter()
+            .flat_map(|item| item.provenance.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let redaction_report_ids = items
+            .iter()
+            .flat_map(|item| item.redaction_report_ids.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let items = items
+            .into_iter()
+            .map(|item| {
+                ContextPackageItem::new(
+                    item.member.member_id(),
+                    PackageSegment::Evidence,
+                    item.content,
+                    Some(item.member.citation().clone()),
+                    item.member.disclosure().clone(),
+                    item.policy_decision_ids,
+                    item.provenance,
+                    item.redaction_report_ids,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let built = self.build(ContextPackageBuildRequest {
+            descriptor,
+            policy,
+            items,
+        })?;
+        policy_decision_ids.extend(built.policy_decision_ids().iter().cloned());
+        policy_decision_ids.sort();
+        policy_decision_ids.dedup();
+        Ok(AssembledContextPackage {
+            descriptor: built.descriptor().clone(),
+            artifact: built.artifact().clone(),
+            members: built.members().to_vec(),
+            policy_decision_ids,
+            provenance,
+            redaction_report_ids,
+            used_input_tokens: built.used_input_units(),
+        })
     }
 }
 
@@ -308,6 +376,7 @@ struct SerializedVersions<'a> {
 struct SerializedBudget {
     max_tokens: u64,
     reserved_response_tokens: u64,
+    used_input_tokens: u64,
 }
 
 #[derive(Serialize)]
@@ -358,6 +427,7 @@ fn canonical_package_bytes(
     descriptor: &ContextPackageDescriptor,
     policy: &ContextBuildPolicy,
     items: &[ContextPackageItem],
+    used_input_tokens: u64,
 ) -> Result<Vec<u8>, PortError> {
     let mut canonical_items = items.iter().collect::<Vec<_>>();
     canonical_items.sort_by(|left, right| left.member_id.cmp(&right.member_id));
@@ -382,6 +452,7 @@ fn canonical_package_bytes(
         budget: SerializedBudget {
             max_tokens: budget.max_tokens(),
             reserved_response_tokens: budget.reserved_response_tokens(),
+            used_input_tokens,
         },
         policy_snapshot_digest: policy.policy_snapshot_digest.as_str(),
         items: canonical_items
@@ -391,6 +462,23 @@ fn canonical_package_bytes(
     };
     let value = serde_json::to_value(package).map_err(|_| integrity())?;
     serde_json_canonicalizer::to_vec(&value).map_err(|_| integrity())
+}
+
+fn canonical_budgeted_package_bytes(
+    descriptor: &ContextPackageDescriptor,
+    policy: &ContextBuildPolicy,
+    items: &[ContextPackageItem],
+) -> Result<Vec<u8>, PortError> {
+    let mut used_input_tokens = 0;
+    for _ in 0..8 {
+        let bytes = canonical_package_bytes(descriptor, policy, items, used_input_tokens)?;
+        let next = u64::try_from(bytes.len()).map_err(|_| budget_exceeded())?;
+        if next == used_input_tokens {
+            return Ok(bytes);
+        }
+        used_input_tokens = next;
+    }
+    Err(integrity())
 }
 
 impl<'a> From<&'a ContextPackageItem> for SerializedItem<'a> {

@@ -11,6 +11,7 @@ use local_agent_terminal_application::{
     SourceIndexMetadata, SourceSnapshot, SourceSnapshotItem, SourceSnapshotRequest,
     SourceStateTransition,
 };
+use local_agent_terminal_context_engine::ContextPackageBuilder;
 use local_agent_terminal_domain::{
     combine_policy_rules, ActorLocality, ArtifactId, ContextBudget, ContextPackageDescriptor,
     ContextPackageIdentity, ContextVersionSet, MatchedPolicyRule, PolicyEffect, PolicyRuleId,
@@ -336,8 +337,11 @@ fn harness(
         mode,
     }));
     let decisions = Box::leak(Box::new(Decisions));
+    let assembler = Box::leak(Box::new(ContextPackageBuilder::new(policy, decisions)));
     (
-        BuildInitialContext::new(source, classifier, store, publisher, policy, decisions),
+        BuildInitialContext::new(
+            source, classifier, store, publisher, policy, decisions, assembler,
+        ),
         state,
     )
 }

@@ -3,7 +3,7 @@ use std::fmt;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-const SUPPORTED_SCHEMA_VERSION: i64 = 7;
+const SUPPORTED_SCHEMA_VERSION: i64 = 8;
 const NORMATIVE_SQL: &str =
     include_str!("../../../docs/multi-agent-terminal-design/schemas/sqlite-v1.sql");
 const V1_ADAPTER_HARDENING_SQL: &str = r#"
@@ -430,6 +430,84 @@ BEGIN
 END;
 "#;
 
+const V8_DELIBERATION_TASK_BUDGETS_SQL: &str = r#"
+CREATE TABLE deliberation_task_budgets (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
+    max_threads INTEGER NOT NULL CHECK (max_threads BETWEEN 1 AND 4096),
+    max_tokens INTEGER NOT NULL CHECK (max_tokens BETWEEN 1 AND 1000000),
+    max_cost_microunits INTEGER NOT NULL
+        CHECK (max_cost_microunits BETWEEN 1 AND 1000000000000),
+    deadline_unix_seconds INTEGER NOT NULL CHECK (deadline_unix_seconds > 0),
+    reserved_threads INTEGER NOT NULL DEFAULT 0
+        CHECK (reserved_threads BETWEEN 0 AND max_threads),
+    reserved_tokens INTEGER NOT NULL DEFAULT 0
+        CHECK (reserved_tokens BETWEEN 0 AND max_tokens),
+    reserved_cost_microunits INTEGER NOT NULL DEFAULT 0
+        CHECK (reserved_cost_microunits BETWEEN 0 AND max_cost_microunits)
+) STRICT;
+
+CREATE TRIGGER deliberation_task_budget_authority_immutable
+BEFORE UPDATE ON deliberation_task_budgets
+FOR EACH ROW
+WHEN NEW.task_id IS NOT OLD.task_id
+    OR NEW.max_threads IS NOT OLD.max_threads
+    OR NEW.max_tokens IS NOT OLD.max_tokens
+    OR NEW.max_cost_microunits IS NOT OLD.max_cost_microunits
+    OR NEW.deadline_unix_seconds IS NOT OLD.deadline_unix_seconds
+BEGIN
+    SELECT RAISE(ABORT, 'deliberation task budget authority is immutable');
+END;
+
+CREATE TRIGGER deliberation_task_budget_reservations_monotonic
+BEFORE UPDATE ON deliberation_task_budgets
+FOR EACH ROW
+WHEN NEW.reserved_threads < OLD.reserved_threads
+    OR NEW.reserved_tokens < OLD.reserved_tokens
+    OR NEW.reserved_cost_microunits < OLD.reserved_cost_microunits
+BEGIN
+    SELECT RAISE(ABORT, 'deliberation task budget reservations must increase');
+END;
+
+CREATE TRIGGER deliberation_task_budget_delete_forbidden
+BEFORE DELETE ON deliberation_task_budgets
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'deliberation task budget authority is immutable');
+END;
+
+CREATE TABLE deliberation_dispatch_reservations (
+    run_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+    phase TEXT NOT NULL CHECK (phase IN (
+        'ParallelAnalysis', 'CrossReview', 'PrePlanVerification', 'Synthesis', 'FinalObjection'
+    )),
+    agent_id TEXT NOT NULL,
+    family_key TEXT NOT NULL,
+    max_tokens INTEGER NOT NULL CHECK (max_tokens BETWEEN 1 AND 1000000),
+    estimated_cost_microunits INTEGER NOT NULL CHECK (estimated_cost_microunits > 0),
+    deadline_unix_seconds INTEGER NOT NULL CHECK (deadline_unix_seconds > 0),
+    run_config_artifact_id TEXT NOT NULL,
+    connection_binding_digest TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX deliberation_dispatch_reservations_task
+ON deliberation_dispatch_reservations(task_id, phase, run_id);
+
+CREATE TRIGGER deliberation_dispatch_reservations_update_forbidden
+BEFORE UPDATE ON deliberation_dispatch_reservations
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'deliberation dispatch reservations are immutable');
+END;
+
+CREATE TRIGGER deliberation_dispatch_reservations_delete_forbidden
+BEFORE DELETE ON deliberation_dispatch_reservations
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'deliberation dispatch reservations are immutable');
+END;
+"#;
+
 #[derive(Debug)]
 pub enum OpenError {
     Database(rusqlite::Error),
@@ -492,6 +570,10 @@ impl From<rusqlite::Error> for OpenError {
 }
 
 pub fn migration_checksum() -> String {
+    checksum(V8_DELIBERATION_TASK_BUDGETS_SQL)
+}
+
+fn v7_migration_checksum() -> String {
     checksum(V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL)
 }
 
@@ -603,6 +685,16 @@ pub(crate) fn validate_or_migrate(connection: &mut Connection) -> Result<(), Ope
             validate_checksum(connection, 6, v6_migration_checksum())?;
             apply_upgrade_migrations(connection, version)?;
         }
+        7 => {
+            validate_checksum(connection, 1, v1_migration_checksum())?;
+            validate_checksum(connection, 2, v2_migration_checksum())?;
+            validate_checksum(connection, 3, v3_migration_checksum())?;
+            validate_checksum(connection, 4, v4_migration_checksum())?;
+            validate_checksum(connection, 5, v5_migration_checksum())?;
+            validate_checksum(connection, 6, v6_migration_checksum())?;
+            validate_checksum(connection, 7, v7_migration_checksum())?;
+            apply_upgrade_migrations(connection, version)?;
+        }
         SUPPORTED_SCHEMA_VERSION => {
             validate_checksum(connection, 1, v1_migration_checksum())?;
             validate_checksum(connection, 2, v2_migration_checksum())?;
@@ -610,7 +702,8 @@ pub(crate) fn validate_or_migrate(connection: &mut Connection) -> Result<(), Ope
             validate_checksum(connection, 4, v4_migration_checksum())?;
             validate_checksum(connection, 5, v5_migration_checksum())?;
             validate_checksum(connection, 6, v6_migration_checksum())?;
-            validate_checksum(connection, 7, migration_checksum())?;
+            validate_checksum(connection, 7, v7_migration_checksum())?;
+            validate_checksum(connection, 8, migration_checksum())?;
         }
         _ => {
             return Err(OpenError::UnsupportedSchema {
@@ -780,6 +873,18 @@ fn apply_initial_migration(connection: &mut Connection) -> Result<(), OpenError>
             7,
             "private_agent_run_outputs_v7",
             env!("CARGO_PKG_VERSION"),
+            v7_migration_checksum()
+        ],
+    )?;
+    transaction.execute_batch(V8_DELIBERATION_TASK_BUDGETS_SQL)?;
+    transaction.execute(
+        "INSERT INTO schema_migrations (
+            version, name, applied_at, application_version, checksum
+         ) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4)",
+        params![
+            8,
+            "deliberation_task_budgets_v8",
+            env!("CARGO_PKG_VERSION"),
             migration_checksum()
         ],
     )?;
@@ -825,6 +930,12 @@ fn apply_upgrade_migrations(connection: &mut Connection, version: i64) -> Result
                 7,
                 "private_agent_run_outputs_v7",
                 V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
+                v7_migration_checksum(),
+            ),
+            (
+                8,
+                "deliberation_task_budgets_v8",
+                V8_DELIBERATION_TASK_BUDGETS_SQL,
                 migration_checksum(),
             ),
         ],
@@ -857,6 +968,12 @@ fn apply_upgrade_migrations(connection: &mut Connection, version: i64) -> Result
                 7,
                 "private_agent_run_outputs_v7",
                 V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
+                v7_migration_checksum(),
+            ),
+            (
+                8,
+                "deliberation_task_budgets_v8",
+                V8_DELIBERATION_TASK_BUDGETS_SQL,
                 migration_checksum(),
             ),
         ],
@@ -883,6 +1000,12 @@ fn apply_upgrade_migrations(connection: &mut Connection, version: i64) -> Result
                 7,
                 "private_agent_run_outputs_v7",
                 V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
+                v7_migration_checksum(),
+            ),
+            (
+                8,
+                "deliberation_task_budgets_v8",
+                V8_DELIBERATION_TASK_BUDGETS_SQL,
                 migration_checksum(),
             ),
         ],
@@ -903,6 +1026,12 @@ fn apply_upgrade_migrations(connection: &mut Connection, version: i64) -> Result
                 7,
                 "private_agent_run_outputs_v7",
                 V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
+                v7_migration_checksum(),
+            ),
+            (
+                8,
+                "deliberation_task_budgets_v8",
+                V8_DELIBERATION_TASK_BUDGETS_SQL,
                 migration_checksum(),
             ),
         ],
@@ -917,13 +1046,33 @@ fn apply_upgrade_migrations(connection: &mut Connection, version: i64) -> Result
                 7,
                 "private_agent_run_outputs_v7",
                 V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
+                v7_migration_checksum(),
+            ),
+            (
+                8,
+                "deliberation_task_budgets_v8",
+                V8_DELIBERATION_TASK_BUDGETS_SQL,
                 migration_checksum(),
             ),
         ],
-        6 => vec![(
-            7,
-            "private_agent_run_outputs_v7",
-            V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
+        6 => vec![
+            (
+                7,
+                "private_agent_run_outputs_v7",
+                V7_PRIVATE_AGENT_RUN_OUTPUTS_SQL,
+                v7_migration_checksum(),
+            ),
+            (
+                8,
+                "deliberation_task_budgets_v8",
+                V8_DELIBERATION_TASK_BUDGETS_SQL,
+                migration_checksum(),
+            ),
+        ],
+        7 => vec![(
+            8,
+            "deliberation_task_budgets_v8",
+            V8_DELIBERATION_TASK_BUDGETS_SQL,
             migration_checksum(),
         )],
         _ => Vec::new(),

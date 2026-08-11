@@ -206,16 +206,19 @@ impl DeliberationBoundaryCheck {
 pub struct DeliberationDispatchBinding {
     request: BoundAgentRunRequest,
     assignment: DeliberationRunAssignment,
+    estimated_cost_microunits: u64,
 }
 
 impl DeliberationDispatchBinding {
     pub fn new(
         request: BoundAgentRunRequest,
         assignment: DeliberationRunAssignment,
+        estimated_cost_microunits: u64,
     ) -> Result<Self, PortError> {
         let binding = Self {
             request,
             assignment,
+            estimated_cost_microunits,
         };
         binding.validate()?;
         Ok(binding)
@@ -233,9 +236,22 @@ impl DeliberationDispatchBinding {
         self.assignment.family()
     }
 
+    pub const fn estimated_cost_microunits(&self) -> u64 {
+        self.estimated_cost_microunits
+    }
+
+    fn budget_reservation(&self) -> DeliberationBudgetReservation {
+        DeliberationBudgetReservation {
+            thread_count: 0,
+            token_count: self.request.run_config.limits.max_output_tokens,
+            cost_microunits: self.estimated_cost_microunits,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), PortError> {
         self.request.validate().map_err(|_| invalid_input())?;
-        if self.request.run_id != *self.assignment.run_id()
+        if self.estimated_cost_microunits == 0
+            || self.request.run_id != *self.assignment.run_id()
             || self.request.agent_id != self.assignment.agent_id()
         {
             return Err(invalid_input());
@@ -248,16 +264,19 @@ impl DeliberationDispatchBinding {
 pub struct DeliberationProposalDispatchPlan {
     task_id: TaskId,
     bindings: [DeliberationDispatchBinding; 2],
+    task_budget: DeliberationTaskBudget,
 }
 
 impl DeliberationProposalDispatchPlan {
     pub fn new(
         first: DeliberationDispatchBinding,
         second: DeliberationDispatchBinding,
+        task_budget: DeliberationTaskBudget,
     ) -> Result<Self, PortError> {
         let plan = Self {
             task_id: first.request.task_id.clone(),
             bindings: [first, second],
+            task_budget,
         };
         plan.validate()?;
         Ok(plan)
@@ -275,15 +294,26 @@ impl DeliberationProposalDispatchPlan {
         &self.bindings
     }
 
+    pub const fn task_budget(&self) -> DeliberationTaskBudget {
+        self.task_budget
+    }
+
+    pub fn budget_reservation(&self) -> Result<DeliberationBudgetReservation, PortError> {
+        dispatch_budget_reservation(&self.bindings)
+    }
+
     pub fn validate(&self) -> Result<(), PortError> {
         let [first, second] = &self.bindings;
         first.validate()?;
         second.validate()?;
+        self.budget_reservation()?.validate_within(self.task_budget)?;
         if first.request.task_id != self.task_id
             || second.request.task_id != self.task_id
             || first.request.run_id == second.request.run_id
             || first.request.agent_id == second.request.agent_id
             || first.assignment.family() == second.assignment.family()
+            || first.request.run_config.limits.deadline > self.task_budget.deadline()
+            || second.request.run_config.limits.deadline > self.task_budget.deadline()
         {
             return Err(invalid_input());
         }
@@ -297,6 +327,7 @@ pub struct DeliberationPhaseDispatchAuthority {
     phase: Phase,
     assignments: Vec<DeliberationRunAssignment>,
     limits: DeliberationLimits,
+    task_budget: DeliberationTaskBudget,
 }
 
 impl DeliberationPhaseDispatchAuthority {
@@ -305,12 +336,14 @@ impl DeliberationPhaseDispatchAuthority {
         phase: Phase,
         assignments: Vec<DeliberationRunAssignment>,
         limits: DeliberationLimits,
+        task_budget: DeliberationTaskBudget,
     ) -> Result<Self, PortError> {
         let authority = Self {
             task_id,
             phase,
             assignments,
             limits,
+            task_budget,
         };
         authority.validate()?;
         Ok(authority)
@@ -330,6 +363,10 @@ impl DeliberationPhaseDispatchAuthority {
 
     pub const fn limits(&self) -> DeliberationLimits {
         self.limits
+    }
+
+    pub const fn task_budget(&self) -> DeliberationTaskBudget {
+        self.task_budget
     }
 
     pub fn validate(&self) -> Result<(), PortError> {
@@ -393,8 +430,18 @@ impl DeliberationPhaseDispatchSet {
         &self.authority
     }
 
+    pub const fn task_budget(&self) -> DeliberationTaskBudget {
+        self.authority.task_budget()
+    }
+
+    pub fn budget_reservation(&self) -> Result<DeliberationBudgetReservation, PortError> {
+        dispatch_budget_reservation(&self.bindings)
+    }
+
     pub fn validate(&self) -> Result<(), PortError> {
         self.authority.validate()?;
+        self.budget_reservation()?
+            .validate_within(self.authority.task_budget())?;
         if self.bindings.is_empty()
             || self.bindings.len() > self.authority.limits().max_agents() as usize
         {
@@ -405,6 +452,8 @@ impl DeliberationPhaseDispatchSet {
         for binding in &self.bindings {
             binding.validate()?;
             if binding.request.task_id != *self.authority.task_id()
+                || binding.request.run_config.limits.deadline
+                    > self.authority.task_budget().deadline()
                 || !self
                     .authority
                     .assignments()
@@ -418,6 +467,15 @@ impl DeliberationPhaseDispatchSet {
         }
         Ok(())
     }
+}
+
+fn dispatch_budget_reservation(
+    bindings: &[DeliberationDispatchBinding],
+) -> Result<DeliberationBudgetReservation, PortError> {
+    bindings.iter().try_fold(
+        DeliberationBudgetReservation::default(),
+        |reservation, binding| reservation.checked_add(binding.budget_reservation()),
+    )
 }
 
 /// Atomically compares complete dispatch-binding sets with durable assignment and budget authority

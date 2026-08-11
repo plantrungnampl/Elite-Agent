@@ -516,8 +516,18 @@ fn valid_context_response(
             .policy_decision_ids
             .iter()
             .all(|decision| valid_opaque_reference(decision))
+        && response
+            .provenance
+            .iter()
+            .all(|provenance| valid_opaque_reference(provenance))
+        && response
+            .redactions
+            .iter()
+            .all(|redaction| valid_opaque_reference(redaction))
         && !has_duplicate_strings(&response.item_ids)
         && !has_duplicate_strings(&response.policy_decision_ids)
+        && !has_duplicate_strings(&response.provenance)
+        && !has_duplicate_strings(&response.redactions)
 }
 
 fn valid_opaque_reference(value: &str) -> bool {

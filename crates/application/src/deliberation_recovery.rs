@@ -97,20 +97,33 @@ impl CanonicalDeliberationFact {
         if envelope.schema != DELIBERATION_RECORD_SCHEMA || envelope.schema_version != 1 {
             return Err(integrity_failure());
         }
+        let legacy_normalized_bytes = legacy_specialist_normalized_bytes(&envelope)?;
         let task_id = TaskId::new(&envelope.task_id).map_err(|_| integrity_failure())?;
         let event_id = EventId::new(&envelope.event_id).map_err(|_| integrity_failure())?;
         let actor_id = ActorId::new(&envelope.actor_id).map_err(|_| integrity_failure())?;
         let record = record_from_fact(envelope.fact, &task_id)?;
         let reopened = Self::issue(task_id, event_id, envelope.event_sequence, actor_id, record)?;
-        if reopened.canonical_bytes != canonical_bytes
-            || reopened.content_digest != content_digest
+        let canonical_matches = reopened.canonical_bytes == canonical_bytes
+            && reopened.content_digest == content_digest;
+        let legacy_matches = legacy_normalized_bytes
+            .as_deref()
+            .is_some_and(|normalized| normalized == reopened.canonical_bytes);
+        if (!canonical_matches && !legacy_matches)
             || reopened.actor_type != envelope.actor_type
             || reopened.observation_class != envelope.observation_class
             || reopened.record.event_type() != envelope.event_type
         {
             return Err(integrity_failure());
         }
-        Ok(reopened)
+        if canonical_matches {
+            Ok(reopened)
+        } else {
+            Ok(Self {
+                canonical_bytes,
+                content_digest,
+                ..reopened
+            })
+        }
     }
 
     pub fn task_id(&self) -> &TaskId {
@@ -148,6 +161,23 @@ impl CanonicalDeliberationFact {
     pub fn content_digest(&self) -> &Sha256Digest {
         &self.content_digest
     }
+}
+
+fn legacy_specialist_normalized_bytes(
+    envelope: &DeliberationFactEnvelopeV1,
+) -> Result<Option<Vec<u8>>, PortError> {
+    let mut normalized = envelope.clone();
+    let DeliberationFactV1::SpecialistRequest { request, .. } = &mut normalized.fact else {
+        return Ok(None);
+    };
+    if request.budget.max_cost_microunits.is_some() {
+        return Ok(None);
+    }
+    request.budget.max_cost_microunits = Some(request.budget.max_tokens);
+    let value = serde_json::to_value(normalized).map_err(|_| integrity_failure())?;
+    serde_json_canonicalizer::to_vec(&value)
+        .map(Some)
+        .map_err(|_| integrity_failure())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -538,7 +568,14 @@ pub fn recover_deliberation(
             }
         }
     }
-    if !input.facts.is_empty() && replay_phase != input.task_state.phase() {
+    if !input.facts.is_empty()
+        && replay_phase != input.task_state.phase()
+        && !(replay_phase == Phase::AwaitingPlanApproval
+            && matches!(
+                input.task_state.phase(),
+                Phase::Synthesis | Phase::Implementation | Phase::Cancelled
+            ))
+    {
         return Err(conflict());
     }
     DeliberationSnapshot::from_recovery(RecoveredDeliberationState {
@@ -694,6 +731,8 @@ struct SpecialistRequestV1 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SpecialistBudgetV1 {
     max_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_cost_microunits: Option<u64>,
     deadline_unix_seconds: i64,
 }
 
@@ -1151,6 +1190,7 @@ fn specialist_request_to_v1(request: &SpecialistRequest) -> SpecialistRequestV1 
             .collect(),
         budget: SpecialistBudgetV1 {
             max_tokens: request.budget().max_tokens(),
+            max_cost_microunits: Some(request.budget().max_cost_microunits()),
             deadline_unix_seconds: request.budget().deadline().unix_seconds(),
         },
     }
@@ -1159,6 +1199,10 @@ fn specialist_request_to_v1(request: &SpecialistRequest) -> SpecialistRequestV1 
 fn specialist_request_from_v1(value: SpecialistRequestV1) -> Result<SpecialistRequest, PortError> {
     let budget = SpecialistBudget::new(
         value.budget.max_tokens,
+        value
+            .budget
+            .max_cost_microunits
+            .unwrap_or(value.budget.max_tokens),
         Timestamp::from_unix_seconds(value.budget.deadline_unix_seconds),
     )
     .map_err(|_| integrity_failure())?;

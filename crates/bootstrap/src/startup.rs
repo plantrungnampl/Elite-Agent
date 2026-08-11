@@ -20,6 +20,7 @@ use crate::agent_runtime::{
     compose_agent_runtime, AnthropicBootstrapConfig, ComposedAgentRuntime, OpenAiBootstrapConfig,
 };
 use crate::context_runtime::{compose_context_runtime, ContextRuntime};
+use crate::deliberation_runtime::{compose_deliberation_runtime, DeliberationRuntime};
 use crate::logging::LocalLog;
 #[cfg(windows)]
 use crate::production_tools::production_tool_broker;
@@ -44,6 +45,7 @@ pub struct Bootstrap {
     diagnostics: Vec<LocalDiagnosticDto>,
     runtime: Option<WorkspaceRuntime>,
     context_runtime: Option<Arc<ContextRuntime>>,
+    deliberation_runtime: Option<Arc<DeliberationRuntime>>,
     agent_runtime: Option<Arc<ComposedAgentRuntime>>,
     tool_runtime: Option<Arc<ToolRuntime>>,
     tool_broker: Option<ToolBrokerConfig>,
@@ -53,6 +55,7 @@ pub struct Bootstrap {
 struct StartupRuntimes {
     workspace: WorkspaceRuntime,
     context: Arc<ContextRuntime>,
+    deliberation: Arc<DeliberationRuntime>,
     agent_runtime: Option<Arc<ComposedAgentRuntime>>,
     tools: ToolRuntime,
 }
@@ -138,6 +141,7 @@ impl Bootstrap {
             diagnostics: Vec::new(),
             runtime: None,
             context_runtime: None,
+            deliberation_runtime: None,
             agent_runtime,
             tool_runtime,
             tool_broker: None,
@@ -155,6 +159,7 @@ impl Bootstrap {
             diagnostics: Vec::new(),
             runtime: None,
             context_runtime: None,
+            deliberation_runtime: None,
             agent_runtime: None,
             tool_runtime: None,
             tool_broker,
@@ -238,6 +243,7 @@ impl Bootstrap {
                 };
                 self.runtime = Some(runtimes.workspace);
                 self.context_runtime = Some(runtimes.context);
+                self.deliberation_runtime = Some(runtimes.deliberation);
                 self.agent_runtime = runtimes.agent_runtime;
                 self.tool_runtime = Some(Arc::new(runtimes.tools));
                 log.push(record(
@@ -284,6 +290,14 @@ impl Bootstrap {
         self.context_runtime.as_deref()
     }
 
+    pub fn deliberation_runtime(&self) -> Option<&DeliberationRuntime> {
+        self.deliberation_runtime.as_deref()
+    }
+
+    pub fn deliberation_runtime_handle(&self) -> Option<Arc<DeliberationRuntime>> {
+        self.deliberation_runtime.clone()
+    }
+
     pub fn agent_runtime(&self) -> Option<&dyn AgentRuntime> {
         self.agent_runtime
             .as_deref()
@@ -322,12 +336,15 @@ impl Bootstrap {
         };
         self.runtime = None;
         self.context_runtime = None;
+        self.deliberation_runtime = None;
     }
 
     fn shutdown_owned_runtimes(&mut self) -> Result<(), StartupFailure> {
         let agent_error = self.shutdown_agent_runtime().err();
         let tool_error = self.shutdown_tool_runtime().err();
         self.runtime = None;
+        self.context_runtime = None;
+        self.deliberation_runtime = None;
 
         if let Some(error) = agent_error {
             return Err(agent_runtime_shutdown_failure(error));
@@ -378,6 +395,7 @@ impl Bootstrap {
             diagnostics: log.into_records(),
             runtime: None,
             context_runtime: None,
+            deliberation_runtime: None,
             agent_runtime: None,
             tool_runtime: None,
             tool_broker: None,
@@ -599,9 +617,21 @@ fn start(
         ),
     ));
 
+    let context_repositories = GitRepositoryGateway::open(
+        &config.trusted_workspace_root,
+        &[config.app_data_dir.join("artifacts")],
+    )
+    .map_err(workspace_reconciliation_failure)?;
+    let context = compose_context_runtime(
+        database.clone(),
+        Arc::clone(&artifacts),
+        context_repositories,
+    )
+    .map_err(context_runtime_failure)?;
     let agent_runtime = compose_agent_runtime(
         database.clone(),
         Arc::clone(&artifacts),
+        Arc::clone(&context),
         config.openai.as_ref(),
         config.anthropic.as_ref(),
     )
@@ -615,11 +645,22 @@ fn start(
             "Configured trusted agent runtime was composed.",
         ));
     }
-    let context_agents: Option<Arc<dyn AgentRuntime>> = agent_runtime
-        .as_ref()
-        .map(|runtime| Arc::clone(runtime) as Arc<dyn AgentRuntime>);
-    let context = compose_context_runtime(database.clone(), Arc::clone(&artifacts), context_agents)
-        .map_err(context_runtime_failure)?;
+    if let Some(runtime) = agent_runtime.as_ref() {
+        context
+            .attach_agents(Arc::clone(runtime) as Arc<dyn AgentRuntime>)
+            .map_err(context_runtime_failure)?;
+    }
+    let deliberation_repositories = GitRepositoryGateway::open(
+        &config.trusted_workspace_root,
+        &[config.app_data_dir.join("artifacts")],
+    )
+    .map_err(workspace_reconciliation_failure)?;
+    let deliberation = compose_deliberation_runtime(
+        database.clone(),
+        Arc::clone(&artifacts),
+        deliberation_repositories,
+        context.policy_snapshot_digest().clone(),
+    );
 
     Ok(StartupRuntimes {
         workspace: WorkspaceRuntime::new(
@@ -630,6 +671,7 @@ fn start(
             workspace_writes,
         ),
         context,
+        deliberation,
         agent_runtime,
         tools,
     })

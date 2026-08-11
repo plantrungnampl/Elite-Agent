@@ -17,9 +17,9 @@ use local_agent_terminal_application::{
 use local_agent_terminal_domain::{
     AgentCancellationReceipt, AgentDescriptor, AgentRunLimits, AgentRunReceipt, ArtifactId,
     BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters,
-    BoundRunConfig, CancelAgentRun, Condition, FencingToken, GitObjectId, OperationState, Phase,
-    RunId, Sequence, Sha256Digest, TaskId, Timestamp, TrustTier, WorkflowState,
-    WorkspaceFingerprint, WorkspaceVersion,
+    BoundRunConfig, CancelAgentRun, Condition, DeliberationTaskBudget, FencingToken, GitObjectId,
+    OperationState, Phase, RunId, Sequence, Sha256Digest, TaskId, Timestamp, TrustTier,
+    WorkflowState, WorkspaceFingerprint, WorkspaceVersion,
 };
 use local_agent_terminal_orchestration::{
     normative_preapproval_transitions, PhaseAdvanceRequest, PreApprovalCoordinator,
@@ -553,11 +553,20 @@ fn dispatch_plan() -> DeliberationProposalDispatchPlan {
         DeliberationDispatchBinding::new(
             bound_run_for("agent-a", "run-a"),
             dispatch_assignment("agent-a", "run-a", "family-a"),
+            100,
         )
         .unwrap(),
         DeliberationDispatchBinding::new(
             bound_run_for("agent-b", "run-b"),
             dispatch_assignment("agent-b", "run-b", "family-b"),
+            100,
+        )
+        .unwrap(),
+        DeliberationTaskBudget::new(
+            4,
+            100_000,
+            10_000,
+            Timestamp::from_unix_seconds(2_000_000_000),
         )
         .unwrap(),
     )

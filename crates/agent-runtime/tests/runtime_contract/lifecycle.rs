@@ -18,14 +18,14 @@ use local_agent_terminal_agent_runtime::{
 use local_agent_terminal_application::{
     AgentArtifactStore, AgentContextQueryRequest, AgentContextQueryResponse, AgentMessageArtifact,
     AgentRequestAudit, AgentRequestAuditDecision, AgentRequestHandler, AgentRequestKind,
-    AgentRunStore, AgentRuntime, AgentSpecialistRequest, AgentSpecialistResponse, Clock, PortError,
-    Retryability, SafeErrorClassification,
+    AgentRunStore, AgentRuntime, AgentSpecialistCommit, AgentSpecialistRequest,
+    AgentSpecialistResponse, Clock, PortError, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     AgentDescriptor, AgentRunLimits, AgentRunSnapshot, AgentRunStatus, AgentRunTerminal,
     ArtifactId, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
-    BoundGenerationParameters, BoundRunConfig, CancelAgentRun, RunId, Sha256Digest, TaskId,
-    Timestamp, TrustTier,
+    BoundGenerationParameters, BoundRunConfig, CancelAgentRun, RunId, Sha256Digest,
+    SpecialistBudget, SpecialistRequest, TaskId, Timestamp, TrustTier,
 };
 
 const EMPTY_JSON_DIGEST: &str =

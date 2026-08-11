@@ -261,6 +261,7 @@ fn exact_authoritative_state_rejects_condition_operation_workspace_and_fencing_s
             TaskId::new("task-1").unwrap(),
             7,
             hostile_state,
+            task_budget(),
             ActorId::new("agent-1").unwrap(),
             artifact("artifact-record-1", '9'),
             EventId::new("event-1").unwrap(),
@@ -755,6 +756,7 @@ fn command(task: &str, version: u64, actor: &str) -> DeliberationCommandContext 
         TaskId::new(task).unwrap(),
         version,
         authoritative_state(Phase::ParallelAnalysis, version),
+        task_budget(),
         ActorId::new(actor).unwrap(),
         artifact("artifact-record-1", '9'),
         EventId::new("event-1").unwrap(),
@@ -774,6 +776,7 @@ fn command_for_phase(
         TaskId::new(task).unwrap(),
         version,
         authoritative_state(phase, version),
+        task_budget(),
         ActorId::new(actor).unwrap(),
         artifact("artifact-record-1", '9'),
         EventId::new("event-1").unwrap(),
@@ -794,6 +797,7 @@ fn command_for_phase_with_artifact(
         TaskId::new(task).unwrap(),
         version,
         authoritative_state(phase, version),
+        task_budget(),
         ActorId::new(actor).unwrap(),
         record_artifact,
         EventId::new("event-1").unwrap(),
@@ -811,6 +815,36 @@ fn authoritative_state(phase: Phase, sequence: u64) -> WorkflowState {
         Sequence::new(sequence),
         WorkspaceVersion::new(1),
         FencingToken::new(1).unwrap(),
+    )
+    .unwrap()
+}
+
+fn command_with_budget(
+    phase: Phase,
+    actor: &str,
+    budget: DeliberationTaskBudget,
+    occurred_at: &str,
+) -> DeliberationCommandContext {
+    DeliberationCommandContext::new(
+        TaskId::new("task-1").unwrap(),
+        7,
+        authoritative_state(phase, 7),
+        budget,
+        ActorId::new(actor).unwrap(),
+        artifact("artifact-record-1", '9'),
+        EventId::new("event-1").unwrap(),
+        "correlation-1",
+        occurred_at,
+    )
+    .unwrap()
+}
+
+fn task_budget() -> DeliberationTaskBudget {
+    DeliberationTaskBudget::new(
+        64,
+        1_000_000,
+        1_000_000_000_000,
+        Timestamp::from_unix_seconds(2_000_000_000),
     )
     .unwrap()
 }
@@ -892,14 +926,18 @@ fn run_assignment(number: u8) -> DeliberationRunAssignment {
 }
 
 fn specialist_request() -> SpecialistRequest {
+    specialist_request_with_id("specialist-1")
+}
+
+fn specialist_request_with_id(request_id: &str) -> SpecialistRequest {
     SpecialistRequest::new(
-        "specialist-1",
+        request_id,
         TaskId::new("task-1").unwrap(),
         RunId::new("run-1").unwrap(),
         "repository-analysis",
         "inspect repository invariants",
         vec![ArtifactId::new("context-1").unwrap()],
-        SpecialistBudget::new(512, Timestamp::from_unix_seconds(1_800_000_000)).unwrap(),
+        SpecialistBudget::new(512, 5_120, Timestamp::from_unix_seconds(1_800_000_000)).unwrap(),
     )
     .unwrap()
 }

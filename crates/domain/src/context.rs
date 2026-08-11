@@ -446,6 +446,10 @@ impl ContextPackageDescriptor {
         self.budget
     }
 
+    pub fn consume_input_tokens(&mut self, tokens: u64) -> Result<(), ContextError> {
+        self.budget.consume_input_tokens(tokens)
+    }
+
     pub fn versions(&self) -> &ContextVersionSet {
         &self.versions
     }

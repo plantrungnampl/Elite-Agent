@@ -1,9 +1,9 @@
 use local_agent_terminal_domain::{
     ActorId, AgentFamilyKey, ApprovalAuthority, ApprovalExecution, ApprovalScope, ArtifactId,
     ClaimVerification, DecisionApproach, DecisionPackage, DeliberationBudget, DeliberationError,
-    DeliberationLimits, Dissent, EvidenceCitation, EvidenceFreshness, FinalObjection,
-    FinalObjectionSet, GitObjectId, IndependentProposal, IndependentQuorum, LineRange,
-    MaterialClaim, ObjectionSeverity, PlanApprovalBinding, PlanIdentity, ProjectId,
+    DeliberationLimits, DeliberationTaskBudget, Dissent, EvidenceCitation, EvidenceFreshness,
+    FinalObjection, FinalObjectionSet, GitObjectId, IndependentProposal, IndependentQuorum,
+    LineRange, MaterialClaim, ObjectionSeverity, PlanApprovalBinding, PlanIdentity, ProjectId,
     RejectedApproach, ReviewEdge, ReviewPlan, RunId, Sha256Digest, SourceIdentity,
     SpecialistBudget, SpecialistRequest, StructuredToolName, TaskId, Timestamp, VerificationMethod,
 };
@@ -153,6 +153,40 @@ fn deliberation_limits_reject_zero_and_effectively_unbounded_values() {
 }
 
 #[test]
+fn task_budget_bounds_threads_tokens_cost_and_deadline() {
+    let budget = DeliberationTaskBudget::new(
+        4,
+        4_096,
+        20_000,
+        Timestamp::from_unix_seconds(1_800_000_000),
+    )
+    .unwrap();
+    assert_eq!(budget.max_threads(), 4);
+    assert_eq!(budget.max_tokens(), 4_096);
+    assert_eq!(budget.max_cost_microunits(), 20_000);
+    assert_eq!(budget.deadline().unix_seconds(), 1_800_000_000);
+
+    assert!(DeliberationTaskBudget::new(
+        0,
+        4_096,
+        20_000,
+        Timestamp::from_unix_seconds(1_800_000_000),
+    )
+    .is_err());
+    assert!(
+        DeliberationTaskBudget::new(4, 0, 20_000, Timestamp::from_unix_seconds(1_800_000_000),)
+            .is_err()
+    );
+    assert!(
+        DeliberationTaskBudget::new(4, 4_096, 0, Timestamp::from_unix_seconds(1_800_000_000),)
+            .is_err()
+    );
+    assert!(
+        DeliberationTaskBudget::new(4, 4_096, 20_000, Timestamp::from_unix_seconds(0)).is_err()
+    );
+}
+
+#[test]
 fn specialist_requests_require_reason_context_and_positive_budget() {
     let context = vec![artifact_id("proposal-1")];
     let budget = specialist_budget();
@@ -177,8 +211,9 @@ fn specialist_requests_require_reason_context_and_positive_budget() {
         budget,
     )
     .is_err());
-    assert!(SpecialistBudget::new(0, Timestamp::from_unix_seconds(10)).is_err());
-    assert!(SpecialistBudget::new(100, Timestamp::from_unix_seconds(0)).is_err());
+    assert!(SpecialistBudget::new(0, 10, Timestamp::from_unix_seconds(10)).is_err());
+    assert!(SpecialistBudget::new(100, 0, Timestamp::from_unix_seconds(10)).is_err());
+    assert!(SpecialistBudget::new(100, 10, Timestamp::from_unix_seconds(0)).is_err());
 }
 
 #[test]
@@ -517,7 +552,7 @@ fn proposal(run: &str, agent: &str, family: &str, artifact: &str) -> Independent
 }
 
 fn specialist_budget() -> SpecialistBudget {
-    SpecialistBudget::new(100, Timestamp::from_unix_seconds(10)).unwrap()
+    SpecialistBudget::new(100, 1_000, Timestamp::from_unix_seconds(10)).unwrap()
 }
 
 fn claim(id: &str, freshness: EvidenceFreshness) -> MaterialClaim {

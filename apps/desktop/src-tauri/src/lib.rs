@@ -4,13 +4,14 @@ use std::sync::{Arc, Mutex};
 use local_agent_terminal_bootstrap::{
     ApprovalId, Bootstrap, CancelToolExecutionRequestDto, CommandErrorDto,
     ConfirmDiscardWorkspaceRequestDto, ContextPackageDto, CreateTaskWorkspaceRequestDto,
-    DeliberationWorkspaceDto, GetApprovalRequestDto, GetContextPackageRequestDto,
-    GetDeliberationWorkspaceRequestDto, LocalDiagnosticDto, OnboardRepositoryRequestDto,
-    PlanApprovalResolutionDto, ProjectSnapshot, RecoveryCandidateRequestDto,
-    ResolveDisplayedPlanApprovalRequestDto, ResolveToolApprovalRequestDto, Sha256Digest,
-    StartupConfig, StartupStatusDto, StopAllToolsReceiptDto, TaskSnapshot, ToolActivityDto,
-    ToolApprovalRequestDto, ToolApprovalResolutionDto, ToolCancellationReceiptDto, ToolRuntime,
-    WorkspaceDashboardDto, WorkspaceDashboardRequestDto, WorkspaceRuntime,
+    DeliberationRuntime, DeliberationWorkspaceDto, GetApprovalRequestDto,
+    GetContextPackageRequestDto, GetDeliberationWorkspaceRequestDto, LocalDiagnosticDto,
+    OnboardRepositoryRequestDto, PlanApprovalResolutionDto, ProjectSnapshot,
+    RecoveryCandidateRequestDto, ResolveDisplayedPlanApprovalRequestDto,
+    ResolveToolApprovalRequestDto, Sha256Digest, StartupConfig, StartupStatusDto,
+    StopAllToolsReceiptDto, TaskSnapshot, ToolActivityDto, ToolApprovalRequestDto,
+    ToolApprovalResolutionDto, ToolCancellationReceiptDto, ToolRuntime, WorkspaceDashboardDto,
+    WorkspaceDashboardRequestDto, WorkspaceRuntime,
 };
 use tauri::Manager;
 
@@ -79,6 +80,19 @@ impl ManagedBootstrap {
             .lock()
             .map_err(|_| CommandErrorDto::internal_state_unavailable())?
             .tool_runtime_handle()
+            .ok_or_else(CommandErrorDto::startup_not_ready)?;
+        operation(runtime)
+    }
+
+    fn with_deliberation_runtime<T>(
+        &self,
+        operation: impl FnOnce(Arc<DeliberationRuntime>) -> Result<T, CommandErrorDto>,
+    ) -> Result<T, CommandErrorDto> {
+        let runtime = self
+            .0
+            .lock()
+            .map_err(|_| CommandErrorDto::internal_state_unavailable())?
+            .deliberation_runtime_handle()
             .ok_or_else(CommandErrorDto::startup_not_ready)?;
         operation(runtime)
     }
@@ -230,22 +244,54 @@ fn stop_all_tools(
 #[tauri::command]
 fn get_deliberation_workspace(
     request: GetDeliberationWorkspaceRequestDto,
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<DeliberationWorkspaceDto, CommandErrorDto> {
+    get_deliberation_workspace_from_state(request, &state)
+}
+
+fn get_deliberation_workspace_from_state(
+    request: GetDeliberationWorkspaceRequestDto,
+    state: &ManagedBootstrap,
 ) -> Result<DeliberationWorkspaceDto, CommandErrorDto> {
     validate_opaque_id(&request.task_id)?;
-    Err(deliberation_runtime_unavailable())
+    state.with_deliberation_runtime(|runtime| {
+        runtime
+            .workspace(&request.task_id)
+            .map_err(CommandErrorDto::from)
+    })
 }
 
 #[tauri::command]
 fn get_context_package(
     request: GetContextPackageRequestDto,
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<ContextPackageDto, CommandErrorDto> {
+    get_context_package_from_state(request, &state)
+}
+
+fn get_context_package_from_state(
+    request: GetContextPackageRequestDto,
+    state: &ManagedBootstrap,
 ) -> Result<ContextPackageDto, CommandErrorDto> {
     validate_opaque_id(&request.package_id)?;
-    Err(deliberation_runtime_unavailable())
+    state.with_deliberation_runtime(|runtime| {
+        runtime
+            .context_package(&request.package_id)
+            .map_err(CommandErrorDto::from)
+    })
 }
 
 #[tauri::command]
 fn resolve_plan_approval(
     request: ResolveDisplayedPlanApprovalRequestDto,
+    state: tauri::State<'_, ManagedBootstrap>,
+) -> Result<PlanApprovalResolutionDto, CommandErrorDto> {
+    resolve_plan_approval_from_state(request, &state)
+}
+
+fn resolve_plan_approval_from_state(
+    request: ResolveDisplayedPlanApprovalRequestDto,
+    state: &ManagedBootstrap,
 ) -> Result<PlanApprovalResolutionDto, CommandErrorDto> {
     validate_opaque_id(&request.approval_id)?;
     let request = request.with_actor("user");
@@ -254,7 +300,11 @@ fn resolve_plan_approval(
     if request.expected_task_version == 0 {
         return Err(invalid_deliberation_request());
     }
-    Err(deliberation_runtime_unavailable())
+    state.with_deliberation_runtime(|runtime| {
+        runtime
+            .resolve_plan_approval(request)
+            .map_err(CommandErrorDto::from)
+    })
 }
 
 fn validate_opaque_id(value: &str) -> Result<(), CommandErrorDto> {
@@ -275,14 +325,6 @@ fn invalid_deliberation_request() -> CommandErrorDto {
         code: "invalid_input".to_owned(),
         message: "The deliberation command request is invalid.".to_owned(),
         retryable: false,
-    }
-}
-
-fn deliberation_runtime_unavailable() -> CommandErrorDto {
-    CommandErrorDto {
-        code: "deliberation_runtime_unavailable".to_owned(),
-        message: "Authoritative deliberation state is unavailable.".to_owned(),
-        retryable: true,
     }
 }
 
@@ -332,16 +374,17 @@ pub fn run() {
 mod tests {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
+    use super::{
+        get_context_package_from_state, get_deliberation_workspace_from_state,
+        resolve_plan_approval_from_state, GetContextPackageRequestDto,
+        GetDeliberationWorkspaceRequestDto, ManagedBootstrap,
+        ResolveDisplayedPlanApprovalRequestDto,
+    };
     use local_agent_terminal_bootstrap::{
         CancelToolExecutionRequestDto, GetApprovalRequestDto, ResolveToolApprovalRequestDto,
         StartupStateDto, ToolRuntimeAvailabilityDto,
     };
     use tempfile::TempDir;
-
-    use super::{
-        GetContextPackageRequestDto, GetDeliberationWorkspaceRequestDto, ManagedBootstrap,
-        ResolveDisplayedPlanApprovalRequestDto,
-    };
 
     #[test]
     fn resolver_failure_is_typed_and_retry_re_resolves_before_ready() {
@@ -500,5 +543,42 @@ mod tests {
             .with_actor("user");
         assert_eq!(request.actor_id, "user");
         assert_eq!(request.approval_id, "approval-1");
+    }
+
+    #[test]
+    fn deliberation_command_handlers_are_backed_by_bootstrap_state() {
+        let parent = TempDir::new().unwrap();
+        let state = ManagedBootstrap::resolve_with(|| Some(parent.path().join("app-data")));
+
+        let workspace = get_deliberation_workspace_from_state(
+            GetDeliberationWorkspaceRequestDto {
+                task_id: "task-missing".to_owned(),
+            },
+            &state,
+        )
+        .unwrap_err();
+        assert_eq!(workspace.code, "not_found");
+
+        let package = get_context_package_from_state(
+            GetContextPackageRequestDto {
+                package_id: "package-missing".to_owned(),
+            },
+            &state,
+        )
+        .unwrap_err();
+        assert_eq!(package.code, "not_found");
+
+        let approval = resolve_plan_approval_from_state(
+            serde_json::from_value(serde_json::json!({
+                "approvalId": "approval-missing",
+                "displayedDigest": format!("sha256:{}", "a".repeat(64)),
+                "expectedTaskVersion": 1,
+                "action": "approve"
+            }))
+            .unwrap(),
+            &state,
+        )
+        .unwrap_err();
+        assert_eq!(approval.code, "not_found");
     }
 }

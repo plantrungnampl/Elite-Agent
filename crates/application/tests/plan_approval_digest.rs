@@ -251,6 +251,21 @@ fn resolution_emits_only_declared_workflow_transitions() {
             "task.cancelled",
             Phase::Cancelled,
         ),
+        (
+            PlanApprovalAction::Revise,
+            "plan.revision.requested",
+            Phase::Synthesis,
+        ),
+        (
+            PlanApprovalAction::Reopen,
+            "plan.revision.requested",
+            Phase::Synthesis,
+        ),
+        (
+            PlanApprovalAction::AddOrReplaceAgent,
+            "plan.revision.requested",
+            Phase::Synthesis,
+        ),
     ] {
         let binding = binding();
         let store = plan_store(binding.clone());
@@ -269,28 +284,6 @@ fn resolution_emits_only_declared_workflow_transitions() {
         assert!(
             matches!(resolution.append.projection_changes.as_slice(), [local_agent_terminal_application::ProjectionChange::TaskState { state, .. }] if state.phase() == phase)
         );
-    }
-
-    for action in [
-        PlanApprovalAction::Revise,
-        PlanApprovalAction::Reopen,
-        PlanApprovalAction::AddOrReplaceAgent,
-    ] {
-        let binding = binding();
-        let store = plan_store(binding.clone());
-        let mut input = approval_input(
-            &binding,
-            canonical_plan_approval_payload(&binding)
-                .unwrap()
-                .operation_digest,
-        );
-        input.action = action;
-
-        assert!(ResolvePlanApproval::new(&store, &FixedClock)
-            .execute(input)
-            .is_err());
-        assert!(store.resolutions.lock().unwrap().is_empty());
-        assert!(!store.loads.lock().unwrap().contains(&"compare-and-resolve"));
     }
 }
 

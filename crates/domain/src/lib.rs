@@ -26,9 +26,10 @@ pub use context::{
 pub use deliberation::{
     AgentFamilyKey, ApprovalAuthority, ApprovalExecution, ApprovalScope, ClaimVerification,
     DecisionApproach, DecisionPackage, DeliberationBudget, DeliberationError, DeliberationLimits,
-    Dissent, FinalObjection, FinalObjectionSet, IndependentProposal, IndependentQuorum,
-    MaterialClaim, ObjectionSeverity, PlanApprovalBinding, PlanIdentity, RejectedApproach,
-    ReviewEdge, ReviewPlan, SpecialistBudget, SpecialistRequest, VerificationMethod,
+    DeliberationTaskBudget, Dissent, FinalObjection, FinalObjectionSet, IndependentProposal,
+    IndependentQuorum, MaterialClaim, ObjectionSeverity, PlanApprovalBinding, PlanIdentity,
+    RejectedApproach, ReviewEdge, ReviewPlan, SpecialistBudget, SpecialistRequest,
+    VerificationMethod,
 };
 pub use event::{Effect, GuardEvaluations, GuardName, WorkflowEvent};
 pub use identity::{

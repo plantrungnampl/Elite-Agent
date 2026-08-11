@@ -1,18 +1,24 @@
-use std::{fmt::Write, sync::Arc};
+use std::{
+    fmt::Write,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use local_agent_terminal_application::{
-    AgentRuntime, ArtifactRef, ArtifactStore, ArtifactWriteReservation, BuildInitialContext,
-    BuildInitialContextRequest, CanonicalJsonRequest, Clock, ContextArtifactKind,
-    ContextArtifactPublisher, ContextArtifactReader, ContextArtifactRef, ContextPackageBinding,
-    ContextPackageDescriptor, ImmutableContextArtifact, PortError, QueryContext,
-    QueryContextRequest, RepositoryLocator, ReservedArtifact, Retryability,
-    SafeErrorClassification, Sha256Digest, TaskQuery, WorkspaceEvidenceStore,
+    AgentContextQueryCommit, AgentRuntime, ArtifactRef, ArtifactStore, ArtifactWriteReservation,
+    BuildInitialContext, BuildInitialContextRequest, CanonicalJsonRequest, Clock,
+    ContextArtifactKind, ContextArtifactPublisher, ContextArtifactReader, ContextArtifactRef,
+    ContextPackageBinding, ContextPackageDescriptor, ContextRetrievalAuthority,
+    ImmutableContextArtifact, InspectRepository, PolicyDecisionId, PolicyDecisionStore, PortError,
+    QueryContext, QueryContextRequest, RecordedPolicyDecision, RepositoryContextSource,
+    RepositoryGateway, RepositoryLocator, ReservedArtifact, RetrievedContextItem, Retryability,
+    SafeErrorClassification, Sha256Digest, SourceSnapshotRequest, TaskId, TaskQuery,
+    WorkspaceEvidenceStore,
 };
 use local_agent_terminal_context_engine::{
     BuiltContextPackage, ContextPackageBuildRequest, ContextPackageBuilder,
 };
 use local_agent_terminal_policy_engine::{PolicyContextSourceClassifier, VersionedPolicyEngine};
-use local_agent_terminal_repository_git::GitRepositoryContextSource;
+use local_agent_terminal_repository_git::{GitRepositoryContextSource, GitRepositoryGateway};
 use local_agent_terminal_storage_files::{
     ContentAddressedArtifactReader, ContentAddressedArtifactStore, JournaledArtifactWriter,
 };
@@ -41,12 +47,15 @@ pub(crate) const DEFAULT_POLICY_BUNDLE: &str = r#"{
 pub(crate) fn compose_context_runtime(
     database: SqliteStore,
     artifacts: Arc<ContentAddressedArtifactStore>,
-    agents: Option<Arc<dyn AgentRuntime>>,
+    repositories: GitRepositoryGateway,
 ) -> Result<Arc<ContextRuntime>, PortError> {
     let policy = Arc::new(VersionedPolicyEngine::from_json(DEFAULT_POLICY_BUNDLE)?);
     let database = database.with_artifact_reader(Arc::new(ContentAddressedArtifactReader));
     Ok(Arc::new(ContextRuntime::new(
-        database, artifacts, policy, agents,
+        database,
+        artifacts,
+        policy,
+        repositories,
     )))
 }
 
@@ -58,7 +67,8 @@ pub struct ContextRuntime {
     database: SqliteStore,
     artifacts: Arc<ContentAddressedArtifactStore>,
     policy: Arc<VersionedPolicyEngine>,
-    agents: Option<Arc<dyn AgentRuntime>>,
+    repositories: GitRepositoryGateway,
+    agents: OnceLock<Arc<dyn AgentRuntime>>,
 }
 
 impl ContextRuntime {
@@ -66,14 +76,19 @@ impl ContextRuntime {
         database: SqliteStore,
         artifacts: Arc<ContentAddressedArtifactStore>,
         policy: Arc<VersionedPolicyEngine>,
-        agents: Option<Arc<dyn AgentRuntime>>,
+        repositories: GitRepositoryGateway,
     ) -> Self {
         Self {
             database,
             artifacts,
             policy,
-            agents,
+            repositories,
+            agents: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn attach_agents(&self, agents: Arc<dyn AgentRuntime>) -> Result<(), PortError> {
+        self.agents.set(agents).map_err(|_| conflict())
     }
 
     pub fn build_initial(
@@ -89,6 +104,7 @@ impl ContextRuntime {
         let classifier = PolicyContextSourceClassifier::new(request.policy.evaluated_at)?;
         let publisher =
             self.publisher_for(&request.package.descriptor, &request.policy.actor.agent_id)?;
+        let assembler = ContextPackageBuilder::new(self.policy.as_ref(), &self.database);
         BuildInitialContext::new(
             &source,
             &classifier,
@@ -96,24 +112,78 @@ impl ContextRuntime {
             &publisher,
             self.policy.as_ref(),
             &self.database,
+            &assembler,
         )
         .execute(request)
     }
 
     pub fn query(&self, request: QueryContextRequest) -> Result<ContextPackageBinding, PortError> {
+        let prepared = self.prepare_query(request)?;
+        self.commit_query(prepared)
+    }
+
+    pub(crate) fn prepare_query(
+        &self,
+        request: QueryContextRequest,
+    ) -> Result<AgentContextQueryCommit, PortError> {
         if &request.policy.policy_snapshot_digest != self.policy.snapshot_digest() {
             return Err(integrity_failure());
         }
         let publisher =
-            self.publisher_for(&request.package.descriptor, &request.policy.actor.agent_id)?;
+            self.query_artifacts_for(&request.package.descriptor, &request.policy.actor.agent_id)?;
+        let decisions = BufferedPolicyDecisionStore::default();
+        let assembler = ContextPackageBuilder::new(self.policy.as_ref(), &decisions);
+        let package = QueryContext::new(
+            &self.database,
+            &publisher,
+            &publisher,
+            self.policy.as_ref(),
+            &decisions,
+            &assembler,
+            self,
+        )
+        .prepare(request)?;
+        let policy_decisions = decisions.records()?;
+        if policy_decisions.iter().any(|record| {
+            let decision_id = PolicyDecisionId::from_decision(&record.decision);
+            !package
+                .policy_decision_ids()
+                .iter()
+                .any(|persisted| persisted == &decision_id)
+        }) {
+            return Err(integrity_failure());
+        }
+        Ok(AgentContextQueryCommit {
+            package,
+            policy_decisions,
+        })
+    }
+
+    pub(crate) fn commit_query(
+        &self,
+        prepared: AgentContextQueryCommit,
+    ) -> Result<ContextPackageBinding, PortError> {
+        for decision in &prepared.policy_decisions {
+            let expected = PolicyDecisionId::from_decision(&decision.decision);
+            if self.database.record(decision.clone())? != expected {
+                return Err(integrity_failure());
+            }
+        }
+        let publisher = self.publisher_for(
+            prepared.package.binding().descriptor(),
+            prepared.package.binding().descriptor().agent_id(),
+        )?;
+        let assembler = ContextPackageBuilder::new(self.policy.as_ref(), &self.database);
         QueryContext::new(
             &self.database,
             &publisher,
             &publisher,
             self.policy.as_ref(),
             &self.database,
+            &assembler,
+            self,
         )
-        .execute(request)
+        .commit(prepared.package)
     }
 
     fn publisher_for(
@@ -126,7 +196,7 @@ impl ContextRuntime {
         }
         let agent = self
             .agents
-            .as_ref()
+            .get()
             .ok_or_else(unavailable)?
             .list_agents()?
             .into_iter()
@@ -145,6 +215,28 @@ impl ContextRuntime {
         Ok(publisher)
     }
 
+    fn query_artifacts_for(
+        &self,
+        descriptor: &ContextPackageDescriptor,
+        policy_agent_id: &str,
+    ) -> Result<ProductionContextArtifacts, PortError> {
+        if descriptor.agent_id() != policy_agent_id {
+            return Err(invalid_input());
+        }
+        let _agent = self
+            .agents
+            .get()
+            .ok_or_else(unavailable)?
+            .list_agents()?
+            .into_iter()
+            .find(|agent| agent.agent_id == descriptor.agent_id())
+            .ok_or_else(unavailable)?;
+        Ok(ProductionContextArtifacts {
+            database: self.database.clone(),
+            artifacts: Arc::clone(&self.artifacts),
+        })
+    }
+
     pub fn policy_snapshot_digest(&self) -> &Sha256Digest {
         self.policy.snapshot_digest()
     }
@@ -154,6 +246,72 @@ impl ContextRuntime {
         request: ContextPackageBuildRequest,
     ) -> Result<BuiltContextPackage, PortError> {
         ContextPackageBuilder::new(self.policy.as_ref(), &self.database).build(request)
+    }
+}
+
+#[derive(Default)]
+struct BufferedPolicyDecisionStore {
+    decisions: Mutex<Vec<(PolicyDecisionId, RecordedPolicyDecision)>>,
+}
+
+impl BufferedPolicyDecisionStore {
+    fn records(&self) -> Result<Vec<RecordedPolicyDecision>, PortError> {
+        self.decisions
+            .lock()
+            .map(|decisions| {
+                decisions
+                    .iter()
+                    .map(|(_, decision)| decision.clone())
+                    .collect()
+            })
+            .map_err(|_| unavailable())
+    }
+}
+
+impl PolicyDecisionStore for BufferedPolicyDecisionStore {
+    fn record(&self, decision: RecordedPolicyDecision) -> Result<PolicyDecisionId, PortError> {
+        let decision_id = PolicyDecisionId::from_decision(&decision.decision);
+        let mut decisions = self.decisions.lock().map_err(|_| unavailable())?;
+        if let Some((_, existing)) = decisions.iter().find(|(id, _)| id == &decision_id) {
+            if existing != &decision {
+                return Err(integrity_failure());
+            }
+            return Ok(decision_id);
+        }
+        decisions.push((decision_id.clone(), decision));
+        Ok(decision_id)
+    }
+}
+
+impl ContextRetrievalAuthority for ContextRuntime {
+    fn verify_current(
+        &self,
+        task_id: &TaskId,
+        items: &[RetrievedContextItem],
+    ) -> Result<(), PortError> {
+        let task = self.database.task(task_id)?;
+        let path = self.database.task_repository_path(task_id)?;
+        let locator = self.repositories.locate_persisted(&path)?;
+        let inspection = self.repositories.inspect(InspectRepository {
+            locator: locator.clone(),
+        })?;
+        let captured_at = self.database.now_utc()?;
+        let source = GitRepositoryContextSource::new(locator, &captured_at)?;
+        let repository_fingerprint = source.repository_fingerprint()?;
+        let snapshot = source.snapshot(SourceSnapshotRequest {
+            project_id: task.project_id,
+            task_id: task_id.clone(),
+            revision: inspection.fingerprint.head().as_str().to_owned(),
+            repository_fingerprint,
+        })?;
+        if items.iter().any(|persisted| {
+            !snapshot.items.iter().any(|current| {
+                current.member_id == persisted.member_id && current.identity == persisted.identity
+            })
+        }) {
+            return Err(conflict());
+        }
+        Ok(())
     }
 }
 
@@ -322,6 +480,13 @@ fn invalid_input() -> PortError {
 fn integrity_failure() -> PortError {
     PortError::failure(
         SafeErrorClassification::IntegrityFailure,
+        Retryability::NonRetryable,
+    )
+}
+
+fn conflict() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::Conflict,
         Retryability::NonRetryable,
     )
 }

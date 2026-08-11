@@ -7,19 +7,21 @@ use std::sync::Mutex;
 use local_agent_terminal_application::{
     canonical_plan_approval_payload, ApprovalId, CanonicalDeliberationFact,
     DeliberationArtifactRef, DeliberationCommandContext, DeliberationCommands,
-    DeliberationPersistenceCommand, DeliberationRecord, DeliberationSnapshot, DeliberationStore,
-    PlanApprovalAuthorityBinding, PlanApprovalAuthorityProvider, PlanApprovalBindingInput,
-    PlanApprovalPathScopeV1, PlanApprovalState, PlanApprovalStore, PortError,
-    PreparePlanApprovalRequestInput, SafeErrorClassification,
+    DeliberationDispatchBinding, DeliberationDispatchStore, DeliberationPersistenceCommand,
+    DeliberationProposalDispatchPlan, DeliberationRecord, DeliberationRunAssignment,
+    DeliberationSnapshot, DeliberationStore, PlanApprovalAuthorityBinding,
+    PlanApprovalAuthorityProvider, PlanApprovalBindingInput, PlanApprovalPathScopeV1,
+    PlanApprovalState, PlanApprovalStore, PortError, PreparePlanApprovalRequestInput,
+    SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
-    ActorId, AgentRunLimits, ArtifactId, BoundAgentConnection, BoundAgentRunRequest,
-    BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, ClaimVerification,
-    DecisionApproach, DecisionPackage, DeliberationLimits, EventId, EvidenceCitation,
-    EvidenceFreshness, FinalObjection, FinalObjectionSet, IndependentProposal, LineRange,
-    MaterialClaim, ObjectionSeverity, ProjectId, ReviewEdge, ReviewPlan, RunId, Sha256Digest,
-    SourceIdentity, SpecialistBudget, SpecialistRequest, TaskId, Timestamp, TrustTier,
-    VerificationMethod,
+    ActorId, AgentFamilyKey, AgentRunLimits, ArtifactId, BoundAgentConnection,
+    BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig,
+    ClaimVerification, DecisionApproach, DecisionPackage, DeliberationLimits,
+    DeliberationTaskBudget, EventId, EvidenceCitation, EvidenceFreshness, FinalObjection,
+    FinalObjectionSet, IndependentProposal, LineRange, MaterialClaim, ObjectionSeverity, ProjectId,
+    ReviewEdge, ReviewPlan, RunId, Sha256Digest, SourceIdentity, SpecialistBudget,
+    SpecialistRequest, TaskId, Timestamp, TrustTier, VerificationMethod,
 };
 use local_agent_terminal_storage_files::{
     ContentAddressedArtifactReader, ContentAddressedArtifactStore,
@@ -240,9 +242,181 @@ impl Drop for TestDatabase {
 #[test]
 fn sqlite_store_exposes_the_application_deliberation_port() {
     fn accepts(_: &dyn DeliberationStore) {}
+    fn accepts_dispatch(_: &dyn DeliberationDispatchStore) {}
 
     let database = TestDatabase::new();
     accepts(&database.store());
+    accepts_dispatch(&database.store());
+}
+
+#[test]
+fn dispatch_reservations_are_atomic_idempotent_and_task_bounded() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let budget =
+        DeliberationTaskBudget::new(4, 16_000, 200, Timestamp::from_unix_seconds(2_000_000_000))
+            .unwrap();
+    let plan = dispatch_plan("run-dispatch-a", "run-dispatch-b", budget);
+
+    store
+        .compare_and_persist_proposal_binding_set(&plan)
+        .unwrap();
+    store
+        .compare_and_persist_proposal_binding_set(&plan)
+        .unwrap();
+
+    let connection = database.connection();
+    let reserved: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT reserved_threads, reserved_tokens, reserved_cost_microunits
+             FROM deliberation_task_budgets WHERE task_id = 'task-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(reserved, (0, 16_000, 200));
+    assert_eq!(count(&connection, "deliberation_dispatch_reservations"), 2);
+
+    let exhausted = dispatch_plan("run-dispatch-c", "run-dispatch-d", budget);
+    let error = store
+        .compare_and_persist_proposal_binding_set(&exhausted)
+        .unwrap_err();
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(count(&connection, "deliberation_dispatch_reservations"), 2);
+
+    let raised =
+        DeliberationTaskBudget::new(4, 32_000, 400, Timestamp::from_unix_seconds(2_000_000_000))
+            .unwrap();
+    let error = store
+        .compare_and_persist_proposal_binding_set(&dispatch_plan(
+            "run-dispatch-a",
+            "run-dispatch-b",
+            raised,
+        ))
+        .unwrap_err();
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+}
+
+#[test]
+fn specialist_persistence_cannot_reuse_tokens_and_cost_reserved_by_dispatch() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let budget =
+        DeliberationTaskBudget::new(4, 20_000, 250, Timestamp::from_unix_seconds(2_000_000_000))
+            .unwrap();
+    store
+        .compare_and_persist_proposal_binding_set(&dispatch_plan(
+            "run-dispatch-a",
+            "run-dispatch-b",
+            budget,
+        ))
+        .unwrap();
+
+    let snapshot = store.load(&TaskId::new("task-1").unwrap()).unwrap();
+    let request = SpecialistRequest::new(
+        "specialist-over-budget",
+        TaskId::new("task-1").unwrap(),
+        RunId::new("run-1").unwrap(),
+        "security-review",
+        "Verify a material security claim.",
+        vec![ArtifactId::new("context-content-1").unwrap()],
+        SpecialistBudget::new(5_000, 100, Timestamp::from_unix_seconds(1_800_000_300)).unwrap(),
+    )
+    .unwrap();
+    let error = DeliberationCommands::new(&store)
+        .request_specialist(
+            command_context_with_budget(
+                &snapshot,
+                "agent-1",
+                database.publish("specialist-over-budget", b"specialist over budget"),
+                "event-specialist-over-budget",
+                budget,
+            ),
+            request,
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+
+    let connection = database.connection();
+    assert_eq!(count(&connection, "events"), 0);
+    let reserved: (i64, i64) = connection
+        .query_row(
+            "SELECT reserved_tokens, reserved_cost_microunits
+             FROM deliberation_task_budgets WHERE task_id = 'task-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(reserved, (16_000, 200));
+}
+
+#[test]
+fn first_v8_budget_authority_seeds_reservations_from_v7_deliberation_records() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let budget =
+        DeliberationTaskBudget::new(4, 21_000, 250, Timestamp::from_unix_seconds(2_000_000_000))
+            .unwrap();
+    let snapshot = store.load(&TaskId::new("task-1").unwrap()).unwrap();
+    let request = SpecialistRequest::new(
+        "specialist-before-v8",
+        TaskId::new("task-1").unwrap(),
+        RunId::new("run-1").unwrap(),
+        "security-review",
+        "Verify a material security claim.",
+        vec![ArtifactId::new("context-content-1").unwrap()],
+        SpecialistBudget::new(5_000, 50, Timestamp::from_unix_seconds(1_800_000_300)).unwrap(),
+    )
+    .unwrap();
+    DeliberationCommands::new(&store)
+        .request_specialist(
+            command_context_with_budget(
+                &snapshot,
+                "agent-1",
+                database.publish("specialist-before-v8", b"specialist before v8"),
+                "event-specialist-before-v8",
+                budget,
+            ),
+            request,
+        )
+        .unwrap();
+
+    let connection = database.connection();
+    connection
+        .execute_batch(
+            "DROP TRIGGER IF EXISTS deliberation_task_budget_delete_forbidden;
+             DELETE FROM deliberation_task_budgets WHERE task_id = 'task-1';",
+        )
+        .unwrap();
+    drop(connection);
+
+    store
+        .compare_and_persist_proposal_binding_set(&dispatch_plan(
+            "run-dispatch-after-v7-a",
+            "run-dispatch-after-v7-b",
+            budget,
+        ))
+        .unwrap();
+
+    let reserved: (i64, i64, i64) = database
+        .connection()
+        .query_row(
+            "SELECT reserved_threads, reserved_tokens, reserved_cost_microunits
+             FROM deliberation_task_budgets WHERE task_id = 'task-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(reserved, (0, 21_000, 250));
 }
 
 #[test]
@@ -258,7 +432,7 @@ fn specialist_request_rejects_an_unavailable_required_context_artifact() {
         "security-review",
         "Verify a material security claim.",
         vec![ArtifactId::new("missing-context").unwrap()],
-        SpecialistBudget::new(1_000, Timestamp::from_unix_seconds(1_800_000_300)).unwrap(),
+        SpecialistBudget::new(1_000, 10_000, Timestamp::from_unix_seconds(1_800_000_300)).unwrap(),
     )
     .unwrap();
 
@@ -765,10 +939,21 @@ fn command_context(
     artifact: DeliberationArtifactRef,
     event_id: &str,
 ) -> DeliberationCommandContext {
+    command_context_with_budget(snapshot, actor_id, artifact, event_id, task_budget())
+}
+
+fn command_context_with_budget(
+    snapshot: &DeliberationSnapshot,
+    actor_id: &str,
+    artifact: DeliberationArtifactRef,
+    event_id: &str,
+    budget: DeliberationTaskBudget,
+) -> DeliberationCommandContext {
     DeliberationCommandContext::new(
         snapshot.task_id.clone(),
         snapshot.task_version,
         snapshot.task_state,
+        budget,
         ActorId::new(actor_id).unwrap(),
         artifact,
         EventId::new(event_id).unwrap(),
@@ -798,11 +983,22 @@ fn command_context_for(
         TaskId::new("task-1").unwrap(),
         version,
         state,
+        task_budget(),
         ActorId::new(actor_id).unwrap(),
         artifact,
         EventId::new(event_id).unwrap(),
         format!("correlation-{event_id}"),
         "2026-08-09T00:00:00Z",
+    )
+    .unwrap()
+}
+
+fn task_budget() -> DeliberationTaskBudget {
+    DeliberationTaskBudget::new(
+        64,
+        1_000_000,
+        1_000_000_000_000,
+        Timestamp::from_unix_seconds(2_000_000_000),
     )
     .unwrap()
 }
@@ -824,6 +1020,10 @@ fn proposal(number: u8) -> IndependentProposal {
 }
 
 fn run_config_artifact(number: u8, binding_digest: Sha256Digest) -> Vec<u8> {
+    canonical_agent_run_config_artifact(&bound_run_request(number, binding_digest)).unwrap()
+}
+
+fn bound_run_request(number: u8, binding_digest: Sha256Digest) -> BoundAgentRunRequest {
     let task_id = TaskId::new("task-1").unwrap();
     let agent_id = format!("agent-{number}");
     let role = "reviewer".to_owned();
@@ -831,7 +1031,7 @@ fn run_config_artifact(number: u8, binding_digest: Sha256Digest) -> Vec<u8> {
     let executable_digest = Some(digest(format!("executable-{number}").as_bytes()));
     let context_digest = digest(b"context");
     let policy_digest = digest(b"policy");
-    let request = BoundAgentRunRequest {
+    BoundAgentRunRequest {
         run_id: RunId::new(format!("run-{number}")).unwrap(),
         task_id: task_id.clone(),
         agent_id: agent_id.clone(),
@@ -895,8 +1095,48 @@ fn run_config_artifact(number: u8, binding_digest: Sha256Digest) -> Vec<u8> {
             binding_digest,
         },
         supersedes_run_id: None,
-    };
-    canonical_agent_run_config_artifact(&request).unwrap()
+    }
+}
+
+fn dispatch_plan(
+    first_run: &str,
+    second_run: &str,
+    budget: DeliberationTaskBudget,
+) -> DeliberationProposalDispatchPlan {
+    let mut first = bound_run_request(1, connection_binding_digest(1));
+    first.run_id = RunId::new(first_run).unwrap();
+    first.idempotency_key = format!("dispatch:{first_run}");
+    let mut second = bound_run_request(2, connection_binding_digest(2));
+    second.run_id = RunId::new(second_run).unwrap();
+    second.idempotency_key = format!("dispatch:{second_run}");
+    DeliberationProposalDispatchPlan::new(
+        DeliberationDispatchBinding::new(
+            first,
+            DeliberationRunAssignment::new(
+                RunId::new(first_run).unwrap(),
+                "agent-1",
+                AgentFamilyKey::from_provider_model("provider-1", "model-1").unwrap(),
+                ActorId::new("agent-1").unwrap(),
+            )
+            .unwrap(),
+            100,
+        )
+        .unwrap(),
+        DeliberationDispatchBinding::new(
+            second,
+            DeliberationRunAssignment::new(
+                RunId::new(second_run).unwrap(),
+                "agent-2",
+                AgentFamilyKey::from_provider_model("provider-2", "model-2").unwrap(),
+                ActorId::new("agent-2").unwrap(),
+            )
+            .unwrap(),
+            100,
+        )
+        .unwrap(),
+        budget,
+    )
+    .unwrap()
 }
 
 fn connection_binding_digest(number: u8) -> Sha256Digest {

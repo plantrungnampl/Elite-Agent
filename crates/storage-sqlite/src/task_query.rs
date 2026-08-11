@@ -18,6 +18,32 @@ use crate::project_store::{parse_repository_snapshot, project_stream_id};
 use crate::workspace_store::{parse_operation_intent, raw_operation_intent};
 use crate::SqliteStore;
 
+impl SqliteStore {
+    /// Returns the persisted canonical repository workdir that owns a task.
+    ///
+    /// Bootstrap uses this only to reconstruct a capability-checked Git locator
+    /// before taking a fresh authoritative repository observation.
+    pub fn task_repository_path(&self, task_id: &TaskId) -> Result<std::path::PathBuf, PortError> {
+        let connection = self.connection().map_err(open_error_to_port)?;
+        let path = connection
+            .query_row(
+                "SELECT p.repository_path
+                 FROM tasks t
+                 JOIN projects p ON p.id = t.project_id
+                 WHERE t.id = ?1",
+                [task_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sqlite_error_to_port)?
+            .ok_or_else(not_found)?;
+        if path.trim().is_empty() {
+            return Err(integrity_failure());
+        }
+        Ok(std::path::PathBuf::from(path))
+    }
+}
+
 impl TaskQuery for SqliteStore {
     fn task(&self, task_id: &TaskId) -> Result<TaskSnapshot, PortError> {
         let connection = self.connection().map_err(open_error_to_port)?;

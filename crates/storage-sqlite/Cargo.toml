@@ -14,4 +14,5 @@ sha2 = "0.10"
 [dev-dependencies]
 local-agent-terminal-agent-protocol = { path = "../agent-protocol" }
 local-agent-terminal-agent-runtime = { path = "../agent-runtime" }
+local-agent-terminal-context-engine = { path = "../context-engine" }
 local-agent-terminal-storage-files = { path = "../storage-files" }

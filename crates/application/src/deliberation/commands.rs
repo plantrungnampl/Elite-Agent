@@ -440,6 +440,11 @@ impl<'a> DeliberationCommands<'a> {
     ) -> Result<DeliberationPersistenceCommand, PortError> {
         record.validate(&snapshot.task_id)?;
         record.validate_authority(&context.actor_id, &snapshot.run_assignments)?;
+        let reservation = record.budget_reservation();
+        snapshot
+            .budget_reservation()?
+            .checked_add(reservation)?
+            .validate_within(context.task_budget)?;
         let event_authority = context.event_authority();
         let append = build_append(
             &snapshot.task_id,
@@ -447,11 +452,15 @@ impl<'a> DeliberationCommands<'a> {
             &snapshot.task_state,
             &event_authority,
             &record,
+            context.task_budget,
+            reservation,
         )?;
         let command = DeliberationPersistenceCommand {
             task_id: snapshot.task_id,
             expected_task_version: snapshot.task_version,
             expected_task_state: snapshot.task_state,
+            task_budget: context.task_budget,
+            budget_reservation: reservation,
             actor_id: context.actor_id,
             event_authority,
             record,
@@ -473,6 +482,7 @@ impl<'a> DeliberationCommands<'a> {
             || snapshot.task_version != context.expected_task_version
             || snapshot.task_state != context.expected_task_state
             || snapshot.task_state.phase() != expected_phase
+            || parse_policy_timestamp(&context.occurred_at)? > context.task_budget.deadline()
         {
             return Err(conflict());
         }
@@ -515,6 +525,8 @@ fn build_append(
     expected_task_state: &WorkflowState,
     authority: &EventAuthority,
     record: &DeliberationRecord,
+    task_budget: DeliberationTaskBudget,
+    budget_reservation: DeliberationBudgetReservation,
 ) -> Result<AppendOperation, PortError> {
     let event_type = WorkflowEvent::new(record.event_type()).map_err(|_| conflict())?;
     let (actor_type, observation_class) = record.authority_labels(&authority.actor_id)?;
@@ -551,7 +563,12 @@ fn build_append(
             actor_type: actor_type.to_owned(),
             actor_id: authority.actor_id.clone(),
             observation_class: observation_class.to_owned(),
-            payload: record.event_payload(task_id, canonical_record.content_digest()),
+            payload: record.event_payload(
+                task_id,
+                canonical_record.content_digest(),
+                task_budget,
+                budget_reservation,
+            ),
             metadata: serde_json::json!({}),
             causation_id: None,
             correlation_id: authority.correlation_id.clone(),

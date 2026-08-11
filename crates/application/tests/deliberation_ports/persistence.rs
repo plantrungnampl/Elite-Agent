@@ -10,7 +10,8 @@ use local_agent_terminal_application::{
 };
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, ClaimVerification, Condition, DecisionApproach, DecisionPackage,
-    DeliberationLimits, Dissent, EventId, EvidenceCitation, EvidenceFreshness, FencingToken,
+    DeliberationLimits, DeliberationTaskBudget, Dissent, EventId, EvidenceCitation,
+    EvidenceFreshness, FencingToken,
     FinalObjection, FinalObjectionSet, IndependentProposal, IndependentQuorum, MaterialClaim,
     ObjectionSeverity, OperationState, Phase, ProjectId, RejectedApproach, ReviewEdge, ReviewPlan,
     RunId, Sequence, Sha256Digest, SourceIdentity, SpecialistBudget, SpecialistRequest, TaskId,
@@ -99,6 +100,103 @@ fn persistence_command_carries_exact_event_projection_and_artifact_authority() {
     );
     assert!(
         matches!(persisted.record(), DeliberationRecord::QuorumPublication { proposals, proposal_artifact, review_plan, review_artifact } if proposals == &IndependentQuorum::new(vec![proposal(1), proposal(2)]).unwrap().reveal() && proposal_artifact.artifact_id().as_str() == "artifact-record-1" && proposal_artifact.content_digest() == &digest('9') && !review_plan.edges().is_empty() && review_artifact.artifact_id().as_str() == "artifact-review-1")
+    );
+}
+
+#[test]
+fn task_budget_bounds_thread_specialist_and_deadline_before_persistence() {
+    let thread_budget = DeliberationTaskBudget::new(
+        1,
+        1_024,
+        10_000,
+        Timestamp::from_unix_seconds(2_000_000_000),
+    )
+    .unwrap();
+    let (store, writes) = make_store(snapshot_with_thread_summary());
+    let error = DeliberationCommands::new(&store)
+        .record_thread_summary(
+            command_with_budget(Phase::CrossReview, "core", thread_budget, "2026-08-09T00:00:00Z"),
+            "thread-2",
+        )
+        .unwrap_err();
+    assert_eq!(error.safe_classification(), SafeErrorClassification::Conflict);
+    assert!(writes.lock().unwrap().commands.is_empty());
+
+    let specialist_budget = DeliberationTaskBudget::new(
+        4,
+        512,
+        5_120,
+        Timestamp::from_unix_seconds(2_000_000_000),
+    )
+    .unwrap();
+    let (store, writes) = make_store(snapshot_with_specialist_request());
+    let error = DeliberationCommands::new(&store)
+        .request_specialist(
+            command_with_budget(
+                Phase::ParallelAnalysis,
+                "agent-1",
+                specialist_budget,
+                "2026-08-09T00:00:00Z",
+            ),
+            specialist_request_with_id("specialist-2"),
+        )
+        .unwrap_err();
+    assert_eq!(error.safe_classification(), SafeErrorClassification::Conflict);
+    assert!(writes.lock().unwrap().commands.is_empty());
+
+    let expired_budget = DeliberationTaskBudget::new(
+        4,
+        1_024,
+        10_000,
+        Timestamp::from_unix_seconds(1_700_000_000),
+    )
+    .unwrap();
+    let (store, writes) = make_store(snapshot(Phase::CrossReview));
+    let error = DeliberationCommands::new(&store)
+        .record_thread_summary(
+            command_with_budget(
+                Phase::CrossReview,
+                "core",
+                expired_budget,
+                "2026-08-09T00:00:00Z",
+            ),
+            "thread-expired",
+        )
+        .unwrap_err();
+    assert_eq!(error.safe_classification(), SafeErrorClassification::Conflict);
+    assert!(writes.lock().unwrap().commands.is_empty());
+}
+
+#[test]
+fn persistence_command_carries_durable_budget_authority_and_reservation() {
+    let budget = DeliberationTaskBudget::new(
+        2,
+        1_024,
+        10_000,
+        Timestamp::from_unix_seconds(2_000_000_000),
+    )
+    .unwrap();
+    let (store, writes) = make_store(snapshot(Phase::CrossReview));
+    DeliberationCommands::new(&store)
+        .record_thread_summary(
+            command_with_budget(Phase::CrossReview, "core", budget, "2026-08-09T00:00:00Z"),
+            "thread-1",
+        )
+        .unwrap();
+
+    let writes = writes.lock().unwrap();
+    let command = &writes.commands[0];
+    assert_eq!(command.task_budget(), budget);
+    assert_eq!(command.budget_reservation().thread_count(), 1);
+    assert_eq!(command.budget_reservation().token_count(), 0);
+    assert_eq!(command.budget_reservation().cost_microunits(), 0);
+    assert_eq!(
+        command.append().events[0].payload["taskBudget"]["maxThreads"],
+        2
+    );
+    assert_eq!(
+        command.append().events[0].payload["budgetReservation"]["threads"],
+        1
     );
 }
 
@@ -335,6 +433,7 @@ fn command_context_binds_the_complete_authoritative_state_without_accepting_an_a
         TaskId::new("task-1").unwrap(),
         7,
         state,
+        task_budget(),
         ActorId::new("actor-1").unwrap(),
         DeliberationArtifactRef::new(
             ArtifactId::new("artifact-record-1").unwrap(),
@@ -361,6 +460,7 @@ fn malformed_correlation_and_timestamp_are_invalid_input_not_stale_conflicts() {
             TaskId::new("task-1").unwrap(),
             7,
             authoritative_state(Phase::ParallelAnalysis, 7),
+            task_budget(),
             ActorId::new("actor-1").unwrap(),
             artifact("artifact-record-1", '9'),
             EventId::new("event-1").unwrap(),
@@ -381,6 +481,7 @@ fn caller_structural_version_mismatch_is_invalid_but_loaded_staleness_is_conflic
         TaskId::new("task-1").unwrap(),
         8,
         authoritative_state(Phase::ParallelAnalysis, 7),
+        task_budget(),
         ActorId::new("actor-1").unwrap(),
         artifact("artifact-record-1", '9'),
         EventId::new("event-1").unwrap(),

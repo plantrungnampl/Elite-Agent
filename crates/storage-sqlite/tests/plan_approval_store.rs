@@ -324,6 +324,52 @@ fn concurrent_plan_resolution_has_exactly_one_terminal_winner() {
 }
 
 #[test]
+fn change_actions_round_trip_and_return_the_task_to_synthesis() {
+    for action in [
+        PlanApprovalAction::Revise,
+        PlanApprovalAction::Reopen,
+        PlanApprovalAction::AddOrReplaceAgent,
+    ] {
+        let database = TestDatabase::new();
+        let store = database.store();
+
+        ResolvePlanApproval::new(&store, &WithinWindow)
+            .execute(resolve_input(&database, action))
+            .unwrap();
+
+        let resolved = database
+            .store()
+            .reload(database.approval.approval_id())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            resolved.terminal,
+            Some(PlanApprovalTerminal::Resolved { action: resolved_action, .. })
+                if resolved_action == action
+        ));
+        let connection = database.connection();
+        assert_eq!(
+            connection
+                .query_row("SELECT phase FROM tasks WHERE id = 'task-1'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "Synthesis"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE event_type = 'plan.revision.requested'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
 fn invalidation_is_atomic_terminal_and_durable() {
     let database = TestDatabase::new();
     let store = database.store();

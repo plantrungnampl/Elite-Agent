@@ -19,6 +19,12 @@ struct RuntimeSink {
     codec: NdjsonCodec,
 }
 
+enum PreparedRequestCommit {
+    None,
+    Context(Box<local_agent_terminal_application::AgentContextQueryCommit>),
+    Specialist(Box<local_agent_terminal_application::AgentSpecialistCommit>),
+}
+
 impl RuntimeSink {
     fn receive_frame(&self, frame: ProtocolFrame) -> Result<InboundDisposition, ProtocolError> {
         self.gate.wait_until_ready()?;
@@ -369,7 +375,7 @@ impl RuntimeSink {
                 let _ = result_sender.send(handler.query_context(request));
             })
             .map_err(|_| ProtocolError::InternalAgentFailure)?;
-        let response = match self.wait_for_handler(result_receiver, worker) {
+        let mut response = match self.wait_for_handler(result_receiver, worker) {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 return self.audited_error(
@@ -410,21 +416,28 @@ impl RuntimeSink {
         let response_frame = success_response(
             request_id,
             json!({
-                "supplementId": response.supplement_id,
+                "supplementId": &response.supplement_id,
                 "contentDigest": response.content_digest.as_str(),
-                "items": response.item_ids,
-                "provenance": [],
-                "redactions": [],
-                "policyDecisionIds": response.policy_decision_ids,
+                "items": &response.item_ids,
+                "provenance": &response.provenance,
+                "redactions": &response.redactions,
+                "policyDecisionIds": &response.policy_decision_ids,
             }),
         )
         .map_err(|_| ProtocolError::InternalAgentFailure)?;
-        self.persist_request_audit(
+        let prepared_commit = response
+            .prepared_commit
+            .take()
+            .map(Box::new)
+            .map(PreparedRequestCommit::Context)
+            .unwrap_or(PreparedRequestCommit::None);
+        self.persist_request_audit_with_commit(
             request_id,
             AgentRequestKind::ContextQuery,
             request_digest,
             AgentRequestAuditDecision::Accepted,
             None,
+            prepared_commit,
         )?;
         Ok(response_frame)
     }
@@ -528,7 +541,7 @@ impl RuntimeSink {
                 let _ = result_sender.send(handler.request_specialist(request));
             })
             .map_err(|_| ProtocolError::InternalAgentFailure)?;
-        let response = match self.wait_for_handler(result_receiver, worker) {
+        let mut response = match self.wait_for_handler(result_receiver, worker) {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 return self.audited_error(
@@ -554,6 +567,7 @@ impl RuntimeSink {
             || response.task_id != self.request.task_id
             || response.request_id != request_id
             || !valid_specialist_reason(response.accepted, &response.reason_code)
+            || response.accepted != response.prepared_commit.is_some()
         {
             return self.audited_error(
                 request_id,
@@ -585,12 +599,19 @@ impl RuntimeSink {
             }),
         )
         .map_err(|_| ProtocolError::InternalAgentFailure)?;
-        self.persist_request_audit(
+        let prepared_commit = response
+            .prepared_commit
+            .take()
+            .map(Box::new)
+            .map(PreparedRequestCommit::Specialist)
+            .unwrap_or(PreparedRequestCommit::None);
+        self.persist_request_audit_with_commit(
             request_id,
             AgentRequestKind::SpecialistRequest,
             request_digest,
             decision,
             audit_reason,
+            prepared_commit,
         )?;
         Ok(response_frame)
     }
@@ -621,6 +642,30 @@ impl RuntimeSink {
         decision: AgentRequestAuditDecision,
         reason_code: Option<String>,
     ) -> Result<(), ProtocolError> {
+        self.persist_request_audit_with_commit(
+            request_id,
+            kind,
+            request_digest,
+            decision,
+            reason_code,
+            PreparedRequestCommit::None,
+        )
+    }
+
+    fn persist_request_audit_with_commit(
+        &self,
+        request_id: &str,
+        kind: AgentRequestKind,
+        request_digest: Sha256Digest,
+        decision: AgentRequestAuditDecision,
+        reason_code: Option<String>,
+        prepared_commit: PreparedRequestCommit,
+    ) -> Result<(), ProtocolError> {
+        let (context_commit, specialist_commit) = match prepared_commit {
+            PreparedRequestCommit::None => (None, None),
+            PreparedRequestCommit::Context(commit) => (Some(*commit), None),
+            PreparedRequestCommit::Specialist(commit) => (None, Some(*commit)),
+        };
         let audit = AgentRequestAudit {
             run_id: self.request.run_id.clone(),
             task_id: self.request.task_id.clone(),
@@ -633,6 +678,8 @@ impl RuntimeSink {
             reason_code,
             deadline: self.request.run_config.limits.deadline,
             fence: AgentRequestAuditFence::new(),
+            context_commit,
+            specialist_commit,
         };
         let fence = audit.fence.clone();
         let handler = Arc::clone(&self.request_handler);

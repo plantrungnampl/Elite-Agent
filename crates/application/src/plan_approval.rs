@@ -909,7 +909,7 @@ fn resolution_append(
         PlanApprovalAction::Revise
         | PlanApprovalAction::Reopen
         | PlanApprovalAction::AddOrReplaceAgent => {
-            return Err(conflict());
+            ("plan.revision.requested", Some("user_feedback_present"))
         }
     };
     let event_type = WorkflowEvent::new(event_type).map_err(|_| conflict())?;

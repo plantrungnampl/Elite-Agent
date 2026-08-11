@@ -1175,6 +1175,42 @@ fn canonical_specialist_request_round_trips_every_request_leaf_and_full_ref() {
 }
 
 #[test]
+fn canonical_legacy_specialist_request_without_cost_rehydrates_with_token_cost_default() {
+    let issued = CanonicalDeliberationFact::issue(
+        task_id(),
+        EventId::new("event-specialist-legacy").unwrap(),
+        3,
+        ActorId::new("agent-1").unwrap(),
+        DeliberationRecord::SpecialistRequest {
+            request: specialist_request(),
+            artifact: artifact("specialist-request-legacy", '2'),
+        },
+    )
+    .unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(issued.canonical_bytes()).unwrap();
+    value["fact"]["request"]["budget"]
+        .as_object_mut()
+        .unwrap()
+        .remove("maxCostMicrounits");
+    let legacy_bytes = serde_json_canonicalizer::to_vec(&value).unwrap();
+
+    let reopened = CanonicalDeliberationFact::rehydrate(
+        legacy_bytes.clone(),
+        digest_bytes(&legacy_bytes),
+    )
+    .unwrap();
+
+    assert_eq!(reopened.canonical_bytes(), legacy_bytes);
+    assert!(matches!(
+        reopened.record(),
+        DeliberationRecord::SpecialistRequest { request, .. }
+            if request.budget().max_tokens() == 512
+                && request.budget().max_cost_microunits() == 512
+    ));
+}
+
+#[test]
 fn canonical_supported_records_reject_actor_class_substitution() {
     let cases = [
         (

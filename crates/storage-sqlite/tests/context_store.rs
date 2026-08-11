@@ -13,6 +13,7 @@ use local_agent_terminal_application::{
     SafeErrorClassification, SourceClassificationRequest, SourceIndexMetadata, SourceSnapshot,
     SourceSnapshotItem, SourceSnapshotRequest, SourceStateTransition,
 };
+use local_agent_terminal_context_engine::ContextPackageBuilder;
 use local_agent_terminal_domain::{
     combine_policy_rules, ActorLocality, ArtifactId, ContextBudget, ContextPackageBinding,
     ContextPackageDescriptor, ContextPackageIdentity, ContextVersionSet, MatchedPolicyRule,
@@ -183,15 +184,20 @@ impl TestDatabase {
 
     fn execute(&self, item: SourceSnapshotItem) -> Result<ContextPackageBinding, PortError> {
         let store = self.store();
+        let source = Source {
+            snapshot: source_snapshot(item),
+        };
+        let publisher = Publisher { database: self };
+        let policy = AllowOrDenyPolicy;
+        let assembler = ContextPackageBuilder::new(&policy, &store);
         BuildInitialContext::new(
-            &Source {
-                snapshot: source_snapshot(item),
-            },
+            &source,
             &Classifier,
             &store,
-            &Publisher { database: self },
-            &AllowOrDenyPolicy,
+            &publisher,
+            &policy,
             &store,
+            &assembler,
         )
         .execute(build_request())
     }
@@ -629,7 +635,7 @@ fn build_request() -> BuildInitialContextRequest {
                 )
                 .unwrap(),
                 "analyze repository",
-                ContextVersionSet::new("prompt.v1", "retrieval.v1", "tokenizer.v1").unwrap(),
+                ContextVersionSet::new("prompt.v1", "retrieval.v1", "byte-token-v1").unwrap(),
                 ContextBudget::new(4_096, 1_024).unwrap(),
             )
             .unwrap(),

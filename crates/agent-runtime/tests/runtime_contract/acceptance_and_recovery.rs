@@ -839,7 +839,10 @@ impl AgentRequestHandler for RecordingRequestHandler {
             content_digest: digest(CONTEXT_DIGEST),
             item_ids: vec!["item-1".to_owned()],
             token_count: 1,
+            provenance: vec!["provenance-1".to_owned()],
+            redactions: vec!["redaction-1".to_owned()],
             policy_decision_ids: vec!["policy-1".to_owned()],
+            prepared_commit: None,
         };
         if self.invalid_context_response {
             response.task_id = task_id("task-2");
@@ -876,6 +879,25 @@ impl AgentRequestHandler for RecordingRequestHandler {
                 "artifact-context-1" | "artifact-context-manifest-1"
             )
         });
+        let prepared_commit = accepted
+            .then(|| {
+                SpecialistRequest::new(
+                    &request.request_id,
+                    request.task_id.clone(),
+                    request.run_id.clone(),
+                    &request.capability,
+                    &request.reason,
+                    request
+                        .required_context_ids
+                        .iter()
+                        .map(|artifact| ArtifactId::new(artifact).unwrap())
+                        .collect(),
+                    SpecialistBudget::new(request.max_tokens, request.max_tokens, request.deadline)
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .map(|request| AgentSpecialistCommit { request });
         let response = AgentSpecialistResponse {
             run_id: request.run_id,
             task_id: request.task_id,
@@ -889,6 +911,7 @@ impl AgentRequestHandler for RecordingRequestHandler {
                 "unrequested_context"
             }
             .to_owned(),
+            prepared_commit,
         };
         if let Some(returned) = &self.specialist_return {
             returned.complete();

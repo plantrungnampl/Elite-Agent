@@ -76,12 +76,14 @@ impl PlanApprovalStore for SqliteStore {
             &live_authority,
         )?;
         append_in_transaction(&transaction, &command.resolution.append)?;
-        let (status, action) = match command.resolution.action {
-            PlanApprovalAction::Approve => ("granted", "approve"),
-            PlanApprovalAction::Reject => ("denied", "reject"),
-            PlanApprovalAction::Revise
-            | PlanApprovalAction::Reopen
-            | PlanApprovalAction::AddOrReplaceAgent => return Err(conflict()),
+        let (status, action, event_type) = match command.resolution.action {
+            PlanApprovalAction::Approve => ("granted", "approve", "plan.approved"),
+            PlanApprovalAction::Reject => ("denied", "reject", "task.cancelled"),
+            PlanApprovalAction::Revise => ("denied", "revise", "plan.revision.requested"),
+            PlanApprovalAction::Reopen => ("denied", "reopen", "plan.revision.requested"),
+            PlanApprovalAction::AddOrReplaceAgent => {
+                ("denied", "add_or_replace_agent", "plan.revision.requested")
+            }
         };
         let changed = transaction
             .execute(
@@ -106,11 +108,7 @@ impl PlanApprovalStore for SqliteStore {
             &transaction,
             &command.expected_current.binding.task_id,
             command.resolution.approval_id.as_str(),
-            if action == "approve" {
-                "plan.approved"
-            } else {
-                "task.cancelled"
-            },
+            event_type,
             Some(action),
         )?;
         transaction.commit().map_err(sqlite_error_to_port)
@@ -343,26 +341,34 @@ fn terminal_state(
             Ok((PlanApprovalState::Requested, None))
         }
         "granted" | "denied" => {
-            let action = if row.status == "granted" {
-                PlanApprovalAction::Approve
+            let (action, expected_action, event) = if row.status == "granted" {
+                (
+                    PlanApprovalAction::Approve,
+                    "approve",
+                    load_terminal_event(
+                        connection,
+                        task_id.as_str(),
+                        approval_id.as_str(),
+                        "plan.approved",
+                    )?,
+                )
             } else {
-                PlanApprovalAction::Reject
-            };
-            let expected_type = if row.status == "granted" {
-                "plan.approved"
-            } else {
-                "task.cancelled"
-            };
-            let event = load_terminal_event(
-                connection,
-                task_id.as_str(),
-                approval_id.as_str(),
-                expected_type,
-            )?;
-            let expected_action = if row.status == "granted" {
-                "approve"
-            } else {
-                "reject"
+                let event = load_denied_resolution_event(
+                    connection,
+                    task_id.as_str(),
+                    approval_id.as_str(),
+                )?;
+                let (action, expected_action) = match event.action.as_deref() {
+                    Some("reject") => (PlanApprovalAction::Reject, "reject"),
+                    Some("revise") => (PlanApprovalAction::Revise, "revise"),
+                    Some("reopen") => (PlanApprovalAction::Reopen, "reopen"),
+                    Some("add_or_replace_agent") => (
+                        PlanApprovalAction::AddOrReplaceAgent,
+                        "add_or_replace_agent",
+                    ),
+                    _ => return Err(integrity_failure()),
+                };
+                (action, expected_action, event)
             };
             if event.action.as_deref() != Some(expected_action)
                 || row.resolved_at.as_deref() != Some(event.created_at.as_str())
@@ -466,6 +472,31 @@ fn load_terminal_event(
             .and_then(Value::as_str)
             .map(str::to_owned),
     })
+}
+
+fn load_denied_resolution_event(
+    connection: &Connection,
+    task_id: &str,
+    approval_id: &str,
+) -> Result<TerminalEvent, PortError> {
+    let event_type: Option<String> = connection
+        .query_row(
+            "SELECT event_type FROM events
+             WHERE stream_id = ?1
+               AND event_type IN ('task.cancelled', 'plan.revision.requested')
+               AND json_extract(payload_json, '$.approvalId') = ?2
+             ORDER BY sequence DESC LIMIT 1",
+            params![task_id, approval_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error_to_port)?;
+    load_terminal_event(
+        connection,
+        task_id,
+        approval_id,
+        &event_type.ok_or_else(integrity_failure)?,
+    )
 }
 
 fn current_state_for_binding(

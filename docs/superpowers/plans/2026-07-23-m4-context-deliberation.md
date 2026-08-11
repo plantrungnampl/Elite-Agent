@@ -607,7 +607,7 @@ Prove:
 
 Require a source-commit-bound manifest, pinned tool versions, hashes for every retained output, zero skipped approval-critical tests, immutable design proof, complete M0–M3 regressions, context security matrix, retrieval/freshness matrix, two-provider conformance, deliberation/recovery matrix, UI/browser accessibility, exact plan approval, repository no-mutation proof, credential canary absence, and independent final review with no unresolved Critical/Important finding.
 
-- [ ] **Step 3 - Run the complete M4 gate**
+- [x] **Step 3 - Run the complete M4 gate**
 
 ```powershell
 node --test tests/contracts/*.test.mjs

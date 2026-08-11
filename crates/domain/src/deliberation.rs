@@ -14,7 +14,9 @@ const MAX_AGENTS: u32 = 64;
 const MAX_ROUNDS: u32 = 32;
 const MAX_REVIEW_EDGES: u32 = 4_096;
 const MAX_SPECIALIST_REQUESTS: u32 = 256;
+const MAX_THREADS: u32 = 4_096;
 const MAX_TOKENS: u64 = 1_000_000;
+const MAX_COST_MICROUNITS: u64 = 1_000_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliberationError {
@@ -286,6 +288,53 @@ impl DeliberationLimits {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliberationTaskBudget {
+    max_threads: u32,
+    max_tokens: u64,
+    max_cost_microunits: u64,
+    deadline: Timestamp,
+}
+
+impl DeliberationTaskBudget {
+    pub fn new(
+        max_threads: u32,
+        max_tokens: u64,
+        max_cost_microunits: u64,
+        deadline: Timestamp,
+    ) -> Result<Self, DeliberationError> {
+        if !(1..=MAX_THREADS).contains(&max_threads)
+            || !(1..=MAX_TOKENS).contains(&max_tokens)
+            || !(1..=MAX_COST_MICROUNITS).contains(&max_cost_microunits)
+            || deadline.unix_seconds() <= 0
+        {
+            return Err(DeliberationError::InvalidBudget);
+        }
+        Ok(Self {
+            max_threads,
+            max_tokens,
+            max_cost_microunits,
+            deadline,
+        })
+    }
+
+    pub const fn max_threads(self) -> u32 {
+        self.max_threads
+    }
+
+    pub const fn max_tokens(self) -> u64 {
+        self.max_tokens
+    }
+
+    pub const fn max_cost_microunits(self) -> u64 {
+        self.max_cost_microunits
+    }
+
+    pub const fn deadline(self) -> Timestamp {
+        self.deadline
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewEdge {
     reviewer_id: String,
@@ -372,22 +421,35 @@ impl ReviewPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpecialistBudget {
     max_tokens: u64,
+    max_cost_microunits: u64,
     deadline: Timestamp,
 }
 
 impl SpecialistBudget {
-    pub fn new(max_tokens: u64, deadline: Timestamp) -> Result<Self, DeliberationError> {
-        if !(1..=MAX_TOKENS).contains(&max_tokens) || deadline.unix_seconds() <= 0 {
+    pub fn new(
+        max_tokens: u64,
+        max_cost_microunits: u64,
+        deadline: Timestamp,
+    ) -> Result<Self, DeliberationError> {
+        if !(1..=MAX_TOKENS).contains(&max_tokens)
+            || !(1..=MAX_COST_MICROUNITS).contains(&max_cost_microunits)
+            || deadline.unix_seconds() <= 0
+        {
             return Err(DeliberationError::InvalidBudget);
         }
         Ok(Self {
             max_tokens,
+            max_cost_microunits,
             deadline,
         })
     }
 
     pub const fn max_tokens(self) -> u64 {
         self.max_tokens
+    }
+
+    pub const fn max_cost_microunits(self) -> u64 {
+        self.max_cost_microunits
     }
 
     pub const fn deadline(self) -> Timestamp {

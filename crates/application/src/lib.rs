@@ -2,14 +2,15 @@
 
 pub use local_agent_terminal_domain::{
     ActorId, ActorLocality, AgentCancellationReceipt, AgentClaim, AgentDescriptor, AgentError,
-    AgentEvidenceRef, AgentRunLimits, AgentRunMessage, AgentRunReceipt, AgentRunSnapshot,
-    AgentRunStatus, AgentRunTerminal, AgentUsage, ArtifactId, BoundAgentConnection,
-    BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig,
-    CancelAgentRun, ContextBudget, ContextError, ContextPackageArtifact, ContextPackageBinding,
-    ContextPackageDescriptor, ContextPackageIdentity, ContextPackageMember, ContextVersionSet,
-    DeliberationError, FencingToken, GitObjectId, LeaseClaim, LineRange, Phase, PolicyAction,
-    PolicyActor, PolicyDecisionSet, PolicyResource, ProjectId, RepositoryId, ResourceClass, RunId,
-    Sequence, Sha256Digest, SourceIdentity, TaskBranch, TaskId, TaskRisk, TrustTier,
+    AgentEvidenceRef, AgentFamilyKey, AgentRunLimits, AgentRunMessage, AgentRunReceipt,
+    AgentRunSnapshot, AgentRunStatus, AgentRunTerminal, AgentUsage, ArtifactId,
+    BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters,
+    BoundRunConfig, CancelAgentRun, ContextBudget, ContextError, ContextPackageArtifact,
+    ContextPackageBinding, ContextPackageDescriptor, ContextPackageIdentity, ContextPackageMember,
+    ContextVersionSet, DeliberationBudget, DeliberationError, EventId, FencingToken, GitObjectId,
+    LeaseClaim, LineRange, Phase, PolicyAction, PolicyActor, PolicyDecisionSet, PolicyResource,
+    ProjectId, RepositoryId, ResourceClass, RunId, Sequence, Sha256Digest, SourceIdentity,
+    SpecialistBudget, SpecialistRequest, TaskBranch, TaskId, TaskRisk, TrustTier,
     WorkspaceFingerprint, WorkspaceVersion, WorktreeId, MAX_GENERATION_PARAMETERS_BYTES,
 };
 
@@ -35,9 +36,10 @@ mod tool;
 mod workspace;
 
 pub use agent::{
-    AgentArtifactStore, AgentContextQueryRequest, AgentContextQueryResponse, AgentMessageArtifact,
-    AgentRequestAudit, AgentRequestAuditDecision, AgentRequestAuditFence, AgentRequestCancellation,
-    AgentRequestHandler, AgentRequestKind, AgentRunStore, AgentRuntime, AgentSpecialistRequest,
+    AgentArtifactStore, AgentContextQueryCommit, AgentContextQueryRequest,
+    AgentContextQueryResponse, AgentMessageArtifact, AgentRequestAudit, AgentRequestAuditDecision,
+    AgentRequestAuditFence, AgentRequestCancellation, AgentRequestHandler, AgentRequestKind,
+    AgentRunStore, AgentRuntime, AgentSpecialistCommit, AgentSpecialistRequest,
     AgentSpecialistResponse,
 };
 pub use append_events::AppendEvents;
@@ -56,24 +58,25 @@ pub use authority::{
 };
 pub use canonical_json::{canonical_evidence, CanonicalEvidenceRef, CanonicalJsonRequest};
 pub use context::{
-    BuildInitialContext, BuildInitialContextRequest, ContextArtifactKind, ContextArtifactPublisher,
-    ContextArtifactReader, ContextArtifactRef, ContextBuildPolicy, ContextChunkRecord,
-    ContextClassificationOutcome, ContextIndexProvenance, ContextIndexProvenanceRehydration,
-    ContextLogicalIdentity, ContextPackageDraft, ContextPackagePersistence, ContextPackageRecord,
-    ContextPolicyDecisionRef, ContextQuery, ContextSensitivity, ContextSourceClassification,
-    ContextSourceClassifier, ContextSourceKind, ContextSourceRecord, ContextSourceState,
-    ContextStore, ImmutableContextArtifact, QueryContext, QueryContextRequest,
-    RepositoryContextSource, RetrievedContextItem, SourceClassificationRequest,
-    SourceIndexMetadata, SourceSnapshot, SourceSnapshotItem, SourceSnapshotRequest,
-    SourceStateTransition,
+    AssembledContextPackage, BuildInitialContext, BuildInitialContextRequest, ContextArtifactKind,
+    ContextArtifactPublisher, ContextArtifactReader, ContextArtifactRef, ContextBuildPolicy,
+    ContextChunkRecord, ContextClassificationOutcome, ContextEvidenceAssemblyItem,
+    ContextIndexProvenance, ContextIndexProvenanceRehydration, ContextLogicalIdentity,
+    ContextPackageAssembler, ContextPackageDraft, ContextPackagePersistence, ContextPackageRecord,
+    ContextPolicyDecisionRef, ContextQuery, ContextRetrievalAuthority, ContextSensitivity,
+    ContextSourceClassification, ContextSourceClassifier, ContextSourceKind, ContextSourceRecord,
+    ContextSourceState, ContextStore, ImmutableContextArtifact, PreparedContextPackage,
+    QueryContext, QueryContextRequest, RepositoryContextSource, RetrievedContextItem,
+    SourceClassificationRequest, SourceIndexMetadata, SourceSnapshot, SourceSnapshotItem,
+    SourceSnapshotRequest, SourceStateTransition,
 };
 pub use deliberation::{
     prepare_initial_deliberation_phase, ClaimSetSnapshot, DecisionDraftSnapshot,
     DeliberationAgentRunReconciliation, DeliberationAgentRunRecovery, DeliberationArtifactRef,
     DeliberationBoundaryCheck, DeliberationBoundaryRecord, DeliberationBoundaryStore,
-    DeliberationClaimCandidate, DeliberationClaimSource, DeliberationCommandContext,
-    DeliberationCommands, DeliberationDispatchBinding, DeliberationDispatchStore,
-    DeliberationDurableBoundary, DeliberationPersistenceCommand,
+    DeliberationBudgetReservation, DeliberationClaimCandidate, DeliberationClaimSource,
+    DeliberationCommandContext, DeliberationCommands, DeliberationDispatchBinding,
+    DeliberationDispatchStore, DeliberationDurableBoundary, DeliberationPersistenceCommand,
     DeliberationPhaseDispatchAuthority, DeliberationPhaseDispatchSet,
     DeliberationProposalDispatchPlan, DeliberationRecord, DeliberationRecoveryCheckpoint,
     DeliberationRecoveryStore, DeliberationRepositoryAuthority, DeliberationRunAssignment,

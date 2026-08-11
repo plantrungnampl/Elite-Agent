@@ -94,7 +94,10 @@ fn agent_ports_are_object_safe_and_keep_only_bound_values_at_the_boundary() {
                 .unwrap(),
                 item_ids: Vec::new(),
                 token_count: 0,
+                provenance: Vec::new(),
+                redactions: Vec::new(),
                 policy_decision_ids: Vec::new(),
+                prepared_commit: None,
             })
         }
 
@@ -108,6 +111,7 @@ fn agent_ports_are_object_safe_and_keep_only_bound_values_at_the_boundary() {
                 request_id: request.request_id,
                 accepted: false,
                 reason_code: "budget_exhausted".to_owned(),
+                prepared_commit: None,
             })
         }
 
