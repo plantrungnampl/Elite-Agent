@@ -1,3 +1,5 @@
+#[path = "deliberation_e2e/support.rs"]
+mod deliberation_support;
 #[allow(dead_code)]
 mod support;
 
@@ -52,9 +54,8 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use support::{
-    commit_context_sources, durable_workspace_bytes, WorkspaceFixture, PROJECT_ID, TASK_ID,
-};
+use deliberation_support::{commit_context_sources, durable_workspace_bytes};
+use support::{WorkspaceFixture, PROJECT_ID, TASK_ID};
 
 const CAPTURED_AT: &str = "2026-08-11T08:00:00Z";
 const SECRET_CANARY: &str = "m4-secret-canary-must-not-persist";
