@@ -842,6 +842,7 @@ fn approval_test_bootstrap(
             trusted_workspace_root: fixture.workspace_root.clone(),
             secret_values: Vec::new(),
             openai: None,
+            anthropic: None,
         },
         ToolBrokerConfig::new(
             APPROVE_PROCESS_POLICY,
@@ -1238,6 +1239,7 @@ fn startup_config(root: &TempDir) -> StartupConfig {
         trusted_workspace_root: root.path().join("workspaces"),
         secret_values: Vec::new(),
         openai: None,
+        anthropic: None,
     }
 }
 

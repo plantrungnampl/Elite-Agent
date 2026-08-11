@@ -231,6 +231,7 @@ fn config(app_data_dir: PathBuf) -> StartupConfig {
         app_data_dir,
         secret_values: Vec::new(),
         openai: None,
+        anthropic: None,
     }
 }
 

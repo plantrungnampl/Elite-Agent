@@ -16,7 +16,9 @@ use local_agent_terminal_storage_files::{
 };
 use local_agent_terminal_storage_sqlite::{DatabaseHealth, DatabaseIssue, OpenError, SqliteStore};
 
-use crate::agent_runtime::{compose_openai_runtime, ComposedAgentRuntime, OpenAiBootstrapConfig};
+use crate::agent_runtime::{
+    compose_agent_runtime, AnthropicBootstrapConfig, ComposedAgentRuntime, OpenAiBootstrapConfig,
+};
 use crate::logging::LocalLog;
 #[cfg(windows)]
 use crate::production_tools::production_tool_broker;
@@ -32,6 +34,7 @@ pub struct StartupConfig {
     pub trusted_workspace_root: PathBuf,
     pub secret_values: Vec<String>,
     pub openai: Option<OpenAiBootstrapConfig>,
+    pub anthropic: Option<AnthropicBootstrapConfig>,
 }
 
 pub struct Bootstrap {
@@ -584,12 +587,13 @@ fn start(
         ),
     ));
 
-    let agent_runtime = config
-        .openai
-        .as_ref()
-        .map(|openai| compose_openai_runtime(database.clone(), Arc::clone(&artifacts), openai))
-        .transpose()
-        .map_err(agent_runtime_failure)?;
+    let agent_runtime = compose_agent_runtime(
+        database.clone(),
+        Arc::clone(&artifacts),
+        config.openai.as_ref(),
+        config.anthropic.as_ref(),
+    )
+    .map_err(agent_runtime_failure)?;
     if agent_runtime.is_some() {
         log.push(record(
             "startup.agent_runtime.composed",

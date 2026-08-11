@@ -1966,9 +1966,12 @@ dependencies = [
  "git2",
  "local-agent-terminal-agent-runtime",
  "local-agent-terminal-application",
+ "local-agent-terminal-context-engine",
  "local-agent-terminal-domain",
+ "local-agent-terminal-orchestration",
  "local-agent-terminal-platform-windows",
  "local-agent-terminal-policy-engine",
+ "local-agent-terminal-provider-anthropic",
  "local-agent-terminal-provider-openai",
  "local-agent-terminal-repository-git",
  "local-agent-terminal-storage-files",
@@ -2058,6 +2061,17 @@ dependencies = [
  "serde_json",
  "serde_json_canonicalizer",
  "sha2",
+]
+
+[[package]]
+name = "local-agent-terminal-provider-anthropic"
+version = "0.1.0"
+dependencies = [
+ "local-agent-terminal-agent-protocol",
+ "reqwest 0.12.28",
+ "serde_json",
+ "sha2",
+ "url",
 ]
 
 [[package]]

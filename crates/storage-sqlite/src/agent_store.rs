@@ -65,8 +65,6 @@ const RUN_CONFIG_LIMIT_FIELDS_V2: &[&str] = &[
     "maxSpecialistRequests",
     "maxToolRequests",
 ];
-const TRUSTED_CORE_ADAPTER_ID: &str = "core_adapter";
-
 pub fn canonical_agent_run_config_artifact(
     request: &BoundAgentRunRequest,
 ) -> Result<Vec<u8>, PortError> {
@@ -125,8 +123,7 @@ impl SqliteStore {
         at: &str,
     ) -> Result<Vec<RunId>, PortError> {
         descriptor.validate().map_err(|_| invalid_input())?;
-        if descriptor.agent_id != TRUSTED_CORE_ADAPTER_ID
-            || descriptor.trust_tier != TrustTier::CoreAdapter
+        if descriptor.trust_tier != TrustTier::CoreAdapter
             || !descriptor.enabled
             || !descriptor.containment_verified
         {
@@ -150,7 +147,7 @@ impl SqliteStore {
                 "SELECT transport_type, trust_tier, manifest_json, manifest_digest,
                             executable_digest, enabled, containment_verified
                      FROM agent_descriptors WHERE id = ?1",
-                [TRUSTED_CORE_ADAPTER_ID],
+                [descriptor.agent_id.as_str()],
                 |row| {
                     Ok(RegisteredDescriptor {
                         transport: row.get(0)?,
@@ -166,7 +163,10 @@ impl SqliteStore {
             .optional()
             .map_err(sqlite_error_to_port)?;
         let Some(registered) = registered else {
-            if active_run_count(&transaction, ActiveRunScope::Agent(TRUSTED_CORE_ADAPTER_ID))? != 0
+            if active_run_count(
+                &transaction,
+                ActiveRunScope::Agent(descriptor.agent_id.as_str()),
+            )? != 0
             {
                 return Err(conflict());
             }
@@ -186,7 +186,7 @@ impl SqliteStore {
         Sha256Digest::new(&registered_executable_digest).map_err(|_| integrity_failure())?;
         let interrupted = interrupt_active_runs(
             &transaction,
-            ActiveRunScope::Agent(TRUSTED_CORE_ADAPTER_ID),
+            ActiveRunScope::Agent(descriptor.agent_id.as_str()),
             completed_at,
             at,
         )?;
@@ -196,7 +196,7 @@ impl SqliteStore {
                     "UPDATE agent_descriptors
                      SET executable_digest = ?1, updated_at = ?2
                      WHERE id = ?3",
-                    params![executable_digest.as_str(), at, TRUSTED_CORE_ADAPTER_ID],
+                    params![executable_digest.as_str(), at, descriptor.agent_id],
                 )
                 .map_err(sqlite_error_to_port)?;
             if updated != 1 {

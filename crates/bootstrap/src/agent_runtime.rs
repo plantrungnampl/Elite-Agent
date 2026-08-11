@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Condvar, Mutex, MutexGuard},
     time::Duration,
 };
@@ -18,6 +18,8 @@ use local_agent_terminal_application::{
     PortError, ProjectId, ReservedArtifact, Retryability, SafeErrorClassification, Sha256Digest,
     TaskId, TaskQuery, TrustTier, WorkspaceEvidenceStore,
 };
+pub use local_agent_terminal_provider_anthropic::AnthropicApiKey;
+use local_agent_terminal_provider_anthropic::{AnthropicMessagesAdapter, AnthropicProviderConfig};
 pub use local_agent_terminal_provider_openai::OpenAiApiKey;
 use local_agent_terminal_provider_openai::{OpenAiProviderConfig, OpenAiResponsesAdapter};
 use local_agent_terminal_storage_files::{
@@ -30,10 +32,13 @@ use url::Url;
 
 use crate::workspace_monitor::publish_canonical_json;
 
-const CORE_ADAPTER_ID: &str = "core_adapter";
-const CORE_CONNECTION_ID: &str = "openai_core_adapter";
+const OPENAI_AGENT_ID: &str = "core_adapter";
+const OPENAI_CONNECTION_ID: &str = "openai_core_adapter";
+const ANTHROPIC_AGENT_ID: &str = "anthropic_core_adapter";
+const ANTHROPIC_CONNECTION_ID: &str = "anthropic_core_adapter";
 const PROTOCOL_VERSION: &str = "1.0";
-const CORE_MANIFEST: &[u8] = br#"{"adapter":"openai-responses","agentId":"core_adapter","providerId":"openai","schema":"trusted-openai-core-adapter-manifest.v1"}"#;
+const OPENAI_MANIFEST: &[u8] = br#"{"adapter":"openai-responses","agentId":"core_adapter","providerId":"openai","schema":"trusted-openai-core-adapter-manifest.v1"}"#;
+const ANTHROPIC_MANIFEST: &[u8] = br#"{"adapter":"anthropic-messages","agentId":"anthropic_core_adapter","providerId":"anthropic","schema":"trusted-anthropic-core-adapter-manifest.v1"}"#;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -46,16 +51,135 @@ pub struct OpenAiBootstrapConfig {
     pub adapter_version: String,
 }
 
-pub(crate) fn compose_openai_runtime(
+#[derive(Clone)]
+pub struct AnthropicBootstrapConfig {
+    pub endpoint: String,
+    pub api_key: AnthropicApiKey,
+    pub manifest_digest: Sha256Digest,
+    pub core_release_digest: Sha256Digest,
+    pub adapter_version: String,
+}
+
+struct ComposedPeer {
+    descriptor: AgentDescriptor,
+    connection: BoundAgentConnection,
+    provider_id: String,
+    peer: Arc<dyn ProtocolPeer>,
+}
+
+pub(crate) fn compose_agent_runtime(
     database: SqliteStore,
     artifacts: Arc<ContentAddressedArtifactStore>,
-    config: &OpenAiBootstrapConfig,
-) -> Result<Arc<ComposedAgentRuntime>, PortError> {
-    let descriptor = core_adapter_descriptor(config)?;
-    let connection = core_adapter_connection(config)?;
+    openai: Option<&OpenAiBootstrapConfig>,
+    anthropic: Option<&AnthropicBootstrapConfig>,
+) -> Result<Option<Arc<ComposedAgentRuntime>>, PortError> {
+    let mut peers = Vec::new();
+    if let Some(config) = openai {
+        peers.push(compose_openai_peer(config)?);
+    }
+    if let Some(config) = anthropic {
+        peers.push(compose_anthropic_peer(config)?);
+    }
+    if peers.is_empty() {
+        return Ok(None);
+    }
     let recovery_at = database.now_utc()?;
-    database.reconcile_trusted_core_adapter(&descriptor, &recovery_at)?;
-    let peer_descriptor = PeerDescriptor {
+    for peer in &peers {
+        database.reconcile_trusted_core_adapter(&peer.descriptor, &recovery_at)?;
+    }
+    compose_runtime(database, artifacts, peers).map(Some)
+}
+
+fn compose_openai_peer(config: &OpenAiBootstrapConfig) -> Result<ComposedPeer, PortError> {
+    let descriptor = core_adapter_descriptor(
+        OPENAI_AGENT_ID,
+        "OpenAI Responses",
+        OPENAI_MANIFEST,
+        &config.manifest_digest,
+        &config.core_release_digest,
+    )?;
+    let connection = core_adapter_connection(
+        OPENAI_CONNECTION_ID,
+        OPENAI_AGENT_ID,
+        &config.manifest_digest,
+        &config.core_release_digest,
+        &config.adapter_version,
+    )?;
+    let peer_descriptor = peer_descriptor(&connection)?;
+    let endpoint = Url::parse(&config.endpoint).map_err(|_| invalid_input())?;
+    let provider = match endpoint.scheme() {
+        "https" => OpenAiProviderConfig::new(
+            endpoint,
+            config.api_key.clone(),
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+        ),
+        "http" => OpenAiProviderConfig::for_loopback_test(
+            endpoint,
+            config.api_key.clone(),
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+        ),
+        _ => return Err(invalid_input()),
+    }
+    .map_err(|_| invalid_input())?;
+    let peer: Arc<dyn ProtocolPeer> = Arc::new(
+        OpenAiResponsesAdapter::new(provider, peer_descriptor).map_err(|_| unavailable())?,
+    );
+    Ok(ComposedPeer {
+        descriptor,
+        connection,
+        provider_id: "openai".to_owned(),
+        peer,
+    })
+}
+
+fn compose_anthropic_peer(config: &AnthropicBootstrapConfig) -> Result<ComposedPeer, PortError> {
+    let descriptor = core_adapter_descriptor(
+        ANTHROPIC_AGENT_ID,
+        "Anthropic Messages",
+        ANTHROPIC_MANIFEST,
+        &config.manifest_digest,
+        &config.core_release_digest,
+    )?;
+    let connection = core_adapter_connection(
+        ANTHROPIC_CONNECTION_ID,
+        ANTHROPIC_AGENT_ID,
+        &config.manifest_digest,
+        &config.core_release_digest,
+        &config.adapter_version,
+    )?;
+    let peer_descriptor = peer_descriptor(&connection)?;
+    let endpoint = Url::parse(&config.endpoint).map_err(|_| invalid_input())?;
+    let provider = match endpoint.scheme() {
+        "https" => AnthropicProviderConfig::new(
+            endpoint,
+            config.api_key.clone(),
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+        ),
+        "http" => AnthropicProviderConfig::for_loopback_test(
+            endpoint,
+            config.api_key.clone(),
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+        ),
+        _ => return Err(invalid_input()),
+    }
+    .map_err(|_| invalid_input())?;
+    let peer: Arc<dyn ProtocolPeer> = Arc::new(
+        AnthropicMessagesAdapter::new(provider, peer_descriptor).map_err(|_| unavailable())?,
+    );
+    Ok(ComposedPeer {
+        descriptor,
+        connection,
+        provider_id: "anthropic".to_owned(),
+        peer,
+    })
+}
+
+fn peer_descriptor(connection: &BoundAgentConnection) -> Result<PeerDescriptor, PortError> {
+    Ok(PeerDescriptor {
         binding: ConnectionBinding {
             connection_id: connection.connection_id.clone(),
             agent_id: connection.agent_id.clone(),
@@ -84,36 +208,13 @@ pub(crate) fn compose_openai_runtime(
             max_concurrent_runs: 1,
             max_context_tokens: 16_384,
         },
-    };
-    let endpoint = Url::parse(&config.endpoint).map_err(|_| invalid_input())?;
-    let provider = match endpoint.scheme() {
-        "https" => OpenAiProviderConfig::new(
-            endpoint,
-            config.api_key.clone(),
-            CONNECT_TIMEOUT,
-            READ_TIMEOUT,
-        ),
-        "http" => OpenAiProviderConfig::for_loopback_test(
-            endpoint,
-            config.api_key.clone(),
-            CONNECT_TIMEOUT,
-            READ_TIMEOUT,
-        ),
-        _ => return Err(invalid_input()),
-    }
-    .map_err(|_| invalid_input())?;
-    let peer: Arc<dyn ProtocolPeer> = Arc::new(
-        OpenAiResponsesAdapter::new(provider, peer_descriptor).map_err(|_| unavailable())?,
-    );
-    compose_runtime(database, artifacts, descriptor, connection, peer)
+    })
 }
 
 fn compose_runtime(
     database: SqliteStore,
     artifacts: Arc<ContentAddressedArtifactStore>,
-    descriptor: AgentDescriptor,
-    connection: BoundAgentConnection,
-    peer: Arc<dyn ProtocolPeer>,
+    peers: Vec<ComposedPeer>,
 ) -> Result<Arc<ComposedAgentRuntime>, PortError> {
     let database = database.with_artifact_reader(Arc::new(ContentAddressedArtifactReader));
     let request_handler = Arc::new(DurableAgentRequestHandler {
@@ -124,17 +225,38 @@ fn compose_runtime(
         database: database.clone(),
         artifacts,
     });
+    let mut descriptors = BTreeMap::new();
+    let mut connections = BTreeMap::new();
+    let mut provider_ids = BTreeMap::new();
+    let mut runtime_peers = Vec::with_capacity(peers.len());
+    for peer in peers {
+        let agent_id = peer.descriptor.agent_id.clone();
+        if descriptors
+            .insert(agent_id.clone(), peer.descriptor.clone())
+            .is_some()
+            || connections
+                .insert(agent_id.clone(), peer.connection.clone())
+                .is_some()
+            || provider_ids
+                .insert(agent_id, peer.provider_id.clone())
+                .is_some()
+        {
+            return Err(integrity_failure());
+        }
+        runtime_peers.push((peer.descriptor, peer.connection.binding_digest, peer.peer));
+    }
     let runtime = Arc::new(ProtocolAgentRuntime::new_with_request_handler(
         Arc::new(database.clone()) as Arc<dyn AgentRunStore>,
         durable_artifacts.clone() as Arc<dyn AgentArtifactStore>,
         Arc::new(database.clone()) as Arc<dyn Clock>,
-        vec![(descriptor.clone(), connection.binding_digest.clone(), peer)],
+        runtime_peers,
         request_handler as Arc<dyn AgentRequestHandler>,
     )?);
     Ok(Arc::new(ComposedAgentRuntime {
         database,
-        descriptor,
-        connection,
+        descriptors,
+        connections,
+        provider_ids,
         durable_artifacts,
         runtime,
         lifecycle: RuntimeLifecycle::new(),
@@ -143,8 +265,9 @@ fn compose_runtime(
 
 pub(crate) struct ComposedAgentRuntime {
     database: SqliteStore,
-    descriptor: AgentDescriptor,
-    connection: BoundAgentConnection,
+    descriptors: BTreeMap<String, AgentDescriptor>,
+    connections: BTreeMap<String, BoundAgentConnection>,
+    provider_ids: BTreeMap<String, String>,
     durable_artifacts: Arc<DurableAgentArtifacts>,
     runtime: Arc<ProtocolAgentRuntime>,
     lifecycle: RuntimeLifecycle,
@@ -207,25 +330,40 @@ impl ComposedAgentRuntime {
 
     fn prepare_run(&self, request: &BoundAgentRunRequest) -> Result<(), PortError> {
         request.validate().map_err(|_| invalid_input())?;
-        if request.run_config.provider_id != "openai"
-            || request.agent_id != self.descriptor.agent_id
-            || request.connection != self.connection
-            || request.run_config.trust_tier != self.descriptor.trust_tier
-            || request.run_config.manifest_digest != self.descriptor.manifest_digest
-            || request.run_config.executable_digest != self.descriptor.executable_digest
+        let descriptor = self
+            .descriptors
+            .get(&request.agent_id)
+            .ok_or_else(invalid_input)?;
+        let connection = self
+            .connections
+            .get(&request.agent_id)
+            .ok_or_else(invalid_input)?;
+        let provider_id = self
+            .provider_ids
+            .get(&request.agent_id)
+            .ok_or_else(invalid_input)?;
+        if request.run_config.provider_id != *provider_id
+            || request.connection != *connection
+            || request.run_config.trust_tier != descriptor.trust_tier
+            || request.run_config.manifest_digest != descriptor.manifest_digest
+            || request.run_config.executable_digest != descriptor.executable_digest
         {
             return Err(invalid_input());
         }
 
-        self.publish_manifest(request)?;
+        self.publish_manifest(request, descriptor)?;
         self.durable_artifacts
             .load_effective_context(&request.context)?;
         self.publish_run_config(request)
     }
 
-    fn publish_manifest(&self, request: &BoundAgentRunRequest) -> Result<(), PortError> {
-        let value: Value = serde_json::from_slice(&self.descriptor.manifest_json)
-            .map_err(|_| integrity_failure())?;
+    fn publish_manifest(
+        &self,
+        request: &BoundAgentRunRequest,
+        descriptor: &AgentDescriptor,
+    ) -> Result<(), PortError> {
+        let value: Value =
+            serde_json::from_slice(&descriptor.manifest_json).map_err(|_| integrity_failure())?;
         let published = publish_canonical_json(
             &self.database,
             self.durable_artifacts.artifacts.as_ref(),
@@ -247,7 +385,7 @@ impl ComposedAgentRuntime {
                 ),
             )?,
         )?;
-        if published.content_hash != self.descriptor.manifest_digest.as_str() {
+        if published.content_hash != descriptor.manifest_digest.as_str() {
             return Err(integrity_failure());
         }
         Ok(())
@@ -487,18 +625,24 @@ impl AgentArtifactStore for DurableAgentArtifacts {
     }
 }
 
-fn core_adapter_descriptor(config: &OpenAiBootstrapConfig) -> Result<AgentDescriptor, PortError> {
-    let manifest_digest = digest_bytes(CORE_MANIFEST);
-    if config.manifest_digest != manifest_digest {
+fn core_adapter_descriptor(
+    agent_id: &str,
+    display_name: &str,
+    manifest: &[u8],
+    configured_manifest_digest: &Sha256Digest,
+    core_release_digest: &Sha256Digest,
+) -> Result<AgentDescriptor, PortError> {
+    let manifest_digest = digest_bytes(manifest);
+    if configured_manifest_digest != &manifest_digest {
         return Err(integrity_failure());
     }
     let descriptor = AgentDescriptor {
-        agent_id: CORE_ADAPTER_ID.to_owned(),
-        display_name: "OpenAI Responses".to_owned(),
+        agent_id: agent_id.to_owned(),
+        display_name: display_name.to_owned(),
         trust_tier: TrustTier::CoreAdapter,
-        manifest_json: CORE_MANIFEST.to_vec(),
+        manifest_json: manifest.to_vec(),
         manifest_digest,
-        executable_digest: Some(config.core_release_digest.clone()),
+        executable_digest: Some(core_release_digest.clone()),
         enabled: true,
         containment_verified: true,
     };
@@ -507,16 +651,20 @@ fn core_adapter_descriptor(config: &OpenAiBootstrapConfig) -> Result<AgentDescri
 }
 
 fn core_adapter_connection(
-    config: &OpenAiBootstrapConfig,
+    connection_id: &str,
+    agent_id: &str,
+    manifest_digest: &Sha256Digest,
+    core_release_digest: &Sha256Digest,
+    adapter_version: &str,
 ) -> Result<BoundAgentConnection, PortError> {
     let mut connection = BoundAgentConnection {
-        connection_id: CORE_CONNECTION_ID.to_owned(),
-        agent_id: CORE_ADAPTER_ID.to_owned(),
+        connection_id: connection_id.to_owned(),
+        agent_id: agent_id.to_owned(),
         trust_tier: TrustTier::CoreAdapter,
-        manifest_digest: config.manifest_digest.clone(),
-        executable_digest: Some(config.core_release_digest.clone()),
+        manifest_digest: manifest_digest.clone(),
+        executable_digest: Some(core_release_digest.clone()),
         contract_version: PROTOCOL_VERSION.to_owned(),
-        adapter_version: config.adapter_version.clone(),
+        adapter_version: adapter_version.to_owned(),
         binding_digest: digest_bytes(b"placeholder"),
     };
     connection.binding_digest = connection_digest(&connection)?;
@@ -761,6 +909,7 @@ mod tests {
                 trusted_workspace_root: temporary.path().join("workspaces"),
                 secret_values: Vec::new(),
                 openai: None,
+                anthropic: None,
             },
             runtime,
         );
@@ -802,12 +951,26 @@ mod tests {
         let config = OpenAiBootstrapConfig {
             endpoint: "http://127.0.0.1:9/v1/responses".to_owned(),
             api_key: OpenAiApiKey::new("sk-test-key").expect("API key"),
-            manifest_digest: digest_bytes(CORE_MANIFEST),
+            manifest_digest: digest_bytes(OPENAI_MANIFEST),
             core_release_digest: digest_bytes(b"test-release"),
             adapter_version: "test-adapter-v1".to_owned(),
         };
-        let descriptor = core_adapter_descriptor(&config).expect("descriptor");
-        let connection = core_adapter_connection(&config).expect("connection");
+        let descriptor = core_adapter_descriptor(
+            OPENAI_AGENT_ID,
+            "OpenAI Responses",
+            OPENAI_MANIFEST,
+            &config.manifest_digest,
+            &config.core_release_digest,
+        )
+        .expect("descriptor");
+        let connection = core_adapter_connection(
+            OPENAI_CONNECTION_ID,
+            OPENAI_AGENT_ID,
+            &config.manifest_digest,
+            &config.core_release_digest,
+            &config.adapter_version,
+        )
+        .expect("connection");
         let peer: Arc<dyn ProtocolPeer> = Arc::new(ScriptedPeer::new(
             Script::Slow,
             peer_descriptor(&connection),
@@ -828,8 +991,9 @@ mod tests {
 
         ComposedAgentRuntime {
             database,
-            descriptor,
-            connection,
+            descriptors: BTreeMap::from([(OPENAI_AGENT_ID.to_owned(), descriptor)]),
+            connections: BTreeMap::from([(OPENAI_AGENT_ID.to_owned(), connection)]),
+            provider_ids: BTreeMap::from([(OPENAI_AGENT_ID.to_owned(), "openai".to_owned())]),
             durable_artifacts,
             runtime,
             lifecycle: RuntimeLifecycle::new(),

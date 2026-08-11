@@ -458,19 +458,19 @@ git commit -m "feat: orchestrate evidence linked deliberation"
 - Modify: `crates/bootstrap/tests/agent_recovery.rs`
 - Modify: `crates/bootstrap/tests/startup.rs`
 
-- [ ] **Step 1 - Write failing Anthropic request tests**
+- [x] **Step 1 - Write failing Anthropic request tests**
 
 Assert exact `POST /v1/messages` path, HTTPS-only production endpoint, loopback-only test HTTP, `x-api-key`, `anthropic-version: 2023-06-01`, content type, mandatory configured model, max tokens, optional temperature, stream flag, stable system instructions, and one user content block carrying the bound effective context representation.
 
 Change every bound input leaf and prove the request changes. Reject unsupported generation parameters, invalid endpoint redirects, oversized context, missing model, invalid header values, and any credential appearance in serialized/debug/error output.
 
-- [ ] **Step 2 - Write failing bounded SSE and lifecycle tests**
+- [x] **Step 2 - Write failing bounded SSE and lifecycle tests**
 
 Handle documented `message_start`, `content_block_start`, `content_block_delta` text, `content_block_stop`, `message_delta`, `message_stop`, and permitted `ping`. Bound line/event/aggregate bytes before growth. Reject invalid order, malformed JSON/UTF-8, unknown required content, conflicting IDs, duplicate stop, premature EOF, missing text, usage regression, HTTP errors, timeout, overload, malformed retry-after, cancellation races, worker panic, and shutdown join failure.
 
 Map exactly one terminal protocol result after durable sink acceptance. Deltas remain presentation-only.
 
-- [ ] **Step 3 - Pass the shared protocol conformance suite**
+- [x] **Step 3 - Pass the shared protocol conformance suite**
 
 Use deterministic loopback HTTP/SSE fixtures and the same start/cancel/terminal harness as OpenAI. No live key, DNS, internet, or billable call is allowed.
 
@@ -478,7 +478,7 @@ Use deterministic loopback HTTP/SSE fixtures and the same start/cancel/terminal 
 cargo test -p local-agent-terminal-provider-anthropic
 ```
 
-- [ ] **Step 4 - Refactor bootstrap composition for multiple trusted peers**
+- [x] **Step 4 - Refactor bootstrap composition for multiple trusted peers**
 
 Replace single descriptor/connection fields with maps keyed by bound agent ID. Compose zero, one, or both provider configs into one `ProtocolAgentRuntime` peer vector. `prepare_run` resolves and verifies the requested binding without provider-name branching. Reconcile every descriptor/connection, publish exact manifest/run config, share durable artifacts, isolate failures, and serialize shutdown.
 
@@ -489,7 +489,7 @@ modules. Those modules adapt the existing SQLite/event/artifact/policy/repositor
 instances to application ports; they must not move orchestration policy back
 into the composition root.
 
-- [ ] **Step 5 - Verify credential isolation, recovery, and commit**
+- [x] **Step 5 - Verify credential isolation, recovery, and commit**
 
 ```powershell
 cargo fmt --all -- --check

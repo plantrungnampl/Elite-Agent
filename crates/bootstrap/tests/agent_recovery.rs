@@ -8,7 +8,8 @@ use local_agent_terminal_application::{
     TaskQuery, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_bootstrap::{
-    Bootstrap, OpenAiApiKey, OpenAiBootstrapConfig, StartupConfig,
+    AnthropicApiKey, AnthropicBootstrapConfig, Bootstrap, OpenAiApiKey, OpenAiBootstrapConfig,
+    StartupConfig,
 };
 use local_agent_terminal_domain::{
     AgentRunLimits, AgentRunStatus, ArtifactId, BoundAgentConnection, BoundAgentRunRequest,
@@ -27,7 +28,9 @@ use support::{WorkspaceFixture, PROJECT_ID, TASK_ID};
 
 const API_KEY_CANARY: &str = "sk-bootstrap-canary";
 const LOOPBACK_ENDPOINT: &str = "http://127.0.0.1:9/v1/responses";
+const ANTHROPIC_LOOPBACK_ENDPOINT: &str = "http://127.0.0.1:9/v1/messages";
 const CORE_MANIFEST: &[u8] = br#"{"adapter":"openai-responses","agentId":"core_adapter","providerId":"openai","schema":"trusted-openai-core-adapter-manifest.v1"}"#;
+const ANTHROPIC_MANIFEST: &[u8] = br#"{"adapter":"anthropic-messages","agentId":"anthropic_core_adapter","providerId":"anthropic","schema":"trusted-anthropic-core-adapter-manifest.v1"}"#;
 const CORE_MANIFEST_DIGEST: &str =
     "sha256:28d00daa6b56f0d8bb9b6ad78dd561a24bb61c668af842446c3a845e5b8ff0e5";
 const CORE_RELEASE_DIGEST: &str =
@@ -144,6 +147,62 @@ fn restart_interrupts_an_incomplete_openai_run_and_reconstructs_its_durable_inpu
     let diagnostics = format!("{:?}", restarted.local_diagnostics());
     assert_not_present(diagnostics.as_bytes(), API_KEY_CANARY);
     assert_not_present(diagnostics.as_bytes(), LOOPBACK_ENDPOINT);
+}
+
+#[test]
+fn restart_reconciles_incomplete_runs_for_both_configured_providers() {
+    let fixture = WorkspaceFixture::new();
+    let first = Bootstrap::new(configured_two_provider_workspace(&fixture));
+    assert_eq!(
+        first.status().state,
+        local_agent_terminal_application::StartupStateDto::Ready
+    );
+
+    let context = canonical_context();
+    let openai_request = bound_request(
+        "run-openai-two-provider-restart",
+        "agent-context-openai-two-provider-restart",
+        digest_bytes(&context),
+    );
+    let anthropic_request = anthropic_bound_request(
+        "run-anthropic-two-provider-restart",
+        "agent-context-anthropic-two-provider-restart",
+        digest_bytes(&context),
+    );
+    persist_running_bound_run(&fixture, &openai_request, &context);
+    persist_running_bound_run_with_manifest(
+        &fixture,
+        &anthropic_request,
+        &context,
+        ANTHROPIC_MANIFEST,
+    );
+
+    drop(first);
+    let restarted = Bootstrap::new(configured_two_provider_workspace(&fixture));
+
+    assert_eq!(
+        restarted.status().state,
+        local_agent_terminal_application::StartupStateDto::Ready
+    );
+    let agents = restarted
+        .agent_runtime_handle()
+        .expect("two-provider runtime")
+        .list_agents()
+        .expect("registered agents");
+    assert_eq!(agents.len(), 2);
+    for request in [&openai_request, &anthropic_request] {
+        let reopened = agent_store(&fixture)
+            .load_run(&request.run_id)
+            .expect("run query")
+            .expect("interrupted run");
+        assert_eq!(reopened.status, AgentRunStatus::Interrupted);
+        assert_eq!(reopened.request, *request);
+    }
+
+    let durable = durable_bytes(&fixture.app_data);
+    assert_not_present(&durable, API_KEY_CANARY);
+    assert_not_present(&durable, LOOPBACK_ENDPOINT);
+    assert_not_present(&durable, ANTHROPIC_LOOPBACK_ENDPOINT);
 }
 
 #[test]
@@ -265,11 +324,24 @@ fn config(root: &Path) -> StartupConfig {
         trusted_workspace_root: root.join("workspaces"),
         secret_values: Vec::new(),
         openai: None,
+        anthropic: None,
     }
 }
 
 fn configured_workspace(fixture: &WorkspaceFixture) -> StartupConfig {
     configured_workspace_with(fixture, CORE_RELEASE_DIGEST, "openai-responses-v1")
+}
+
+fn configured_two_provider_workspace(fixture: &WorkspaceFixture) -> StartupConfig {
+    let mut config = configured_workspace(fixture);
+    config.anthropic = Some(AnthropicBootstrapConfig {
+        endpoint: ANTHROPIC_LOOPBACK_ENDPOINT.to_owned(),
+        api_key: AnthropicApiKey::new(API_KEY_CANARY).expect("API key"),
+        manifest_digest: digest_bytes(ANTHROPIC_MANIFEST),
+        core_release_digest: digest(CORE_RELEASE_DIGEST),
+        adapter_version: "anthropic-messages-v1".to_owned(),
+    });
+    config
 }
 
 fn configured_workspace_with(
@@ -288,6 +360,7 @@ fn configured_workspace_with(
             core_release_digest: digest(core_release_digest),
             adapter_version: adapter_version.to_owned(),
         }),
+        anthropic: None,
     }
 }
 
@@ -361,6 +434,24 @@ fn bound_request(
     request
 }
 
+fn anthropic_bound_request(
+    run: &str,
+    effective_context_artifact_id: &str,
+    effective_context_digest: Sha256Digest,
+) -> BoundAgentRunRequest {
+    let mut request = bound_request(run, effective_context_artifact_id, effective_context_digest);
+    request.agent_id = "anthropic_core_adapter".to_owned();
+    request.context.agent_id = request.agent_id.clone();
+    request.run_config.agent_id = request.agent_id.clone();
+    request.run_config.manifest_digest = digest_bytes(ANTHROPIC_MANIFEST);
+    request.run_config.adapter_version = "anthropic-messages-v1".to_owned();
+    request.run_config.provider_id = "anthropic".to_owned();
+    request.run_config.model_id = "claude-task8-model".to_owned();
+    request.connection = anthropic_connection();
+    request.validate().expect("Anthropic bound request");
+    request
+}
+
 fn core_connection() -> BoundAgentConnection {
     let mut connection = BoundAgentConnection {
         connection_id: "openai_core_adapter".to_owned(),
@@ -370,6 +461,35 @@ fn core_connection() -> BoundAgentConnection {
         executable_digest: Some(digest(CORE_RELEASE_DIGEST)),
         contract_version: "1.0".to_owned(),
         adapter_version: "openai-responses-v1".to_owned(),
+        binding_digest: digest(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+    };
+    connection.binding_digest = digest_bytes(&canonical_json(json!({
+        "schema": "agent-connection-binding.v1",
+        "identity": {
+            "connectionId": connection.connection_id,
+            "agentId": connection.agent_id,
+        },
+        "manifestDigest": connection.manifest_digest.as_str(),
+        "executableDigest": connection.executable_digest.as_ref().map(Sha256Digest::as_str),
+        "trustTier": connection.trust_tier.as_str(),
+        "contractVersion": connection.contract_version,
+        "adapterVersion": connection.adapter_version,
+    })));
+    connection.validate().expect("canonical connection");
+    connection
+}
+
+fn anthropic_connection() -> BoundAgentConnection {
+    let mut connection = BoundAgentConnection {
+        connection_id: "anthropic_core_adapter".to_owned(),
+        agent_id: "anthropic_core_adapter".to_owned(),
+        trust_tier: TrustTier::CoreAdapter,
+        manifest_digest: digest_bytes(ANTHROPIC_MANIFEST),
+        executable_digest: Some(digest(CORE_RELEASE_DIGEST)),
+        contract_version: "1.0".to_owned(),
+        adapter_version: "anthropic-messages-v1".to_owned(),
         binding_digest: digest(
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ),
@@ -463,11 +583,20 @@ fn persist_running_bound_run(
     request: &BoundAgentRunRequest,
     context: &[u8],
 ) {
+    persist_running_bound_run_with_manifest(fixture, request, context, CORE_MANIFEST);
+}
+
+fn persist_running_bound_run_with_manifest(
+    fixture: &WorkspaceFixture,
+    request: &BoundAgentRunRequest,
+    context: &[u8],
+    manifest: &[u8],
+) {
     publish_artifact(
         fixture,
         request.context.manifest_artifact_id.as_str(),
         "manifest",
-        CORE_MANIFEST,
+        manifest,
     );
     publish_artifact(
         fixture,

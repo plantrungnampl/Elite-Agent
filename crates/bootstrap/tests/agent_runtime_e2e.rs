@@ -20,7 +20,8 @@ use local_agent_terminal_application::{
     SafeErrorClassification, TaskQuery, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_bootstrap::{
-    Bootstrap, OpenAiApiKey, OpenAiBootstrapConfig, StartupConfig,
+    AnthropicApiKey, AnthropicBootstrapConfig, Bootstrap, OpenAiApiKey, OpenAiBootstrapConfig,
+    StartupConfig,
 };
 use local_agent_terminal_domain::{
     AgentRunLimits, AgentRunStatus, ArtifactId, BoundAgentConnection, BoundAgentRunRequest,
@@ -40,6 +41,7 @@ use support::{WorkspaceFixture, PROJECT_ID, TASK_ID};
 
 const API_KEY_CANARY: &str = "sk-bootstrap-canary";
 const CORE_MANIFEST: &[u8] = br#"{"adapter":"openai-responses","agentId":"core_adapter","providerId":"openai","schema":"trusted-openai-core-adapter-manifest.v1"}"#;
+const ANTHROPIC_MANIFEST: &[u8] = br#"{"adapter":"anthropic-messages","agentId":"anthropic_core_adapter","providerId":"anthropic","schema":"trusted-anthropic-core-adapter-manifest.v1"}"#;
 const CORE_MANIFEST_DIGEST: &str =
     "sha256:28d00daa6b56f0d8bb9b6ad78dd561a24bb61c668af842446c3a845e5b8ff0e5";
 const CORE_RELEASE_DIGEST: &str =
@@ -54,7 +56,9 @@ fn startup_without_openai_is_ready_without_an_agent_runtime() {
 
     assert_eq!(
         bootstrap.status().state,
-        local_agent_terminal_application::StartupStateDto::Ready
+        local_agent_terminal_application::StartupStateDto::Ready,
+        "{:?}",
+        bootstrap.local_diagnostics()
     );
     assert!(bootstrap.agent_runtime_handle().is_none());
 }
@@ -66,7 +70,9 @@ fn configured_openai_registers_the_exact_trusted_core_adapter_descriptor() {
 
     assert_eq!(
         bootstrap.status().state,
-        local_agent_terminal_application::StartupStateDto::Ready
+        local_agent_terminal_application::StartupStateDto::Ready,
+        "{:?}",
+        bootstrap.local_diagnostics()
     );
     let agents = bootstrap
         .agent_runtime_handle()
@@ -87,6 +93,146 @@ fn configured_openai_registers_the_exact_trusted_core_adapter_descriptor() {
     );
     assert!(agents[0].enabled);
     assert!(agents[0].containment_verified);
+}
+
+#[test]
+fn configured_anthropic_registers_its_exact_trusted_core_adapter_descriptor() {
+    let fixture = TempDir::new().expect("temporary application directory");
+    let bootstrap = Bootstrap::new(configured_anthropic(fixture.path()));
+
+    assert_eq!(
+        bootstrap.status().state,
+        local_agent_terminal_application::StartupStateDto::Ready,
+        "{:?}",
+        bootstrap.local_diagnostics()
+    );
+    let agents = bootstrap
+        .agent_runtime_handle()
+        .expect("configured provider runtime")
+        .list_agents()
+        .expect("registered agents");
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0].agent_id, "anthropic_core_adapter");
+    assert_eq!(agents[0].manifest_json, ANTHROPIC_MANIFEST);
+    assert_eq!(agents[0].manifest_digest, digest_bytes(ANTHROPIC_MANIFEST));
+    assert!(agents[0].enabled);
+    assert!(agents[0].containment_verified);
+}
+
+#[test]
+fn configured_openai_and_anthropic_register_two_exact_agent_bindings() {
+    let fixture = TempDir::new().expect("temporary application directory");
+    let mut config = configured(fixture.path());
+    config.anthropic = Some(anthropic_config(
+        "https://api.anthropic.test/v1/messages".to_owned(),
+    ));
+    let bootstrap = Bootstrap::new(config);
+
+    assert_eq!(
+        bootstrap.status().state,
+        local_agent_terminal_application::StartupStateDto::Ready,
+        "{:?}",
+        bootstrap.local_diagnostics()
+    );
+    let agents = bootstrap
+        .agent_runtime_handle()
+        .expect("configured provider runtime")
+        .list_agents()
+        .expect("registered agents");
+    assert_eq!(agents.len(), 2);
+    assert_eq!(agents[0].agent_id, "anthropic_core_adapter");
+    assert_eq!(agents[0].manifest_json, ANTHROPIC_MANIFEST);
+    assert_eq!(agents[1].agent_id, "core_adapter");
+    assert_eq!(agents[1].manifest_json, CORE_MANIFEST);
+}
+
+#[test]
+fn two_provider_runtime_routes_by_agent_and_isolates_an_openai_failure() {
+    let fixture = WorkspaceFixture::new();
+    let context = canonical_context();
+    let openai_request = bound_request(
+        "run-openai-isolated-outage",
+        "agent-context-openai-isolated-outage",
+        digest_bytes(&context),
+    );
+    let anthropic_request = anthropic_bound_request(
+        "run-anthropic-success",
+        "agent-context-anthropic-success",
+        digest_bytes(&context),
+    );
+    for request in [&openai_request, &anthropic_request] {
+        publish_artifact(
+            &fixture,
+            request.context.effective_context_artifact_id.as_str(),
+            "content",
+            &context,
+        );
+    }
+
+    let openai_server = ImmediateResponseServer::unavailable();
+    let mut anthropic_server = GatedSseServer::anthropic_success();
+    let openai_endpoint = openai_server.endpoint().to_owned();
+    let anthropic_endpoint = anthropic_server.endpoint().to_owned();
+    let mut config = configured_workspace(&fixture, openai_endpoint.clone());
+    config.anthropic = Some(anthropic_config(anthropic_endpoint.clone()));
+    let bootstrap = Bootstrap::new(config);
+    let runtime = bootstrap
+        .agent_runtime_handle()
+        .expect("configured two-provider runtime");
+
+    runtime
+        .start_run(openai_request.clone())
+        .expect("durable OpenAI receipt");
+    runtime
+        .start_run(anthropic_request.clone())
+        .expect("durable Anthropic receipt");
+
+    let openai_http = openai_server.capture_and_join();
+    assert_eq!(openai_http.target, "/v1/responses");
+    assert_eq!(
+        openai_http.header("authorization"),
+        Some(&format!("Bearer {API_KEY_CANARY}"))
+    );
+
+    let anthropic_http = anthropic_server.await_request();
+    assert_eq!(anthropic_http.target, "/v1/messages");
+    assert_eq!(
+        anthropic_http.header("x-api-key"),
+        Some(&API_KEY_CANARY.to_owned())
+    );
+    assert_eq!(
+        anthropic_http.header("anthropic-version"),
+        Some(&"2023-06-01".to_owned())
+    );
+    let anthropic_body: Value =
+        serde_json::from_slice(&anthropic_http.body).expect("Anthropic request JSON");
+    assert_eq!(anthropic_body["model"], "claude-task8-model");
+    assert_eq!(anthropic_body["max_tokens"], 256);
+    assert_eq!(anthropic_body["stream"], true);
+    assert_eq!(anthropic_body["temperature"], 0);
+    assert_eq!(
+        anthropic_body["messages"][0]["content"][0]["text"],
+        String::from_utf8(context).expect("context text")
+    );
+
+    anthropic_server.release_and_join();
+    assert_eq!(
+        wait_for_terminal(&fixture, &openai_request.run_id).status,
+        AgentRunStatus::Failed
+    );
+    assert_eq!(
+        wait_for_terminal(&fixture, &anthropic_request.run_id).status,
+        AgentRunStatus::Succeeded
+    );
+
+    let durable = durable_bytes(&fixture.app_data);
+    assert_not_present(&durable, API_KEY_CANARY);
+    assert_not_present(&durable, &openai_endpoint);
+    assert_not_present(&durable, &anthropic_endpoint);
+    let diagnostics = format!("{:?}", bootstrap.local_diagnostics());
+    assert_not_present(diagnostics.as_bytes(), API_KEY_CANARY);
+    assert_not_present(diagnostics.as_bytes(), &openai_endpoint);
+    assert_not_present(diagnostics.as_bytes(), &anthropic_endpoint);
 }
 
 #[test]
@@ -392,6 +538,7 @@ fn reconfigure_waits_for_active_openai_worker_and_permanently_closes_cloned_hand
         trusted_workspace_root: fixture.workspace_root.clone(),
         secret_values: vec![API_KEY_CANARY.to_owned()],
         openai: None,
+        anthropic: None,
     };
     let (completed, completed_rx) = mpsc::channel();
     let reconfigure = thread::spawn(move || {
@@ -686,6 +833,7 @@ fn config(root: &Path) -> StartupConfig {
         trusted_workspace_root: root.join("workspaces"),
         secret_values: Vec::new(),
         openai: None,
+        anthropic: None,
     }
 }
 
@@ -697,12 +845,21 @@ fn configured(root: &Path) -> StartupConfig {
     config
 }
 
+fn configured_anthropic(root: &Path) -> StartupConfig {
+    let mut config = config(root);
+    config.anthropic = Some(anthropic_config(
+        "https://api.anthropic.test/v1/messages".to_owned(),
+    ));
+    config
+}
+
 fn configured_workspace(fixture: &WorkspaceFixture, endpoint: String) -> StartupConfig {
     StartupConfig {
         app_data_dir: fixture.app_data.clone(),
         trusted_workspace_root: fixture.workspace_root.clone(),
         secret_values: vec![API_KEY_CANARY.to_owned()],
         openai: Some(openai_config(endpoint)),
+        anthropic: None,
     }
 }
 
@@ -716,25 +873,62 @@ fn openai_config(endpoint: String) -> OpenAiBootstrapConfig {
     }
 }
 
+fn anthropic_config(endpoint: String) -> AnthropicBootstrapConfig {
+    AnthropicBootstrapConfig {
+        endpoint,
+        api_key: AnthropicApiKey::new(API_KEY_CANARY).expect("API key"),
+        manifest_digest: digest_bytes(ANTHROPIC_MANIFEST),
+        core_release_digest: Sha256Digest::new(CORE_RELEASE_DIGEST).expect("release digest"),
+        adapter_version: "anthropic-messages-v1".to_owned(),
+    }
+}
+
 fn bound_request(
     run: &str,
     effective_context_artifact_id: &str,
     effective_context_digest: Sha256Digest,
 ) -> BoundAgentRunRequest {
+    bound_provider_request(
+        run,
+        effective_context_artifact_id,
+        effective_context_digest,
+        openai_test_binding(),
+    )
+}
+
+fn anthropic_bound_request(
+    run: &str,
+    effective_context_artifact_id: &str,
+    effective_context_digest: Sha256Digest,
+) -> BoundAgentRunRequest {
+    bound_provider_request(
+        run,
+        effective_context_artifact_id,
+        effective_context_digest,
+        anthropic_test_binding(),
+    )
+}
+
+fn bound_provider_request(
+    run: &str,
+    effective_context_artifact_id: &str,
+    effective_context_digest: Sha256Digest,
+    binding: TestProviderBinding,
+) -> BoundAgentRunRequest {
     let task_id = TaskId::new(TASK_ID).expect("task id");
-    let connection = core_connection();
+    let connection = core_connection(&binding);
     let generation_parameters = canonical_json(json!({"temperature": 0}));
     let request = BoundAgentRunRequest {
         run_id: RunId::new(run).expect("run id"),
         task_id: task_id.clone(),
-        agent_id: "core_adapter".to_owned(),
+        agent_id: binding.agent_id.to_owned(),
         role: "critic".to_owned(),
         phase: "analysis".to_owned(),
         idempotency_key: format!("{TASK_ID}:critic:{run}"),
         context: BoundEffectiveContext {
             context_package_id: format!("context-package-{run}"),
             task_id: task_id.clone(),
-            agent_id: "core_adapter".to_owned(),
+            agent_id: binding.agent_id.to_owned(),
             role: "critic".to_owned(),
             objective: "Review the current task.".to_owned(),
             manifest_artifact_id: ArtifactId::new(format!("agent-manifest-{run}"))
@@ -751,19 +945,19 @@ fn bound_request(
             run_config_artifact_id: ArtifactId::new(format!("agent-run-config-{run}"))
                 .expect("run config artifact id"),
             task_id: task_id.clone(),
-            agent_id: "core_adapter".to_owned(),
+            agent_id: binding.agent_id.to_owned(),
             role: "critic".to_owned(),
             context_package_id: format!("context-package-{run}"),
             effective_context_artifact_id: ArtifactId::new(effective_context_artifact_id)
                 .expect("context artifact id"),
             effective_context_digest,
             trust_tier: TrustTier::CoreAdapter,
-            manifest_digest: digest(CORE_MANIFEST_DIGEST),
+            manifest_digest: binding.manifest_digest,
             executable_digest: Some(digest(CORE_RELEASE_DIGEST)),
             contract_version: "1.0".to_owned(),
-            adapter_version: "openai-responses-v1".to_owned(),
-            provider_id: "openai".to_owned(),
-            model_id: "gpt-task8-model".to_owned(),
+            adapter_version: binding.adapter_version.to_owned(),
+            provider_id: binding.provider_id.to_owned(),
+            model_id: binding.model_id.to_owned(),
             generation_parameters: BoundGenerationParameters {
                 digest: digest_bytes(&generation_parameters),
                 canonical_json: generation_parameters,
@@ -786,15 +980,46 @@ fn bound_request(
     request
 }
 
-fn core_connection() -> BoundAgentConnection {
-    let mut connection = BoundAgentConnection {
-        connection_id: "openai_core_adapter".to_owned(),
-        agent_id: "core_adapter".to_owned(),
-        trust_tier: TrustTier::CoreAdapter,
+struct TestProviderBinding {
+    agent_id: &'static str,
+    connection_id: &'static str,
+    manifest_digest: Sha256Digest,
+    adapter_version: &'static str,
+    provider_id: &'static str,
+    model_id: &'static str,
+}
+
+fn openai_test_binding() -> TestProviderBinding {
+    TestProviderBinding {
+        agent_id: "core_adapter",
+        connection_id: "openai_core_adapter",
         manifest_digest: digest(CORE_MANIFEST_DIGEST),
+        adapter_version: "openai-responses-v1",
+        provider_id: "openai",
+        model_id: "gpt-task8-model",
+    }
+}
+
+fn anthropic_test_binding() -> TestProviderBinding {
+    TestProviderBinding {
+        agent_id: "anthropic_core_adapter",
+        connection_id: "anthropic_core_adapter",
+        manifest_digest: digest_bytes(ANTHROPIC_MANIFEST),
+        adapter_version: "anthropic-messages-v1",
+        provider_id: "anthropic",
+        model_id: "claude-task8-model",
+    }
+}
+
+fn core_connection(binding: &TestProviderBinding) -> BoundAgentConnection {
+    let mut connection = BoundAgentConnection {
+        connection_id: binding.connection_id.to_owned(),
+        agent_id: binding.agent_id.to_owned(),
+        trust_tier: TrustTier::CoreAdapter,
+        manifest_digest: binding.manifest_digest.clone(),
         executable_digest: Some(digest(CORE_RELEASE_DIGEST)),
         contract_version: "1.0".to_owned(),
-        adapter_version: "openai-responses-v1".to_owned(),
+        adapter_version: binding.adapter_version.to_owned(),
         binding_digest: digest(
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ),
@@ -984,19 +1209,29 @@ struct GatedSseServer {
 
 impl GatedSseServer {
     fn success() -> Self {
+        Self::with_response(
+            "/v1/responses",
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-task8\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"accepted output\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-task8\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+        )
+    }
+
+    fn anthropic_success() -> Self {
+        Self::with_response(
+            "/v1/messages",
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-task8\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"accepted anthropic output\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )
+    }
+
+    fn with_response(path: &str, body: &'static [u8]) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
-        let endpoint = format!(
-            "http://{}/v1/responses",
-            listener.local_addr().expect("address")
-        );
+        let endpoint = format!("http://{}{path}", listener.local_addr().expect("address"));
         let (captured_sender, captured) = mpsc::channel();
         let (release, wait_for_release) = mpsc::channel();
         let worker = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("OpenAI request");
+            let (mut stream, _) = listener.accept().expect("provider request");
             captured_sender
                 .send(read_http_request(&stream))
                 .expect("captured request");
-            let body = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-task8\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"accepted output\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-task8\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n";
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1023,7 +1258,7 @@ impl GatedSseServer {
     fn await_request(&self) -> CapturedRequest {
         self.captured
             .recv_timeout(Duration::from_secs(1))
-            .expect("OpenAI request")
+            .expect("provider request")
     }
 
     fn release_and_join(&mut self) {

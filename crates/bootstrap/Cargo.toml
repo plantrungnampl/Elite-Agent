@@ -6,7 +6,10 @@ edition = "2021"
 [dependencies]
 local-agent-terminal-agent-runtime = { path = "../agent-runtime" }
 local-agent-terminal-application = { path = "../application" }
+local-agent-terminal-context-engine = { path = "../context-engine" }
+local-agent-terminal-orchestration = { path = "../orchestration" }
 local-agent-terminal-policy-engine = { path = "../policy-engine" }
+local-agent-terminal-provider-anthropic = { path = "../provider-anthropic" }
 local-agent-terminal-provider-openai = { path = "../provider-openai" }
 local-agent-terminal-repository-git = { path = "../repository-git" }
 local-agent-terminal-storage-files = { path = "../storage-files" }

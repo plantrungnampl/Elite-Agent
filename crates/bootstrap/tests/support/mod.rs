@@ -121,6 +121,7 @@ impl WorkspaceFixture {
             trusted_workspace_root: self.workspace_root.clone(),
             secret_values: Vec::new(),
             openai: None,
+            anthropic: None,
         })
     }
 
