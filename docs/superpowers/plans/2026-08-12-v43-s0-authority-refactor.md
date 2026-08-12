@@ -131,11 +131,15 @@ Expected: one commit containing the existing M4 fixes plus the corrected fixture
 - Modify: `crates/application/src/plan_approval.rs`
 - Modify: `crates/application/src/deliberation/commands.rs`
 - Modify: `crates/application/src/deliberation/ports.rs`
+- Modify: `crates/application/src/deliberation/records.rs`
+- Modify: `crates/orchestration/src/recovery.rs`
 - Modify: `crates/storage-sqlite/src/workspace_store.rs`
 - Modify: `crates/application/tests/plan_approval_digest.rs`
 - Modify: `crates/application/tests/deliberation_ports/objections_and_approval.rs`
 - Modify: `crates/application/tests/deliberation_ports/persistence.rs`
+- Modify: `crates/bootstrap/tests/deliberation_e2e.rs`
 - Modify: `crates/orchestration/tests/workflow_contract.rs`
+- Modify: `crates/storage-sqlite/tests/deliberation_store.rs`
 - Modify: `crates/storage-sqlite/tests/workspace_recovery.rs`
 
 **Interfaces:**
@@ -248,7 +252,7 @@ Do not infer approval evidence from a Boolean guard.
 
 - [ ] **Step 5: Update domain callers and run focused tests**
 
-Update the four production `reduce` callers identified by the code graph (`plan_approval.rs`, deliberation `commands.rs`, deliberation `ports.rs`, and `workspace_store.rs`) to construct `TransitionRequest` with exact rule/evidence/effect kinds. Adapt only the named regression tests. Run:
+Update the four production `reduce` callers identified by the code graph (`plan_approval.rs`, deliberation `commands.rs`, deliberation `ports.rs`, and `workspace_store.rs`) to construct `TransitionRequest` with exact rule/evidence/effect kinds. Make only the compile-preserving support edits required by the expanded v3 phase/state shape: map the new post-approval phases to the existing recovery `PostApproval` category and clone non-`Copy` workflow state/event IDs only at existing owned DTO/record/test boundaries. Adapt only the named regression tests. Run:
 
 ```powershell
 cargo fmt --all -- --check
@@ -261,7 +265,7 @@ Expected: all commands exit 0.
 - [ ] **Step 6: Commit the v3 pure workflow slice**
 
 ```powershell
-git add crates/domain/src/lib.rs crates/domain/src/workflow.rs crates/domain/src/workflow/types.rs crates/domain/src/workflow/specification.rs crates/domain/src/workflow/reducer.rs crates/domain/tests/workflow_contract.rs crates/application/src/plan_approval.rs crates/application/src/deliberation/commands.rs crates/application/src/deliberation/ports.rs crates/storage-sqlite/src/workspace_store.rs crates/application/tests/plan_approval_digest.rs crates/application/tests/deliberation_ports/objections_and_approval.rs crates/application/tests/deliberation_ports/persistence.rs crates/orchestration/tests/workflow_contract.rs crates/storage-sqlite/tests/workspace_recovery.rs
+git add crates/domain/src/lib.rs crates/domain/src/workflow.rs crates/domain/src/workflow/types.rs crates/domain/src/workflow/specification.rs crates/domain/src/workflow/reducer.rs crates/domain/tests/workflow_contract.rs crates/application/src/plan_approval.rs crates/application/src/deliberation/commands.rs crates/application/src/deliberation/ports.rs crates/application/src/deliberation/records.rs crates/orchestration/src/recovery.rs crates/storage-sqlite/src/workspace_store.rs crates/application/tests/plan_approval_digest.rs crates/application/tests/deliberation_ports/objections_and_approval.rs crates/application/tests/deliberation_ports/persistence.rs crates/bootstrap/tests/deliberation_e2e.rs crates/orchestration/tests/workflow_contract.rs crates/storage-sqlite/tests/deliberation_store.rs crates/storage-sqlite/tests/workspace_recovery.rs
 git diff --cached --check
 git commit -m "feat: adopt workflow v3 domain authority"
 ```
@@ -271,6 +275,8 @@ Before committing, confirm no production line references `workflow-transitions.v
 ---
 
 ### Task 3: Install and verify SQLite v7 plus the exact v6-to-v7 migration
+
+**Execution dependency:** Run this task as the persistence prerequisite for the open Task 2 review finding. Task 2 remains incomplete until this task is reviewed clean and both production workflow readers are subsequently changed to rehydrate the full v7 authority row.
 
 **Files:**
 - Replace: `crates/storage-sqlite/src/migrations.rs`
@@ -289,6 +295,8 @@ pub(crate) fn verify_required_schema(connection: &Connection) -> Result<(), Open
 ```
 
 Empty databases install v7; exact normative v6 databases migrate to v7; v7 databases reopen; application schema v9 and all other surfaces fail closed.
+
+The completed schema must expose `task_workflow_authority.workflow_profile`, `outcome_mode`, `stream_version`, `profile_revision`, `last_transition_event_id`, and `last_profile_revision_id` as the only trusted persistence source for Task 2's production rehydration fix. Do not populate clean-v7 task authority with compatibility defaults: initial profile/outcome selection remains an explicit trusted application command in later tasks. Exact normative v6 rows migrate according to `migrate-v6-to-v7.sql`; unrelated application v9 data is reset/rejected per the approved policy.
 
 - [ ] **Step 1: Write RED clean/migration/rejection tests**
 
