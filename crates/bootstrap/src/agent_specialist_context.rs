@@ -1,7 +1,7 @@
 use local_agent_terminal_application::{
-    ArtifactId, ArtifactRef, ArtifactStore, CanonicalJsonRequest, DeliberationArtifactRef,
-    DeliberationRunAssignment, PortError, Retryability, SafeErrorClassification, Sha256Digest,
-    SpecialistRequest, TaskQuery, WorkspaceEvidenceStore,
+    AgentRunStore, ArtifactId, ArtifactRef, ArtifactStore, CanonicalJsonRequest,
+    DeliberationArtifactRef, DeliberationRunAssignment, PortError, Retryability,
+    SafeErrorClassification, Sha256Digest, SpecialistRequest, TaskQuery, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_storage_files::ContentAddressedArtifactStore;
 use local_agent_terminal_storage_sqlite::SqliteStore;
@@ -18,6 +18,28 @@ pub(crate) fn publish_specialist_context_package(
     thread_id: &str,
     audit_artifact: &DeliberationArtifactRef,
 ) -> Result<DeliberationArtifactRef, PortError> {
+    let parent_run = AgentRunStore::load_run(database, request.requesting_run())?
+        .ok_or_else(permission_denied)?;
+    let parent_context = database
+        .context_package_view(&parent_run.request.context.context_package_id)?
+        .ok_or_else(permission_denied)?;
+    if parent_run.request.task_id != *request.task_id()
+        || parent_context.task_id != request.task_id().as_str()
+        || parent_context.agent_id != parent_run.request.agent_id
+        || parent_context.role != parent_run.request.role
+        || parent_context.artifact_id
+            != parent_run
+                .request
+                .context
+                .effective_context_artifact_id
+                .as_str()
+        || parent_context.policy_snapshot_digest
+            != parent_run.request.context.policy_snapshot_digest.as_str()
+        || request.required_context().len() != 1
+        || request.required_context()[0].as_str() != parent_context.artifact_id
+    {
+        return Err(integrity_failure());
+    }
     let mut disclosed_bytes = 0_u64;
     let mut members = Vec::with_capacity(request.required_context().len());
     for artifact_id in request.required_context() {
@@ -68,7 +90,7 @@ pub(crate) fn publish_specialist_context_package(
             "actorId": assignment.actor_id().as_str(),
             "family": assignment.family().as_str(),
             "capability": request.capability(),
-            "reason": request.reason(),
+            "reasonDigest": stable_digest(request.reason()),
         },
         "directThreadId": thread_id,
         "budget": {
@@ -84,6 +106,12 @@ pub(crate) fn publish_specialist_context_package(
             "no-tool-access",
         ],
         "provenance": {
+            "parentContextPackageId": parent_context.package_id,
+            "parentContextArtifactId": parent_context.artifact_id,
+            "parentContextPolicySnapshotDigest": parent_context.policy_snapshot_digest,
+            "parentContextPolicyDecisionIds": parent_context.policy_decision_ids,
+            "parentPromptTemplateVersion": parent_context.prompt_template_version,
+            "parentRetrievalPipelineVersion": parent_context.retrieval_pipeline_version,
             "requestAuditArtifactId": audit_artifact.artifact_id().as_str(),
             "requestAuditDigest": audit_artifact.content_digest().as_str(),
         },

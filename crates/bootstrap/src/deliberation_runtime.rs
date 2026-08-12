@@ -19,8 +19,9 @@ use local_agent_terminal_application::{
     ThreadMessageDto, WorkflowPhaseDto, WorkflowPhaseStateDto, WorkspaceFingerprint,
 };
 use local_agent_terminal_orchestration::{
-    plan_deliberation_recovery, DeliberationCoordinator, DeliberationRecoveryAction,
-    PreApprovalAdvance, PreApprovalCoordinator, PrePlanOperation,
+    plan_deliberation_recovery, verify_repository_boundary, BoundaryOutcome,
+    DeliberationCoordinator, DeliberationRecoveryAction, PreApprovalAdvance,
+    PreApprovalCoordinator, PrePlanOperation,
 };
 use local_agent_terminal_repository_git::GitRepositoryGateway;
 use local_agent_terminal_storage_files::{
@@ -165,6 +166,15 @@ impl DeliberationRuntime {
         let store = self.query_store.as_deref().ok_or_else(unavailable)?;
         let runtime = self.agent_runtime.as_deref().ok_or_else(unavailable)?;
         let snapshot = DeliberationStore::load(store, &task_id)?;
+        let boundary = verify_repository_boundary(
+            self.authority.as_deref().ok_or_else(unavailable)?,
+            self.boundaries.as_deref().ok_or_else(unavailable)?,
+            &task_id,
+            snapshot.task_state.phase(),
+        )?;
+        if boundary == BoundaryOutcome::Blocked {
+            return Err(integrity_failure());
+        }
         for assignment in &snapshot.run_assignments {
             let run = AgentRunStore::load_run(store, assignment.run_id())?
                 .ok_or_else(integrity_failure)?;
@@ -279,6 +289,7 @@ impl DeliberationRuntime {
             expected_task_version: request.expected_task_version,
             actor_id: ActorId::new(&request.actor_id).map_err(|_| invalid_input())?,
             action: request.action,
+            feedback: request.feedback,
         };
         let resolution = ResolvePlanApproval::new(store, store).execute(input)?;
         let task_id = resolution
@@ -363,8 +374,18 @@ fn present_cards(
     snapshot: &local_agent_terminal_application::DeliberationSnapshot,
 ) -> Result<Vec<DeliberationCardDto>, PortError> {
     let mut cards = Vec::new();
-    if snapshot.quorum().is_some() {
-        for proposal in snapshot.private_proposals() {
+    if let Some(quorum) = snapshot.quorum() {
+        let published: Vec<_> = quorum
+            .proposals()
+            .iter()
+            .map(|proposal| proposal.artifact_id().as_str())
+            .collect();
+        for proposal in snapshot.private_proposals().iter().filter(|proposal| {
+            is_published_proposal(
+                proposal.proposal_artifact().artifact_id().as_str(),
+                &published,
+            )
+        }) {
             cards.push(card_from_artifact(
                 artifacts,
                 proposal.proposal_artifact(),
@@ -402,6 +423,10 @@ fn present_cards(
         )?);
     }
     Ok(cards)
+}
+
+fn is_published_proposal(proposal_id: &str, published: &[&str]) -> bool {
+    published.contains(&proposal_id)
 }
 
 fn card_from_artifact(
@@ -931,6 +956,19 @@ fn integrity_failure() -> PortError {
         SafeErrorClassification::IntegrityFailure,
         Retryability::NonRetryable,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_published_proposal;
+
+    #[test]
+    fn private_proposal_is_not_visible_after_a_different_quorum_is_published() {
+        let published = ["proposal-selected-a", "proposal-selected-b"];
+
+        assert!(is_published_proposal("proposal-selected-a", &published));
+        assert!(!is_published_proposal("proposal-private", &published));
+    }
 }
 
 fn invalid_input() -> PortError {

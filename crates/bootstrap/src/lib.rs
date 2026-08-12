@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod agent_runtime;
+mod agent_runtime_support;
 mod agent_specialist_context;
 mod context_runtime;
 mod deliberation_runtime;

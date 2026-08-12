@@ -456,7 +456,9 @@ pub enum BoundaryOutcome {
     Blocked,
 }
 
-fn verify_repository_boundary(
+/// Compares the current repository fingerprint with the task baseline and durably invalidates
+/// context packages before any caller may resume an external effect.
+pub fn verify_repository_boundary(
     authority: &dyn DeliberationRepositoryAuthority,
     store: &dyn DeliberationBoundaryStore,
     task_id: &TaskId,

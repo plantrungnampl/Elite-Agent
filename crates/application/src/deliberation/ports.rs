@@ -250,9 +250,15 @@ impl DeliberationDispatchBinding {
 
     pub fn validate(&self) -> Result<(), PortError> {
         self.request.validate().map_err(|_| invalid_input())?;
+        let authoritative_family = AgentFamilyKey::from_provider_model(
+            &self.request.run_config.provider_id,
+            &self.request.run_config.model_id,
+        )
+        .map_err(|_| invalid_input())?;
         if self.estimated_cost_microunits == 0
             || self.request.run_id != *self.assignment.run_id()
             || self.request.agent_id != self.assignment.agent_id()
+            || self.assignment.family() != &authoritative_family
         {
             return Err(invalid_input());
         }

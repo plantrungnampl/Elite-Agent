@@ -155,21 +155,24 @@ fn coordinator_checks_boundary_commits_effect_and_accepts_run_before_external_di
 
 #[test]
 fn proposal_dispatch_plan_requires_exact_two_heterogeneous_authorities() {
+    let first_request = bound_run_for("agent-a", "run-a");
     let first = DeliberationDispatchBinding::new(
-        bound_run_for("agent-a", "run-a"),
-        dispatch_assignment("agent-a", "run-a", "family-a"),
+        first_request.clone(),
+        dispatch_assignment_for(&first_request),
         100,
     )
     .unwrap();
+    let duplicate_agent_request = bound_run_for("agent-a", "run-b");
     let duplicate_agent = DeliberationDispatchBinding::new(
-        bound_run_for("agent-a", "run-b"),
-        dispatch_assignment("agent-a", "run-b", "family-b"),
+        duplicate_agent_request.clone(),
+        dispatch_assignment_for(&duplicate_agent_request),
         100,
     )
     .unwrap();
+    let duplicate_family_request = bound_run_for("agent-b", "run-b");
     let duplicate_family = DeliberationDispatchBinding::new(
-        bound_run_for("agent-b", "run-b"),
-        dispatch_assignment("agent-b", "run-b", "family-a"),
+        duplicate_family_request.clone(),
+        dispatch_assignment_for(&duplicate_family_request),
         100,
     )
     .unwrap();
@@ -182,16 +185,26 @@ fn proposal_dispatch_plan_requires_exact_two_heterogeneous_authorities() {
 }
 
 #[test]
+fn dispatch_binding_rejects_a_self_asserted_provider_family() {
+    let request = bound_run_for("agent-a", "run-forged-family");
+    let assignment = dispatch_assignment("agent-a", "run-forged-family", "caller-invented-family");
+
+    assert!(DeliberationDispatchBinding::new(request, assignment, 100).is_err());
+}
+
+#[test]
 fn dispatch_reserves_declared_tokens_cost_and_deadline_before_runtime() {
+    let first_request = bound_run_for("agent-a", "run-a");
     let first = DeliberationDispatchBinding::new(
-        bound_run_for("agent-a", "run-a"),
-        dispatch_assignment("agent-a", "run-a", "family-a"),
+        first_request.clone(),
+        dispatch_assignment_for(&first_request),
         100,
     )
     .unwrap();
+    let second_request = bound_run_for_model("agent-b", "run-b", "model-2");
     let second = DeliberationDispatchBinding::new(
-        bound_run_for("agent-b", "run-b"),
-        dispatch_assignment("agent-b", "run-b", "family-b"),
+        second_request.clone(),
+        dispatch_assignment_for(&second_request),
         100,
     )
     .unwrap();
@@ -230,9 +243,10 @@ fn dispatch_reserves_declared_tokens_cost_and_deadline_before_runtime() {
 
 #[test]
 fn later_phase_dispatch_accepts_one_bounded_authority_and_rejects_over_budget_or_mismatch() {
+    let authorized_request = bound_run_for("agent-a", "run-a");
     let authorized = DeliberationDispatchBinding::new(
-        bound_run_for("agent-a", "run-a"),
-        dispatch_assignment("agent-a", "run-a", "family-a"),
+        authorized_request.clone(),
+        dispatch_assignment_for(&authorized_request),
         100,
     )
     .unwrap();
@@ -241,8 +255,8 @@ fn later_phase_dispatch_accepts_one_bounded_authority_and_rejects_over_budget_or
         TaskId::new("task-1").unwrap(),
         Phase::CrossReview,
         vec![
-            dispatch_assignment("agent-a", "run-a", "family-a"),
-            dispatch_assignment("agent-b", "run-b", "family-a"),
+            dispatch_assignment_for(&authorized_request),
+            dispatch_assignment_for(&bound_run_for("agent-b", "run-b")),
         ],
         limits,
         task_budget(),
@@ -253,21 +267,21 @@ fn later_phase_dispatch_accepts_one_bounded_authority_and_rejects_over_budget_or
 
     assert_eq!(dispatch_set.bindings().len(), 1);
     assert!(DeliberationPhaseDispatchSet::new(
-        vec![
-            authorized,
+        vec![authorized, {
+            let request = bound_run_for("agent-b", "run-b");
             DeliberationDispatchBinding::new(
-                bound_run_for("agent-b", "run-b"),
-                dispatch_assignment("agent-b", "run-b", "family-a"),
+                request.clone(),
+                dispatch_assignment_for(&request),
                 100,
             )
-            .unwrap(),
-        ],
+            .unwrap()
+        },],
         authority,
     )
     .is_err());
     let unauthorized = DeliberationDispatchBinding::new(
-        bound_run_for("agent-a", "run-a"),
-        dispatch_assignment("agent-a", "run-a", "family-a"),
+        authorized_request.clone(),
+        dispatch_assignment_for(&authorized_request),
         100,
     )
     .unwrap();
@@ -305,18 +319,19 @@ fn one_coordinator_path_guards_every_dispatching_preplan_phase() {
         let dispatch = if phase == Phase::ParallelAnalysis {
             PrePlanDispatch::Proposal(Box::new(proposal_dispatch_plan()))
         } else {
+            let request = bound_run_for("agent-a", "run-a");
             PrePlanDispatch::Phase(
                 DeliberationPhaseDispatchSet::new(
                     vec![DeliberationDispatchBinding::new(
-                        bound_run_for("agent-a", "run-a"),
-                        dispatch_assignment("agent-a", "run-a", "family-a"),
+                        request.clone(),
+                        dispatch_assignment_for(&request),
                         100,
                     )
                     .unwrap()],
                     DeliberationPhaseDispatchAuthority::new(
                         TaskId::new("task-1").unwrap(),
                         phase,
-                        vec![dispatch_assignment("agent-a", "run-a", "family-a")],
+                        vec![dispatch_assignment_for(&request)],
                         DeliberationLimits::new(1, 2, 8, 2).unwrap(),
                         task_budget(),
                     )
@@ -417,18 +432,17 @@ fn coordinator_rejects_write_capability_and_nonzero_tool_budget_before_durable_w
     let mut request = bound_run_for("agent-a", "run-a");
     request.run_config.limits.max_tool_requests = 1;
     let nonzero_tool_plan = DeliberationProposalDispatchPlan::new(
-        DeliberationDispatchBinding::new(
-            request,
-            dispatch_assignment("agent-a", "run-a", "family-a"),
-            100,
-        )
-        .unwrap(),
-        DeliberationDispatchBinding::new(
-            bound_run_for("agent-b", "run-b"),
-            dispatch_assignment("agent-b", "run-b", "family-b"),
-            100,
-        )
-        .unwrap(),
+        DeliberationDispatchBinding::new(request.clone(), dispatch_assignment_for(&request), 100)
+            .unwrap(),
+        {
+            let request = bound_run_for_model("agent-b", "run-b", "model-2");
+            DeliberationDispatchBinding::new(
+                request.clone(),
+                dispatch_assignment_for(&request),
+                100,
+            )
+            .unwrap()
+        },
         task_budget(),
     )
     .unwrap();
@@ -798,6 +812,7 @@ fn canonical_resolution_reloads_and_appends_exact_plan_approved_event() {
             expected_task_version: 8,
             actor_id: ActorId::new("actor-1").unwrap(),
             action: PlanApprovalAction::Approve,
+            feedback: None,
         })
         .unwrap();
 
@@ -952,10 +967,15 @@ fn bound_run(run: &str) -> BoundAgentRunRequest {
 }
 
 fn bound_run_for(agent: &str, run: &str) -> BoundAgentRunRequest {
+    bound_run_for_model(agent, run, "model-1")
+}
+
+fn bound_run_for_model(agent: &str, run: &str, model_id: &str) -> BoundAgentRunRequest {
     let mut request = bound_run(run);
     request.agent_id = agent.to_owned();
     request.context.agent_id = agent.to_owned();
     request.run_config.agent_id = agent.to_owned();
+    request.run_config.model_id = model_id.to_owned();
     request.connection.agent_id = agent.to_owned();
     request.connection.binding_digest = match agent {
         "agent-a" => {
@@ -971,20 +991,28 @@ fn bound_run_for(agent: &str, run: &str) -> BoundAgentRunRequest {
 }
 
 fn proposal_dispatch_plan() -> DeliberationProposalDispatchPlan {
+    let first = bound_run_for("agent-a", "run-a");
+    let second = bound_run_for_model("agent-b", "run-b", "model-2");
     DeliberationProposalDispatchPlan::new(
-        DeliberationDispatchBinding::new(
-            bound_run_for("agent-a", "run-a"),
-            dispatch_assignment("agent-a", "run-a", "family-a"),
-            100,
-        )
-        .unwrap(),
-        DeliberationDispatchBinding::new(
-            bound_run_for("agent-b", "run-b"),
-            dispatch_assignment("agent-b", "run-b", "family-b"),
-            100,
-        )
-        .unwrap(),
+        DeliberationDispatchBinding::new(first.clone(), dispatch_assignment_for(&first), 100)
+            .unwrap(),
+        DeliberationDispatchBinding::new(second.clone(), dispatch_assignment_for(&second), 100)
+            .unwrap(),
         task_budget(),
+    )
+    .unwrap()
+}
+
+fn dispatch_assignment_for(request: &BoundAgentRunRequest) -> DeliberationRunAssignment {
+    DeliberationRunAssignment::new(
+        request.run_id.clone(),
+        request.agent_id.clone(),
+        AgentFamilyKey::from_provider_model(
+            &request.run_config.provider_id,
+            &request.run_config.model_id,
+        )
+        .unwrap(),
+        ActorId::new(&request.agent_id).unwrap(),
     )
     .unwrap()
 }
@@ -1447,7 +1475,6 @@ fn decision(claim: MaterialClaim) -> DecisionPackage {
             "prefer approach b",
         )
         .unwrap()],
-        &["dissent-1"],
         ArtifactId::new("plan-1").unwrap(),
     )
     .unwrap()

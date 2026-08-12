@@ -12,8 +12,6 @@ export type EvidenceState = "verified" | "unverified" | "inconclusive";
 export type PlanApprovalAction =
   | "approve"
   | "revise"
-  | "reopen"
-  | "add_or_replace_agent"
   | "reject";
 
 export interface WorkflowPhaseDto {
@@ -206,6 +204,7 @@ export interface ResolvePlanApprovalRequestDto {
   displayedDigest: string;
   expectedTaskVersion: number;
   action: PlanApprovalAction;
+  feedback: string | null;
 }
 
 export interface PlanApprovalResolutionDto {
@@ -221,8 +220,6 @@ const SHA256 = /^sha256:[0-9a-f]{64}$/;
 const PLAN_ACTIONS = new Set<PlanApprovalAction>([
   "approve",
   "revise",
-  "reopen",
-  "add_or_replace_agent",
   "reject",
 ]);
 
@@ -260,6 +257,7 @@ export function resolvePlanApproval(
     "displayedDigest",
     "expectedTaskVersion",
     "action",
+    "feedback",
   ]);
   validOpaqueId(request.approvalId, "approvalId");
   if (!SHA256.test(request.displayedDigest)) {
@@ -273,6 +271,18 @@ export function resolvePlanApproval(
   }
   if (!PLAN_ACTIONS.has(request.action)) {
     throw new TypeError("action is not an allowed plan approval action");
+  }
+  if (request.action === "revise") {
+    if (
+      request.feedback === null ||
+      request.feedback.trim().length === 0 ||
+      request.feedback.length > 16_384 ||
+      request.feedback.includes("\0")
+    ) {
+      throw new TypeError("feedback is required for a revision");
+    }
+  } else if (request.feedback !== null) {
+    throw new TypeError("feedback is only allowed for a revision");
   }
   return invoke<PlanApprovalResolutionDto>("resolve_plan_approval", { request });
 }

@@ -533,10 +533,15 @@ fn bound_run(run: &str) -> BoundAgentRunRequest {
 }
 
 fn bound_run_for(agent: &str, run: &str) -> BoundAgentRunRequest {
+    bound_run_for_model(agent, run, "model-1")
+}
+
+fn bound_run_for_model(agent: &str, run: &str, model_id: &str) -> BoundAgentRunRequest {
     let mut request = bound_run(run);
     request.agent_id = agent.to_owned();
     request.context.agent_id = agent.to_owned();
     request.run_config.agent_id = agent.to_owned();
+    request.run_config.model_id = model_id.to_owned();
     request.connection.agent_id = agent.to_owned();
     request.connection.binding_digest = Sha256Digest::new(match agent {
         "agent-a" => "sha256:fee954809eb23cd03870b20d408b54ffcb4112d25afb76131bb3fd2ffb29699a",
@@ -549,19 +554,13 @@ fn bound_run_for(agent: &str, run: &str) -> BoundAgentRunRequest {
 }
 
 fn dispatch_plan() -> DeliberationProposalDispatchPlan {
+    let first = bound_run_for("agent-a", "run-a");
+    let second = bound_run_for_model("agent-b", "run-b", "model-2");
     DeliberationProposalDispatchPlan::new(
-        DeliberationDispatchBinding::new(
-            bound_run_for("agent-a", "run-a"),
-            dispatch_assignment("agent-a", "run-a", "family-a"),
-            100,
-        )
-        .unwrap(),
-        DeliberationDispatchBinding::new(
-            bound_run_for("agent-b", "run-b"),
-            dispatch_assignment("agent-b", "run-b", "family-b"),
-            100,
-        )
-        .unwrap(),
+        DeliberationDispatchBinding::new(first.clone(), dispatch_assignment_for(&first), 100)
+            .unwrap(),
+        DeliberationDispatchBinding::new(second.clone(), dispatch_assignment_for(&second), 100)
+            .unwrap(),
         DeliberationTaskBudget::new(
             4,
             100_000,
@@ -573,12 +572,16 @@ fn dispatch_plan() -> DeliberationProposalDispatchPlan {
     .unwrap()
 }
 
-fn dispatch_assignment(agent: &str, run: &str, family: &str) -> DeliberationRunAssignment {
+fn dispatch_assignment_for(request: &BoundAgentRunRequest) -> DeliberationRunAssignment {
     DeliberationRunAssignment::new(
-        RunId::new(run).unwrap(),
-        agent,
-        local_agent_terminal_domain::AgentFamilyKey::new(family).unwrap(),
-        local_agent_terminal_domain::ActorId::new(agent).unwrap(),
+        request.run_id.clone(),
+        request.agent_id.clone(),
+        local_agent_terminal_domain::AgentFamilyKey::from_provider_model(
+            &request.run_config.provider_id,
+            &request.run_config.model_id,
+        )
+        .unwrap(),
+        local_agent_terminal_domain::ActorId::new(&request.agent_id).unwrap(),
     )
     .unwrap()
 }

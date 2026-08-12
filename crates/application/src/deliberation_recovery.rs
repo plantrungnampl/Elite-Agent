@@ -1351,20 +1351,11 @@ fn decision_package_from_v1(value: DecisionPackageV1) -> Result<DecisionPackage,
             .map_err(|_| integrity_failure())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let expected_dissent_ids = dissent
-        .iter()
-        .map(|dissent| dissent.dissent_id().to_owned())
-        .collect::<Vec<_>>();
-    let expected_dissent_refs = expected_dissent_ids
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
     DecisionPackage::new(
         selected,
         rejected,
         evidence,
         dissent,
-        &expected_dissent_refs,
         ArtifactId::new(value.plan_artifact_id).map_err(|_| integrity_failure())?,
     )
     .map_err(|_| integrity_failure())

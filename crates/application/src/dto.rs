@@ -38,6 +38,7 @@ pub struct ResolveDisplayedPlanApprovalRequestDto {
     pub displayed_digest: String,
     pub expected_task_version: u64,
     pub action: PlanApprovalAction,
+    pub feedback: Option<String>,
 }
 
 impl ResolveDisplayedPlanApprovalRequestDto {
@@ -48,6 +49,7 @@ impl ResolveDisplayedPlanApprovalRequestDto {
             expected_task_version: self.expected_task_version,
             actor_id: actor_id.into(),
             action: self.action,
+            feedback: self.feedback,
         }
     }
 }
@@ -77,6 +79,7 @@ pub struct ResolvePlanApprovalRequestDto {
     pub expected_task_version: u64,
     pub actor_id: String,
     pub action: PlanApprovalAction,
+    pub feedback: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

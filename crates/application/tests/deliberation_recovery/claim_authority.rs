@@ -1114,7 +1114,6 @@ fn decision_package_for(plan_id: &str) -> DecisionPackage {
             ),
         ],
         dissent,
-        &["dissent-a", "dissent-b"],
         ArtifactId::new(plan_id).unwrap(),
     )
     .unwrap()

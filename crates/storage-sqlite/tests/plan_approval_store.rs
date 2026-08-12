@@ -345,23 +345,11 @@ fn concurrent_plan_resolution_has_exactly_one_terminal_winner() {
 
 #[test]
 fn change_actions_round_trip_with_distinct_events_and_phases() {
-    for (action, expected_phase, expected_event_type) in [
-        (
-            PlanApprovalAction::Revise,
-            "Synthesis",
-            "plan.revision.requested",
-        ),
-        (
-            PlanApprovalAction::Reopen,
-            "CrossReview",
-            "plan.discussion.reopened",
-        ),
-        (
-            PlanApprovalAction::AddOrReplaceAgent,
-            "ContextBuild",
-            "plan.roster_change.requested",
-        ),
-    ] {
+    for (action, expected_phase, expected_event_type) in [(
+        PlanApprovalAction::Revise,
+        "Synthesis",
+        "plan.revision.requested",
+    )] {
         let database = TestDatabase::new();
         let store = database.store();
 
@@ -398,6 +386,20 @@ fn change_actions_round_trip_with_distinct_events_and_phases() {
                 .unwrap(),
             1
         );
+    }
+
+    for action in [
+        PlanApprovalAction::Reopen,
+        PlanApprovalAction::AddOrReplaceAgent,
+    ] {
+        let database = TestDatabase::new();
+        let store = database.store();
+        let mut input = resolve_input(&database, action);
+        input.feedback = Some("This action has no normative transition.".to_owned());
+        assert!(ResolvePlanApproval::new(&store, &WithinWindow)
+            .execute(input)
+            .is_err());
+        assert_pending_without_terminal_event(&database);
     }
 }
 
@@ -735,6 +737,8 @@ fn resolve_input(database: &TestDatabase, action: PlanApprovalAction) -> Resolve
         expected_task_version: 8,
         actor_id: ActorId::new("actor-1").unwrap(),
         action,
+        feedback: (action == PlanApprovalAction::Revise)
+            .then(|| "Revise the plan with the supplied user feedback.".to_owned()),
     }
 }
 

@@ -248,10 +248,7 @@ pub enum DeliberationRecord {
 impl DeliberationRecord {
     pub fn budget_reservation(&self) -> DeliberationBudgetReservation {
         match self {
-            Self::ThreadSummary { .. } => DeliberationBudgetReservation {
-                thread_count: 1,
-                ..DeliberationBudgetReservation::default()
-            },
+            Self::ThreadSummary { .. } => DeliberationBudgetReservation::default(),
             Self::SpecialistRequest { request, .. } => DeliberationBudgetReservation {
                 thread_count: 1,
                 token_count: request.budget().max_tokens(),

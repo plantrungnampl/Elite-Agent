@@ -630,11 +630,10 @@ fn decision(evidence: Vec<MaterialClaim>) -> DecisionPackage {
         vec![Dissent::new(
             "dissent-1",
             "agent-2",
-            artifact("dissent-artifact"),
+            artifact("proposal-2"),
             "prefer the rejected alternative",
         )
         .unwrap()],
-        &["dissent-1"],
         artifact("plan-1"),
     )
     .unwrap()

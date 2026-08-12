@@ -1090,7 +1090,6 @@ fn decision_with_claims_for_plan(
             "remaining concern",
         )
         .unwrap()],
-        &["dissent-1"],
         ArtifactId::new(plan_id).unwrap(),
     )
     .unwrap()

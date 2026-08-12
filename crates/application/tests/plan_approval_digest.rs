@@ -209,6 +209,7 @@ fn resolver_reloads_shared_plan_and_recomputes_authoritative_binding() {
             expected_task_version: binding.task_version,
             actor_id: ActorId::new(&binding.actor_id).unwrap(),
             action: PlanApprovalAction::Approve,
+            feedback: None,
         })
         .unwrap();
 
@@ -256,16 +257,6 @@ fn resolution_emits_only_declared_workflow_transitions() {
             "plan.revision.requested",
             Phase::Synthesis,
         ),
-        (
-            PlanApprovalAction::Reopen,
-            "plan.discussion.reopened",
-            Phase::CrossReview,
-        ),
-        (
-            PlanApprovalAction::AddOrReplaceAgent,
-            "plan.roster_change.requested",
-            Phase::ContextBuild,
-        ),
     ] {
         let binding = binding();
         let store = plan_store(binding.clone());
@@ -276,6 +267,8 @@ fn resolution_emits_only_declared_workflow_transitions() {
                 .operation_digest,
         );
         input.action = action;
+        input.feedback = (action == PlanApprovalAction::Revise)
+            .then(|| "Revise the plan using this exact feedback.".to_owned());
 
         let resolution = ResolvePlanApproval::new(&store, &FixedClock)
             .execute(input)
@@ -284,6 +277,26 @@ fn resolution_emits_only_declared_workflow_transitions() {
         assert!(
             matches!(resolution.append.projection_changes.as_slice(), [local_agent_terminal_application::ProjectionChange::TaskState { state, .. }] if state.phase() == phase)
         );
+    }
+
+    for action in [
+        PlanApprovalAction::Reopen,
+        PlanApprovalAction::AddOrReplaceAgent,
+    ] {
+        let binding = binding();
+        let store = plan_store(binding.clone());
+        let mut input = approval_input(
+            &binding,
+            canonical_plan_approval_payload(&binding)
+                .unwrap()
+                .operation_digest,
+        );
+        input.action = action;
+        input.feedback = Some("This must not fabricate a transition.".to_owned());
+        assert!(ResolvePlanApproval::new(&store, &FixedClock)
+            .execute(input)
+            .is_err());
+        assert!(store.resolutions.lock().unwrap().is_empty());
     }
 }
 
@@ -387,6 +400,7 @@ fn stale_or_substituted_authority_cannot_resolve() {
             expected_task_version: binding.task_version,
             actor_id: ActorId::new(&binding.actor_id).unwrap(),
             action: PlanApprovalAction::Approve,
+            feedback: None,
         })
         .is_err());
     assert!(store.resolutions.lock().unwrap().is_empty());
@@ -1090,6 +1104,7 @@ fn approval_input(
         expected_task_version: binding.task_version,
         actor_id: ActorId::new(&binding.actor_id).unwrap(),
         action: PlanApprovalAction::Approve,
+        feedback: None,
     }
 }
 

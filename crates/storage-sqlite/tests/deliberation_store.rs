@@ -10,21 +10,21 @@ use local_agent_terminal_application::{
     DeliberationCommandContext, DeliberationCommands, DeliberationDispatchBinding,
     DeliberationDispatchStore, DeliberationPersistenceCommand, DeliberationPhaseDispatchAuthority,
     DeliberationPhaseDispatchSet, DeliberationPlanDto, DeliberationProposalDispatchPlan,
-    DeliberationRecord, DeliberationRunAssignment, DeliberationSnapshot, DeliberationStore,
-    DeliberationSynthesisStore, PersistDeliberationSynthesis, PlanApprovalAuthorityBinding,
-    PlanApprovalAuthorityProvider, PlanApprovalBindingInput, PlanApprovalPathScopeV1,
-    PlanApprovalState, PlanApprovalStore, PortError, PreparePlanApprovalRequestInput,
-    SafeErrorClassification,
+    DeliberationRecord, DeliberationRejectedAlternativeDto, DeliberationRunAssignment,
+    DeliberationSnapshot, DeliberationStore, DeliberationSynthesisStore,
+    PersistDeliberationSynthesis, PlanApprovalAuthorityBinding, PlanApprovalAuthorityProvider,
+    PlanApprovalBindingInput, PlanApprovalPathScopeV1, PlanApprovalState, PlanApprovalStore,
+    PortError, PreparePlanApprovalRequestInput, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     ActorId, AgentFamilyKey, AgentRunLimits, ArtifactId, BoundAgentConnection,
     BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig,
     ClaimVerification, DecisionApproach, DecisionPackage, DeliberationLimits,
-    DeliberationTaskBudget, EventId, EvidenceCitation, EvidenceFreshness, FinalObjection,
+    DeliberationTaskBudget, Dissent, EventId, EvidenceCitation, EvidenceFreshness, FinalObjection,
     FinalObjectionSet, GitObjectId, IndependentProposal, LineRange, MaterialClaim,
-    ObjectionSeverity, Phase, ProjectId, ReviewEdge, ReviewPlan, RunId, Sha256Digest,
-    SourceIdentity, SpecialistBudget, SpecialistRequest, TaskId, Timestamp, TrustTier,
-    VerificationMethod, WorkspaceFingerprint,
+    ObjectionSeverity, Phase, ProjectId, RejectedApproach, ReviewEdge, ReviewPlan, RunId,
+    Sha256Digest, SourceIdentity, SpecialistBudget, SpecialistRequest, TaskId, Timestamp,
+    TrustTier, VerificationMethod, WorkspaceFingerprint,
 };
 use local_agent_terminal_storage_files::{
     ContentAddressedArtifactReader, ContentAddressedArtifactStore,
@@ -846,7 +846,27 @@ fn private_receipts_replay_without_messages_then_quorum_publishes_atomically_and
         .unwrap();
     let snapshot = reopened.load(&TaskId::new("task-1").unwrap()).unwrap();
     let decision_one = database.publish("decision-draft-1", b"decision draft one");
-    let plan_one = database.publish("plan-1", b"plan one");
+    let mismatched_plan = database.publish("plan-mismatch", b"not the canonical plan DTO");
+    let before_synthesis = count(&database.connection(), "deliberation_records");
+    let mismatched = PersistDeliberationSynthesis::new(&reopened)
+        .prepare(
+            command_context(&snapshot, "core", decision_one.clone(), "event-decision-1"),
+            decision("plan-mismatch", claim(true)),
+            plan_dto(),
+            mismatched_plan,
+            1,
+        )
+        .unwrap();
+    assert!(reopened.persist_synthesis(mismatched).is_err());
+    assert_eq!(
+        count(&database.connection(), "deliberation_records"),
+        before_synthesis
+    );
+    assert_eq!(
+        count(&database.connection(), "deliberation_synthesis_plans"),
+        0
+    );
+    let plan_one = database.publish("plan-1", &plan_bytes());
     let synthesis = PersistDeliberationSynthesis::new(&reopened)
         .prepare(
             command_context(&snapshot, "core", decision_one.clone(), "event-decision-1"),
@@ -937,7 +957,7 @@ fn private_receipts_replay_without_messages_then_quorum_publishes_atomically_and
         )
         .unwrap();
     let snapshot = reopened.load(&TaskId::new("task-1").unwrap()).unwrap();
-    let plan_two = database.publish("plan-2", b"plan two");
+    let plan_two = database.publish("plan-2", &plan_bytes());
     PersistDeliberationSynthesis::new(&reopened)
         .execute(
             command_context(&snapshot, "core", decision_two, "event-decision-2"),
@@ -1149,10 +1169,13 @@ fn workspace_fingerprint(character: char) -> WorkspaceFingerprint {
 fn plan_dto() -> DeliberationPlanDto {
     DeliberationPlanDto {
         selected_approach_id: "selected-approach".to_owned(),
-        rejected_alternatives: Vec::new(),
+        rejected_alternatives: vec![DeliberationRejectedAlternativeDto {
+            approach_id: "rejected-approach".to_owned(),
+            reason: "The verified evidence supports proposal 1.".to_owned(),
+        }],
         verified_claim_ids: vec!["claim-a".to_owned()],
         inconclusive_claim_ids: Vec::new(),
-        dissent_ids: Vec::new(),
+        dissent_ids: vec!["dissent-agent-2".to_owned()],
         affected_files: vec!["crates/application/src/deliberation/commands.rs".to_owned()],
         implementation_steps: vec!["Persist the complete synthesis atomically".to_owned()],
         planned_tools: vec!["cargo.test".to_owned()],
@@ -1163,6 +1186,10 @@ fn plan_dto() -> DeliberationPlanDto {
         estimated_duration_seconds: Some(30),
         confidence: 90,
     }
+}
+
+fn plan_bytes() -> Vec<u8> {
+    serde_json_canonicalizer::to_vec(&plan_dto()).unwrap()
 }
 
 fn proposal(number: u8) -> IndependentProposal {
@@ -1410,6 +1437,23 @@ fn claim(verified: bool) -> MaterialClaim {
 }
 
 fn decision(plan_artifact_id: &str, evidence: MaterialClaim) -> DecisionPackage {
+    let rejected = RejectedApproach::new(
+        DecisionApproach::new(
+            "rejected-approach",
+            ArtifactId::new("proposal-2").unwrap(),
+            Vec::new(),
+        )
+        .unwrap(),
+        "The verified evidence supports proposal 1.",
+    )
+    .unwrap();
+    let dissent = Dissent::new(
+        "dissent-agent-2",
+        "agent-2",
+        ArtifactId::new("proposal-2").unwrap(),
+        "Agent 2 retains proposal 2 as the rejected alternative.",
+    )
+    .unwrap();
     DecisionPackage::new(
         DecisionApproach::new(
             "selected-approach",
@@ -1417,10 +1461,9 @@ fn decision(plan_artifact_id: &str, evidence: MaterialClaim) -> DecisionPackage 
             vec![evidence.claim_id().to_owned()],
         )
         .unwrap(),
-        Vec::new(),
+        vec![rejected],
         vec![evidence],
-        Vec::new(),
-        &[],
+        vec![dissent],
         ArtifactId::new(plan_artifact_id).unwrap(),
     )
     .unwrap()

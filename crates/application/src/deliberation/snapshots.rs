@@ -766,7 +766,8 @@ pub(crate) struct RecoveredDeliberationState {
 
 impl DeliberationSnapshot {
     fn budget_reservation(&self) -> Result<DeliberationBudgetReservation, PortError> {
-        let thread_count = u32::try_from(self.thread_summaries.len()).map_err(|_| conflict())?;
+        let thread_count =
+            u32::try_from(self.specialist_requests.len()).map_err(|_| conflict())?;
         self.specialist_requests.iter().try_fold(
             DeliberationBudgetReservation {
                 thread_count,

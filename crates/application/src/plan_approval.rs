@@ -405,6 +405,7 @@ pub trait PlanApprovalCurrentAuthoritySource: Send + Sync {
 pub struct PlanApprovalResolution {
     pub approval_id: ApprovalId,
     pub action: PlanApprovalAction,
+    pub feedback: Option<String>,
     pub actor_id: ActorId,
     pub expected_task_version: u64,
     pub operation_digest: Sha256Digest,
@@ -437,6 +438,7 @@ impl CompareAndResolvePlanApproval {
             &self.resolution.actor_id,
             &self.resolution.resolved_at,
             &self.resolution.operation_digest,
+            self.resolution.feedback.as_deref(),
         )?;
         if self.expected_approval.state != PlanApprovalState::Requested
             || self.expected_approval.binding != self.expected_current.binding
@@ -657,6 +659,7 @@ pub struct ResolvePlanApprovalInput {
     pub expected_task_version: u64,
     pub actor_id: ActorId,
     pub action: PlanApprovalAction,
+    pub feedback: Option<String>,
 }
 
 pub struct ResolvePlanApproval<'a> {
@@ -673,6 +676,7 @@ impl<'a> ResolvePlanApproval<'a> {
         &self,
         input: ResolvePlanApprovalInput,
     ) -> Result<PlanApprovalResolution, PortError> {
+        validate_resolution_action(&input)?;
         let stored = self
             .store
             .reload(&input.approval_id)?
@@ -751,10 +755,12 @@ impl<'a> ResolvePlanApproval<'a> {
             &input.actor_id,
             &observed_at,
             &operation_digest,
+            input.feedback.as_deref(),
         )?;
         let resolution = PlanApprovalResolution {
             approval_id: input.approval_id,
             action: input.action,
+            feedback: input.feedback,
             actor_id: input.actor_id,
             expected_task_version: input.expected_task_version,
             operation_digest: operation_digest.clone(),
@@ -902,6 +908,7 @@ fn resolution_append(
     actor_id: &ActorId,
     resolved_at: &str,
     operation_digest: &Sha256Digest,
+    feedback: Option<&str>,
 ) -> Result<AppendOperation, PortError> {
     let (event_type, guard, explicit_phase) = match action {
         PlanApprovalAction::Approve => ("plan.approved", Some("plan_approval_digest_valid"), None),
@@ -911,16 +918,9 @@ fn resolution_append(
             Some("user_feedback_present"),
             None,
         ),
-        PlanApprovalAction::Reopen => (
-            "plan.discussion.reopened",
-            Some("user_feedback_present"),
-            Some(Phase::CrossReview),
-        ),
-        PlanApprovalAction::AddOrReplaceAgent => (
-            "plan.roster_change.requested",
-            Some("user_feedback_present"),
-            Some(Phase::ContextBuild),
-        ),
+        PlanApprovalAction::Reopen | PlanApprovalAction::AddOrReplaceAgent => {
+            return Err(invalid_input());
+        }
     };
     let event_type = WorkflowEvent::new(event_type).map_err(|_| conflict())?;
     let mut guards = GuardEvaluations::new();
@@ -965,6 +965,7 @@ fn resolution_append(
                 "approvalId": approval_id.as_str(),
                 "action": action,
                 "operationDigest": operation_digest.as_str(),
+                "userFeedback": feedback,
             }),
             metadata: serde_json::json!({}),
             causation_id: None,
@@ -977,6 +978,26 @@ fn resolution_append(
             updated_at: resolved_at.to_owned(),
         }],
     })
+}
+
+fn validate_resolution_action(input: &ResolvePlanApprovalInput) -> Result<(), PortError> {
+    match input.action {
+        PlanApprovalAction::Revise
+            if input.feedback.as_ref().is_some_and(|feedback| {
+                !feedback.trim().is_empty() && feedback.len() <= 16_384 && !feedback.contains('\0')
+            }) =>
+        {
+            Ok(())
+        }
+        PlanApprovalAction::Approve | PlanApprovalAction::Reject if input.feedback.is_none() => {
+            Ok(())
+        }
+        PlanApprovalAction::Revise
+        | PlanApprovalAction::Approve
+        | PlanApprovalAction::Reject
+        | PlanApprovalAction::Reopen
+        | PlanApprovalAction::AddOrReplaceAgent => Err(invalid_input()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

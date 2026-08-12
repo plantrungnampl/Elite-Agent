@@ -31,6 +31,23 @@ pub struct StoredContextPackageView {
 }
 
 impl SqliteStore {
+    pub fn context_package_is_invalidated(&self, package_id: &str) -> Result<bool, PortError> {
+        if package_id.trim().is_empty() {
+            return Err(invalid_input());
+        }
+        self.connection()
+            .map_err(open_error_to_port)?
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM deliberation_context_package_invalidations
+                    WHERE context_package_id = ?1
+                 )",
+                [package_id],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_error_to_port)
+    }
+
     pub fn context_package_view(
         &self,
         package_id: &str,

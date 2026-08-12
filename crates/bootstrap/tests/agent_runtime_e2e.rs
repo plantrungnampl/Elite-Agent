@@ -16,7 +16,8 @@ use std::{
 };
 
 use local_agent_terminal_application::{
-    AgentRunStore, ArtifactRef, ArtifactStore, ArtifactWriteReservation, Clock, ReservedArtifact,
+    AgentRunStore, ArtifactRef, ArtifactStore, ArtifactWriteReservation, Clock,
+    DeliberationBoundaryCheck, DeliberationBoundaryStore, ReservedArtifact,
     SafeErrorClassification, TaskQuery, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_bootstrap::{
@@ -25,8 +26,8 @@ use local_agent_terminal_bootstrap::{
 };
 use local_agent_terminal_domain::{
     AgentRunLimits, AgentRunStatus, ArtifactId, BoundAgentConnection, BoundAgentRunRequest,
-    BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, CancelAgentRun, RunId,
-    Sha256Digest, TaskId, Timestamp, TrustTier,
+    BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, CancelAgentRun, GitObjectId,
+    Phase, RunId, Sha256Digest, TaskId, Timestamp, TrustTier, WorkspaceFingerprint,
 };
 use local_agent_terminal_storage_files::{
     ContentAddressedArtifactReader, ContentAddressedArtifactStore, JournaledArtifactWriter,
@@ -460,6 +461,77 @@ fn missing_or_mismatched_context_fails_before_openai_loopback_dispatch() {
             .expect("run-config query")
             .is_none());
     }
+}
+
+#[test]
+fn invalidated_context_fails_before_openai_loopback_dispatch() {
+    let fixture = WorkspaceFixture::new();
+    let context = canonical_context();
+    let request = bound_request(
+        "run-invalidated-context",
+        "agent-context-invalidated",
+        digest_bytes(&context),
+    );
+    publish_artifact(
+        &fixture,
+        request.context.effective_context_artifact_id.as_str(),
+        "content",
+        &context,
+    );
+
+    let endpoint = UnobservedLoopback::new();
+    let bootstrap = Bootstrap::new(configured_workspace(
+        &fixture,
+        endpoint.endpoint().to_owned(),
+    ));
+    let runtime = bootstrap
+        .agent_runtime_handle()
+        .expect("configured provider runtime");
+    publish_artifact(
+        &fixture,
+        request.context.manifest_artifact_id.as_str(),
+        "manifest",
+        CORE_MANIFEST,
+    );
+    publish_artifact(
+        &fixture,
+        request.run_config.run_config_artifact_id.as_str(),
+        "run-config",
+        &canonical_agent_run_config_artifact(&request).expect("canonical run config"),
+    );
+    let database = SqliteStore::open(&fixture.database_path)
+        .expect("database")
+        .with_artifact_reader(Arc::new(ContentAddressedArtifactReader));
+    database
+        .create_bound_run(&request)
+        .expect("created run with current context");
+    database
+        .compare_and_persist_boundary(DeliberationBoundaryCheck::new(
+            request.task_id.clone(),
+            Phase::ParallelAnalysis,
+            workspace_fingerprint('a'),
+        ))
+        .expect("accepted baseline");
+    let invalidation = database
+        .compare_and_persist_boundary(DeliberationBoundaryCheck::new(
+            request.task_id.clone(),
+            Phase::CrossReview,
+            workspace_fingerprint('b'),
+        ))
+        .expect("persisted invalidation");
+    assert!(invalidation.blocked);
+
+    let result = runtime.start_run(request.clone());
+    if result.is_ok() {
+        endpoint.complete_one_connection_unavailable();
+        let _ = wait_for_terminal(&fixture, &request.run_id);
+    }
+    let error = result.expect_err("invalidated context rejected");
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    endpoint.assert_no_connection();
 }
 
 #[test]
@@ -1050,6 +1122,15 @@ fn canonical_context() -> Vec<u8> {
     }))
 }
 
+fn workspace_fingerprint(character: char) -> WorkspaceFingerprint {
+    WorkspaceFingerprint::new(
+        GitObjectId::new(character.to_string().repeat(40)).expect("git object id"),
+        digest_bytes(format!("index-{character}").as_bytes()).as_str(),
+        digest_bytes(format!("status-{character}").as_bytes()).as_str(),
+    )
+    .expect("workspace fingerprint")
+}
+
 fn canonical_json(value: Value) -> Vec<u8> {
     serde_json_canonicalizer::to_vec(&value).expect("canonical JSON")
 }
@@ -1375,6 +1456,31 @@ impl UnobservedLoopback {
                     if Instant::now() >= deadline {
                         return;
                     }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("loopback accept failed: {error}"),
+            }
+        }
+    }
+
+    fn complete_one_connection_unavailable(&self) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match self.listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .expect("unavailable response");
+                    stream.flush().expect("unavailable response flush");
+                    return;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "provider did not reach the loopback after accepting the invalid context"
+                    );
                     thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) => panic!("loopback accept failed: {error}"),

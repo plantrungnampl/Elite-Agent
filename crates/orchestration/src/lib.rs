@@ -10,9 +10,9 @@ pub use claims::{
     ClaimOrchestrationError, SynthesisRequest,
 };
 pub use coordinator::{
-    normative_preapproval_transitions, DeliberationCoordinator, NormativeTransition,
-    PhaseAdvanceRequest, PreApprovalAdvance, PreApprovalCoordinator, PrePlanDispatch,
-    PrePlanOperation, PrePlanReadView,
+    normative_preapproval_transitions, verify_repository_boundary, BoundaryOutcome,
+    DeliberationCoordinator, NormativeTransition, PhaseAdvanceRequest, PreApprovalAdvance,
+    PreApprovalCoordinator, PrePlanDispatch, PrePlanOperation, PrePlanReadView,
 };
 pub use recovery::{
     plan_deliberation_recovery, plan_dispatch_recovery, DeliberationRecoveryAction,

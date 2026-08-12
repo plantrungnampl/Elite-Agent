@@ -20,8 +20,6 @@ interface PlanApprovalPanelProps {
 
 const secondaryActions: Array<{ label: string; action: PlanApprovalAction }> = [
   { label: "Revise", action: "revise" },
-  { label: "Reopen", action: "reopen" },
-  { label: "Add/replace agent", action: "add_or_replace_agent" },
   { label: "Reject", action: "reject" },
 ];
 
@@ -34,6 +32,7 @@ export function PlanApprovalPanel({
   const [busy, setBusy] = useState(false);
   const [invalidated, setInvalidated] = useState(false);
   const [feedback, setFeedback] = useState(approvalStatusLabel(approval.status));
+  const [revisionFeedback, setRevisionFeedback] = useState("");
   const [error, setError] = useState<string | null>(null);
   const actionable = approval.status === "requested" && !invalidated && !busy;
 
@@ -49,6 +48,7 @@ export function PlanApprovalPanel({
         displayedDigest: approval.operationDigest,
         expectedTaskVersion: taskVersion,
         action,
+        feedback: action === "revise" ? revisionFeedback.trim() : null,
       });
       setFeedback(action === "approve" ? "Plan approval recorded" : "Plan action recorded");
       onResolved(resolution);
@@ -148,6 +148,14 @@ export function PlanApprovalPanel({
         />
         Confirm approval of this exact plan digest
       </label>
+      <label>
+        Revision feedback
+        <textarea
+          value={revisionFeedback}
+          disabled={!actionable}
+          onChange={(event) => setRevisionFeedback(event.currentTarget.value)}
+        />
+      </label>
       <div className="approval-actions">
         <button
           className="primary-button"
@@ -162,7 +170,7 @@ export function PlanApprovalPanel({
             key={action}
             className={action === "reject" ? "danger-button" : "secondary-button"}
             type="button"
-            disabled={!actionable}
+            disabled={!actionable || (action === "revise" && revisionFeedback.trim() === "")}
             onClick={() => void handleAction(action)}
           >
             {label}

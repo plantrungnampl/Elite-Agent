@@ -20,10 +20,9 @@ use local_agent_terminal_application::{
     ContextPackageContract, ContextPackageDescriptor, ContextPackageDraft, ContextPackageIdentity,
     ContextQuery, ContextRunReconstructibility, ContextVersionSet, DeliberationArtifactRef,
     DeliberationBudget, DeliberationCommandContext, DeliberationCommands,
-    DeliberationRunAssignment, DeliberationStore, EventId, PolicyActor, PortError, ProjectId,
-    ReservedArtifact, ResourceClass, Retryability, RiskLevel, RunId, SafeErrorClassification,
-    Sha256Digest, SpecialistBudget, SpecialistRequest, TaskId, TaskQuery, TaskRisk, TrustTier,
-    WorkspaceEvidenceStore,
+    DeliberationRunAssignment, DeliberationStore, EventId, PolicyActor, PortError,
+    ReservedArtifact, ResourceClass, RiskLevel, RunId, Sha256Digest, SpecialistBudget,
+    SpecialistRequest, TaskId, TaskQuery, TaskRisk, TrustTier, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_orchestration::{
     authorize_specialist, AgentEligibility, SpecialistDenial,
@@ -37,10 +36,17 @@ use local_agent_terminal_storage_files::{
 };
 use local_agent_terminal_storage_sqlite::{canonical_agent_run_config_artifact, SqliteStore};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::{context_runtime::ContextRuntime, workspace_monitor::publish_canonical_json};
+use crate::{
+    agent_runtime_support::{
+        conflict, connection_digest, deliberation_context_contract, digest_bytes,
+        integrity_failure, invalid_input, not_found, permission_denied, project_id, stable_digest,
+        unavailable,
+    },
+    context_runtime::ContextRuntime,
+    workspace_monitor::publish_canonical_json,
+};
 
 const OPENAI_AGENT_ID: &str = "core_adapter";
 const OPENAI_CONNECTION_ID: &str = "openai_core_adapter";
@@ -549,6 +555,9 @@ impl AgentRequestHandler for DurableAgentRequestHandler {
         if task.phase.as_str() != request.phase {
             return Err(conflict());
         }
+        let deliberation = DeliberationStore::load(&self.database, &request.task_id)?;
+        let authoritative =
+            deliberation_context_contract(&deliberation, &snapshot.request.context.objective);
         let identity = stable_digest(&format!(
             "{}:{}:{}:{}:{}",
             request.run_id.as_str(),
@@ -626,10 +635,10 @@ impl AgentRequestHandler for DurableAgentRequestHandler {
                         contract: ContextPackageContract {
                             task_scope: request.scopes.clone(),
                             policy_constraints: vec!["read-only-preapproval".to_owned()],
-                            shared_summary: snapshot.request.context.objective.clone(),
-                            accepted_decisions: Vec::new(),
-                            unresolved_objections: Vec::new(),
-                            active_thread_messages: Vec::new(),
+                            shared_summary: authoritative.shared_summary,
+                            accepted_decisions: authoritative.accepted_decisions,
+                            unresolved_objections: authoritative.unresolved_objections,
+                            active_thread_messages: authoritative.active_thread_messages,
                             permissions: vec!["context.query".to_owned()],
                             protocol_capabilities: vec![
                                 "context/query".to_owned(),
@@ -748,6 +757,34 @@ impl AgentRequestHandler for DurableAgentRequestHandler {
                 request,
                 false,
                 "request_deadline_exceeded",
+                None,
+            ));
+        }
+        let parent_context = self
+            .database
+            .context_package_view(&snapshot.request.context.context_package_id)?
+            .ok_or_else(permission_denied)?;
+        if parent_context.task_id != request.task_id.as_str()
+            || parent_context.agent_id != snapshot.request.agent_id
+            || parent_context.role != snapshot.request.role
+            || parent_context.artifact_id
+                != snapshot
+                    .request
+                    .context
+                    .effective_context_artifact_id
+                    .as_str()
+            || parent_context.policy_snapshot_digest
+                != snapshot.request.context.policy_snapshot_digest.as_str()
+        {
+            return Err(integrity_failure());
+        }
+        if request.required_context_ids.len() != 1
+            || request.required_context_ids[0] != parent_context.artifact_id
+        {
+            return Ok(specialist_response(
+                request,
+                false,
+                "unrequested_context",
                 None,
             ));
         }
@@ -1077,6 +1114,31 @@ impl AgentArtifactStore for DurableAgentArtifacts {
         &self,
         context: &BoundEffectiveContext,
     ) -> Result<Vec<u8>, PortError> {
+        match self
+            .database
+            .context_package_view(&context.context_package_id)?
+        {
+            Some(package)
+                if package.package_id == context.context_package_id
+                    && package.task_id == context.task_id.as_str()
+                    && package.agent_id == context.agent_id
+                    && package.role == context.role
+                    && package.objective == context.objective
+                    && package.artifact_id == context.effective_context_artifact_id.as_str()
+                    && package.policy_snapshot_digest
+                        == context.policy_snapshot_digest.as_str()
+                    && package.prompt_template_version == context.prompt_template_version
+                    && package.retrieval_pipeline_version == context.retrieval_pipeline_version => {
+            }
+            Some(_) => return Err(integrity_failure()),
+            None if self
+                .database
+                .context_package_is_invalidated(&context.context_package_id)? =>
+            {
+                return Err(integrity_failure());
+            }
+            None => {}
+        }
         let evidence = self
             .database
             .available_evidence(&context.effective_context_artifact_id)?
@@ -1210,78 +1272,6 @@ fn core_adapter_connection(
     Ok(connection)
 }
 
-fn connection_digest(connection: &BoundAgentConnection) -> Result<Sha256Digest, PortError> {
-    let value = json!({
-        "schema": "agent-connection-binding.v1",
-        "identity": {
-            "connectionId": connection.connection_id,
-            "agentId": connection.agent_id,
-        },
-        "manifestDigest": connection.manifest_digest.as_str(),
-        "executableDigest": connection.executable_digest.as_ref().map(Sha256Digest::as_str),
-        "trustTier": connection.trust_tier.as_str(),
-        "contractVersion": connection.contract_version,
-        "adapterVersion": connection.adapter_version,
-    });
-    let canonical = serde_json_canonicalizer::to_vec(&value).map_err(|_| integrity_failure())?;
-    Ok(digest_bytes(&canonical))
-}
-
-fn project_id(database: &SqliteStore, task_id: &TaskId) -> Result<ProjectId, PortError> {
-    Ok(database.task(task_id)?.project_id)
-}
-
-fn digest_bytes(bytes: &[u8]) -> Sha256Digest {
-    Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes)))
-        .expect("SHA-256 formatting is valid")
-}
-
-fn stable_digest(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
-}
-
-fn invalid_input() -> PortError {
-    PortError::failure(
-        SafeErrorClassification::InvalidInput,
-        Retryability::NonRetryable,
-    )
-}
-
-fn not_found() -> PortError {
-    PortError::failure(
-        SafeErrorClassification::NotFound,
-        Retryability::NonRetryable,
-    )
-}
-
-fn unavailable() -> PortError {
-    PortError::failure(
-        SafeErrorClassification::Unavailable,
-        Retryability::NonRetryable,
-    )
-}
-
-fn integrity_failure() -> PortError {
-    PortError::failure(
-        SafeErrorClassification::IntegrityFailure,
-        Retryability::NonRetryable,
-    )
-}
-
-fn conflict() -> PortError {
-    PortError::failure(
-        SafeErrorClassification::Conflict,
-        Retryability::NonRetryable,
-    )
-}
-
-fn permission_denied() -> PortError {
-    PortError::failure(
-        SafeErrorClassification::PermissionDenied,
-        Retryability::NonRetryable,
-    )
-}
-
 #[cfg(test)]
 pub(crate) fn failing_runtime_for_test(path: &std::path::Path) -> Arc<ComposedAgentRuntime> {
     tests::failing_runtime_for_test(path)
@@ -1300,8 +1290,9 @@ mod tests {
     };
 
     use local_agent_terminal_agent_runtime::{ProtocolAgentRuntime, Script, ScriptedPeer};
-    use local_agent_terminal_application::AgentRequestAuditFence;
-    use local_agent_terminal_application::StartupStateDto;
+    use local_agent_terminal_application::{
+        AgentRequestAuditFence, Retryability, SafeErrorClassification, StartupStateDto,
+    };
     use local_agent_terminal_domain::{RunId, TaskId, Timestamp};
     use rusqlite::params;
     use tempfile::TempDir;
@@ -1444,6 +1435,13 @@ mod tests {
             "content",
             b"bound specialist context",
         );
+        publish_runtime_test_artifact(
+            &connection,
+            artifacts.as_ref(),
+            "artifact-unbound-context",
+            "content",
+            b"task-bound but not disclosed to the parent run",
+        );
         let descriptor = AgentDescriptor {
             agent_id: "agent-parent".to_owned(),
             display_name: "Parent agent".to_owned(),
@@ -1576,6 +1574,25 @@ mod tests {
                 available: true,
             }],
         };
+        let bypass = handler
+            .request_specialist(AgentSpecialistRequest {
+                run_id: run_request.run_id.clone(),
+                task_id: run_request.task_id.clone(),
+                connection_id: connection_binding.connection_id.clone(),
+                connection_binding_digest: connection_binding.binding_digest.clone(),
+                phase: run_request.phase.clone(),
+                request_id: "specialist-unbound-context".to_owned(),
+                capability: "review".to_owned(),
+                reason: "Attempt a same-task disclosure bypass".to_owned(),
+                required_context_ids: vec!["artifact-unbound-context".to_owned()],
+                max_tokens: 100,
+                deadline: Timestamp::from_unix_seconds(2_000_000_000),
+                cancellation: local_agent_terminal_application::AgentRequestCancellation::new(),
+            })
+            .expect("bounded specialist denial");
+        assert!(!bypass.accepted);
+        assert_eq!(bypass.reason_code, "unrequested_context");
+        assert!(bypass.prepared_commit.is_none());
         let request = AgentSpecialistRequest {
             run_id: run_request.run_id.clone(),
             task_id: run_request.task_id.clone(),

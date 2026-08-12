@@ -104,7 +104,7 @@ fn persistence_command_carries_exact_event_projection_and_artifact_authority() {
 }
 
 #[test]
-fn task_budget_bounds_thread_specialist_and_deadline_before_persistence() {
+fn task_budget_bounds_specialist_requests_and_deadline_before_persistence() {
     let thread_budget = DeliberationTaskBudget::new(
         1,
         1_024,
@@ -113,14 +113,13 @@ fn task_budget_bounds_thread_specialist_and_deadline_before_persistence() {
     )
     .unwrap();
     let (store, writes) = make_store(snapshot_with_thread_summary());
-    let error = DeliberationCommands::new(&store)
+    DeliberationCommands::new(&store)
         .record_thread_summary(
             command_with_budget(Phase::CrossReview, "core", thread_budget, "2026-08-09T00:00:00Z"),
             "thread-2",
         )
-        .unwrap_err();
-    assert_eq!(error.safe_classification(), SafeErrorClassification::Conflict);
-    assert!(writes.lock().unwrap().commands.is_empty());
+        .unwrap();
+    assert_eq!(writes.lock().unwrap().commands.len(), 1);
 
     let specialist_budget = DeliberationTaskBudget::new(
         4,
@@ -187,7 +186,7 @@ fn persistence_command_carries_durable_budget_authority_and_reservation() {
     let writes = writes.lock().unwrap();
     let command = &writes.commands[0];
     assert_eq!(command.task_budget(), budget);
-    assert_eq!(command.budget_reservation().thread_count(), 1);
+    assert_eq!(command.budget_reservation().thread_count(), 0);
     assert_eq!(command.budget_reservation().token_count(), 0);
     assert_eq!(command.budget_reservation().cost_microunits(), 0);
     assert_eq!(
@@ -196,7 +195,7 @@ fn persistence_command_carries_durable_budget_authority_and_reservation() {
     );
     assert_eq!(
         command.append().events[0].payload["budgetReservation"]["threads"],
-        1
+        0
     );
 }
 
@@ -984,6 +983,45 @@ fn synthesis_requires_unique_exact_authoritative_claim_ids() {
             .is_err());
         assert_eq!(writes.lock().unwrap().decisions, 0);
     }
+}
+
+#[test]
+fn synthesis_rejects_a_decision_that_drops_an_authoritative_participant_position() {
+    let verified = claim("claim-a", true);
+    let state = snapshot_with_verified_claims(vec![verified.clone()]);
+    let (store, writes) = make_store(state);
+    let decision = DecisionPackage::new(
+        DecisionApproach::new(
+            "selected",
+            ArtifactId::new("proposal-1").unwrap(),
+            vec![verified.claim_id().to_owned()],
+        )
+        .unwrap(),
+        vec![RejectedApproach::new(
+            DecisionApproach::new(
+                "rejected",
+                ArtifactId::new("proposal-2").unwrap(),
+                Vec::new(),
+            )
+            .unwrap(),
+            "less evidence",
+        )
+        .unwrap()],
+        vec![verified],
+        Vec::new(),
+        ArtifactId::new("plan-1").unwrap(),
+    )
+    .unwrap();
+
+    assert!(DeliberationCommands::new(&store)
+        .synthesize(
+            command_for_phase("task-1", 7, "core", Phase::Synthesis),
+            decision,
+            artifact("plan-1", '4'),
+            1,
+        )
+        .is_err());
+    assert!(writes.lock().unwrap().commands.is_empty());
 }
 
 #[test]

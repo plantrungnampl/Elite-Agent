@@ -958,6 +958,7 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
         expected_task_version: awaiting.task_version,
         actor_id: ActorId::new("approver-1").expect("approver actor"),
         action: PlanApprovalAction::Approve,
+        feedback: None,
     };
     assert!(ResolvePlanApproval::new(&approval_store, &ApprovalClock)
         .execute(stale_resolution)
@@ -976,6 +977,7 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
         expected_task_version: awaiting.task_version,
         actor_id: "approver-1".to_owned(),
         action: PlanApprovalAction::Approve,
+        feedback: None,
     };
     let deliberation = bootstrap
         .deliberation_runtime()
@@ -1683,7 +1685,6 @@ fn evidence_linked_decision(
             "retain the stale-evidence concern until refreshed",
         )
         .expect("preserved dissent")],
-        &["dissent-anthropic"],
         plan,
     )
     .expect("evidence-linked decision")

@@ -63,9 +63,36 @@ impl DeliberationSynthesisStore for SqliteStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
+        validate_synthesis_plan_artifact(&transaction, artifact_reader, &command)?;
         persist_command_in_transaction(&transaction, artifact_reader, command.persistence())?;
         persist_synthesis_plan(&transaction, &command)?;
         transaction.commit().map_err(sqlite_error_to_port)
+    }
+}
+
+fn validate_synthesis_plan_artifact(
+    connection: &Connection,
+    artifact_reader: &dyn ArtifactRootReader,
+    command: &DeliberationSynthesisCommand,
+) -> Result<(), PortError> {
+    let DeliberationRecord::DecisionDraft { plan_artifact, .. } = command.persistence().record()
+    else {
+        return Err(invalid_input());
+    };
+    let persisted = read_available_artifact(
+        connection,
+        artifact_reader,
+        plan_artifact.artifact_id(),
+        command.persistence().task_id(),
+        Some(plan_artifact.content_digest().as_str()),
+        Some(plan_artifact.size_bytes()),
+    )?;
+    let canonical =
+        serde_json_canonicalizer::to_vec(command.plan()).map_err(|_| integrity_failure())?;
+    if persisted == canonical {
+        Ok(())
+    } else {
+        Err(integrity_failure())
     }
 }
 
@@ -320,7 +347,10 @@ fn persist_synthesis_plan(
         .events
         .first()
         .ok_or_else(invalid_input)?;
-    let plan_json = serde_json::to_string(command.plan()).map_err(|_| integrity_failure())?;
+    let plan_json = String::from_utf8(
+        serde_json_canonicalizer::to_vec(command.plan()).map_err(|_| integrity_failure())?,
+    )
+    .map_err(|_| integrity_failure())?;
     let plan_digest = format!("sha256:{:x}", Sha256::digest(plan_json.as_bytes()));
     let existing: Option<(String, String, String)> = transaction
         .query_row(

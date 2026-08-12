@@ -695,7 +695,6 @@ fn recovery_rejects_changed_verification_authority_and_decision_evidence() {
                 Some(ClaimVerification::Verified),
             )],
             Vec::new(),
-            &[],
             ArtifactId::new("plan-1").unwrap(),
         )
         .unwrap(),

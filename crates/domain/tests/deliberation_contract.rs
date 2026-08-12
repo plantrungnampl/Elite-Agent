@@ -268,7 +268,6 @@ fn synthesis_rejects_nonterminal_claims_and_selected_approaches_without_evidence
         .unwrap(),
         vec![pending],
         Vec::new(),
-        &[],
     )
     .is_err());
 
@@ -279,7 +278,6 @@ fn synthesis_rejects_nonterminal_claims_and_selected_approaches_without_evidence
         DecisionApproach::new("approach-1", artifact_id("proposal-1"), Vec::new()).unwrap(),
         vec![terminal],
         Vec::new(),
-        &[],
     )
     .is_err());
 }
@@ -296,36 +294,27 @@ fn selected_approach_requires_every_supporting_claim_to_be_verified() {
         let evidence = claim("claim-1", EvidenceFreshness::Current)
             .classify(verification)
             .unwrap();
-        assert!(decision_package(selected.clone(), vec![evidence], Vec::new(), &[]).is_err());
+        assert!(decision_package(selected.clone(), vec![evidence], Vec::new()).is_err());
     }
 
     let verified = claim("claim-1", EvidenceFreshness::Current)
         .classify(ClaimVerification::Verified)
         .unwrap();
-    assert!(decision_package(selected, vec![verified], Vec::new(), &[]).is_ok());
+    assert!(decision_package(selected, vec![verified], Vec::new()).is_ok());
 }
 
 #[test]
-fn synthesis_rejects_lost_dissent() {
+fn decision_rejects_duplicate_dissent_ids() {
     let terminal = terminal_claim("claim-1");
     let selected = selected_approach("approach-1", "claim-1");
-
-    assert!(decision_package(
-        selected.clone(),
-        vec![terminal.clone()],
-        Vec::new(),
-        &["dissent-1"]
-    )
-    .is_err());
-
-    let preserved = vec![Dissent::new(
+    let dissent = Dissent::new(
         "dissent-1",
         "agent-2",
         artifact_id("dissent-artifact-1"),
         "The rollback evidence is incomplete.",
     )
-    .unwrap()];
-    assert!(decision_package(selected, vec![terminal], preserved, &["dissent-1"]).is_ok());
+    .unwrap();
+    assert!(decision_package(selected, vec![terminal], vec![dissent.clone(), dissent],).is_err());
 }
 
 #[test]
@@ -368,15 +357,8 @@ fn decision_members_use_stable_canonical_order() {
         dissent("dissent-a", "agent-2"),
     ];
 
-    let package = DecisionPackage::new(
-        selected,
-        rejected,
-        evidence,
-        dissent,
-        &["dissent-b", "dissent-a"],
-        artifact_id("plan-1"),
-    )
-    .unwrap();
+    let package =
+        DecisionPackage::new(selected, rejected, evidence, dissent, artifact_id("plan-1")).unwrap();
 
     assert_eq!(
         package
@@ -603,14 +585,12 @@ fn decision_package(
     selected: DecisionApproach,
     evidence: Vec<MaterialClaim>,
     dissent: Vec<Dissent>,
-    expected_dissent: &[&str],
 ) -> Result<DecisionPackage, local_agent_terminal_domain::DeliberationError> {
     DecisionPackage::new(
         selected,
         Vec::new(),
         evidence,
         dissent,
-        expected_dissent,
         artifact_id("plan-1"),
     )
 }

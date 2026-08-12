@@ -815,7 +815,6 @@ impl DecisionPackage {
         mut rejected: Vec<RejectedApproach>,
         mut evidence: Vec<MaterialClaim>,
         mut dissent: Vec<Dissent>,
-        expected_dissent_ids: &[&str],
         plan: ArtifactId,
     ) -> Result<Self, DeliberationError> {
         if selected.evidence_claim_ids.is_empty()
@@ -863,18 +862,6 @@ impl DecisionPackage {
         {
             return Err(DeliberationError::InvalidDecision);
         }
-        let actual_dissent: BTreeSet<_> = dissent
-            .iter()
-            .map(|entry| entry.dissent_id.as_str())
-            .collect();
-        let expected_dissent: BTreeSet<_> = expected_dissent_ids.iter().copied().collect();
-        if expected_dissent.len() != expected_dissent_ids.len()
-            || expected_dissent.iter().any(|id| !valid_identifier(id))
-            || actual_dissent != expected_dissent
-        {
-            return Err(DeliberationError::LostDissent);
-        }
-
         Ok(Self {
             selected,
             rejected,

@@ -28,6 +28,7 @@ describe("deliberation Tauri API", () => {
       displayedDigest: `sha256:${"a".repeat(64)}`,
       expectedTaskVersion: 9,
       action: "approve" as const,
+      feedback: null,
     };
 
     await getDeliberationWorkspace(workspace);
@@ -68,10 +69,11 @@ describe("deliberation Tauri API", () => {
         displayedDigest: `sha256:${"a".repeat(64)}`,
         expectedTaskVersion: 9,
         action: "approve",
+        feedback: null,
         rawPlan: { tools: ["shell"] },
       } as unknown as ResolvePlanApprovalRequestDto),
     ).toThrow(
-      "exactly: approvalId, displayedDigest, expectedTaskVersion, action",
+      "exactly: approvalId, displayedDigest, expectedTaskVersion, action, feedback",
     );
     for (const forbidden of [
       "providerPayload",
@@ -87,9 +89,10 @@ describe("deliberation Tauri API", () => {
           displayedDigest: `sha256:${"a".repeat(64)}`,
           expectedTaskVersion: 9,
           action: "approve",
+          feedback: null,
           [forbidden]: "untrusted",
         } as unknown as ResolvePlanApprovalRequestDto),
-      ).toThrow("exactly: approvalId, displayedDigest, expectedTaskVersion, action");
+      ).toThrow("exactly: approvalId, displayedDigest, expectedTaskVersion, action, feedback");
     }
     expect(invoke).not.toHaveBeenCalled();
   });
@@ -104,6 +107,7 @@ describe("deliberation Tauri API", () => {
         displayedDigest: "not-a-digest",
         expectedTaskVersion: 9,
         action: "approve",
+        feedback: null,
       }),
     ).toThrow();
     expect(() =>
@@ -112,6 +116,7 @@ describe("deliberation Tauri API", () => {
         displayedDigest: `sha256:${"a".repeat(64)}`,
         expectedTaskVersion: 0,
         action: "approve",
+        feedback: null,
       }),
     ).toThrow();
     expect(() =>
@@ -120,6 +125,7 @@ describe("deliberation Tauri API", () => {
         displayedDigest: `sha256:${"a".repeat(64)}`,
         expectedTaskVersion: 9,
         action: "replace" as "approve",
+        feedback: null,
       }),
     ).toThrow();
     expect(invoke).not.toHaveBeenCalled();

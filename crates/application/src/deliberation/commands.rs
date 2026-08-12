@@ -286,6 +286,7 @@ impl<'a> DeliberationCommands<'a> {
             || authoritative_claims.len() != verification_set.claims.len()
             || decision_claims.len() != decision.evidence().len()
             || authoritative_claims != decision_claims
+            || !preserves_authoritative_positions(&snapshot, &decision)
         {
             return Err(conflict());
         }
@@ -538,6 +539,45 @@ impl<'a> PersistDeliberationSynthesis<'a> {
         command.validate()?;
         Ok(command)
     }
+}
+
+fn preserves_authoritative_positions(
+    snapshot: &DeliberationSnapshot,
+    decision: &DecisionPackage,
+) -> bool {
+    let Some(quorum) = snapshot.quorum.as_ref() else {
+        return false;
+    };
+    let selected_artifact = decision.selected().artifact_id().as_str();
+    if quorum
+        .proposals()
+        .iter()
+        .filter(|proposal| proposal.artifact_id().as_str() == selected_artifact)
+        .count()
+        != 1
+    {
+        return false;
+    }
+    let expected = quorum
+        .proposals()
+        .iter()
+        .filter(|proposal| proposal.artifact_id().as_str() != selected_artifact)
+        .map(|proposal| (proposal.agent_id(), proposal.artifact_id().as_str()))
+        .collect::<BTreeSet<_>>();
+    let rejected = decision
+        .rejected()
+        .iter()
+        .map(|approach| approach.approach().artifact_id().as_str())
+        .collect::<BTreeSet<_>>();
+    let dissent = decision
+        .dissent()
+        .iter()
+        .map(|position| (position.participant_id(), position.artifact_id().as_str()))
+        .collect::<BTreeSet<_>>();
+    expected.len() == decision.rejected().len()
+        && expected.len() == decision.dissent().len()
+        && expected.iter().all(|(_, artifact_id)| rejected.contains(artifact_id))
+        && expected == dissent
 }
 
 fn build_append(

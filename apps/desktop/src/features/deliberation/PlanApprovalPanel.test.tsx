@@ -46,7 +46,7 @@ describe("PlanApprovalPanel", () => {
       expect(screen.getAllByText(text, { exact: false })[0]).toBeVisible();
     }
     expect(screen.getByRole("button", { name: "Approve" })).toHaveClass("primary-button");
-    for (const action of ["Revise", "Reopen", "Add/replace agent", "Reject"]) {
+    for (const action of ["Revise", "Reject"]) {
       expect(screen.getByRole("button", { name: action })).toBeVisible();
     }
 
@@ -74,17 +74,13 @@ describe("PlanApprovalPanel", () => {
       displayedDigest: `sha256:${"a".repeat(64)}`,
       expectedTaskVersion: 9,
       action: "approve",
+      feedback: null,
     });
     expect(onResolved).toHaveBeenCalled();
     expect(screen.getByRole("status")).toHaveTextContent("Plan approval recorded");
   });
 
-  it.each([
-    ["Revise", "revise"],
-    ["Reopen", "reopen"],
-    ["Add/replace agent", "add_or_replace_agent"],
-    ["Reject", "reject"],
-  ] as const)("maps %s to its allowlisted action", async (label, action) => {
+  it.each([["Reject", "reject"]] as const)("maps %s to its allowlisted action", async (label, action) => {
     const user = userEvent.setup();
     render(
       <PlanApprovalPanel approval={approvalFixture()} taskVersion={9} onResolved={vi.fn()} />,
@@ -95,6 +91,25 @@ describe("PlanApprovalPanel", () => {
       displayedDigest: `sha256:${"a".repeat(64)}`,
       expectedTaskVersion: 9,
       action,
+      feedback: null,
+    });
+  });
+
+  it("requires and submits explicit revision feedback", async () => {
+    const user = userEvent.setup();
+    render(
+      <PlanApprovalPanel approval={approvalFixture()} taskVersion={9} onResolved={vi.fn()} />,
+    );
+    const revise = screen.getByRole("button", { name: "Revise" });
+    expect(revise).toBeDisabled();
+    await user.type(screen.getByRole("textbox", { name: "Revision feedback" }), "Add recovery evidence.");
+    await user.click(revise);
+    expect(deliberationApi.resolvePlanApproval).toHaveBeenCalledWith({
+      approvalId: "approval-1",
+      displayedDigest: `sha256:${"a".repeat(64)}`,
+      expectedTaskVersion: 9,
+      action: "revise",
+      feedback: "Add recovery evidence.",
     });
   });
 
@@ -126,6 +141,7 @@ describe("PlanApprovalPanel", () => {
     render(
       <PlanApprovalPanel approval={approvalFixture()} taskVersion={9} onResolved={vi.fn()} />,
     );
+    await user.type(screen.getByRole("textbox", { name: "Revision feedback" }), "Retry with exact evidence.");
     await user.click(screen.getByRole("button", { name: "Revise" }));
     expect(screen.getByRole("alert")).toHaveTextContent(
       "Approval changed and must be reviewed again.",
