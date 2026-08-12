@@ -365,14 +365,18 @@ impl<'a> DeliberationCommands<'a> {
             return Err(conflict());
         }
         let transition = WorkflowEvent::new("objection.round.closed").map_err(|_| conflict())?;
-        let mut guards = GuardEvaluations::new();
-        guards.insert(
-            GuardName::new("no_accepted_severe_objection").map_err(|_| conflict())?,
-            true,
-        );
-        let next_state = *reduce(&snapshot.task_state, &transition, &guards)
+        let next_state = reduce(
+            &snapshot.task_state,
+            &transition_request(
+                "WF-P013",
+                transition,
+                &["final_objection_clearance"],
+                &["create_plan_approval_request"],
+            ),
+        )
             .map_err(|_| conflict())?
-            .state();
+            .state()
+            .clone();
         let approval_authority = self
             .plan_approval_authority
             .ok_or_else(conflict)?
@@ -600,12 +604,11 @@ fn build_append(
         record.clone(),
     )?;
     let projection_changes = if record.changes_phase() {
-        let mut guards = GuardEvaluations::new();
-        let guard = record.transition_guard().ok_or_else(conflict)?;
-        guards.insert(GuardName::new(guard).map_err(|_| conflict())?, true);
-        let state = *reduce(expected_task_state, &event_type, &guards)
+        let request = transition_request_for_record(record, expected_task_state, event_type.clone())?;
+        let state = reduce(expected_task_state, &request)
             .map_err(|_| conflict())?
-            .state();
+            .state()
+            .clone();
         vec![ProjectionChange::TaskState {
             task_id: task_id.clone(),
             state,
@@ -637,6 +640,71 @@ fn build_append(
         }],
         projection_changes,
     })
+}
+
+fn transition_request_for_record(
+    record: &DeliberationRecord,
+    state: &WorkflowState,
+    event: WorkflowEvent,
+) -> Result<local_agent_terminal_domain::TransitionRequest, PortError> {
+    let (rule_id, evidence_kinds, effect_kinds) = match record {
+        DeliberationRecord::QuorumPublication { .. } => (
+            "WF-P004",
+            ["analysis_quorum_receipt"].as_slice(),
+            ["publish_selected_proposals", "assign_review_edges"].as_slice(),
+        ),
+        DeliberationRecord::ClaimSet { .. } => (
+            "WF-P005",
+            ["review_completion_receipt"].as_slice(),
+            ["freeze_material_claims"].as_slice(),
+        ),
+        DeliberationRecord::VerificationSet { .. } => (
+            "WF-P006",
+            ["claim_verification_set"].as_slice(),
+            ["persist_claim_verification_set"].as_slice(),
+        ),
+        DeliberationRecord::DecisionDraft { .. } => (
+            "WF-P007",
+            ["decision_draft_artifact"].as_slice(),
+            ["publish_immutable_decision_draft"].as_slice(),
+        ),
+        DeliberationRecord::ObjectionSevereAccepted { .. } => (
+            if state.workflow_profile() == local_agent_terminal_domain::WorkflowProfile::Quick {
+                "WF-P009"
+            } else {
+                "WF-P008"
+            },
+            ["accepted_severe_objection"].as_slice(),
+            ["increment_review_round"].as_slice(),
+        ),
+        DeliberationRecord::ObjectionRoundClosed { .. } => (
+            "WF-P013",
+            ["final_objection_clearance"].as_slice(),
+            ["create_plan_approval_request"].as_slice(),
+        ),
+        _ => return Err(conflict()),
+    };
+    Ok(transition_request(rule_id, event, evidence_kinds, effect_kinds))
+}
+
+fn transition_request(
+    rule_id: &str,
+    event: WorkflowEvent,
+    guard_evidence_kinds: &[&str],
+    effect_kinds: &[&str],
+) -> local_agent_terminal_domain::TransitionRequest {
+    local_agent_terminal_domain::TransitionRequest {
+        rule_id: rule_id.to_owned(),
+        event,
+        guard_evidence_kinds: guard_evidence_kinds
+            .iter()
+            .map(|kind| (*kind).to_owned())
+            .collect(),
+        effect_kinds: effect_kinds
+            .iter()
+            .map(|kind| (*kind).to_owned())
+            .collect(),
+    }
 }
 
 fn validate_claim_set(claims: &[MaterialClaim], require_terminal: bool) -> Result<(), PortError> {

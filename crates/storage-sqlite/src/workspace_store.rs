@@ -10,8 +10,8 @@ use local_agent_terminal_application::{
     WorkspaceRecoveryStore, WorkspaceStateStore, WorktreeIntent,
 };
 use local_agent_terminal_domain::{
-    reduce, ArtifactId, Condition, FencingToken, GitObjectId, GuardEvaluations, OperationState,
-    Phase, ProjectId, RepositoryId, Sequence, TaskBranch, TaskId, WorkflowEvent, WorkflowState,
+    reduce, ArtifactId, Condition, FencingToken, GitObjectId, OperationState, Phase, ProjectId,
+    RepositoryId, Sequence, TaskBranch, TaskId, TransitionRequest, WorkflowEvent, WorkflowState,
     WorkspaceVersion, WorktreeId,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
@@ -1349,8 +1349,31 @@ fn record_workspace_mutation_with_authority(
     )
     .map_err(|_| integrity_failure())?;
     let event = WorkflowEvent::new("workspace.mutated").map_err(|_| invalid_input())?;
-    let transition = reduce(&state, &event, &GuardEvaluations::new()).map_err(|_| conflict())?;
-    let next_state = *transition.state();
+    let transition = reduce(
+        &state,
+        &TransitionRequest {
+            rule_id: "WF-W001".to_owned(),
+            event,
+            guard_evidence_kinds: ["workspace_mutation_evidence"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            effect_kinds: [
+                "revoke_executor_lease",
+                "increment_fencing_epoch",
+                "invalidate_affected_approvals",
+                "discard_candidate_tree",
+                "discard_candidate_commit",
+                "stop_write_capable_tools",
+                "capture_workspace_evidence",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        },
+    )
+    .map_err(|_| conflict())?;
+    let next_state = transition.state().clone();
     let next_sequence = current_sequence.checked_add(1).ok_or_else(invalid_input)?;
     let now: String = transaction
         .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {

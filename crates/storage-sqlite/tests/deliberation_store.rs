@@ -1106,7 +1106,7 @@ fn command_context_with_budget(
     DeliberationCommandContext::new(
         snapshot.task_id.clone(),
         snapshot.task_version,
-        snapshot.task_state,
+        snapshot.task_state.clone(),
         budget,
         ActorId::new(actor_id).unwrap(),
         artifact,

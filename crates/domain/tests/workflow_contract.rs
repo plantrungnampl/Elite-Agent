@@ -1,992 +1,406 @@
 use std::collections::BTreeSet;
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use local_agent_terminal_domain::{
-    reduce, ActorId, Condition, EventId, FencingToken, GuardEvaluations, GuardName, OperationState,
-    Phase, Sequence, StreamId, TaskId, WorkflowError, WorkflowEvent, WorkflowState,
-    WorkspaceVersion,
+    reduce, reduce_condition, Condition, FencingToken, GuardEvaluations, GuardName, OperationState,
+    Phase, TaskOutcomeMode, TransitionRequest, WorkflowEvent, WorkflowProfile, WorkflowState,
+    WorkflowStateSnapshot,
 };
 use serde_json::Value;
 
 const WORKFLOW_JSON: &str =
-    include_str!("../../../docs/multi-agent-terminal-design/schemas/workflow-transitions.v1.json");
+    include_str!("../../../docs/multi-agent-terminal-design/schemas/workflow-transitions.v3.json");
 
 fn specification() -> Value {
     serde_json::from_str(WORKFLOW_JSON).expect("normative workflow JSON must parse")
-}
-
-fn enum_names(specification: &Value, field: &str) -> Vec<String> {
-    specification[field]
-        .as_array()
-        .expect("enum list")
-        .iter()
-        .map(|value| value.as_str().expect("enum name").to_owned())
-        .collect()
 }
 
 fn event(name: &str) -> WorkflowEvent {
     WorkflowEvent::new(name).expect("declared event is non-empty")
 }
 
-fn guard_evaluations(values: impl IntoIterator<Item = (String, bool)>) -> GuardEvaluations {
-    let mut evaluations = GuardEvaluations::new();
-    for (name, satisfied) in values {
-        evaluations.insert(
-            GuardName::new(name).expect("declared guard is non-empty"),
-            satisfied,
-        );
-    }
-    evaluations
+fn string_set(values: &Value) -> BTreeSet<String> {
+    values
+        .as_array()
+        .expect("kind array")
+        .iter()
+        .map(|value| value.as_str().expect("kind").to_owned())
+        .collect()
 }
 
-fn guard_for(rule: &Value, satisfied: bool) -> GuardEvaluations {
-    rule.get("guard")
-        .and_then(Value::as_str)
-        .map(|name| guard_evaluations([(name.to_owned(), satisfied)]))
-        .unwrap_or_default()
-}
-
-fn all_satisfied_guards(specification: &Value) -> GuardEvaluations {
-    let transition_groups = [
-        "phaseTransitions",
-        "conditionTransitions",
-        "operationTransitions",
-    ];
-    let mut names = BTreeSet::new();
-
-    for group in transition_groups {
-        for rule in specification[group].as_array().expect("transition list") {
-            if let Some(name) = rule.get("guard").and_then(Value::as_str) {
-                names.insert(name.to_owned());
-            }
-        }
-    }
-    for rule in specification["globalEvents"]
-        .as_object()
-        .expect("global event map")
-        .values()
-    {
-        if let Some(name) = rule.get("guard").and_then(Value::as_str) {
-            names.insert(name.to_owned());
-        }
-    }
-
-    guard_evaluations(names.into_iter().map(|name| (name, true)))
-}
-
-fn state(phase: Phase, condition: Condition, operation: OperationState) -> WorkflowState {
-    state_with_versions(phase, condition, operation, 7, 3, 2)
-}
-
-fn state_with_versions(
+fn state(
     phase: Phase,
     condition: Condition,
     operation: OperationState,
-    sequence: i64,
-    workspace_version: i64,
-    fencing_token: i64,
+    workflow_profile: WorkflowProfile,
+    outcome_mode: TaskOutcomeMode,
 ) -> WorkflowState {
-    WorkflowState::new(
+    WorkflowState::rehydrate(WorkflowStateSnapshot {
         phase,
         condition,
         operation,
-        Sequence::try_from(sequence).expect("nonnegative sequence"),
-        WorkspaceVersion::try_from(workspace_version).expect("nonnegative workspace version"),
-        FencingToken::try_from(fencing_token).expect("positive fencing token"),
-    )
+        workflow_profile,
+        outcome_mode,
+        stream_version: 7,
+        profile_revision: 2,
+        workspace_version: 3,
+        fencing_epoch: 4,
+        last_transition_event_id: Some("transition-7".to_owned()),
+        last_profile_revision_id: Some("profile-revision-2".to_owned()),
+    })
     .expect("valid workflow state")
 }
 
-fn effect_names(outcome: &local_agent_terminal_domain::Transition) -> Vec<&str> {
-    outcome
+fn active_state(phase: Phase, profile: WorkflowProfile, outcome: TaskOutcomeMode) -> WorkflowState {
+    state(
+        phase,
+        Condition::Active,
+        OperationState::None,
+        profile,
+        outcome,
+    )
+}
+
+fn command_request(rule: &Value) -> TransitionRequest {
+    TransitionRequest {
+        rule_id: rule["ruleId"].as_str().expect("rule ID").to_owned(),
+        event: event(rule["event"].as_str().expect("event")),
+        guard_evidence_kinds: string_set(&rule["requiredEvidenceKinds"]),
+        effect_kinds: string_set(&rule["requiredEffectKinds"]),
+    }
+}
+
+fn rule<'a>(specification: &'a Value, rule_id: &str) -> &'a Value {
+    specification["phaseTransitions"]
+        .as_array()
+        .expect("phase rules")
+        .iter()
+        .chain(
+            specification["globalPhaseTransitions"]
+                .as_array()
+                .expect("global rules"),
+        )
+        .chain(std::iter::once(&specification["workspaceDirtyTransition"]))
+        .find(|candidate| candidate["ruleId"].as_str() == Some(rule_id))
+        .unwrap_or_else(|| panic!("missing {rule_id}"))
+}
+
+fn effect_names(transition: &local_agent_terminal_domain::Transition) -> Vec<&str> {
+    transition
         .effects()
         .iter()
         .map(|effect| effect.as_str())
         .collect()
 }
 
-fn expected_effects(rule: &Value) -> Vec<&str> {
-    rule.get("effects")
-        .and_then(Value::as_array)
-        .map(|effects| {
-            effects
-                .iter()
-                .map(|effect| effect.as_str().expect("effect name"))
-                .collect()
-        })
-        .unwrap_or_default()
+fn effect_names_from(rule: &Value) -> Vec<&str> {
+    rule["effects"]
+        .as_array()
+        .expect("effects")
+        .iter()
+        .map(|effect| effect.as_str().expect("effect"))
+        .collect()
 }
 
-fn declared_event_names(specification: &Value) -> Vec<String> {
-    let mut names = BTreeSet::new();
-    for group in [
-        "phaseTransitions",
-        "conditionTransitions",
-        "operationTransitions",
-    ] {
-        for rule in specification[group].as_array().expect("transition list") {
-            names.insert(rule["event"].as_str().expect("transition event").to_owned());
-        }
-    }
-    names.insert(
-        specification["workspaceDirtyTransition"]["event"]
-            .as_str()
-            .expect("workspace dirty event")
-            .to_owned(),
-    );
-    names.extend(
-        specification["globalEvents"]
-            .as_object()
-            .expect("global event map")
-            .keys()
-            .cloned(),
-    );
-    names.into_iter().collect()
-}
-
-fn generated_valid_states() -> Vec<WorkflowState> {
-    let mut states = Vec::new();
-    for phase in Phase::ALL {
-        if phase.is_terminal() {
-            states.push(state(*phase, Condition::Active, OperationState::None));
-            continue;
-        }
-        for condition in Condition::ALL {
-            for operation in OperationState::ALL {
-                states.push(state(*phase, *condition, *operation));
-            }
-        }
-    }
-    states
-}
-
-fn is_declared_for(specification: &Value, source: &WorkflowState, event_name: &str) -> bool {
-    let phase_declared = specification["phaseTransitions"]
-        .as_array()
-        .expect("phase transitions")
-        .iter()
-        .any(|rule| {
-            rule["from"].as_str() == Some(source.phase().as_str())
-                && rule["event"].as_str() == Some(event_name)
-        });
-    let condition_declared = specification["conditionTransitions"]
-        .as_array()
-        .expect("condition transitions")
-        .iter()
-        .any(|rule| {
-            rule["from"].as_str() == Some(source.condition().as_str())
-                && rule["event"].as_str() == Some(event_name)
-        });
-    let operation_declared = specification["operationTransitions"]
-        .as_array()
-        .expect("operation transitions")
-        .iter()
-        .any(|rule| {
-            rule["from"].as_str() == Some(source.operation().as_str())
-                && rule["event"].as_str() == Some(event_name)
-        });
-    let workspace_dirty_declared = specification["workspaceDirtySources"]
-        .as_array()
-        .expect("workspace dirty sources")
-        .iter()
-        .any(|phase| phase.as_str() == Some(source.phase().as_str()))
-        && specification["workspaceDirtyTransition"]["event"].as_str() == Some(event_name);
-    let global_declared = !source.phase().is_terminal()
-        && specification["globalEvents"]
-            .as_object()
-            .expect("global events")
-            .contains_key(event_name);
-
-    phase_declared
-        || condition_declared
-        || operation_declared
-        || workspace_dirty_declared
-        || global_declared
+fn guard_evaluations(guard: &str, satisfied: bool) -> GuardEvaluations {
+    let mut evaluations = GuardEvaluations::new();
+    evaluations.insert(GuardName::new(guard).expect("declared guard"), satisfied);
+    evaluations
 }
 
 #[test]
-fn parses_every_normative_phase_condition_and_operation_state() {
-    let specification = specification();
+fn v3_state_retains_profile_outcome_and_authority_versions() {
+    let state = WorkflowState::rehydrate(WorkflowStateSnapshot {
+        phase: Phase::ContextBuild,
+        condition: Condition::Active,
+        operation: OperationState::None,
+        workflow_profile: WorkflowProfile::Quick,
+        outcome_mode: TaskOutcomeMode::WorkspaceChange,
+        stream_version: 7,
+        profile_revision: 2,
+        workspace_version: 3,
+        fencing_epoch: 4,
+        last_transition_event_id: Some("transition-7".to_owned()),
+        last_profile_revision_id: Some("profile-revision-2".to_owned()),
+    })
+    .unwrap();
 
-    let phases = enum_names(&specification, "phases");
-    assert_eq!(phases.len(), Phase::ALL.len());
-    for name in phases {
-        let parsed = Phase::from_str(&name).expect("declared phase must parse");
-        assert_eq!(parsed.as_str(), name);
-    }
-
-    let conditions = enum_names(&specification, "conditions");
-    assert_eq!(conditions.len(), Condition::ALL.len());
-    for name in conditions {
-        let parsed = Condition::from_str(&name).expect("declared condition must parse");
-        assert_eq!(parsed.as_str(), name);
-    }
-
-    let operations = enum_names(&specification, "operationStates");
-    assert_eq!(operations.len(), OperationState::ALL.len());
-    for name in operations {
-        let parsed = OperationState::from_str(&name).expect("declared operation state must parse");
-        assert_eq!(parsed.as_str(), name);
-    }
-
-    assert!(Phase::from_str("Invented").is_err());
-    assert!(Condition::from_str("Invented").is_err());
-    assert!(OperationState::from_str("Invented").is_err());
+    assert_eq!(state.workflow_profile(), WorkflowProfile::Quick);
+    assert_eq!(state.outcome_mode(), TaskOutcomeMode::WorkspaceChange);
+    assert_eq!(state.stream_version(), 7);
+    assert_eq!(state.profile_revision(), 2);
+    assert_eq!(state.workspace_version().get(), 3);
+    assert_eq!(state.fencing_token(), FencingToken::new(4).unwrap());
+    assert_eq!(state.last_transition_event_id(), Some("transition-7"));
+    assert_eq!(state.last_profile_revision_id(), Some("profile-revision-2"));
 }
 
 #[test]
-fn accepts_every_declared_phase_transition_and_exact_effects() {
+fn v3_enums_and_authoritative_rule_counts_match_the_schema() {
     let specification = specification();
 
-    for rule in specification["phaseTransitions"]
+    assert_eq!(
+        specification["workflowProfiles"].as_array().unwrap().len(),
+        4
+    );
+    assert_eq!(
+        specification["taskOutcomeModes"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(
+        specification["phaseTransitions"].as_array().unwrap().len(),
+        30
+    );
+    assert_eq!(
+        specification["globalPhaseTransitions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(specification["workspaceDirtyTransition"]["ruleId"]
+        .as_str()
+        .unwrap()
+        .starts_with("WF-W"));
+    assert_eq!(
+        specification["conditionTransitions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+
+    for name in specification["phases"].as_array().unwrap() {
+        let name = name.as_str().unwrap();
+        assert_eq!(Phase::from_str(name).unwrap().as_str(), name);
+    }
+    for name in specification["workflowProfiles"].as_array().unwrap() {
+        let name = name.as_str().unwrap();
+        assert_eq!(WorkflowProfile::from_str(name).unwrap().as_str(), name);
+    }
+    for name in specification["taskOutcomeModes"].as_array().unwrap() {
+        let name = name.as_str().unwrap();
+        assert_eq!(TaskOutcomeMode::from_str(name).unwrap().as_str(), name);
+    }
+    for condition in specification["conditionTransitions"].as_array().unwrap() {
+        assert!(condition.get("ruleId").is_none());
+        assert!(condition.get("effects").is_none());
+        assert!(condition.get("requiredEffectKinds").is_none());
+    }
+}
+
+#[test]
+fn every_id_bearing_rule_accepts_its_declared_source_profile_outcome_and_exact_sets() {
+    let specification = specification();
+    let rules = specification["phaseTransitions"]
         .as_array()
-        .expect("phase transitions")
-    {
-        let from = Phase::from_str(rule["from"].as_str().expect("from phase")).unwrap();
-        let to = Phase::from_str(rule["to"].as_str().expect("to phase")).unwrap();
-        let event_name = rule["event"].as_str().expect("event");
-        let source = state(from, Condition::Active, OperationState::None);
+        .unwrap()
+        .iter()
+        .chain(specification["globalPhaseTransitions"].as_array().unwrap())
+        .chain(std::iter::once(&specification["workspaceDirtyTransition"]));
 
-        let outcome = reduce(&source, &event(event_name), &guard_for(rule, true))
-            .unwrap_or_else(|error| panic!("{from:?} --{event_name}--> {to:?}: {error:?}"));
+    for rule in rules {
+        let source_phase = rule
+            .get("from")
+            .and_then(Value::as_str)
+            .or_else(|| rule["fromPhases"][0].as_str())
+            .expect("source phase");
+        let profile = WorkflowProfile::from_str(
+            rule["allowedProfiles"][0]
+                .as_str()
+                .expect("allowed profile"),
+        )
+        .unwrap();
+        let outcome = TaskOutcomeMode::from_str(
+            rule["allowedOutcomes"][0]
+                .as_str()
+                .expect("allowed outcome"),
+        )
+        .unwrap();
+        let source = active_state(Phase::from_str(source_phase).unwrap(), profile, outcome);
+        let transition = reduce(&source, &command_request(rule)).unwrap_or_else(|error| {
+            panic!(
+                "{} should reduce: {error:?}",
+                rule["ruleId"].as_str().unwrap()
+            )
+        });
 
-        assert_eq!(outcome.state().phase(), to);
         assert_eq!(
-            outcome.state().sequence().get(),
-            source.sequence().get() + 1
+            transition.state().phase(),
+            Phase::from_str(rule["to"].as_str().unwrap()).unwrap()
         );
-        assert_eq!(effect_names(&outcome), expected_effects(rule));
+        assert_eq!(transition.state().stream_version(), 8);
+        assert_eq!(
+            transition.state().workflow_profile(),
+            source.workflow_profile()
+        );
+        assert_eq!(transition.state().outcome_mode(), source.outcome_mode());
+        assert_eq!(transition.rule_id(), rule["ruleId"].as_str());
+        assert_eq!(effect_names(&transition), effect_names_from(rule));
     }
 }
 
 #[test]
-fn accepts_every_declared_condition_transition_without_changing_phase() {
+fn quick_context_path_uses_wf_p003_and_not_standard_route() {
     let specification = specification();
+    let source = active_state(
+        Phase::ContextBuild,
+        WorkflowProfile::Quick,
+        TaskOutcomeMode::WorkspaceChange,
+    );
 
-    for rule in specification["conditionTransitions"]
-        .as_array()
-        .expect("condition transitions")
-    {
-        let from = Condition::from_str(rule["from"].as_str().expect("from condition")).unwrap();
-        let to = Condition::from_str(rule["to"].as_str().expect("to condition")).unwrap();
-        let source = state(Phase::ContextBuild, from, OperationState::None);
-
-        let outcome = reduce(
-            &source,
-            &event(rule["event"].as_str().expect("event")),
-            &guard_for(rule, true),
-        )
-        .unwrap();
-
-        assert_eq!(outcome.state().phase(), source.phase());
-        assert_eq!(outcome.state().condition(), to);
-        assert_eq!(outcome.state().operation(), source.operation());
-    }
+    let quick = reduce(&source, &command_request(rule(&specification, "WF-P003"))).unwrap();
+    assert_eq!(quick.state().phase(), Phase::PrePlanVerification);
+    assert!(reduce(&source, &command_request(rule(&specification, "WF-P002"))).is_err());
 }
 
 #[test]
-fn accepts_every_declared_operation_transition_without_changing_phase() {
+fn severe_objection_routes_are_profile_specific() {
     let specification = specification();
+    let quick = active_state(
+        Phase::FinalObjection,
+        WorkflowProfile::Quick,
+        TaskOutcomeMode::WorkspaceChange,
+    );
+    let standard = active_state(
+        Phase::FinalObjection,
+        WorkflowProfile::Standard,
+        TaskOutcomeMode::WorkspaceChange,
+    );
 
-    for rule in specification["operationTransitions"]
-        .as_array()
-        .expect("operation transitions")
-    {
-        let from =
-            OperationState::from_str(rule["from"].as_str().expect("from operation")).unwrap();
-        let to = OperationState::from_str(rule["to"].as_str().expect("to operation")).unwrap();
-        let source = state(Phase::ContextBuild, Condition::Active, from);
-
-        let outcome = reduce(
-            &source,
-            &event(rule["event"].as_str().expect("event")),
-            &guard_for(rule, true),
-        )
-        .unwrap();
-
-        assert_eq!(outcome.state().phase(), source.phase());
-        assert_eq!(outcome.state().condition(), source.condition());
-        assert_eq!(outcome.state().operation(), to);
-    }
+    assert_eq!(
+        reduce(&quick, &command_request(rule(&specification, "WF-P009")))
+            .unwrap()
+            .state()
+            .phase(),
+        Phase::PrePlanVerification
+    );
+    assert!(reduce(&quick, &command_request(rule(&specification, "WF-P008"))).is_err());
+    assert_eq!(
+        reduce(&standard, &command_request(rule(&specification, "WF-P008")))
+            .unwrap()
+            .state()
+            .phase(),
+        Phase::CrossReview
+    );
+    assert!(reduce(&standard, &command_request(rule(&specification, "WF-P009"))).is_err());
 }
 
 #[test]
-fn accepts_workspace_dirty_and_global_transitions_from_their_declared_sources() {
+fn plan_approval_requires_wf_p015_exact_effect_set_and_preserves_profile_revision() {
     let specification = specification();
-    let dirty_rule = &specification["workspaceDirtyTransition"];
+    let source = active_state(
+        Phase::AwaitingPlanApproval,
+        WorkflowProfile::Standard,
+        TaskOutcomeMode::WorkspaceChange,
+    );
+    let rule = rule(&specification, "WF-P015");
 
-    for source_name in enum_names(&specification, "workspaceDirtySources") {
-        let source_phase = Phase::from_str(&source_name).unwrap();
-        let source = state(source_phase, Condition::Active, OperationState::None);
-        let outcome = reduce(
-            &source,
-            &event(dirty_rule["event"].as_str().unwrap()),
-            &GuardEvaluations::new(),
-        )
-        .unwrap();
+    let transition = reduce(&source, &command_request(rule)).unwrap();
+    assert_eq!(transition.state().phase(), Phase::Implementation);
+    assert_eq!(transition.state().profile_revision(), 2);
+    assert_eq!(
+        effect_names(&transition),
+        vec!["persist_approved_plan_version", "allocate_executor_lease"]
+    );
 
-        assert_eq!(outcome.state().phase(), Phase::WorkspaceDirty);
-        assert_eq!(effect_names(&outcome), expected_effects(dirty_rule));
-    }
+    let mut missing_effect = command_request(rule);
+    missing_effect.effect_kinds.clear();
+    assert!(reduce(&source, &missing_effect).is_err());
 
-    for (event_name, rule) in specification["globalEvents"].as_object().unwrap() {
-        let source = state(Phase::ContextBuild, Condition::Active, OperationState::None);
-        let outcome = reduce(&source, &event(event_name), &guard_for(rule, true)).unwrap();
-        let expected_phase = rule
-            .get("to")
-            .and_then(Value::as_str)
-            .map(|name| Phase::from_str(name).unwrap())
-            .unwrap_or(source.phase());
-
-        assert_eq!(outcome.state().phase(), expected_phase);
-        let expected_global_effect = rule
-            .get("effect")
-            .and_then(Value::as_str)
-            .into_iter()
-            .collect::<Vec<_>>();
-        assert_eq!(effect_names(&outcome), expected_global_effect);
-    }
+    let mut extra_effect = command_request(rule);
+    extra_effect
+        .effect_kinds
+        .insert("invented_effect".to_owned());
+    assert!(reduce(&source, &extra_effect).is_err());
 }
 
 #[test]
-fn rejects_each_named_guard_when_false_or_missing() {
+fn global_terminal_paths_accept_every_declared_source_then_become_irreversible() {
     let specification = specification();
 
-    for group in [
-        "phaseTransitions",
-        "conditionTransitions",
-        "operationTransitions",
-    ] {
-        for rule in specification[group].as_array().unwrap() {
-            let Some(guard_name) = rule.get("guard").and_then(Value::as_str) else {
-                continue;
-            };
-            let source = match group {
-                "phaseTransitions" => state(
-                    Phase::from_str(rule["from"].as_str().unwrap()).unwrap(),
-                    Condition::Active,
-                    OperationState::None,
-                ),
-                "conditionTransitions" => state(
-                    Phase::ContextBuild,
-                    Condition::from_str(rule["from"].as_str().unwrap()).unwrap(),
-                    OperationState::None,
-                ),
-                "operationTransitions" => state(
-                    Phase::ContextBuild,
-                    Condition::Active,
-                    OperationState::from_str(rule["from"].as_str().unwrap()).unwrap(),
-                ),
-                _ => unreachable!(),
-            };
-            let transition_event = event(rule["event"].as_str().unwrap());
-
-            let false_error =
-                reduce(&source, &transition_event, &guard_for(rule, false)).unwrap_err();
-            assert!(matches!(
-                false_error,
-                WorkflowError::GuardRejected { ref guard } if guard.as_str() == guard_name
-            ));
-
-            let missing_error =
-                reduce(&source, &transition_event, &GuardEvaluations::new()).unwrap_err();
-            assert!(matches!(
-                missing_error,
-                WorkflowError::GuardNotEvaluated { ref guard } if guard.as_str() == guard_name
-            ));
+    for rule in specification["globalPhaseTransitions"].as_array().unwrap() {
+        for source in rule["fromPhases"].as_array().unwrap() {
+            let source = state(
+                Phase::from_str(source.as_str().unwrap()).unwrap(),
+                Condition::Paused,
+                OperationState::Running,
+                WorkflowProfile::Standard,
+                TaskOutcomeMode::WorkspaceChange,
+            );
+            let terminal = reduce(&source, &command_request(rule)).unwrap();
+            assert!(terminal.state().phase().is_terminal());
+            assert_eq!(terminal.state().condition(), Condition::Active);
+            assert_eq!(terminal.state().operation(), OperationState::None);
+            assert!(reduce(terminal.state(), &command_request(rule)).is_err());
         }
     }
-
-    for (event_name, rule) in specification["globalEvents"].as_object().unwrap() {
-        let Some(guard_name) = rule.get("guard").and_then(Value::as_str) else {
-            continue;
-        };
-        let source = state(Phase::ContextBuild, Condition::Active, OperationState::None);
-        let error = reduce(&source, &event(event_name), &guard_for(rule, false)).unwrap_err();
-        assert!(matches!(
-            error,
-            WorkflowError::GuardRejected { ref guard } if guard.as_str() == guard_name
-        ));
-    }
 }
 
 #[test]
-fn rejects_undeclared_transitions_and_paused_phase_advancement() {
-    let intake = state(Phase::Intake, Condition::Active, OperationState::None);
-    let before = intake;
-    let error = reduce(
-        &intake,
-        &event("context.initial.ready"),
-        &guard_evaluations([("required_context_packages_valid".to_owned(), true)]),
-    )
-    .unwrap_err();
-    assert!(matches!(error, WorkflowError::UndeclaredTransition { .. }));
-    assert_eq!(intake, before);
+fn condition_rules_are_idless_and_change_only_condition_and_stream_version() {
+    let specification = specification();
 
-    let paused = state(Phase::Intake, Condition::Paused, OperationState::None);
-    let error = reduce(
-        &paused,
-        &event("task.validated"),
-        &guard_evaluations([("repository_policy_budgets_valid".to_owned(), true)]),
-    )
-    .unwrap_err();
-    assert!(matches!(error, WorkflowError::PhaseNotDispatchable { .. }));
-
-    let error = reduce(
-        &intake,
-        &event("workspace.mutated"),
-        &GuardEvaluations::new(),
-    )
-    .unwrap_err();
-    assert!(matches!(error, WorkflowError::UndeclaredTransition { .. }));
-}
-
-#[test]
-fn observed_workspace_mutation_increments_version_outside_json_effects() {
-    let source = state(Phase::FinalReview, Condition::Active, OperationState::None);
-    let dirty_rule = &specification()["workspaceDirtyTransition"];
-    assert!(
-        !expected_effects(dirty_rule).contains(&"increment_workspace_version"),
-        "workspace version is a cross-document trust invariant, not a declared JSON effect"
-    );
-    let dirty = reduce(
-        &source,
-        &event("workspace.mutated"),
-        &GuardEvaluations::new(),
-    )
-    .unwrap();
-
-    assert_eq!(dirty.state().phase(), Phase::WorkspaceDirty);
-    assert_eq!(
-        dirty.state().workspace_version().get(),
-        source.workspace_version().get() + 1
-    );
-}
-
-#[test]
-fn preserves_workspace_dirty_recovery_and_fencing_semantics() {
-    let source = state(Phase::FinalReview, Condition::Active, OperationState::None);
-    let dirty = reduce(
-        &source,
-        &event("workspace.mutated"),
-        &GuardEvaluations::new(),
-    )
-    .unwrap();
-
-    assert_eq!(dirty.state().phase(), Phase::WorkspaceDirty);
-    assert_eq!(
-        dirty.state().fencing_token().get(),
-        source.fencing_token().get() + 1
-    );
-    assert!(effect_names(&dirty).contains(&"invalidate_affected_approvals"));
-
-    let repaired = reduce(
-        dirty.state(),
-        &event("workspace.repair.authorized"),
-        &guard_evaluations([("mutation_evidence_preserved".to_owned(), true)]),
-    )
-    .unwrap();
-    assert_eq!(repaired.state().phase(), Phase::Repair);
-    assert_eq!(
-        repaired.state().fencing_token().get(),
-        dirty.state().fencing_token().get() + 1
-    );
-
-    let reconciled_source = state(
-        Phase::WorkspaceDirty,
-        Condition::Active,
-        OperationState::None,
-    );
-    let reconciled = reduce(
-        &reconciled_source,
-        &event("workspace.reconciled"),
-        &guard_evaluations([("candidate_rebuilt_and_verified".to_owned(), true)]),
-    )
-    .unwrap();
-    assert_eq!(reconciled.state().phase(), Phase::FinalReview);
-}
-
-#[test]
-fn condition_changes_inside_workspace_dirty_do_not_invent_new_mutations() {
-    let dirty = state(
-        Phase::WorkspaceDirty,
-        Condition::Active,
-        OperationState::None,
-    );
-    let paused = reduce(
-        &dirty,
-        &event("task.paused"),
-        &guard_evaluations([("phase_nonterminal".to_owned(), true)]),
-    )
-    .unwrap();
-
-    assert_eq!(paused.state().condition(), Condition::Paused);
-    assert_eq!(
-        paused.state().workspace_version(),
-        dirty.workspace_version()
-    );
-    assert_eq!(paused.state().fencing_token(), dirty.fencing_token());
-}
-
-#[test]
-fn preserves_approval_and_verification_repair_semantics() {
-    let awaiting_plan = state(
-        Phase::AwaitingPlanApproval,
-        Condition::Active,
-        OperationState::None,
-    );
-    let approved = reduce(
-        &awaiting_plan,
-        &event("plan.approved"),
-        &guard_evaluations([("plan_approval_digest_valid".to_owned(), true)]),
-    )
-    .unwrap();
-    assert_eq!(approved.state().phase(), Phase::Implementation);
-    assert_eq!(
-        approved.state().fencing_token().get(),
-        awaiting_plan.fencing_token().get() + 1
-    );
-
-    let approval_required = reduce(
-        &state(
-            Phase::Implementation,
-            Condition::Active,
-            OperationState::None,
-        ),
-        &event("operation.approval.required"),
-        &GuardEvaluations::new(),
-    )
-    .unwrap();
-    assert_eq!(
-        approval_required.state().operation(),
-        OperationState::AwaitingApproval
-    );
-    let running = reduce(
-        approval_required.state(),
-        &event("approval.granted"),
-        &guard_evaluations([("approval_digest_recomputed".to_owned(), true)]),
-    )
-    .unwrap();
-    assert_eq!(running.state().operation(), OperationState::Running);
-
-    let verification = state(Phase::Verification, Condition::Active, OperationState::None);
-    let repair = reduce(
-        &verification,
-        &event("verification.failed"),
-        &guard_evaluations([("repair_budget_available".to_owned(), true)]),
-    )
-    .unwrap();
-    assert_eq!(repair.state().phase(), Phase::Repair);
-    assert_eq!(
-        repair.state().fencing_token().get(),
-        verification.fencing_token().get() + 1
-    );
-
-    let submitted = reduce(
-        repair.state(),
-        &event("repair.submitted"),
-        &guard_evaluations([("current_fenced_executor_and_scoped_writes".to_owned(), true)]),
-    )
-    .unwrap();
-    assert_eq!(submitted.state().phase(), Phase::Verification);
-    assert_eq!(
-        submitted.state().workspace_version().get(),
-        repair.state().workspace_version().get() + 1
-    );
-}
-
-#[test]
-fn approval_granted_requires_an_active_condition() {
-    let guards = guard_evaluations([("approval_digest_recomputed".to_owned(), true)]);
-
-    for condition in [
-        Condition::Paused,
-        Condition::Blocked,
-        Condition::BudgetExhausted,
-    ] {
+    for rule in specification["conditionTransitions"].as_array().unwrap() {
         let source = state(
-            Phase::Implementation,
-            condition,
-            OperationState::AwaitingApproval,
+            Phase::Verification,
+            Condition::from_str(rule["from"].as_str().unwrap()).unwrap(),
+            OperationState::Running,
+            WorkflowProfile::HighAssurance,
+            TaskOutcomeMode::LocalCommit,
         );
-        let before = source;
+        let transition = reduce_condition(
+            &source,
+            &event(rule["event"].as_str().unwrap()),
+            &guard_evaluations(rule["guard"].as_str().unwrap(), true),
+        )
+        .unwrap_or_else(|error| panic!("condition rule should reduce: {error:?}"));
 
-        let result = reduce(&source, &event("approval.granted"), &guards);
-
-        assert!(
-            result.is_err(),
-            "approval entered Running while condition was {condition}"
+        assert_eq!(
+            transition.state().condition(),
+            Condition::from_str(rule["to"].as_str().unwrap()).unwrap()
         );
-        assert_eq!(source, before);
+        assert_eq!(transition.state().phase(), source.phase());
+        assert_eq!(transition.state().operation(), source.operation());
+        assert_eq!(
+            transition.state().workflow_profile(),
+            source.workflow_profile()
+        );
+        assert_eq!(transition.state().outcome_mode(), source.outcome_mode());
+        assert_eq!(
+            transition.state().profile_revision(),
+            source.profile_revision()
+        );
+        assert_eq!(
+            transition.state().workspace_version(),
+            source.workspace_version()
+        );
+        assert_eq!(transition.state().fencing_token(), source.fencing_token());
+        assert_eq!(
+            transition.state().stream_version(),
+            source.stream_version() + 1
+        );
+        assert_eq!(transition.rule_id(), None);
+        assert!(transition.effects().is_empty());
     }
 }
 
 #[test]
-fn terminal_states_are_normalized_and_cannot_transition() {
-    assert!(WorkflowState::new(
-        Phase::Completed,
-        Condition::Paused,
-        OperationState::None,
-        Sequence::try_from(0).unwrap(),
-        WorkspaceVersion::try_from(0).unwrap(),
-        FencingToken::try_from(1).unwrap(),
+fn condition_rules_require_their_declared_guard() {
+    let specification = specification();
+    let rule = &specification["conditionTransitions"][0];
+    let source = active_state(
+        Phase::ContextBuild,
+        WorkflowProfile::Standard,
+        TaskOutcomeMode::WorkspaceChange,
+    );
+    let event = event(rule["event"].as_str().unwrap());
+
+    assert!(reduce_condition(&source, &event, &GuardEvaluations::new()).is_err());
+    assert!(reduce_condition(
+        &source,
+        &event,
+        &guard_evaluations(rule["guard"].as_str().unwrap(), false)
     )
     .is_err());
-
-    let local_commit = state(Phase::LocalCommit, Condition::Active, OperationState::None);
-    let completed = reduce(
-        &local_commit,
-        &event("commit.verified"),
-        &guard_evaluations([("commit_tree_equals_candidate_tree".to_owned(), true)]),
-    )
-    .unwrap();
-    assert_eq!(completed.state().phase(), Phase::Completed);
-    assert_eq!(completed.state().condition(), Condition::Active);
-    assert_eq!(completed.state().operation(), OperationState::None);
-
-    for event_name in declared_event_names(&specification()) {
-        let error = reduce(
-            completed.state(),
-            &event(&event_name),
-            &all_satisfied_guards(&specification()),
-        )
-        .unwrap_err();
-        assert!(matches!(error, WorkflowError::TerminalPhase { .. }));
-    }
-}
-
-#[test]
-fn cancellation_and_failure_require_resolved_external_operations() {
-    let running = state(
-        Phase::Implementation,
-        Condition::Active,
-        OperationState::Running,
-    );
-    let requested = reduce(
-        &running,
-        &event("task.cancel.requested"),
-        &GuardEvaluations::new(),
-    )
-    .unwrap();
-    assert_eq!(requested.state().phase(), Phase::Implementation);
-    assert_eq!(requested.state().operation(), OperationState::Cancelling);
-
-    let error = reduce(&running, &event("task.cancelled"), &GuardEvaluations::new()).unwrap_err();
-    assert!(matches!(error, WorkflowError::OperationNotResolved { .. }));
-
-    let indeterminate = state(
-        Phase::Implementation,
-        Condition::Active,
-        OperationState::Indeterminate,
-    );
-    let error = reduce(
-        &indeterminate,
-        &event("task.failed"),
-        &guard_evaluations([(
-            "no_running_or_indeterminate_operation_and_failure_evidence_persisted".to_owned(),
-            true,
-        )]),
-    )
-    .unwrap_err();
-    assert!(matches!(error, WorkflowError::OperationNotResolved { .. }));
-
-    let resolved = state(
-        Phase::Implementation,
-        Condition::Paused,
-        OperationState::None,
-    );
-    let cancelled = reduce(
-        &resolved,
-        &event("task.cancelled"),
-        &GuardEvaluations::new(),
-    )
-    .unwrap();
-    assert_eq!(cancelled.state().phase(), Phase::Cancelled);
-    assert_eq!(cancelled.state().condition(), Condition::Active);
-    assert_eq!(cancelled.state().operation(), OperationState::None);
-}
-
-#[test]
-fn task_failed_excludes_exactly_running_and_indeterminate_operations() {
-    let guards = guard_evaluations([(
-        "no_running_or_indeterminate_operation_and_failure_evidence_persisted".to_owned(),
-        true,
-    )]);
-
-    for operation in [
-        OperationState::None,
-        OperationState::AwaitingApproval,
-        OperationState::Cancelling,
-    ] {
-        let source = state(Phase::Implementation, Condition::Paused, operation);
-        let failed = reduce(&source, &event("task.failed"), &guards)
-            .unwrap_or_else(|error| panic!("{operation} should be accepted: {error}"));
-
-        assert_eq!(failed.state().phase(), Phase::Failed);
-        assert_eq!(failed.state().condition(), Condition::Active);
-        assert_eq!(failed.state().operation(), OperationState::None);
-    }
-
-    for operation in [OperationState::Running, OperationState::Indeterminate] {
-        let source = state(Phase::Implementation, Condition::Active, operation);
-        assert!(matches!(
-            reduce(&source, &event("task.failed"), &guards),
-            Err(WorkflowError::OperationNotResolved {
-                operation: rejected
-            }) if rejected == operation
-        ));
-    }
-}
-
-#[test]
-fn task_cancelled_still_requires_a_fully_resolved_operation() {
-    for operation in OperationState::ALL
-        .iter()
-        .copied()
-        .filter(|operation| *operation != OperationState::None)
-    {
-        let source = state(Phase::Implementation, Condition::Active, operation);
-        assert!(matches!(
-            reduce(
-                &source,
-                &event("task.cancelled"),
-                &GuardEvaluations::new()
-            ),
-            Err(WorkflowError::OperationNotResolved {
-                operation: rejected
-            }) if rejected == operation
-        ));
-    }
-}
-
-#[test]
-fn typed_ids_and_numeric_values_reject_invalid_boundaries() {
-    assert_eq!(TaskId::new("task-1").unwrap().as_str(), "task-1");
-    assert_eq!(StreamId::new("stream-1").unwrap().as_str(), "stream-1");
-    assert_eq!(EventId::new("event-1").unwrap().as_str(), "event-1");
-    assert_eq!(ActorId::new("actor-1").unwrap().as_str(), "actor-1");
-
-    assert!(TaskId::new("").is_err());
-    assert!(StreamId::new("  ").is_err());
-    assert!(EventId::new("\n").is_err());
-    assert!(ActorId::new("\t").is_err());
-
-    assert_eq!(Sequence::try_from(0).unwrap().get(), 0);
-    assert!(Sequence::try_from(-1).is_err());
-    assert_eq!(WorkspaceVersion::try_from(0).unwrap().get(), 0);
-    assert!(WorkspaceVersion::try_from(-1).is_err());
-    assert_eq!(FencingToken::try_from(1).unwrap().get(), 1);
-    assert!(FencingToken::try_from(0).is_err());
-    assert!(FencingToken::try_from(-1).is_err());
-}
-
-#[test]
-fn numeric_values_cover_the_normative_u64_range_and_reject_overflow() {
-    assert_eq!(Sequence::new(u64::MAX).get(), u64::MAX);
-    assert_eq!(WorkspaceVersion::new(u64::MAX).get(), u64::MAX);
-    assert_eq!(FencingToken::new(u64::MAX).unwrap().get(), u64::MAX);
-    assert!(FencingToken::new(0).is_err());
-
-    let source = WorkflowState::new(
-        Phase::Intake,
-        Condition::Active,
-        OperationState::None,
-        Sequence::new(u64::MAX),
-        WorkspaceVersion::new(0),
-        FencingToken::new(1).unwrap(),
-    )
-    .unwrap();
-    let before = source;
-    let error = reduce(
-        &source,
-        &event("task.validated"),
-        &guard_evaluations([("repository_policy_budgets_valid".to_owned(), true)]),
-    )
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        WorkflowError::VersionOverflow { field: "sequence" }
-    ));
-    assert_eq!(source, before);
-}
-
-#[test]
-fn generated_rejections_leave_state_unchanged() {
-    for source in generated_valid_states() {
-        let before = source;
-        let result = reduce(
-            &source,
-            &event("undeclared.property.event"),
-            &GuardEvaluations::new(),
-        );
-
-        assert!(result.is_err());
-        assert_eq!(source, before);
-    }
-}
-
-#[test]
-fn generated_accepted_transitions_are_normative_and_versions_never_decrease() {
-    let specification = specification();
-    let guards = all_satisfied_guards(&specification);
-    let events = declared_event_names(&specification);
-
-    for source in generated_valid_states() {
-        for event_name in &events {
-            if let Ok(outcome) = reduce(&source, &event(event_name), &guards) {
-                assert!(
-                    is_declared_for(&specification, &source, event_name),
-                    "accepted undeclared transition from {:?} on {event_name}",
-                    source
-                );
-                assert_eq!(
-                    outcome.state().sequence().get(),
-                    source.sequence().get() + 1
-                );
-                assert!(
-                    outcome.state().workspace_version().get() >= source.workspace_version().get()
-                );
-                assert!(outcome.state().fencing_token().get() >= source.fencing_token().get());
-            }
-        }
-    }
-}
-
-#[test]
-fn generated_terminal_states_never_leave_terminality_without_a_declared_recovery() {
-    let specification = specification();
-    let guards = all_satisfied_guards(&specification);
-
-    for phase in Phase::ALL
-        .iter()
-        .copied()
-        .filter(|phase| phase.is_terminal())
-    {
-        let terminal = state(phase, Condition::Active, OperationState::None);
-        for event_name in declared_event_names(&specification) {
-            let explicitly_declared_recovery = specification["phaseTransitions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|rule| {
-                    rule["from"].as_str() == Some(phase.as_str())
-                        && rule["event"].as_str() == Some(event_name.as_str())
-                });
-            let result = reduce(&terminal, &event(&event_name), &guards);
-
-            assert!(
-                result.is_err() || explicitly_declared_recovery,
-                "terminal phase {phase:?} left terminality on {event_name}"
-            );
-        }
-    }
-}
-
-#[test]
-fn domain_crate_declares_only_pure_data_dependencies() {
-    const MANIFEST: &str = include_str!("../Cargo.toml");
-
-    let dependency_section = MANIFEST
-        .split_once("[dependencies]")
-        .expect("dependency section")
-        .1
-        .split("\n[")
-        .next()
-        .expect("dependency body");
-    let direct_dependencies = dependency_section
-        .lines()
-        .filter_map(|line| line.split_once('=').map(|(name, _)| name.trim()))
-        .filter(|name| !name.is_empty())
-        .collect::<BTreeSet<_>>();
-
-    assert_eq!(
-        direct_dependencies,
-        BTreeSet::from(["serde", "serde_json", "serde_json_canonicalizer", "sha2"])
-    );
-
-    for source_path in domain_source_paths() {
-        let source = fs::read_to_string(&source_path).unwrap_or_else(|error| {
-            panic!("read domain source {}: {error}", source_path.display())
-        });
-        let lowercase = source.to_ascii_lowercase();
-        for forbidden in [
-            "tauri",
-            "tokio",
-            "async_std",
-            "rusqlite",
-            "sqlx",
-            "std::fs",
-            "std::process",
-            "git2",
-            "windows::",
-        ] {
-            assert!(
-                !lowercase.contains(forbidden),
-                "domain source contains forbidden dependency {forbidden}"
-            );
-        }
-    }
-}
-
-fn domain_source_paths() -> Vec<PathBuf> {
-    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut paths = Vec::new();
-    collect_domain_source_paths(&source_root, &mut paths).unwrap_or_else(|error| {
-        panic!("discover domain sources {}: {error}", source_root.display())
-    });
-    paths.sort();
-    paths
-}
-
-fn collect_domain_source_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    let metadata = fs::symlink_metadata(directory)?;
-    assert_supported_source_entry(directory, &metadata);
-    assert!(
-        metadata.is_dir(),
-        "domain source root is not a directory: {}",
-        directory.display()
-    );
-
-    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        assert_supported_source_entry(&path, &metadata);
-        if metadata.is_dir() {
-            collect_domain_source_paths(&path, paths)?;
-        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
-            paths.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn assert_supported_source_entry(path: &Path, metadata: &fs::Metadata) {
-    assert!(
-        !metadata.file_type().is_symlink() && !is_reparse_point(metadata),
-        "domain source tree contains a symlink or reparse point: {}",
-        path.display()
-    );
-    assert!(
-        metadata.is_dir() || metadata.is_file(),
-        "domain source tree contains an unsupported entry: {}",
-        path.display()
-    );
-}
-
-#[cfg(windows)]
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
-    false
 }

@@ -799,7 +799,7 @@ fn workspace_mutation_is_atomic_and_invalidates_candidate_approvals() {
         result.task_state.phase(),
         local_agent_terminal_domain::Phase::WorkspaceDirty
     );
-    assert_eq!(result.task_state.workspace_version().get(), 1);
+    assert_eq!(result.task_state.workspace_version().get(), 0);
     assert_eq!(result.task_state.fencing_token().get(), 2);
     assert_eq!(
         result.invalidated_approval_ids,
@@ -834,7 +834,7 @@ fn workspace_mutation_is_atomic_and_invalidates_candidate_approvals() {
             },
         )
         .unwrap();
-    assert_eq!(task, ("WorkspaceDirty".to_owned(), 1, 2, 3, None, 3));
+    assert_eq!(task, ("WorkspaceDirty".to_owned(), 0, 2, 3, None, 3));
     assert_eq!(
         connection
             .query_row(

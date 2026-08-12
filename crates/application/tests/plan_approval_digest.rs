@@ -18,8 +18,8 @@ use local_agent_terminal_application::{
     StoredPlanApproval, StoredPlanApprovalRehydration,
 };
 use local_agent_terminal_domain::{
-    ActorId, Condition, FencingToken, OperationState, Phase, Sequence, Sha256Digest, TaskId,
-    WorkflowState, WorkspaceVersion,
+    ActorId, Condition, OperationState, Phase, Sequence, Sha256Digest, TaskId, TaskOutcomeMode,
+    WorkflowProfile, WorkflowState, WorkflowStateSnapshot,
 };
 
 type BindingMutation = (&'static str, Box<dyn Fn(&mut PlanApprovalBindingInput)>);
@@ -1124,14 +1124,19 @@ fn awaiting_approval_state(version: u64) -> WorkflowState {
 }
 
 fn awaiting_approval_state_with_workspace(version: u64, workspace_version: u64) -> WorkflowState {
-    WorkflowState::new(
-        Phase::AwaitingPlanApproval,
-        Condition::Active,
-        OperationState::None,
-        Sequence::new(version),
-        WorkspaceVersion::new(workspace_version),
-        FencingToken::new(3).unwrap(),
-    )
+    WorkflowState::rehydrate(WorkflowStateSnapshot {
+        phase: Phase::AwaitingPlanApproval,
+        condition: Condition::Active,
+        operation: OperationState::None,
+        workflow_profile: WorkflowProfile::Standard,
+        outcome_mode: TaskOutcomeMode::WorkspaceChange,
+        stream_version: version,
+        profile_revision: 1,
+        workspace_version,
+        fencing_epoch: 3,
+        last_transition_event_id: Some("transition-7".to_owned()),
+        last_profile_revision_id: Some("profile-revision-1".to_owned()),
+    })
     .unwrap()
 }
 

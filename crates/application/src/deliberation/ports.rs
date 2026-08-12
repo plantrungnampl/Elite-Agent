@@ -33,7 +33,7 @@ pub struct PreparedInitialDeliberationPhase {
 pub fn prepare_initial_deliberation_phase(
     request: InitialDeliberationPhaseRequest,
     event_type: &str,
-    guard: &str,
+    _guard: &str,
     expected_phase: Phase,
 ) -> Result<PreparedInitialDeliberationPhase, PortError> {
     if !matches!(
@@ -50,11 +50,11 @@ pub fn prepare_initial_deliberation_phase(
         return Err(invalid_input());
     }
     let event = WorkflowEvent::new(event_type).map_err(|_| invalid_input())?;
-    let mut guards = GuardEvaluations::new();
-    guards.insert(GuardName::new(guard).map_err(|_| invalid_input())?, true);
-    let next_state = *reduce(&request.expected_state, &event, &guards)
+    let transition = initial_phase_transition_request(&request.expected_state, event.clone())?;
+    let next_state = reduce(&request.expected_state, &transition)
         .map_err(|_| invalid_input())?
-        .state();
+        .state()
+        .clone();
     if next_state.phase() != expected_phase {
         return Err(conflict());
     }
@@ -90,11 +90,55 @@ pub fn prepare_initial_deliberation_phase(
         }],
         projection_changes: vec![ProjectionChange::TaskState {
             task_id: request.task_id,
-            state: next_state,
+            state: next_state.clone(),
             updated_at: request.occurred_at,
         }],
     };
     Ok(PreparedInitialDeliberationPhase { append, next_state })
+}
+
+fn initial_phase_transition_request(
+    state: &WorkflowState,
+    event: WorkflowEvent,
+) -> Result<local_agent_terminal_domain::TransitionRequest, PortError> {
+    let (rule_id, guard_evidence_kinds, effect_kinds) = match (state.phase(), event.as_str()) {
+        (Phase::Intake, "task.validated") => (
+            "WF-P001",
+            ["profile_outcome_policy_budget_receipt"].as_slice(),
+            [
+                "persist_risk",
+                "persist_base_identity",
+                "persist_workflow_profile",
+                "persist_outcome_mode",
+            ]
+            .as_slice(),
+        ),
+        (Phase::ContextBuild, "context.initial.ready")
+            if state.workflow_profile()
+                == local_agent_terminal_domain::WorkflowProfile::Quick => (
+            "WF-P003",
+            ["context_package_set"].as_slice(),
+            ["freeze_quick_path_input"].as_slice(),
+        ),
+        (Phase::ContextBuild, "context.initial.ready") => (
+            "WF-P002",
+            ["context_package_set"].as_slice(),
+            ["freeze_independent_inputs"].as_slice(),
+        ),
+        _ => return Err(invalid_input()),
+    };
+    Ok(local_agent_terminal_domain::TransitionRequest {
+        rule_id: rule_id.to_owned(),
+        event,
+        guard_evidence_kinds: guard_evidence_kinds
+            .iter()
+            .map(|kind| (*kind).to_owned())
+            .collect(),
+        effect_kinds: effect_kinds
+            .iter()
+            .map(|kind| (*kind).to_owned())
+            .collect(),
+    })
 }
 
 /// A read-only authority used by pre-approval orchestration to rescan repository identity.

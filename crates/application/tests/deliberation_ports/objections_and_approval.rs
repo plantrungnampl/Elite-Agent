@@ -214,44 +214,39 @@ fn every_deliberation_record_category_has_a_checked_exact_event_path() {
 }
 
 #[test]
-fn exact_authoritative_state_rejects_condition_operation_workspace_and_fencing_substitution() {
+fn exact_authoritative_state_rejects_all_v3_axis_substitution() {
     let snapshot = snapshot(Phase::ParallelAnalysis);
+    let task_state_snapshot = snapshot.task_state.snapshot();
     let hostile_states = [
-        WorkflowState::new(
-            Phase::ParallelAnalysis,
-            Condition::Paused,
-            OperationState::None,
-            Sequence::new(7),
-            WorkspaceVersion::new(1),
-            FencingToken::new(1).unwrap(),
-        )
+        WorkflowState::rehydrate(WorkflowStateSnapshot {
+            condition: Condition::Paused,
+            ..task_state_snapshot.clone()
+        })
         .unwrap(),
-        WorkflowState::new(
-            Phase::ParallelAnalysis,
-            Condition::Active,
-            OperationState::Running,
-            Sequence::new(7),
-            WorkspaceVersion::new(1),
-            FencingToken::new(1).unwrap(),
-        )
+        WorkflowState::rehydrate(WorkflowStateSnapshot {
+            operation: OperationState::Running,
+            ..task_state_snapshot.clone()
+        })
         .unwrap(),
-        WorkflowState::new(
-            Phase::ParallelAnalysis,
-            Condition::Active,
-            OperationState::None,
-            Sequence::new(7),
-            WorkspaceVersion::new(2),
-            FencingToken::new(1).unwrap(),
-        )
+        WorkflowState::rehydrate(WorkflowStateSnapshot {
+            workspace_version: 2,
+            ..task_state_snapshot.clone()
+        })
         .unwrap(),
-        WorkflowState::new(
-            Phase::ParallelAnalysis,
-            Condition::Active,
-            OperationState::None,
-            Sequence::new(7),
-            WorkspaceVersion::new(1),
-            FencingToken::new(2).unwrap(),
-        )
+        WorkflowState::rehydrate(WorkflowStateSnapshot {
+            fencing_epoch: 2,
+            ..task_state_snapshot.clone()
+        })
+        .unwrap(),
+        WorkflowState::rehydrate(WorkflowStateSnapshot {
+            workflow_profile: WorkflowProfile::Quick,
+            ..task_state_snapshot.clone()
+        })
+        .unwrap(),
+        WorkflowState::rehydrate(WorkflowStateSnapshot {
+            outcome_mode: TaskOutcomeMode::ReadOnlyDeliverable,
+            ..task_state_snapshot
+        })
         .unwrap(),
     ];
 
@@ -808,14 +803,19 @@ fn command_for_phase_with_artifact(
 }
 
 fn authoritative_state(phase: Phase, sequence: u64) -> WorkflowState {
-    WorkflowState::new(
+    WorkflowState::rehydrate(WorkflowStateSnapshot {
         phase,
-        Condition::Active,
-        OperationState::None,
-        Sequence::new(sequence),
-        WorkspaceVersion::new(1),
-        FencingToken::new(1).unwrap(),
-    )
+        condition: Condition::Active,
+        operation: OperationState::None,
+        workflow_profile: WorkflowProfile::Standard,
+        outcome_mode: TaskOutcomeMode::WorkspaceChange,
+        stream_version: sequence,
+        profile_revision: 1,
+        workspace_version: 1,
+        fencing_epoch: 1,
+        last_transition_event_id: Some("transition-7".to_owned()),
+        last_profile_revision_id: Some("profile-revision-1".to_owned()),
+    })
     .unwrap()
 }
 

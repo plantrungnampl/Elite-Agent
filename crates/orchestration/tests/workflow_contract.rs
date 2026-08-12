@@ -23,11 +23,10 @@ use local_agent_terminal_domain::{
     BoundGenerationParameters, BoundRunConfig, CancelAgentRun, ClaimVerification, Condition,
     DecisionApproach, DecisionPackage, DeliberationLimits, DeliberationTaskBudget, Dissent,
     EvidenceCitation, EvidenceFreshness, FencingToken, FinalObjection, FinalObjectionSet,
-    GitObjectId, GuardEvaluations, GuardName, IndependentProposal, IndependentQuorum,
-    MaterialClaim, ObjectionSeverity, OperationState, Phase, ProjectId, RejectedApproach,
-    ReviewEdge, ReviewPlan, RunId, Sequence, Sha256Digest, SourceIdentity, TaskId, Timestamp,
-    TrustTier, VerificationMethod, WorkflowEvent, WorkflowState, WorkspaceFingerprint,
-    WorkspaceVersion,
+    GitObjectId, IndependentProposal, IndependentQuorum, MaterialClaim, ObjectionSeverity,
+    OperationState, Phase, ProjectId, RejectedApproach, ReviewEdge, ReviewPlan, RunId, Sequence,
+    Sha256Digest, SourceIdentity, TaskId, Timestamp, TransitionRequest, TrustTier,
+    VerificationMethod, WorkflowEvent, WorkflowState, WorkspaceFingerprint, WorkspaceVersion,
 };
 use local_agent_terminal_orchestration::{
     normative_preapproval_transitions, select_independent_agents, AgentEligibility,
@@ -60,14 +59,13 @@ fn normative_preapproval_sequence_never_skips_quorum_verification_or_approval() 
 
     let mut state = workflow_state(Phase::Intake, 0);
     for transition in transitions {
-        let event = WorkflowEvent::new(transition.event).unwrap();
-        let mut guards = GuardEvaluations::new();
-        if let Some(guard) = transition.guard {
-            guards.insert(GuardName::new(guard).unwrap(), true);
-        }
-        state = *local_agent_terminal_domain::reduce(&state, &event, &guards)
-            .unwrap()
-            .state();
+        state = local_agent_terminal_domain::reduce(
+            &state,
+            &preapproval_transition_request(transition.event),
+        )
+        .unwrap()
+        .state()
+        .clone();
         assert_eq!(state.phase(), transition.to);
     }
 }
@@ -556,8 +554,18 @@ fn repository_checked_quorum_publication_reveals_only_after_two_private_proposal
     ] {
         assert!(local_agent_terminal_domain::reduce(
             &workflow_state(Phase::ParallelAnalysis, 2),
-            &WorkflowEvent::new(skipped).unwrap(),
-            &GuardEvaluations::new(),
+            &TransitionRequest {
+                rule_id: "WF-P004".to_owned(),
+                event: WorkflowEvent::new(skipped).unwrap(),
+                guard_evidence_kinds: ["analysis_quorum_receipt"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                effect_kinds: ["publish_selected_proposals", "assign_review_edges"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            },
         )
         .is_err());
     }
@@ -875,6 +883,62 @@ fn workflow_state(phase: Phase, sequence: u64) -> WorkflowState {
         FencingToken::new(1).unwrap(),
     )
     .unwrap()
+}
+
+fn preapproval_transition_request(event: &str) -> TransitionRequest {
+    let (rule_id, evidence_kinds, effect_kinds) = match event {
+        "task.validated" => (
+            "WF-P001",
+            ["profile_outcome_policy_budget_receipt"].as_slice(),
+            [
+                "persist_risk",
+                "persist_base_identity",
+                "persist_workflow_profile",
+                "persist_outcome_mode",
+            ]
+            .as_slice(),
+        ),
+        "context.initial.ready" => (
+            "WF-P002",
+            ["context_package_set"].as_slice(),
+            ["freeze_independent_inputs"].as_slice(),
+        ),
+        "analysis.quorum.reached" => (
+            "WF-P004",
+            ["analysis_quorum_receipt"].as_slice(),
+            ["publish_selected_proposals", "assign_review_edges"].as_slice(),
+        ),
+        "review.complete" => (
+            "WF-P005",
+            ["review_completion_receipt"].as_slice(),
+            ["freeze_material_claims"].as_slice(),
+        ),
+        "claims.checked" => (
+            "WF-P006",
+            ["claim_verification_set"].as_slice(),
+            ["persist_claim_verification_set"].as_slice(),
+        ),
+        "decision.draft.created" => (
+            "WF-P007",
+            ["decision_draft_artifact"].as_slice(),
+            ["publish_immutable_decision_draft"].as_slice(),
+        ),
+        "objection.round.closed" => (
+            "WF-P013",
+            ["final_objection_clearance"].as_slice(),
+            ["create_plan_approval_request"].as_slice(),
+        ),
+        _ => panic!("unexpected preapproval event {event}"),
+    };
+    TransitionRequest {
+        rule_id: rule_id.to_owned(),
+        event: WorkflowEvent::new(event).unwrap(),
+        guard_evidence_kinds: evidence_kinds
+            .iter()
+            .map(|kind| (*kind).to_owned())
+            .collect(),
+        effect_kinds: effect_kinds.iter().map(|kind| (*kind).to_owned()).collect(),
+    }
 }
 
 fn approval_workflow_state() -> WorkflowState {

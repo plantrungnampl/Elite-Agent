@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use local_agent_terminal_domain::{
     reduce, ActorId, AgentFamilyKey, AgentRunSnapshot, ArtifactId, BoundAgentRunRequest,
     DecisionPackage, DeliberationLimits, DeliberationTaskBudget, EventId, FinalObjectionSet,
-    GuardEvaluations, GuardName, IndependentProposal, IndependentQuorum, MaterialClaim,
-    ObjectionSeverity, Phase, ReviewPlan, RunId, Sha256Digest, SpecialistRequest, StreamId, TaskId,
-    WorkflowEvent, WorkflowState, WorkspaceFingerprint,
+    IndependentProposal, IndependentQuorum, MaterialClaim, ObjectionSeverity, Phase, ReviewPlan,
+    RunId, Sha256Digest, SpecialistRequest, StreamId, TaskId, WorkflowEvent, WorkflowState,
+    WorkspaceFingerprint,
 };
 
 use crate::{
@@ -66,8 +66,8 @@ impl DeliberationCommandContext {
         self.expected_task_version
     }
 
-    pub const fn expected_task_state(&self) -> WorkflowState {
-        self.expected_task_state
+    pub fn expected_task_state(&self) -> WorkflowState {
+        self.expected_task_state.clone()
     }
 
     pub const fn task_budget(&self) -> DeliberationTaskBudget {
@@ -412,18 +412,6 @@ impl DeliberationRecord {
         }
     }
 
-    const fn transition_guard(&self) -> Option<&'static str> {
-        match self {
-            Self::QuorumPublication { .. } => Some("minimum_independent_results"),
-            Self::ClaimSet { .. } => Some("review_outputs_or_bounded_stop"),
-            Self::VerificationSet { .. } => Some("all_material_claims_classified"),
-            Self::DecisionDraft { .. } => Some("decision_schema_and_evidence_valid"),
-            Self::ObjectionSevereAccepted { .. } => Some("reopen_criteria_satisfied"),
-            Self::ObjectionRoundClosed { .. } => Some("no_accepted_severe_objection"),
-            _ => None,
-        }
-    }
-
     const fn changes_phase(&self) -> bool {
         matches!(
             self,
@@ -650,8 +638,8 @@ impl DeliberationPersistenceCommand {
         self.expected_task_version
     }
 
-    pub const fn expected_task_state(&self) -> WorkflowState {
-        self.expected_task_state
+    pub fn expected_task_state(&self) -> WorkflowState {
+        self.expected_task_state.clone()
     }
 
     pub const fn task_budget(&self) -> DeliberationTaskBudget {

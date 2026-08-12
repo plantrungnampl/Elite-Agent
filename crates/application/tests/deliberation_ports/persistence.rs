@@ -15,7 +15,8 @@ use local_agent_terminal_domain::{
     FinalObjection, FinalObjectionSet, IndependentProposal, IndependentQuorum, MaterialClaim,
     ObjectionSeverity, OperationState, Phase, ProjectId, RejectedApproach, ReviewEdge, ReviewPlan,
     RunId, Sequence, Sha256Digest, SourceIdentity, SpecialistBudget, SpecialistRequest, TaskId,
-    Timestamp, VerificationMethod, WorkflowState, WorkspaceVersion,
+    TaskOutcomeMode, Timestamp, VerificationMethod, WorkflowProfile, WorkflowState,
+    WorkflowStateSnapshot, WorkspaceVersion,
 };
 
 #[derive(Default)]
@@ -1207,7 +1208,7 @@ fn accepted_severe_objection_transitions_to_cross_review_and_close_then_rejects(
         .append()
         .projection_changes[0]
     {
-        ProjectionChange::TaskState { state, .. } => *state,
+        ProjectionChange::TaskState { state, .. } => state.clone(),
     };
     assert_eq!(next_state.phase(), Phase::CrossReview);
 

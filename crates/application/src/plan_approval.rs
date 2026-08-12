@@ -1,6 +1,8 @@
+use std::collections::BTreeSet;
+
 use local_agent_terminal_domain::{
-    reduce, ActorId, Condition, EventId, GuardEvaluations, GuardName, OperationState, Phase,
-    Sequence, Sha256Digest, StreamId, TaskId, WorkflowEvent, WorkflowState,
+    reduce, ActorId, EventId, Phase, Sha256Digest, StreamId, TaskId, TransitionRequest,
+    WorkflowEvent, WorkflowState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -910,45 +912,53 @@ fn resolution_append(
     operation_digest: &Sha256Digest,
     feedback: Option<&str>,
 ) -> Result<AppendOperation, PortError> {
-    let (event_type, guard, explicit_phase) = match action {
-        PlanApprovalAction::Approve => ("plan.approved", Some("plan_approval_digest_valid"), None),
-        PlanApprovalAction::Reject => ("task.cancelled", None, None),
+    let (rule_id, event_name, guard_evidence_kinds, effect_kinds) = match action {
+        PlanApprovalAction::Approve => (
+            "WF-P015",
+            "plan.approved",
+            ["plan_approval_receipt"].as_slice(),
+            ["persist_approved_plan_version", "allocate_executor_lease"].as_slice(),
+        ),
+        PlanApprovalAction::Reject => (
+            "WF-G001",
+            "task.cancelled",
+            ["cancellation_receipt"].as_slice(),
+            [
+                "revoke_executor_lease",
+                "stop_active_runs",
+                "persist_terminal_reason",
+            ]
+            .as_slice(),
+        ),
         PlanApprovalAction::Revise => (
+            "WF-P014",
             "plan.revision.requested",
-            Some("user_feedback_present"),
-            None,
+            ["user_feedback"].as_slice(),
+            ["supersede_decision_draft"].as_slice(),
         ),
         PlanApprovalAction::Reopen | PlanApprovalAction::AddOrReplaceAgent => {
             return Err(invalid_input());
         }
     };
-    let event_type = WorkflowEvent::new(event_type).map_err(|_| conflict())?;
-    let mut guards = GuardEvaluations::new();
-    if let Some(guard) = guard {
-        guards.insert(GuardName::new(guard).map_err(|_| conflict())?, true);
-    }
-    let state = if let Some(phase) = explicit_phase {
-        WorkflowState::new(
-            phase,
-            Condition::Active,
-            OperationState::None,
-            Sequence::new(
-                current
-                    .task_state
-                    .sequence()
-                    .get()
-                    .checked_add(1)
-                    .ok_or_else(conflict)?,
-            ),
-            current.task_state.workspace_version(),
-            current.task_state.fencing_token(),
-        )
-        .map_err(|_| conflict())?
-    } else {
-        *reduce(&current.task_state, &event_type, &guards)
-            .map_err(|_| conflict())?
-            .state()
-    };
+    let event_type = WorkflowEvent::new(event_name).map_err(|_| conflict())?;
+    let state = reduce(
+        &current.task_state,
+        &TransitionRequest {
+            rule_id: rule_id.to_owned(),
+            event: event_type.clone(),
+            guard_evidence_kinds: guard_evidence_kinds
+                .iter()
+                .map(|kind| (*kind).to_owned())
+                .collect::<BTreeSet<_>>(),
+            effect_kinds: effect_kinds
+                .iter()
+                .map(|kind| (*kind).to_owned())
+                .collect::<BTreeSet<_>>(),
+        },
+    )
+    .map_err(|_| conflict())?
+    .state()
+    .clone();
     let task_id = TaskId::new(&current.binding.task_id).map_err(|_| conflict())?;
     Ok(AppendOperation {
         stream_id: StreamId::new(task_id.as_str()).map_err(|_| conflict())?,

@@ -48,8 +48,9 @@ pub use tool::{
     WorktreeCapability,
 };
 pub use workflow::{
-    reduce, Condition, OperationState, ParseWorkflowValueError, Phase, Transition, WorkflowError,
-    WorkflowState,
+    reduce, reduce_condition, Condition, OperationState, ParseWorkflowValueError, Phase,
+    TaskOutcomeMode, Transition, TransitionRequest, WorkflowError, WorkflowProfile, WorkflowState,
+    WorkflowStateSnapshot,
 };
 pub use workspace::{
     authorize_fenced_write, FencedWriteError, GitObjectId, LeaseClaim, TaskBranch,

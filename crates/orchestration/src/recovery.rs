@@ -109,8 +109,10 @@ pub fn plan_deliberation_recovery(snapshot: &DeliberationSnapshot) -> Deliberati
         | Phase::Verification
         | Phase::Repair
         | Phase::FinalReview
+        | Phase::AwaitingDeliverableApproval
+        | Phase::AwaitingWorkspaceApproval
         | Phase::AwaitingCommitApproval
-        | Phase::LocalCommit
+        | Phase::RefPromotion
         | Phase::WorkspaceDirty
         | Phase::Completed
         | Phase::Cancelled

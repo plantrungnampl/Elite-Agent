@@ -1575,7 +1575,7 @@ fn command_context(
     DeliberationCommandContext::new(
         snapshot.task_id.clone(),
         snapshot.task_version,
-        snapshot.task_state,
+        snapshot.task_state.clone(),
         deliberation_task_budget(),
         actor,
         artifact,
