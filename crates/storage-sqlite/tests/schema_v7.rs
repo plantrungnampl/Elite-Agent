@@ -1,0 +1,350 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use local_agent_terminal_storage_sqlite::{OpenError, SqliteStore};
+use rusqlite::{params, Connection};
+
+const SQLITE_V6: &str =
+    include_str!("../../../docs/multi-agent-terminal-design/schemas/sqlite-v6.sql");
+const SQLITE_V7: &str =
+    include_str!("../../../docs/multi-agent-terminal-design/schemas/sqlite-v7.sql");
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaObject {
+    table: String,
+    sql: String,
+}
+
+type SchemaObjects = BTreeMap<(String, String), SchemaObject>;
+
+struct TempDirectory(PathBuf);
+
+impl TempDirectory {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "local-agent-terminal-schema-v7-test-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn database_path(&self) -> PathBuf {
+        self.0.join("state.sqlite3")
+    }
+}
+
+impl Drop for TempDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn clean_v7_and_migrated_v7_have_identical_authority_objects() {
+    let expected = normative_v7_objects();
+    assert_eq!(expected.len(), 481);
+
+    let clean_directory = TempDirectory::new();
+    let clean_path = clean_directory.database_path();
+    SqliteStore::open(&clean_path).unwrap();
+
+    let migrated_directory = TempDirectory::new();
+    let migrated_path = migrated_directory.database_path();
+    install_script(&migrated_path, SQLITE_V6);
+    SqliteStore::open(&migrated_path).unwrap();
+
+    assert_eq!(authority_objects(&clean_path, &expected), expected);
+    assert_eq!(authority_objects(&migrated_path, &expected), expected);
+}
+
+#[test]
+fn exact_normative_v7_reopens_without_changing_authority_objects() {
+    let expected = normative_v7_objects();
+    let directory = TempDirectory::new();
+    let path = directory.database_path();
+    install_script(&path, SQLITE_V7);
+
+    SqliteStore::open(&path).unwrap();
+    SqliteStore::open(&path).unwrap();
+
+    assert_eq!(authority_objects(&path, &expected), expected);
+}
+
+#[test]
+fn exact_v6_authority_row_migrates_with_normative_v7_fields() {
+    let directory = TempDirectory::new();
+    let path = directory.database_path();
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch(SQLITE_V6).unwrap();
+    seed_task(&connection);
+    connection
+        .execute(
+            "INSERT INTO task_workflow_authority (
+                task_id, workflow_profile, outcome_mode, phase, selected_by_kind,
+                selected_by_actor_binding_id, selection_policy_digest, created_at,
+                updated_at, completed_at
+             ) VALUES (?1, 'Standard', 'WorkspaceChange', 'Intake', 'core', NULL, ?2, ?3, ?3, NULL)",
+            params!["task-1", digest('b'), "2026-08-12T00:00:00.000Z"],
+        )
+        .unwrap();
+    drop(connection);
+
+    SqliteStore::open(&path).unwrap();
+
+    let connection = Connection::open(path).unwrap();
+    let authority: (String, String, i64, i64, Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT workflow_profile, outcome_mode, stream_version, profile_revision,
+                    last_transition_event_id, last_profile_revision_id
+             FROM task_workflow_authority WHERE task_id = 'task-1'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        authority,
+        (
+            "Standard".to_owned(),
+            "WorkspaceChange".to_owned(),
+            0,
+            1,
+            None,
+            None,
+        )
+    );
+}
+
+#[test]
+fn clean_v7_does_not_fabricate_task_workflow_authority() {
+    let directory = TempDirectory::new();
+    let path = directory.database_path();
+
+    SqliteStore::open(&path).unwrap();
+
+    let connection = Connection::open(path).unwrap();
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM task_workflow_authority", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn application_version_marker_is_not_accepted_as_normative_v7() {
+    let directory = TempDirectory::new();
+    let path = directory.database_path();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_migrations(version INTEGER NOT NULL);\n\
+             INSERT INTO schema_migrations(version) VALUES (9);",
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = SqliteStore::open(path).unwrap_err();
+    assert!(matches!(error, OpenError::UnsupportedSchema { .. }));
+}
+
+#[test]
+fn nonempty_unknown_schema_is_rejected_without_mutation() {
+    let directory = TempDirectory::new();
+    let path = directory.database_path();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch("CREATE TABLE unknown_authority(id TEXT PRIMARY KEY) STRICT;")
+        .unwrap();
+    let before = schema_objects(&connection);
+    let journal_mode_before: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    drop(connection);
+
+    let error = SqliteStore::open(&path).unwrap_err();
+    assert!(matches!(error, OpenError::UnsupportedSchema { .. }));
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(schema_objects(&connection), before);
+    let journal_mode_after: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode_after, journal_mode_before);
+}
+
+#[test]
+fn initialized_connections_enforce_runtime_pragmas_and_integrity() {
+    let directory = TempDirectory::new();
+    let path = directory.database_path();
+    let store = SqliteStore::open(&path).unwrap();
+
+    let settings = store.pragma_settings().unwrap();
+    assert!(settings.foreign_keys);
+    assert_eq!(settings.journal_mode.to_ascii_lowercase(), "wal");
+    assert_eq!(settings.synchronous, 2);
+    assert_eq!(settings.busy_timeout_ms, 5000);
+
+    let connection = Connection::open(path).unwrap();
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+}
+
+#[test]
+fn app_projections_cannot_write_task_workflow_authority() {
+    let expected = normative_v7_objects();
+    let authority_names: BTreeSet<_> = expected.keys().cloned().collect();
+    let directory = TempDirectory::new();
+    let path = directory.database_path();
+    SqliteStore::open(&path).unwrap();
+
+    let connection = Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    let installed = schema_objects(&connection);
+    let projection_writers: Vec<_> = installed
+        .iter()
+        .filter(|(key, object)| {
+            !authority_names.contains(key) && object.sql.contains("updatetask_workflow_authority")
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    assert!(projection_writers.is_empty(), "{projection_writers:?}");
+
+    seed_task(&connection);
+    connection
+        .execute(
+            "INSERT INTO task_workflow_authority (
+                task_id, workflow_profile, outcome_mode, phase, selected_by_kind,
+                selected_by_actor_binding_id, selection_policy_digest, created_at,
+                updated_at, completed_at, stream_version, last_transition_event_id,
+                profile_revision, last_profile_revision_id
+             ) VALUES (?1, 'Standard', 'WorkspaceChange', 'Intake', 'core', NULL, ?2, ?3, ?3, NULL, 0, NULL, 1, NULL)",
+            params!["task-1", digest('b'), "2026-08-12T00:00:00.000Z"],
+        )
+        .unwrap();
+    let error = connection
+        .execute(
+            "UPDATE task_workflow_authority
+             SET phase = 'ContextBuild', stream_version = 1, updated_at = ?1
+             WHERE task_id = 'task-1'",
+            ["2026-08-12T00:00:01.000Z"],
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("matching accepted transition event"));
+}
+
+fn normative_v7_objects() -> SchemaObjects {
+    let connection = Connection::open_in_memory().unwrap();
+    connection.execute_batch(SQLITE_V7).unwrap();
+    schema_objects(&connection)
+}
+
+fn install_script(path: &Path, script: &str) {
+    let connection = Connection::open(path).unwrap();
+    connection.execute_batch(script).unwrap();
+}
+
+fn authority_objects(path: &Path, expected: &SchemaObjects) -> SchemaObjects {
+    let connection = Connection::open(path).unwrap();
+    schema_objects(&connection)
+        .into_iter()
+        .filter(|(key, _)| expected.contains_key(key))
+        .collect()
+}
+
+fn schema_objects(connection: &Connection) -> SchemaObjects {
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name, tbl_name, sql
+             FROM sqlite_schema
+             WHERE name NOT LIKE 'sqlite_%'
+             ORDER BY type, name",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            let object_type: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let table: String = row.get(2)?;
+            let sql: Option<String> = row.get(3)?;
+            Ok((
+                (object_type, name),
+                SchemaObject {
+                    table,
+                    sql: normalize_sql(sql.as_deref().unwrap_or_default()),
+                },
+            ))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn normalize_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn seed_task(connection: &Connection) {
+    connection
+        .execute(
+            "INSERT INTO projects (
+                id, name, repository_path, repository_identity, created_at, updated_at,
+                policy_profile_id, artifact_root_mode, artifact_root_path
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, 'application_data', ?7)",
+            params![
+                "project-1",
+                "Project",
+                "D:/repository",
+                digest('c'),
+                "2026-08-12T00:00:00.000Z",
+                "policy-1",
+                "D:/artifacts",
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tasks (
+                id, project_id, title, objective, phase, condition, operation_state,
+                risk_level, base_branch, base_commit, task_branch, worktree_path,
+                current_sequence, workspace_version, fencing_epoch, row_version,
+                active_candidate_commit_oid, active_candidate_tree, created_at, updated_at
+             ) VALUES (
+                ?1, 'project-1', 'Task', 'Objective', 'Intake', 'Active', 'None',
+                'medium', 'main', ?2, NULL, NULL, 0, 0, 0, 0, NULL, NULL, ?3, ?3
+             )",
+            params![
+                "task-1",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "2026-08-12T00:00:00.000Z",
+            ],
+        )
+        .unwrap();
+}
+
+fn digest(character: char) -> String {
+    format!("sha256:{}", character.to_string().repeat(64))
+}

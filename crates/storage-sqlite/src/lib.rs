@@ -77,8 +77,6 @@ impl SqliteStore {
             plan_approval_authority_source: None,
         };
         let mut connection = Connection::open(&store.path)?;
-        migrations::reject_unknown_schema_without_mutation(&connection)?;
-        initialize_connection(&connection)?;
         migrations::validate_or_migrate(&mut connection)?;
         initialize_connection(&connection)?;
         Ok(store)
