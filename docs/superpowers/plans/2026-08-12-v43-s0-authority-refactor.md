@@ -122,6 +122,7 @@ Expected: one commit containing the existing M4 fixes plus the corrected fixture
 ### Task 2: Replace the pure workflow model and reducer with workflow v3
 
 **Files:**
+- Modify: `crates/domain/src/lib.rs`
 - Modify: `crates/domain/src/workflow.rs`
 - Create: `crates/domain/src/workflow/types.rs`
 - Create: `crates/domain/src/workflow/specification.rs`
@@ -167,7 +168,15 @@ pub fn reduce(
     state: &WorkflowState,
     request: &TransitionRequest,
 ) -> Result<Transition, WorkflowError>;
+
+pub fn reduce_condition(
+    state: &WorkflowState,
+    event: &WorkflowEvent,
+    guards: &GuardEvaluations,
+) -> Result<Transition, WorkflowError>;
 ```
+
+`reduce` resolves only the 33 command-authoritative `WF-P`, `WF-W`, and `WF-G` rules accepted by `WorkflowTransitionCommand v1` and normalized by SQLite v7. `reduce_condition` resolves the six ID-less condition rules against their declared guard while preserving phase, profile, outcome, and operation. Do not invent `WF-C` IDs.
 
 - [ ] **Step 1: Write RED tests for the v3 state and route surface**
 
@@ -197,7 +206,7 @@ fn v3_state_retains_profile_outcome_and_authority_versions() {
 }
 ```
 
-Add RED cases for `WF-P003`, `WF-P008`, `WF-P009`, `WF-P015`, all terminal paths, missing required effects, and wrong-profile severe-objection routing.
+Add RED cases for `WF-P003`, `WF-P008`, `WF-P009`, `WF-P015`, all terminal paths, missing required effects, wrong-profile severe-objection routing, and all six condition transitions through `reduce_condition`.
 
 - [ ] **Step 2: Run the workflow contract and confirm the v1 implementation is red**
 
@@ -221,11 +230,11 @@ const WORKFLOW_JSON: &str = include_str!(
 );
 ```
 
-Parse all four profiles, three outcome modes, 30 phase rules, two global rules, six condition rules, profile escalations, and the workspace-dirty rule. Reject unknown fields, duplicate selectors, missing rule IDs, and ambiguous profile routes.
+Parse all four profiles, three outcome modes, 30 phase rules, two global rules, six condition rules, profile escalations, and the workspace-dirty rule. Reject unknown fields, duplicate selectors, missing IDs on ID-bearing `WF-P/W/G` rules, and ambiguous profile routes. Condition rules are structurally validated by `(from, event, to, guard)` and intentionally have no rule ID or effect set.
 
 - [ ] **Step 4: Implement the pure v3 reducer**
 
-The reducer must resolve the caller-supplied `rule_id`, verify source/profile/outcome/event, require the exact declared guard/effect kind sets, apply only the declared axis/effects, increment stream version once, and preserve profile revision unless the separate escalation reducer is used.
+The command reducer must resolve the caller-supplied `rule_id` among the 33 `WF-P/W/G` rules, verify source/profile/outcome/event, require the exact declared guard/effect kind sets, apply only the declared axis/effects, increment stream version once, and preserve profile revision unless the separate escalation reducer is used. The condition reducer must select exactly one of the six ID-less rules by current condition and event, require its declared guard evaluation, change only condition plus stream version, and never produce a transition-command rule ID.
 
 Use an exact-set check:
 
@@ -252,7 +261,7 @@ Expected: all commands exit 0.
 - [ ] **Step 6: Commit the v3 pure workflow slice**
 
 ```powershell
-git add crates/domain/src/workflow.rs crates/domain/src/workflow/types.rs crates/domain/src/workflow/specification.rs crates/domain/src/workflow/reducer.rs crates/domain/tests/workflow_contract.rs crates/application/src/plan_approval.rs crates/application/src/deliberation/commands.rs crates/application/src/deliberation/ports.rs crates/storage-sqlite/src/workspace_store.rs crates/application/tests/plan_approval_digest.rs crates/application/tests/deliberation_ports/objections_and_approval.rs crates/application/tests/deliberation_ports/persistence.rs crates/orchestration/tests/workflow_contract.rs crates/storage-sqlite/tests/workspace_recovery.rs
+git add crates/domain/src/lib.rs crates/domain/src/workflow.rs crates/domain/src/workflow/types.rs crates/domain/src/workflow/specification.rs crates/domain/src/workflow/reducer.rs crates/domain/tests/workflow_contract.rs crates/application/src/plan_approval.rs crates/application/src/deliberation/commands.rs crates/application/src/deliberation/ports.rs crates/storage-sqlite/src/workspace_store.rs crates/application/tests/plan_approval_digest.rs crates/application/tests/deliberation_ports/objections_and_approval.rs crates/application/tests/deliberation_ports/persistence.rs crates/orchestration/tests/workflow_contract.rs crates/storage-sqlite/tests/workspace_recovery.rs
 git diff --cached --check
 git commit -m "feat: adopt workflow v3 domain authority"
 ```
