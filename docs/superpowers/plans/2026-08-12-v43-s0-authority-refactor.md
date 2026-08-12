@@ -29,13 +29,13 @@
 **Files:**
 - Modify: `crates/storage-sqlite/tests/deliberation_store.rs`
 - Verify/stage existing implementation changes under: `apps/desktop/src/api/deliberation.ts`, `apps/desktop/src/api/deliberation.test.ts`, `apps/desktop/src/features/deliberation/PlanApprovalPanel.tsx`, `apps/desktop/src/features/deliberation/PlanApprovalPanel.test.tsx`, `crates/application/src/deliberation/commands.rs`, `crates/application/src/deliberation/ports.rs`, `crates/application/src/deliberation/records.rs`, `crates/application/src/deliberation/snapshots.rs`, `crates/application/src/deliberation_recovery.rs`, `crates/application/src/dto.rs`, `crates/application/src/plan_approval.rs`, `crates/bootstrap/src/agent_runtime.rs`, `crates/bootstrap/src/agent_runtime_support.rs`, `crates/bootstrap/src/agent_specialist_context.rs`, `crates/bootstrap/src/deliberation_runtime.rs`, `crates/bootstrap/src/lib.rs`, `crates/domain/src/deliberation.rs`, `crates/orchestration/src/coordinator.rs`, `crates/orchestration/src/lib.rs`, `crates/storage-sqlite/src/context_store.rs`, `crates/storage-sqlite/src/deliberation_store.rs`
-- Verify/stage existing tests under: `crates/application/tests/deliberation_ports/objections_and_approval.rs`, `crates/application/tests/deliberation_ports/persistence.rs`, `crates/application/tests/deliberation_recovery/claim_authority.rs`, `crates/application/tests/deliberation_recovery/replay.rs`, `crates/application/tests/plan_approval_digest.rs`, `crates/bootstrap/tests/agent_runtime_e2e.rs`, `crates/bootstrap/tests/deliberation_e2e.rs`, `crates/domain/tests/deliberation_contract.rs`, `crates/orchestration/tests/request_contract.rs`, `crates/orchestration/tests/workflow_contract.rs`, `crates/storage-sqlite/tests/plan_approval_store.rs`
+- Verify/stage existing tests under: `crates/application/tests/deliberation_ports/objections_and_approval.rs`, `crates/application/tests/deliberation_ports/persistence.rs`, `crates/application/tests/deliberation_recovery/claim_authority.rs`, `crates/application/tests/deliberation_recovery/replay.rs`, `crates/application/tests/plan_approval_digest.rs`, `crates/bootstrap/tests/agent_runtime_e2e.rs`, `crates/bootstrap/tests/deliberation_e2e.rs`, `crates/domain/tests/deliberation_contract.rs`, `crates/orchestration/tests/request_contract.rs`, `crates/orchestration/tests/workflow_contract.rs`, `crates/orchestration/tests/zero_mutation.rs`, `crates/storage-sqlite/tests/plan_approval_store.rs`
 
 **Interfaces:**
 - Consumes: the current `DecisionPackage::new` contract and the quorum-position preservation check already present in the dirty implementation.
 - Produces: a green, committed pre-S0 code baseline without staging `docs/multi-agent-terminal-design/**`.
 
-- [ ] **Step 1: Reproduce the inherited red regression**
+- [x] **Step 1: Reproduce the inherited red regression**
 
 Run:
 
@@ -45,7 +45,7 @@ cargo test -p local-agent-terminal-storage-sqlite --test deliberation_store priv
 
 Expected: FAIL at synthesis preparation with `SafeErrorClassification::Conflict` because the helper decision omits the second quorum position.
 
-- [ ] **Step 2: Correct the fixture without weakening production invariants**
+- [x] **Step 2: Correct the fixture without weakening production invariants**
 
 Update `decision` so proposal 2 is represented once as a rejected approach and once as dissent:
 
@@ -86,13 +86,13 @@ fn decision(plan_artifact_id: &str, evidence: MaterialClaim) -> DecisionPackage 
 
 Import `RejectedApproach` and `Dissent` from `local_agent_terminal_domain` in the test module.
 
-- [ ] **Step 3: Verify the focused regression is green**
+- [x] **Step 3: Verify the focused regression is green**
 
 Run the Step 1 command again.
 
 Expected: PASS with one test executed.
 
-- [ ] **Step 4: Verify the inherited code baseline**
+- [x] **Step 4: Verify the inherited code baseline**
 
 Run:
 
@@ -105,7 +105,7 @@ pnpm --dir apps/desktop test --run
 
 Expected: every command exits 0. If another test is red, stop and use `superpowers:systematic-debugging` before changing code.
 
-- [ ] **Step 5: Commit only the inherited non-design implementation baseline**
+- [x] **Step 5: Commit only the inherited non-design implementation baseline**
 
 Stage the exact code and test paths listed in this task, verify the staged name list contains no `docs/multi-agent-terminal-design` path, then commit:
 
