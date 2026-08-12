@@ -222,6 +222,7 @@ const PLAN_ACTIONS = new Set<PlanApprovalAction>([
   "revise",
   "reject",
 ]);
+const MAX_REVISION_FEEDBACK_UTF8_BYTES = 16_384;
 
 export function getDeliberationWorkspace(
   request: GetDeliberationWorkspaceRequestDto,
@@ -276,7 +277,7 @@ export function resolvePlanApproval(
     if (
       request.feedback === null ||
       request.feedback.trim().length === 0 ||
-      request.feedback.length > 16_384 ||
+      new TextEncoder().encode(request.feedback).byteLength > MAX_REVISION_FEEDBACK_UTF8_BYTES ||
       request.feedback.includes("\0")
     ) {
       throw new TypeError("feedback is required for a revision");

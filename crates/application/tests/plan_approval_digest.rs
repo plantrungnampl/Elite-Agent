@@ -240,6 +240,47 @@ fn resolver_reloads_shared_plan_and_recomputes_authoritative_binding() {
 }
 
 #[test]
+fn revision_feedback_enforces_utf8_byte_boundary() {
+    // "界" is three UTF-8 bytes: 5,461 copies plus "a" is 16,384 bytes.
+    let at_limit_binding = binding();
+    let store = plan_store(at_limit_binding.clone());
+    let mut at_limit = approval_input(
+        &at_limit_binding,
+        canonical_plan_approval_payload(&at_limit_binding)
+            .unwrap()
+            .operation_digest,
+    );
+    at_limit.action = PlanApprovalAction::Revise;
+    at_limit.feedback = Some(format!("{}a", "界".repeat(5_461)));
+
+    assert!(ResolvePlanApproval::new(&store, &FixedClock)
+        .execute(at_limit)
+        .is_ok());
+    assert_eq!(store.resolutions.lock().unwrap().len(), 1);
+
+    let above_limit_binding = binding();
+    let store = plan_store(above_limit_binding.clone());
+    let mut above_limit = approval_input(
+        &above_limit_binding,
+        canonical_plan_approval_payload(&above_limit_binding)
+            .unwrap()
+            .operation_digest,
+    );
+    above_limit.action = PlanApprovalAction::Revise;
+    above_limit.feedback = Some("界".repeat(5_462));
+
+    let error = ResolvePlanApproval::new(&store, &FixedClock)
+        .execute(above_limit)
+        .unwrap_err();
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::InvalidInput
+    );
+    assert!(store.loads.lock().unwrap().is_empty());
+    assert!(store.resolutions.lock().unwrap().is_empty());
+}
+
+#[test]
 fn resolution_emits_only_declared_workflow_transitions() {
     for (action, event, phase) in [
         (

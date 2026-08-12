@@ -130,4 +130,24 @@ describe("deliberation Tauri API", () => {
     ).toThrow();
     expect(invoke).not.toHaveBeenCalled();
   });
+
+  it("enforces the revision feedback UTF-8 byte boundary before invoking", async () => {
+    // "界" is three UTF-8 bytes: 5,461 copies plus "a" is 16,384 bytes.
+    const feedbackAtLimit = `${"界".repeat(5_461)}a`;
+    const feedbackAboveLimit = "界".repeat(5_462);
+    const request = {
+      approvalId: "approval-1",
+      displayedDigest: `sha256:${"a".repeat(64)}`,
+      expectedTaskVersion: 9,
+      action: "revise" as const,
+    };
+
+    await expect(
+      resolvePlanApproval({ ...request, feedback: feedbackAtLimit }),
+    ).resolves.toEqual({});
+    expect(() =>
+      resolvePlanApproval({ ...request, feedback: feedbackAboveLimit }),
+    ).toThrow("feedback is required for a revision");
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
 });
