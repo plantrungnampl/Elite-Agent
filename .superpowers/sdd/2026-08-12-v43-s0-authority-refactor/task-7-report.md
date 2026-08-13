@@ -63,3 +63,22 @@ The v2 schema is currently an untracked, user-owned file in the preserved docs w
 - `cargo test -p local-agent-terminal-bootstrap agent_runtime::tests::` - 5 passed.
 - `cargo clippy -p local-agent-terminal-agent-runtime --all-targets -- -D warnings` and `cargo clippy -p local-agent-terminal-bootstrap --all-targets -- -D warnings` - exit 0.
 - `cargo fmt --all -- --check` - exit 0.
+
+## Fix round 2 - fail-closed crash windows
+
+- A reconstructed terminal run now returns `Conflict` before session or provider dispatch. A durable core request in `Pending` is never retried automatically; only a newly `Begun` request may call `peer.start` or `peer.cancel`.
+- Agent-originated `Pending` requests now return a transport failure without inventing an `internal_error` terminal response, rerouting the request, or repeating its effect.
+- Agent responses follow prepare, non-mutating method-specific validation, response-artifact publication, durable audit/effect, protocol terminal completion, then session mutation and return. `run.complete` publishes its response artifact before message and terminal persistence.
+- A real SQLite plus content-addressed-store reopen regression proves the completed start response bytes remain exact, startup interruption leaves the old run `Interrupted`, tuple drift conflicts, and only a fresh run with `supersedes_run_id` may proceed.
+- Independent re-review returned `APPROVE` with no actionable findings.
+
+### Fix round 2 verification
+
+- `cargo test -p local-agent-terminal-agent-protocol` - 1 unit, 9 codec, 6 conformance, 2 schema-type, and 16 session-contract tests passed; doc tests passed.
+- `cargo test -p local-agent-terminal-agent-runtime --all-targets` - 5 unit, 2 fake-conformance, and 79 runtime-contract tests passed.
+- `cargo test -p local-agent-terminal-storage-sqlite --test agent_store -- --test-threads=1` - 25 passed, including exact completed-start reopen/interruption/supersession evidence.
+- `cargo test -p local-agent-terminal-provider-openai --all-features` - 28 passed; doc tests passed.
+- `cargo test -p local-agent-terminal-provider-anthropic --all-features` - 32 passed; doc tests passed.
+- `cargo test -p local-agent-terminal-bootstrap agent_runtime::tests::` - 5 passed.
+- `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace --doc` - exit 0.
+- All eight Fix Round 2 files are below 2,000 lines; the largest is `crates/storage-sqlite/tests/agent_store.rs` at 1,815 lines.

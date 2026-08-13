@@ -691,7 +691,7 @@ Expected: tests pass and the commit contains no design-package files.
 - Consumes: `agent-protocol.v2.schema.json`, 13 canonical `schemas/examples-v2` frames, existing durable protocol request/stream ports, and Task 5 run bindings.
 - Produces: generated v2 frame types, protocol version `2.0`, v2 method ownership and correlation, and runtime/provider descriptors that pass the shared v2 conformance suite.
 
-- [ ] **Step 1: Point generated types and contract tests at v2 and confirm RED**
+- [x] **Step 1: Point generated types and contract tests at v2 and confirm RED**
 
 Change `generated.rs` to:
 
@@ -709,21 +709,21 @@ cargo test -p local-agent-terminal-agent-protocol --all-features -- --nocapture
 
 Expected: compile/test failures expose every v1 field/method assumption.
 
-- [ ] **Step 2: Implement the closed v2 codec and method-specific response validation**
+- [x] **Step 2: Implement the closed v2 codec and method-specific response validation**
 
 Bundle v2, remove supplemental v1 schema patches, validate each request/response definition directly, use `capabilities` rather than historical `features`, enforce core/agent request-ID prefixes, and keep notifications response-free.
 
-- [ ] **Step 3: Update session and conformance state**
+- [x] **Step 3: Update session and conformance state**
 
 Negotiate version `2.0`, persist `(connection_id, request_id, method, digest)`, validate response shape from the durable pending method, enforce exactly one terminal request, contiguous stream sequence, replay digest identity, pending limits, and high/low watermark behavior.
 
-- [ ] **Step 4: Update runtime frames and provider descriptors**
+- [x] **Step 4: Update runtime frames and provider descriptors**
 
 Generate `initialize`, `initialized`, `agent.run.start`, cancel, complete, context, tool, specialist, heartbeat, shutdown, and exit frames from v2 shapes. `agent.run.start` includes only `runId`, `taskId`, `contextPackageRef`, `idempotencyKey`, and optional `role`; do not duplicate RunConfiguration fields into the wire frame.
 
 Every provider descriptor advertises `2.0` and the v2 capability names.
 
-- [ ] **Step 5: Run protocol, runtime, and provider contracts**
+- [x] **Step 5: Run protocol, runtime, and provider contracts**
 
 ```powershell
 cargo fmt --all -- --check
@@ -735,7 +735,7 @@ cargo test -p local-agent-terminal-provider-anthropic --all-features
 
 Expected: all commands exit 0; all 13 canonical v2 frames validate and no production source references `agent-protocol.v1.schema.json` or protocol `1.0`.
 
-- [ ] **Step 6: Commit MACP v2**
+- [x] **Step 6: Commit MACP v2**
 
 ```powershell
 git add crates/agent-protocol/src/generated.rs crates/agent-protocol/src/codec.rs crates/agent-protocol/src/session.rs crates/agent-protocol/src/peer.rs crates/agent-protocol/src/error.rs crates/agent-protocol/tests/codec.rs crates/agent-protocol/tests/conformance.rs crates/agent-protocol/tests/schema_types.rs crates/agent-protocol/tests/session_contract.rs crates/agent-runtime/src/runtime/protocol.rs crates/agent-runtime/src/runtime/connection.rs crates/agent-runtime/src/runtime/lifecycle.rs crates/agent-runtime/src/runtime/tests.rs crates/agent-runtime/tests/fake_conformance.rs crates/agent-runtime/tests/runtime_contract.rs crates/agent-runtime/tests/runtime_contract/acceptance_and_recovery.rs crates/agent-runtime/tests/runtime_contract/lifecycle.rs crates/provider-openai/src/adapter.rs crates/provider-openai/tests/conformance.rs crates/provider-openai/tests/request_contract.rs crates/provider-openai/tests/streaming_contract.rs crates/provider-anthropic/src/adapter.rs crates/provider-anthropic/src/request.rs crates/provider-anthropic/tests/conformance.rs crates/provider-anthropic/tests/request_contract.rs crates/provider-anthropic/tests/streaming_contract.rs
