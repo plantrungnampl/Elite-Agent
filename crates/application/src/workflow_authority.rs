@@ -84,6 +84,7 @@ impl PreparedWorkflowTransition {
 }
 
 pub trait WorkflowAuthorityStore: Send + Sync {
+    fn trusted_core_actor_digest(&self) -> Result<Sha256Digest, PortError>;
     fn load_workflow(&self, task_id: &TaskId) -> Result<WorkflowState, PortError>;
     fn persist_transition(
         &self,
@@ -114,6 +115,10 @@ impl<'a> TransitionWorkflow<'a> {
         project_id: ProjectId,
         command_artifact_id: ArtifactId,
     ) -> Result<PreparedWorkflowTransition, PortError> {
+        let trusted_core_actor_digest = self.store.trusted_core_actor_digest()?;
+        if input.core_actor_digest != trusted_core_actor_digest {
+            return Err(conflict());
+        }
         let state = self.store.load_workflow(&input.task_id)?;
         prepare_workflow_transition(&state, input, project_id, command_artifact_id)
     }

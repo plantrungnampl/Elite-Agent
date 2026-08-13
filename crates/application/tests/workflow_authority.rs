@@ -176,6 +176,11 @@ struct RecordingAuthority {
 }
 
 impl WorkflowAuthorityStore for RecordingAuthority {
+    fn trusted_core_actor_digest(&self) -> Result<Sha256Digest, PortError> {
+        self.calls.lock().unwrap().push("actor");
+        Ok(digest(b'e'))
+    }
+
     fn load_workflow(&self, _task_id: &TaskId) -> Result<WorkflowState, PortError> {
         self.calls.lock().unwrap().push("load");
         Ok(state())
@@ -222,8 +227,29 @@ fn execute_publishes_command_before_authority_transaction() {
     assert_eq!(next.phase(), Phase::Implementation);
     assert_eq!(
         authority.calls.lock().unwrap().as_slice(),
-        ["load", "publish", "persist"]
+        ["actor", "load", "publish", "persist"]
     );
+}
+
+#[test]
+fn execute_rejects_untrusted_core_actor_before_publication() {
+    let authority = RecordingAuthority::default();
+    let mut request = input();
+    request.core_actor_digest = digest(b'f');
+
+    let error = TransitionWorkflow::new(&authority, &authority)
+        .execute(
+            request,
+            ProjectId::new("project-1").unwrap(),
+            ArtifactId::new("command-artifact").unwrap(),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::Conflict
+    );
+    assert_eq!(authority.calls.lock().unwrap().as_slice(), ["actor"]);
 }
 
 #[test]
@@ -241,5 +267,8 @@ fn execute_does_not_persist_when_command_publication_fails() {
         error.safe_classification(),
         local_agent_terminal_application::SafeErrorClassification::IntegrityFailure
     );
-    assert_eq!(authority.calls.lock().unwrap().as_slice(), ["load"]);
+    assert_eq!(
+        authority.calls.lock().unwrap().as_slice(),
+        ["actor", "load"]
+    );
 }

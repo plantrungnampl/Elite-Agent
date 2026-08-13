@@ -37,7 +37,8 @@ impl Fixture {
         let artifacts = ContentAddressedArtifactStore::open(&directory).unwrap();
         let store = SqliteStore::open(&path)
             .unwrap()
-            .with_artifact_reader(Arc::new(ContentAddressedArtifactReader));
+            .with_artifact_reader(Arc::new(ContentAddressedArtifactReader))
+            .with_workflow_core_actor_digest(digest(b"actor"));
         let fixture = Self {
             directory,
             path,
@@ -447,6 +448,143 @@ fn seed_plan_approval_authority(fixture: &Fixture) {
         .unwrap();
 }
 
+fn seed_other_task_plan_approval_receipt(fixture: &Fixture) {
+    let connection = fixture.connection();
+    let operation_digest = digest(b"task-2-plan-request");
+    let actor_digest = digest(b"task-2-plan-actor");
+    connection
+        .execute(
+            "INSERT INTO tasks (
+                id, project_id, title, objective, phase, condition, operation_state,
+                risk_level, base_branch, base_commit, current_sequence, workspace_version,
+                fencing_epoch, row_version, created_at, updated_at
+             ) VALUES ('task-2', 'project-1', 'Other task', 'Other approval', 'Intake',
+                'Active', 'None', 'medium', 'main', ?1, 0, 0, 1, 0,
+                '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z')",
+            ["b".repeat(40)],
+        )
+        .unwrap();
+    for (id, artifact_type, content_hash) in [
+        (
+            "task-2-plan-request",
+            "plan-approval",
+            operation_digest.as_str(),
+        ),
+        (
+            "task-2-credential-evidence",
+            "credential",
+            digest(b"task-2-credential").as_str(),
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO artifacts (
+                    id, task_id, project_id, artifact_type, logical_path, content_hash,
+                    storage_key, size_bytes, mime_type, availability, created_by_type,
+                    created_by_id, created_at, supersedes, verification_state
+                 ) VALUES (?1, 'task-2', 'project-1', ?2, ?1, ?3, ?1, 1,
+                    'application/json', 'available', 'core', 'test',
+                    '2026-08-09T00:00:00Z', NULL, 'hash_verified')",
+                params![id, artifact_type, content_hash],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO operation_intents (
+                id, task_id, run_id, operation_kind, idempotency_class, idempotency_key,
+                canonical_request_artifact_id, operation_digest, actor_binding_digest,
+                status, current_attempt_no, created_at, updated_at
+             ) VALUES ('task-2-plan-intent', 'task-2', NULL, 'plan.approve',
+                'non_repeatable', 'task-2-plan-intent-key', 'task-2-plan-request',
+                ?1, ?2, 'pending', 0, '2026-08-09T00:00:00Z',
+                '2026-08-09T00:00:00Z')",
+            params![operation_digest.as_str(), actor_digest.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO approvals (
+                id, task_id, operation_intent_id, approval_type, schema_version,
+                operation_digest, actor_binding_digest, nonce, status, requested_at,
+                resolved_at, expires_at, request_artifact_id, invalidation_reason
+             ) VALUES ('task-2-approval', 'task-2', 'task-2-plan-intent', 'plan',
+                'approval-digest.v1', ?1, ?2, 'task-2-approval-nonce', 'pending',
+                '2026-08-09T00:00:00Z', NULL, '2026-08-10T00:00:00Z',
+                'task-2-plan-request', NULL)",
+            params![operation_digest.as_str(), actor_digest.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO approval_decision_receipts (
+                id, approval_id, task_id, operation_intent_id, operation_digest,
+                actor_binding_digest, nonce, decision, credential_evidence_artifact_id,
+                decided_at, receipt_digest
+             ) VALUES ('task-2-approval-receipt', 'task-2-approval', 'task-2',
+                'task-2-plan-intent', ?1, ?2, 'task-2-approval-nonce', 'granted',
+                'task-2-credential-evidence', '2026-08-09T00:00:09Z', ?3)",
+            params![
+                operation_digest.as_str(),
+                actor_digest.as_str(),
+                digest(b"task-2-approval-receipt").as_str(),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO actor_bindings (
+                id, actor_kind, actor_id, session_id, proof_type, binding_digest,
+                issued_at, expires_at, revoked_at, session_epoch
+             ) VALUES ('task-2-actor', 'system', 'workflow-authority',
+                'task-2-session', 'local_authenticated_session', ?1,
+                '2026-08-09T00:00:00Z', '2026-08-10T00:00:00Z', NULL, 1)",
+            [actor_digest.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO credential_challenges (
+                id, actor_binding_id, purpose, operation_digest, nonce,
+                challenge_digest, issued_at, expires_at
+             ) VALUES ('task-2-challenge', 'task-2-actor', 'plan.approval', ?1,
+                '123456789012345678901234', ?2, '2026-08-09T00:00:00Z',
+                '2026-08-10T00:00:00Z')",
+            params![
+                operation_digest.as_str(),
+                digest(b"task-2-challenge").as_str()
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO credential_challenge_receipts (
+                id, challenge_id, actor_binding_id, proof_type, proof_artifact_id,
+                verified_at, receipt_digest
+             ) VALUES ('task-2-challenge-receipt', 'task-2-challenge', 'task-2-actor',
+                'local_authenticated_session', 'task-2-credential-evidence',
+                '2026-08-09T00:00:09Z', ?1)",
+            [digest(b"task-2-challenge-receipt").as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO approval_actor_proof_bindings (
+                approval_receipt_id, actor_binding_id, challenge_receipt_id, created_at
+             ) VALUES ('task-2-approval-receipt', 'task-2-actor',
+                'task-2-challenge-receipt', '2026-08-09T00:00:09Z')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE approvals SET status = 'granted', resolved_at = '2026-08-09T00:00:09Z'
+             WHERE id = 'task-2-approval'",
+            [],
+        )
+        .unwrap();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn seed_accepted_transition(
     fixture: &Fixture,
@@ -702,6 +840,97 @@ fn accepted_workflow_transition_is_atomic_and_rehydratable() {
 }
 
 #[test]
+fn untrusted_core_actor_is_rejected_without_publication_or_authority_mutation() {
+    let fixture = Fixture::new();
+    let mut request = wf_p001_input();
+    request.core_actor_digest = digest(b"caller-selected-actor");
+    let command = prepare_workflow_transition(
+        &state_at_intake(),
+        request,
+        ProjectId::new("project-1").unwrap(),
+        ArtifactId::new("command-untrusted-actor").unwrap(),
+    )
+    .unwrap();
+    fixture.seed_command_artifact(
+        "command-untrusted-actor",
+        &command.command_artifact.canonical_bytes,
+    );
+
+    let error = fixture.store.persist_transition(&command).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(
+        fixture
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM workflow_transition_events",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn regressed_clock_persists_a_monotonic_rfc3339_authority_timestamp() {
+    let fixture = Fixture::new();
+    fixture
+        .connection()
+        .execute(
+            "UPDATE task_workflow_authority
+             SET updated_at = '2099-01-01T00:00:00.000Z'
+             WHERE task_id = 'task-1'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .connection()
+            .query_row(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', updated_at, '+1 second')
+                 FROM task_workflow_authority WHERE task_id = 'task-1'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .as_deref(),
+        Some("2099-01-01T00:00:01.000Z")
+    );
+    let mut request = wf_p001_input();
+    request.command_id = "command-clock-regression".to_owned();
+    request.transition_event_id = "transition-clock-regression".to_owned();
+    let command = prepare_workflow_transition(
+        &state_at_intake(),
+        request,
+        ProjectId::new("project-1").unwrap(),
+        ArtifactId::new("command-clock-regression").unwrap(),
+    )
+    .unwrap();
+    fixture.seed_command_artifact(
+        "command-clock-regression",
+        &command.command_artifact.canonical_bytes,
+    );
+
+    fixture.store.persist_transition(&command).unwrap();
+
+    let accepted_at: String = fixture
+        .connection()
+        .query_row(
+            "SELECT accepted_at FROM workflow_transition_events
+             WHERE id = 'transition-clock-regression'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(accepted_at, "2099-01-01T00:00:01.000Z");
+    assert!(!accepted_at.ends_with('~'));
+}
+
+#[test]
 fn wf_p015_accepts_exact_approval_receipt_and_required_effects() {
     let fixture = Fixture::new();
     seed_plan_approval_authority(&fixture);
@@ -783,7 +1012,9 @@ fn missing_artifact_reader_does_not_mutate_authority() {
     )
     .unwrap();
     fixture.seed_command_artifact("command-p001", &command.command_artifact.canonical_bytes);
-    let store = SqliteStore::open(&fixture.path).unwrap();
+    let store = SqliteStore::open(&fixture.path)
+        .unwrap()
+        .with_workflow_core_actor_digest(digest(b"actor"));
 
     let error = store.persist_transition(&command).unwrap_err();
     assert_eq!(
@@ -912,6 +1143,82 @@ fn stale_replay_is_conflict_without_a_second_event() {
 }
 
 #[test]
+fn raw_accepted_replay_reaches_terminal_event_immutability_trigger() {
+    let fixture = Fixture::new();
+    fixture.seed_transition_artifact("raw-replay");
+    seed_accepted_transition(
+        &fixture,
+        "raw-replay",
+        "WF-P001",
+        "task.validated",
+        "Intake",
+        "ContextBuild",
+        "Standard",
+        0,
+        "2026-08-09T00:00:01.000Z",
+    );
+
+    let error = fixture
+        .connection()
+        .execute(
+            "UPDATE workflow_transition_events
+             SET status = 'accepted', accepted_at = '2026-08-09T00:00:02.000Z'
+             WHERE id = 'raw-replay'",
+            [],
+        )
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("terminal workflow transition event is immutable"));
+}
+
+#[test]
+fn raw_cross_task_plan_receipt_reaches_exact_receipt_trigger() {
+    let fixture = Fixture::new();
+    seed_plan_approval_authority(&fixture);
+    seed_other_task_plan_approval_receipt(&fixture);
+    fixture.seed_transition_artifact("raw-cross-task-receipt");
+    let connection = fixture.connection();
+    let binding_digest = digest(b"raw-cross-task-receipt");
+    connection
+        .execute(
+            "INSERT INTO workflow_transition_events (
+                id, task_id, rule_id, expected_stream_version, from_phase, event_type,
+                to_phase, workflow_profile, outcome_mode, transition_command_artifact_id,
+                guard_set_digest, effect_set_digest, core_actor_digest, reducer_version,
+                status, prepared_at, accepted_at, rejected_at
+             ) VALUES ('raw-cross-task-receipt', 'task-1', 'WF-P015', 8,
+                'AwaitingPlanApproval', 'plan.approved', 'Implementation',
+                'HighAssurance', 'WorkspaceChange', 'raw-cross-task-receipt',
+                ?1, ?1, ?1, 'v3', 'prepared',
+                '2026-08-09T00:00:10.000Z', NULL, NULL)",
+            [binding_digest.as_str()],
+        )
+        .unwrap();
+
+    let error = connection
+        .execute(
+            "INSERT INTO workflow_transition_guard_bindings (
+                transition_event_id, evidence_kind, evidence_ref, subject_digest,
+                evidence_digest, artifact_id, approval_receipt_id, acceptance_receipt_id,
+                verification_receipt_id, ref_promotion_receipt_id
+             ) VALUES ('raw-cross-task-receipt', 'plan_approval_receipt',
+                'task-2-approval-receipt', ?1, ?2, NULL,
+                'task-2-approval-receipt', NULL, NULL, NULL)",
+            params![
+                digest(b"task-2-plan-request").as_str(),
+                digest(b"task-2-approval-receipt").as_str(),
+            ],
+        )
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("plan approval receipt must be exact and granted"));
+}
+
+#[test]
 fn raw_projection_update_and_missing_bindings_are_rejected_by_v7_triggers() {
     let fixture = Fixture::new();
     let connection = fixture.connection();
@@ -949,6 +1256,18 @@ fn raw_projection_update_and_missing_bindings_are_rejected_by_v7_triggers() {
     assert!(error.to_string().contains("missing required"));
 
     let fixture = Fixture::new();
+    fixture.seed_transition_artifact("seed-wrong-profile-p001");
+    seed_accepted_transition(
+        &fixture,
+        "seed-wrong-profile-p001",
+        "WF-P001",
+        "task.validated",
+        "Intake",
+        "ContextBuild",
+        "Standard",
+        0,
+        "2026-08-09T00:00:01.000Z",
+    );
     fixture.seed_transition_artifact("wrong-profile");
     let connection = fixture.connection();
     let error = connection
@@ -958,14 +1277,16 @@ fn raw_projection_update_and_missing_bindings_are_rejected_by_v7_triggers() {
                 to_phase, workflow_profile, outcome_mode, transition_command_artifact_id,
                 guard_set_digest, effect_set_digest, core_actor_digest, reducer_version,
                 status, prepared_at, accepted_at, rejected_at
-             ) VALUES ('wrong-profile', 'task-1', 'WF-P001', 0, 'Intake',
-                'task.validated', 'ContextBuild', 'Quick', 'WorkspaceChange',
+             ) VALUES ('wrong-profile', 'task-1', 'WF-P003', 1, 'ContextBuild',
+                'context.initial.ready', 'PrePlanVerification', 'Standard', 'WorkspaceChange',
                 'wrong-profile', ?1, ?1, ?1, 'v3', 'prepared',
                 '2026-08-09T00:00:00Z', NULL, NULL)",
             [digest(b"wrong-profile").as_str()],
         )
         .unwrap_err();
-    assert!(error.to_string().contains("current authority"));
+    assert!(error
+        .to_string()
+        .contains("workflow transition profile route is not allowed by the rule"));
 
     let fixture = Fixture::new();
     fixture.seed_transition_artifact("raw-event-missing-effect");

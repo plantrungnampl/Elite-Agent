@@ -14,6 +14,12 @@ use crate::event_store::{open_error_to_port, sqlite_error_to_port};
 use crate::SqliteStore;
 
 impl WorkflowAuthorityStore for SqliteStore {
+    fn trusted_core_actor_digest(&self) -> Result<Sha256Digest, PortError> {
+        self.workflow_core_actor_digest()
+            .cloned()
+            .ok_or_else(unavailable)
+    }
+
     fn load_workflow(
         &self,
         task_id: &TaskId,
@@ -26,6 +32,9 @@ impl WorkflowAuthorityStore for SqliteStore {
         &self,
         command: &PreparedWorkflowTransition,
     ) -> Result<local_agent_terminal_domain::WorkflowState, PortError> {
+        if self.trusted_core_actor_digest()? != command.core_actor_digest {
+            return Err(conflict());
+        }
         validate_prepared_command(command)?;
 
         // Artifact publication is deliberately an earlier journal operation. This
@@ -591,11 +600,29 @@ fn authority_timestamp(
             row.get(0)
         })
         .map_err(sqlite_error_to_port)?;
-    if now > previous {
-        Ok(now)
-    } else {
-        Ok(format!("{previous}~"))
+    let incremented_previous: Option<String> = transaction
+        .query_row(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1, '+1 second')",
+            [&previous],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error_to_port)?;
+    choose_authority_timestamp(&previous, now, incremented_previous)
+}
+
+fn choose_authority_timestamp(
+    previous: &str,
+    now: String,
+    incremented_previous: Option<String>,
+) -> Result<String, PortError> {
+    if now.as_str() > previous {
+        return Ok(now);
     }
+    let next = incremented_previous.ok_or_else(integrity_failure)?;
+    if next.as_str() <= previous {
+        return Err(integrity_failure());
+    }
+    Ok(next)
 }
 
 fn guard_values(command: &PreparedWorkflowTransition) -> Vec<Value> {
@@ -716,4 +743,36 @@ fn unavailable() -> PortError {
         SafeErrorClassification::Unavailable,
         local_agent_terminal_application::Retryability::Retryable,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_authority_timestamp;
+
+    #[test]
+    fn equal_clock_uses_the_next_rfc3339_instant() {
+        let previous = "2026-08-09T00:00:00.000Z";
+        assert_eq!(
+            choose_authority_timestamp(
+                previous,
+                previous.to_owned(),
+                Some("2026-08-09T00:00:01.000Z".to_owned()),
+            )
+            .unwrap(),
+            "2026-08-09T00:00:01.000Z"
+        );
+    }
+
+    #[test]
+    fn regressed_clock_uses_the_next_rfc3339_instant() {
+        assert_eq!(
+            choose_authority_timestamp(
+                "2026-08-09T00:00:00.000Z",
+                "2026-08-08T23:59:59.999Z".to_owned(),
+                Some("2026-08-09T00:00:01.000Z".to_owned()),
+            )
+            .unwrap(),
+            "2026-08-09T00:00:01.000Z"
+        );
+    }
 }

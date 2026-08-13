@@ -28,6 +28,7 @@ use std::sync::Arc;
 use local_agent_terminal_application::{
     ArtifactRootReader, Clock, PlanApprovalCurrentAuthoritySource, PortError,
 };
+use local_agent_terminal_domain::Sha256Digest;
 use rusqlite::Connection;
 
 pub use agent_store::{canonical_agent_run_config_artifact, StoredAgentRunUsage};
@@ -41,6 +42,7 @@ pub struct SqliteStore {
     path: PathBuf,
     artifact_reader: Option<Arc<dyn ArtifactRootReader>>,
     plan_approval_authority_source: Option<Arc<dyn PlanApprovalCurrentAuthoritySource>>,
+    workflow_core_actor_digest: Option<Sha256Digest>,
 }
 
 impl fmt::Debug for SqliteStore {
@@ -55,6 +57,10 @@ impl fmt::Debug for SqliteStore {
             .field(
                 "plan_approval_authority_source_configured",
                 &self.plan_approval_authority_source.is_some(),
+            )
+            .field(
+                "workflow_core_actor_digest_configured",
+                &self.workflow_core_actor_digest.is_some(),
             )
             .finish()
     }
@@ -76,6 +82,7 @@ impl SqliteStore {
             path: path.as_ref().to_owned(),
             artifact_reader: None,
             plan_approval_authority_source: None,
+            workflow_core_actor_digest: None,
         };
         let mut connection = Connection::open(&store.path)?;
         migrations::validate_or_migrate(&mut connection)?;
@@ -95,6 +102,12 @@ impl SqliteStore {
         source: Arc<dyn PlanApprovalCurrentAuthoritySource>,
     ) -> Self {
         self.plan_approval_authority_source = Some(source);
+        self
+    }
+
+    #[must_use]
+    pub fn with_workflow_core_actor_digest(mut self, digest: Sha256Digest) -> Self {
+        self.workflow_core_actor_digest = Some(digest);
         self
     }
 
@@ -126,6 +139,10 @@ impl SqliteStore {
 
     pub(crate) fn artifact_reader(&self) -> Option<&dyn ArtifactRootReader> {
         self.artifact_reader.as_deref()
+    }
+
+    pub(crate) fn workflow_core_actor_digest(&self) -> Option<&Sha256Digest> {
+        self.workflow_core_actor_digest.as_ref()
     }
 }
 
