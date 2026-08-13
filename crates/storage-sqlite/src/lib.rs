@@ -18,6 +18,7 @@ mod project_store;
 mod task_query;
 mod tool_activity;
 mod tool_execution_store;
+mod workflow_authority_store;
 mod workspace_store;
 
 use std::fmt;

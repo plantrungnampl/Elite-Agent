@@ -11,7 +11,7 @@ pub use local_agent_terminal_domain::{
     DeliberationError, EventId, EvidenceFreshness, FencingToken, GitObjectId, LeaseClaim,
     LineRange, Phase, PolicyAction, PolicyActor, PolicyDecisionSet, PolicyResource, ProjectId,
     RepositoryId, ResourceClass, RunId, Sequence, Sha256Digest, SourceIdentity, SpecialistBudget,
-    SpecialistRequest, TaskBranch, TaskId, TaskRisk, TrustTier, WorkspaceFingerprint,
+    SpecialistRequest, TaskBranch, TaskId, TaskRisk, Timestamp, TrustTier, WorkspaceFingerprint,
     WorkspaceVersion, WorktreeId, MAX_GENERATION_PARAMETERS_BYTES,
 };
 
@@ -34,6 +34,7 @@ mod ports;
 mod repository;
 mod resume;
 mod tool;
+mod workflow_authority;
 mod workspace;
 
 pub use agent::{
@@ -198,6 +199,11 @@ pub use tool::{
     ToolExecutionStreamMetadata, ToolExecutionTerminal, ToolExecutionTerminalKind,
     ToolPolicyContext, ToolRequest, ToolRequestBindingDigest, VerifiedBytes,
     VerifiedFileWriteCompensation, VerifiedWrite,
+};
+pub use workflow_authority::{
+    prepare_workflow_transition, PreparedWorkflowTransition, TransitionWorkflow,
+    TransitionWorkflowInput, WorkflowAuthorityStore, WorkflowCommandPublisher,
+    WorkflowEffectBinding, WorkflowGuardEvidence,
 };
 pub use workspace::{
     ArtifactRootMode, GetWorkspaceDashboard, IdempotencyClass, IntentTransition, NewProject,
