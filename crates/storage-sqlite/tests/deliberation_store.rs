@@ -43,6 +43,14 @@ struct TestDatabase {
 
 impl TestDatabase {
     fn new() -> Self {
+        Self::new_with_workflow_authority(true)
+    }
+
+    fn new_without_workflow_authority() -> Self {
+        Self::new_with_workflow_authority(false)
+    }
+
+    fn new_with_workflow_authority(seed_workflow_authority: bool) -> Self {
         let directory = std::env::temp_dir().join(format!(
             "local-agent-terminal-deliberation-store-test-{}-{}",
             std::process::id(),
@@ -59,6 +67,9 @@ impl TestDatabase {
             artifact_root,
         };
         database.seed();
+        if seed_workflow_authority {
+            database.seed_authoritative_workflow_state();
+        }
         database
     }
 
@@ -109,6 +120,137 @@ impl TestDatabase {
         for number in 1..=2 {
             self.seed_agent_run(number);
         }
+    }
+
+    fn seed_authoritative_workflow_state(&self) {
+        for (artifact_id, artifact_type) in [
+            ("workflow-transition-p1", "workflow_transition_command"),
+            ("workflow-transition-p2", "workflow_transition_command"),
+            ("workflow-profile-revision-reason", "receipt"),
+        ] {
+            self.publish_raw(
+                &ArtifactId::new(artifact_id).unwrap(),
+                artifact_type,
+                artifact_id.as_bytes(),
+            )
+            .unwrap();
+        }
+
+        let connection = self.connection();
+        let policy_digest = digest(b"workflow-policy");
+        connection
+            .execute(
+                "INSERT INTO task_workflow_authority (
+                    task_id, workflow_profile, outcome_mode, phase, selected_by_kind,
+                    selected_by_actor_binding_id, selection_policy_digest, created_at,
+                    updated_at, completed_at, stream_version, last_transition_event_id,
+                    profile_revision, last_profile_revision_id
+                 ) VALUES (
+                    'task-1', 'Standard', 'LocalCommit', 'Intake', 'core', NULL, ?1,
+                    '2026-08-09T00:00:00.000Z', '2026-08-09T00:00:00.000Z', NULL,
+                    0, NULL, 1, NULL
+                 )",
+                [policy_digest.as_str()],
+            )
+            .unwrap();
+
+        accept_workflow_transition(
+            &connection,
+            WorkflowTransitionFixture {
+                transition_id: "workflow-transition-p1",
+                rule_id: "WF-P001",
+                expected_stream_version: 0,
+                from_phase: "Intake",
+                event_type: "task.validated",
+                to_phase: "ContextBuild",
+                workflow_profile: "Standard",
+                outcome_mode: "LocalCommit",
+                transition_artifact_id: "workflow-transition-p1",
+                guard_kinds: &["profile_outcome_policy_budget_receipt"],
+                effect_kinds: &[
+                    "persist_risk",
+                    "persist_base_identity",
+                    "persist_workflow_profile",
+                    "persist_outcome_mode",
+                ],
+                accepted_at: "2026-08-09T00:00:00.001Z",
+            },
+        );
+        connection
+            .execute(
+                "UPDATE task_workflow_authority
+                 SET phase = 'ContextBuild', stream_version = 1,
+                     last_transition_event_id = 'workflow-transition-p1',
+                     updated_at = '2026-08-09T00:00:00.002Z'
+                 WHERE task_id = 'task-1'",
+                [],
+            )
+            .unwrap();
+
+        accept_workflow_transition(
+            &connection,
+            WorkflowTransitionFixture {
+                transition_id: "workflow-transition-p2",
+                rule_id: "WF-P002",
+                expected_stream_version: 1,
+                from_phase: "ContextBuild",
+                event_type: "context.initial.ready",
+                to_phase: "ParallelAnalysis",
+                workflow_profile: "Standard",
+                outcome_mode: "LocalCommit",
+                transition_artifact_id: "workflow-transition-p2",
+                guard_kinds: &["context_package_set"],
+                effect_kinds: &["freeze_independent_inputs"],
+                accepted_at: "2026-08-09T00:00:00.003Z",
+            },
+        );
+        connection
+            .execute(
+                "UPDATE task_workflow_authority
+                 SET phase = 'ParallelAnalysis', stream_version = 2,
+                     last_transition_event_id = 'workflow-transition-p2',
+                     updated_at = '2026-08-09T00:00:00.004Z'
+                 WHERE task_id = 'task-1'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO workflow_profile_revisions (
+                    id, task_id, revision_no, expected_stream_version, from_profile,
+                    to_profile, reason_artifact_id, policy_digest, decided_by_kind,
+                    actor_binding_id, created_at, receipt_digest
+                 ) VALUES (
+                    'workflow-profile-revision-2', 'task-1', 2, 2, 'Standard',
+                    'HighAssurance', 'workflow-profile-revision-reason', ?1, 'core', NULL,
+                    '2026-08-09T00:00:00.005Z', ?2
+                 )",
+                params![
+                    policy_digest.as_str(),
+                    digest(b"profile-revision-2").as_str()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE task_workflow_authority
+                 SET workflow_profile = 'HighAssurance', stream_version = 3,
+                     profile_revision = 2,
+                     last_profile_revision_id = 'workflow-profile-revision-2',
+                     updated_at = '2026-08-09T00:00:00.006Z'
+                 WHERE task_id = 'task-1'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE tasks
+                 SET current_sequence = 3, workspace_version = 3, fencing_epoch = 4,
+                     row_version = row_version + 1
+                 WHERE id = 'task-1'",
+                [],
+            )
+            .unwrap();
     }
 
     fn seed_agent_run(&self, number: u8) {
@@ -242,6 +384,91 @@ impl Drop for TestDatabase {
     }
 }
 
+struct WorkflowTransitionFixture<'a> {
+    transition_id: &'a str,
+    rule_id: &'a str,
+    expected_stream_version: i64,
+    from_phase: &'a str,
+    event_type: &'a str,
+    to_phase: &'a str,
+    workflow_profile: &'a str,
+    outcome_mode: &'a str,
+    transition_artifact_id: &'a str,
+    guard_kinds: &'a [&'a str],
+    effect_kinds: &'a [&'a str],
+    accepted_at: &'a str,
+}
+
+fn accept_workflow_transition(connection: &Connection, transition: WorkflowTransitionFixture<'_>) {
+    let binding_digest = digest(transition.transition_id.as_bytes());
+    connection
+        .execute(
+            "INSERT INTO workflow_transition_events (
+                id, task_id, rule_id, expected_stream_version, from_phase, event_type,
+                to_phase, workflow_profile, outcome_mode, transition_command_artifact_id,
+                guard_set_digest, effect_set_digest, core_actor_digest, reducer_version,
+                status, prepared_at, accepted_at, rejected_at
+             ) VALUES (
+                ?1, 'task-1', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10, 'v3',
+                'prepared', ?11, NULL, NULL
+             )",
+            params![
+                transition.transition_id,
+                transition.rule_id,
+                transition.expected_stream_version,
+                transition.from_phase,
+                transition.event_type,
+                transition.to_phase,
+                transition.workflow_profile,
+                transition.outcome_mode,
+                transition.transition_artifact_id,
+                binding_digest.as_str(),
+                transition.accepted_at,
+            ],
+        )
+        .unwrap();
+    for (index, evidence_kind) in transition.guard_kinds.iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO workflow_transition_guard_bindings (
+                    transition_event_id, evidence_kind, evidence_ref, subject_digest,
+                    evidence_digest, artifact_id, approval_receipt_id, acceptance_receipt_id,
+                    verification_receipt_id, ref_promotion_receipt_id
+                 ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, NULL, NULL, NULL, NULL)",
+                params![
+                    transition.transition_id,
+                    evidence_kind,
+                    format!("{}:guard:{index}", transition.transition_id),
+                    binding_digest.as_str(),
+                ],
+            )
+            .unwrap();
+    }
+    for (index, effect_kind) in transition.effect_kinds.iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO workflow_transition_effect_bindings (
+                    transition_event_id, effect_kind, effect_ref, effect_digest, artifact_id
+                 ) VALUES (?1, ?2, ?3, ?4, NULL)",
+                params![
+                    transition.transition_id,
+                    effect_kind,
+                    format!("{}:effect:{index}", transition.transition_id),
+                    binding_digest.as_str(),
+                ],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "UPDATE workflow_transition_events
+             SET status = 'accepted', accepted_at = ?1
+             WHERE id = ?2",
+            params![transition.accepted_at, transition.transition_id],
+        )
+        .unwrap();
+}
+
 #[test]
 fn sqlite_store_exposes_the_application_deliberation_port() {
     fn accepts(_: &dyn DeliberationStore) {}
@@ -254,6 +481,79 @@ fn sqlite_store_exposes_the_application_deliberation_port() {
     accepts_dispatch(&database.store());
     accepts_boundary(&database.store());
     accepts_synthesis(&database.store());
+}
+
+#[test]
+fn deliberation_load_rehydrates_exact_v7_workflow_authority() {
+    let database = TestDatabase::new();
+
+    let snapshot = database
+        .store()
+        .load(&TaskId::new("task-1").unwrap())
+        .unwrap();
+    let state = snapshot.task_state;
+
+    assert_eq!(state.phase(), Phase::ParallelAnalysis);
+    assert_eq!(
+        state.workflow_profile(),
+        local_agent_terminal_domain::WorkflowProfile::HighAssurance
+    );
+    assert_eq!(
+        state.outcome_mode(),
+        local_agent_terminal_domain::TaskOutcomeMode::LocalCommit
+    );
+    assert_eq!(state.stream_version(), 3);
+    assert_eq!(state.profile_revision(), 2);
+    assert_eq!(state.workspace_version().get(), 3);
+    assert_eq!(state.fencing_token().get(), 4);
+    assert_eq!(
+        state.last_transition_event_id(),
+        Some("workflow-transition-p2")
+    );
+    assert_eq!(
+        state.last_profile_revision_id(),
+        Some("workflow-profile-revision-2")
+    );
+}
+
+#[test]
+fn deliberation_load_fails_closed_when_v7_workflow_authority_is_missing() {
+    let database = TestDatabase::new_without_workflow_authority();
+
+    let error = database
+        .store()
+        .load(&TaskId::new("task-1").unwrap())
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+}
+
+#[test]
+fn deliberation_load_fails_closed_when_authority_transition_is_mismatched() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let connection = database.connection();
+    connection
+        .execute_batch("DROP TRIGGER task_workflow_v7_update_guard;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE task_workflow_authority
+             SET last_transition_event_id = 'workflow-transition-p1'
+             WHERE task_id = 'task-1'",
+            [],
+        )
+        .unwrap();
+
+    let error = store.load(&TaskId::new("task-1").unwrap()).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
 }
 
 #[test]

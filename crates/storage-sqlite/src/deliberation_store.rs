@@ -8,8 +8,8 @@ use local_agent_terminal_application::{
     DeliberationSynthesisStore, PortError, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
-    ArtifactId, Condition, FencingToken, OperationState, Phase, Sequence, Sha256Digest, TaskId,
-    WorkflowState, WorkspaceVersion,
+    ArtifactId, Condition, OperationState, Phase, Sha256Digest, TaskId, TaskOutcomeMode,
+    WorkflowProfile, WorkflowState, WorkflowStateSnapshot,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -20,6 +20,21 @@ use crate::agent_store::{
 use crate::deliberation_budget_store::reserve_task_budget;
 use crate::event_store::{append_in_transaction, open_error_to_port, sqlite_error_to_port};
 use crate::SqliteStore;
+
+type WorkflowAuthorityRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
 
 impl DeliberationStore for SqliteStore {
     fn load(&self, task_id: &TaskId) -> Result<DeliberationSnapshot, PortError> {
@@ -656,11 +671,16 @@ pub(crate) fn load_workflow_state(
     connection: &Connection,
     task_id: &TaskId,
 ) -> Result<WorkflowState, PortError> {
-    let raw: Option<(String, String, String, i64, i64, i64)> = connection
+    let raw: Option<WorkflowAuthorityRow> = connection
         .query_row(
-            "SELECT phase, condition, operation_state, current_sequence,
-                    workspace_version, fencing_epoch
-             FROM tasks WHERE id = ?1",
+            "SELECT tasks.phase, tasks.condition, tasks.operation_state,
+                    authority.phase, authority.workflow_profile, authority.outcome_mode,
+                    authority.stream_version, authority.profile_revision,
+                    tasks.workspace_version, tasks.fencing_epoch,
+                    authority.last_transition_event_id, authority.last_profile_revision_id
+             FROM tasks
+             JOIN task_workflow_authority AS authority ON authority.task_id = tasks.id
+             WHERE tasks.id = ?1",
             [task_id.as_str()],
             |row| {
                 Ok((
@@ -670,30 +690,164 @@ pub(crate) fn load_workflow_state(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
                 ))
             },
         )
         .optional()
         .map_err(sqlite_error_to_port)?;
-    let Some((phase, condition, operation, sequence, workspace, fencing)) = raw else {
-        return Err(not_found());
+    let Some((
+        task_phase,
+        condition,
+        operation,
+        authority_phase,
+        workflow_profile,
+        outcome_mode,
+        stream_version,
+        profile_revision,
+        workspace_version,
+        fencing_epoch,
+        last_transition_event_id,
+        last_profile_revision_id,
+    )) = raw
+    else {
+        let task_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
+                [task_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_error_to_port)?;
+        return Err(if task_exists {
+            integrity_failure()
+        } else {
+            not_found()
+        });
     };
-    WorkflowState::new(
-        Phase::from_str(&phase).map_err(|_| integrity_failure())?,
-        Condition::from_str(&condition).map_err(|_| integrity_failure())?,
-        OperationState::from_str(&operation).map_err(|_| integrity_failure())?,
-        Sequence::try_from(sequence).map_err(|_| integrity_failure())?,
-        WorkspaceVersion::try_from(workspace).map_err(|_| integrity_failure())?,
-        workflow_fencing_token(fencing)?,
+    let (
+        Some(task_phase),
+        Some(condition),
+        Some(operation),
+        Some(authority_phase),
+        Some(workflow_profile),
+        Some(outcome_mode),
+        Some(stream_version),
+        Some(profile_revision),
+        Some(workspace_version),
+        Some(fencing_epoch),
+    ) = (
+        task_phase,
+        condition,
+        operation,
+        authority_phase,
+        workflow_profile,
+        outcome_mode,
+        stream_version,
+        profile_revision,
+        workspace_version,
+        fencing_epoch,
     )
-    .map_err(|_| integrity_failure())
+    else {
+        return Err(integrity_failure());
+    };
+    if task_phase != authority_phase
+        || last_transition_event_id
+            .as_deref()
+            .is_some_and(str::is_empty)
+        || last_profile_revision_id
+            .as_deref()
+            .is_some_and(str::is_empty)
+    {
+        return Err(integrity_failure());
+    }
+    let profile_revision = u64::try_from(profile_revision).map_err(|_| integrity_failure())?;
+    if profile_revision == 0
+        || (profile_revision == 1 && last_profile_revision_id.is_some())
+        || (profile_revision > 1 && last_profile_revision_id.is_none())
+    {
+        return Err(integrity_failure());
+    }
+    let snapshot = WorkflowStateSnapshot {
+        phase: Phase::from_str(&authority_phase).map_err(|_| integrity_failure())?,
+        condition: Condition::from_str(&condition).map_err(|_| integrity_failure())?,
+        operation: OperationState::from_str(&operation).map_err(|_| integrity_failure())?,
+        workflow_profile: WorkflowProfile::from_str(&workflow_profile)
+            .map_err(|_| integrity_failure())?,
+        outcome_mode: TaskOutcomeMode::from_str(&outcome_mode).map_err(|_| integrity_failure())?,
+        stream_version: u64::try_from(stream_version).map_err(|_| integrity_failure())?,
+        profile_revision,
+        workspace_version: u64::try_from(workspace_version).map_err(|_| integrity_failure())?,
+        fencing_epoch: u64::try_from(fencing_epoch).map_err(|_| integrity_failure())?,
+        last_transition_event_id,
+        last_profile_revision_id,
+    };
+    validate_workflow_authority_references(connection, task_id, &snapshot)?;
+    WorkflowState::rehydrate(snapshot).map_err(|_| integrity_failure())
 }
 
-fn workflow_fencing_token(persisted_epoch: i64) -> Result<FencingToken, PortError> {
-    let epoch = u64::try_from(persisted_epoch).map_err(|_| integrity_failure())?;
-    // A task has epoch zero before its first writer lease. The workflow reducer still requires
-    // a positive identity token, but this value is never used as lease authority.
-    FencingToken::new(epoch.max(1)).map_err(|_| integrity_failure())
+fn validate_workflow_authority_references(
+    connection: &Connection,
+    task_id: &TaskId,
+    snapshot: &WorkflowStateSnapshot,
+) -> Result<(), PortError> {
+    if snapshot.phase != Phase::Intake && snapshot.last_transition_event_id.is_none() {
+        return Err(integrity_failure());
+    }
+    if let Some(transition_event_id) = &snapshot.last_transition_event_id {
+        let transition_matches: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM workflow_transition_events
+                    WHERE id = ?1
+                      AND task_id = ?2
+                      AND status = 'accepted'
+                      AND to_phase = ?3
+                      AND outcome_mode = ?4
+                )",
+                params![
+                    transition_event_id,
+                    task_id.as_str(),
+                    snapshot.phase.as_str(),
+                    snapshot.outcome_mode.as_str(),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_error_to_port)?;
+        if !transition_matches {
+            return Err(integrity_failure());
+        }
+    }
+    if let Some(profile_revision_id) = &snapshot.last_profile_revision_id {
+        let profile_revision =
+            i64::try_from(snapshot.profile_revision).map_err(|_| integrity_failure())?;
+        let revision_matches: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM workflow_profile_revisions
+                    WHERE id = ?1
+                      AND task_id = ?2
+                      AND revision_no = ?3
+                      AND to_profile = ?4
+                )",
+                params![
+                    profile_revision_id,
+                    task_id.as_str(),
+                    profile_revision,
+                    snapshot.workflow_profile.as_str(),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_error_to_port)?;
+        if !revision_matches {
+            return Err(integrity_failure());
+        }
+    }
+    Ok(())
 }
 
 fn validate_record_artifacts(

@@ -12,8 +12,8 @@ use local_agent_terminal_application::{
     ResolvePlanApprovalInput, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
-    ActorId, ArtifactId, Condition, FencingToken, OperationState, Phase, Sequence, Sha256Digest,
-    TaskId, WorkflowState, WorkspaceVersion,
+    ActorId, ArtifactId, Condition, OperationState, Phase, Sha256Digest, TaskId, TaskOutcomeMode,
+    WorkflowProfile, WorkflowState, WorkflowStateSnapshot,
 };
 use local_agent_terminal_storage_files::{
     ContentAddressedArtifactReader, ContentAddressedArtifactStore,
@@ -623,6 +623,20 @@ fn seed_authority(path: &PathBuf, artifact_root: &PathBuf) {
         "content",
         b"context",
     );
+    publish_artifact(
+        path,
+        artifact_root,
+        ArtifactId::new("artifact-workflow-transition-command").unwrap(),
+        "workflow_transition_command",
+        b"workflow transition command",
+    );
+    publish_artifact(
+        path,
+        artifact_root,
+        ArtifactId::new("artifact-workflow-profile-revision").unwrap(),
+        "receipt",
+        b"workflow profile revision",
+    );
     let connection = Connection::open(path).unwrap();
     connection
         .execute_batch("PRAGMA foreign_keys = ON;")
@@ -637,6 +651,270 @@ fn seed_authority(path: &PathBuf, artifact_root: &PathBuf) {
                 'artifact-agent-manifest-1', 'artifact-context-1', ?1, ?2,
                 'prompt.v1', 'retrieval.v1', '2026-08-09T00:00:00Z')",
             params![digest(b"context").as_str(), policy_digest.as_str()],
+        )
+        .unwrap();
+    seed_awaiting_plan_approval_workflow_state(&connection, &policy_digest);
+}
+
+struct WorkflowTransitionFixture {
+    id: &'static str,
+    rule_id: &'static str,
+    expected_stream_version: i64,
+    from_phase: &'static str,
+    event_type: &'static str,
+    to_phase: &'static str,
+    workflow_profile: &'static str,
+}
+
+fn seed_awaiting_plan_approval_workflow_state(
+    connection: &Connection,
+    policy_digest: &Sha256Digest,
+) {
+    connection
+        .execute(
+            "INSERT INTO task_workflow_authority (
+                task_id, workflow_profile, outcome_mode, phase, selected_by_kind,
+                selected_by_actor_binding_id, selection_policy_digest, created_at,
+                updated_at, completed_at, stream_version, last_transition_event_id,
+                profile_revision, last_profile_revision_id
+             ) VALUES (
+                'task-1', 'Standard', 'WorkspaceChange', 'Intake', 'core', NULL, ?1,
+                '2026-08-09T00:00:00.000Z', '2026-08-09T00:00:00.000Z', NULL,
+                0, NULL, 1, NULL
+             )",
+            [policy_digest.as_str()],
+        )
+        .unwrap();
+
+    for (index, transition) in [
+        WorkflowTransitionFixture {
+            id: "workflow-transition-p001",
+            rule_id: "WF-P001",
+            expected_stream_version: 0,
+            from_phase: "Intake",
+            event_type: "task.validated",
+            to_phase: "ContextBuild",
+            workflow_profile: "Standard",
+        },
+        WorkflowTransitionFixture {
+            id: "workflow-transition-p002",
+            rule_id: "WF-P002",
+            expected_stream_version: 1,
+            from_phase: "ContextBuild",
+            event_type: "context.initial.ready",
+            to_phase: "ParallelAnalysis",
+            workflow_profile: "Standard",
+        },
+        WorkflowTransitionFixture {
+            id: "workflow-transition-p004",
+            rule_id: "WF-P004",
+            expected_stream_version: 2,
+            from_phase: "ParallelAnalysis",
+            event_type: "analysis.quorum.reached",
+            to_phase: "CrossReview",
+            workflow_profile: "Standard",
+        },
+        WorkflowTransitionFixture {
+            id: "workflow-transition-p005",
+            rule_id: "WF-P005",
+            expected_stream_version: 3,
+            from_phase: "CrossReview",
+            event_type: "review.complete",
+            to_phase: "PrePlanVerification",
+            workflow_profile: "Standard",
+        },
+        WorkflowTransitionFixture {
+            id: "workflow-transition-p006",
+            rule_id: "WF-P006",
+            expected_stream_version: 4,
+            from_phase: "PrePlanVerification",
+            event_type: "claims.checked",
+            to_phase: "Synthesis",
+            workflow_profile: "Standard",
+        },
+        WorkflowTransitionFixture {
+            id: "workflow-transition-p007",
+            rule_id: "WF-P007",
+            expected_stream_version: 5,
+            from_phase: "Synthesis",
+            event_type: "decision.draft.created",
+            to_phase: "FinalObjection",
+            workflow_profile: "Standard",
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let updated_at = format!("2026-08-09T00:00:{:02}.000Z", index + 1);
+        accept_workflow_transition(connection, &transition, &updated_at);
+        connection
+            .execute(
+                "UPDATE task_workflow_authority
+                 SET phase = ?1, stream_version = ?2, last_transition_event_id = ?3,
+                     updated_at = ?4
+                 WHERE task_id = 'task-1'",
+                params![
+                    transition.to_phase,
+                    transition.expected_stream_version + 1,
+                    transition.id,
+                    updated_at,
+                ],
+            )
+            .unwrap();
+    }
+
+    connection
+        .execute(
+            "INSERT INTO workflow_profile_revisions (
+                id, task_id, revision_no, expected_stream_version, from_profile,
+                to_profile, reason_artifact_id, policy_digest, decided_by_kind,
+                actor_binding_id, created_at, receipt_digest
+             ) VALUES (
+                'workflow-profile-revision-2', 'task-1', 2, 6, 'Standard',
+                'HighAssurance', 'artifact-workflow-profile-revision', ?1, 'core', NULL,
+                '2026-08-09T00:00:07.000Z', ?2
+             )",
+            params![
+                policy_digest.as_str(),
+                digest(b"workflow-profile-revision-2").as_str(),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE task_workflow_authority
+             SET workflow_profile = 'HighAssurance', stream_version = 7,
+                 profile_revision = 2,
+                 last_profile_revision_id = 'workflow-profile-revision-2',
+                 updated_at = '2026-08-09T00:00:07.000Z'
+             WHERE task_id = 'task-1'",
+            [],
+        )
+        .unwrap();
+
+    let transition = WorkflowTransitionFixture {
+        id: "workflow-transition-p013",
+        rule_id: "WF-P013",
+        expected_stream_version: 7,
+        from_phase: "FinalObjection",
+        event_type: "objection.round.closed",
+        to_phase: "AwaitingPlanApproval",
+        workflow_profile: "HighAssurance",
+    };
+    accept_workflow_transition(connection, &transition, "2026-08-09T00:00:08.000Z");
+    connection
+        .execute(
+            "UPDATE task_workflow_authority
+             SET phase = 'AwaitingPlanApproval', stream_version = 8,
+                 last_transition_event_id = 'workflow-transition-p013',
+                 updated_at = '2026-08-09T00:00:08.000Z'
+             WHERE task_id = 'task-1'",
+            [],
+        )
+        .unwrap();
+}
+
+fn accept_workflow_transition(
+    connection: &Connection,
+    transition: &WorkflowTransitionFixture,
+    accepted_at: &str,
+) {
+    let binding_digest = digest(transition.id.as_bytes());
+    connection
+        .execute(
+            "INSERT INTO workflow_transition_events (
+                id, task_id, rule_id, expected_stream_version, from_phase, event_type,
+                to_phase, workflow_profile, outcome_mode, transition_command_artifact_id,
+                guard_set_digest, effect_set_digest, core_actor_digest, reducer_version,
+                status, prepared_at, accepted_at, rejected_at
+             ) VALUES (
+                ?1, 'task-1', ?2, ?3, ?4, ?5, ?6, ?7, 'WorkspaceChange',
+                'artifact-workflow-transition-command', ?8, ?8, ?8, 'v3',
+                'prepared', ?9, NULL, NULL
+             )",
+            params![
+                transition.id,
+                transition.rule_id,
+                transition.expected_stream_version,
+                transition.from_phase,
+                transition.event_type,
+                transition.to_phase,
+                transition.workflow_profile,
+                binding_digest.as_str(),
+                accepted_at,
+            ],
+        )
+        .unwrap();
+
+    let guard_kinds: Vec<String> = {
+        let mut statement = connection
+            .prepare(
+                "SELECT evidence_kind
+                 FROM workflow_transition_rule_guard_requirements
+                 WHERE rule_id = ?1
+                 ORDER BY evidence_kind",
+            )
+            .unwrap();
+        statement
+            .query_map([transition.rule_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    for (index, evidence_kind) in guard_kinds.iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO workflow_transition_guard_bindings (
+                    transition_event_id, evidence_kind, evidence_ref, subject_digest,
+                    evidence_digest, artifact_id, approval_receipt_id, acceptance_receipt_id,
+                    verification_receipt_id, ref_promotion_receipt_id
+                 ) VALUES (?1, ?2, ?3, NULL, ?4, NULL, NULL, NULL, NULL, NULL)",
+                params![
+                    transition.id,
+                    evidence_kind,
+                    format!("{}:guard:{index}", transition.id),
+                    binding_digest.as_str(),
+                ],
+            )
+            .unwrap();
+    }
+
+    let effect_kinds: Vec<String> = {
+        let mut statement = connection
+            .prepare(
+                "SELECT effect_kind
+                 FROM workflow_transition_rule_effect_requirements
+                 WHERE rule_id = ?1
+                 ORDER BY effect_kind",
+            )
+            .unwrap();
+        statement
+            .query_map([transition.rule_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    for (index, effect_kind) in effect_kinds.iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO workflow_transition_effect_bindings (
+                    transition_event_id, effect_kind, effect_ref, effect_digest, artifact_id
+                 ) VALUES (?1, ?2, ?3, ?4, NULL)",
+                params![
+                    transition.id,
+                    effect_kind,
+                    format!("{}:effect:{index}", transition.id),
+                    binding_digest.as_str(),
+                ],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "UPDATE workflow_transition_events
+             SET status = 'accepted', accepted_at = ?1
+             WHERE id = ?2",
+            params![accepted_at, transition.id],
         )
         .unwrap();
 }
@@ -712,14 +990,19 @@ fn binding() -> PlanApprovalBindingInput {
 }
 
 fn awaiting_state() -> WorkflowState {
-    WorkflowState::new(
-        Phase::AwaitingPlanApproval,
-        Condition::Active,
-        OperationState::None,
-        Sequence::new(8),
-        WorkspaceVersion::new(1),
-        FencingToken::new(1).unwrap(),
-    )
+    WorkflowState::rehydrate(WorkflowStateSnapshot {
+        phase: Phase::AwaitingPlanApproval,
+        condition: Condition::Active,
+        operation: OperationState::None,
+        workflow_profile: WorkflowProfile::HighAssurance,
+        outcome_mode: TaskOutcomeMode::WorkspaceChange,
+        stream_version: 8,
+        profile_revision: 2,
+        workspace_version: 1,
+        fencing_epoch: 1,
+        last_transition_event_id: Some("workflow-transition-p013".to_owned()),
+        last_profile_revision_id: Some("workflow-profile-revision-2".to_owned()),
+    })
     .unwrap()
 }
 

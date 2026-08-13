@@ -622,6 +622,65 @@ fn seed_mutation_state(path: &Path, store: &SqliteStore) {
             )
             .unwrap();
     }
+    drop(connection);
+    seed_authoritative_mutation_workflow(path);
+}
+
+fn seed_authoritative_mutation_workflow(path: &Path) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TRIGGER task_workflow_insert_guard;
+             DROP TRIGGER workflow_transition_event_insert_guard;
+             DROP TRIGGER workflow_profile_revision_insert_guard;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO workflow_transition_events (
+                id, task_id, rule_id, expected_stream_version, from_phase, event_type,
+                to_phase, workflow_profile, outcome_mode, transition_command_artifact_id,
+                guard_set_digest, effect_set_digest, core_actor_digest, reducer_version,
+                status, prepared_at, accepted_at, rejected_at
+             ) VALUES (
+                'workflow-transition-7', 'task-1', 'WF-P015', 6,
+                'AwaitingPlanApproval', 'plan.approved', 'Implementation',
+                'HighAssurance', 'LocalCommit', 'artifact-repository',
+                ?1, ?1, ?1, 'v3', 'accepted',
+                '2026-07-26T00:00:06Z', '2026-07-26T00:00:06Z', NULL
+             )",
+            [DIGEST_A],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO workflow_profile_revisions (
+                id, task_id, revision_no, expected_stream_version, from_profile,
+                to_profile, reason_artifact_id, policy_digest, decided_by_kind,
+                actor_binding_id, created_at, receipt_digest
+             ) VALUES (
+                'workflow-profile-revision-2', 'task-1', 2, 5, 'Standard',
+                'HighAssurance', 'artifact-repository', ?1, 'core', NULL,
+                '2026-07-26T00:00:05Z', ?2
+             )",
+            params![DIGEST_A, DIGEST_B],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO task_workflow_authority (
+                task_id, workflow_profile, outcome_mode, phase, selected_by_kind,
+                selected_by_actor_binding_id, selection_policy_digest, created_at,
+                updated_at, completed_at, stream_version, last_transition_event_id,
+                profile_revision, last_profile_revision_id
+             ) VALUES (
+                'task-1', 'HighAssurance', 'LocalCommit', 'Implementation', 'core',
+                NULL, ?1, '2026-07-26T00:00:00Z', '2026-07-26T00:00:07Z', NULL,
+                7, 'workflow-transition-7', 2, 'workflow-profile-revision-2'
+             )",
+            [DIGEST_A],
+        )
+        .unwrap();
 }
 
 fn acquire(run: &str, expected_fencing_epoch: u64) -> AcquireLease {
@@ -865,6 +924,36 @@ fn workspace_mutation_is_atomic_and_invalidates_candidate_approvals() {
     assert!(payload.contains("\"preEvidenceArtifactId\":\"artifact-pre\""));
     assert!(payload.contains("\"postEvidenceArtifactId\":\"artifact-post\""));
     assert!(payload.contains("\"resumeTarget\":\"Implementation\""));
+}
+
+#[test]
+fn workspace_mutation_rehydrates_exact_v7_workflow_authority() {
+    let database = TempDatabase::new();
+    let store = SqliteStore::open(&database.path).unwrap();
+    seed_mutation_state(&database.path, &store);
+
+    let result = store
+        .record_workspace_mutation(mutation_request(&store))
+        .unwrap();
+
+    assert_eq!(
+        result.task_state.workflow_profile(),
+        local_agent_terminal_domain::WorkflowProfile::HighAssurance
+    );
+    assert_eq!(
+        result.task_state.outcome_mode(),
+        local_agent_terminal_domain::TaskOutcomeMode::LocalCommit
+    );
+    assert_eq!(result.task_state.stream_version(), 8);
+    assert_eq!(result.task_state.profile_revision(), 2);
+    assert_eq!(
+        result.task_state.last_transition_event_id(),
+        Some("workflow-transition-7")
+    );
+    assert_eq!(
+        result.task_state.last_profile_revision_id(),
+        Some("workflow-profile-revision-2")
+    );
 }
 
 #[test]

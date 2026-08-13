@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use local_agent_terminal_application::{
     Clock, ExpectedPresence, IdempotencyClass, IntentTransition, NewProject, NewTask,
     OperationIntent, OperationIntentStatus, PortError, ProjectSnapshot, RecoveryAction,
@@ -11,13 +9,14 @@ use local_agent_terminal_application::{
 };
 use local_agent_terminal_domain::{
     reduce, ArtifactId, Condition, FencingToken, GitObjectId, OperationState, Phase, ProjectId,
-    RepositoryId, Sequence, TaskBranch, TaskId, TransitionRequest, WorkflowEvent, WorkflowState,
-    WorkspaceVersion, WorktreeId,
+    RepositoryId, Sequence, TaskBranch, TaskId, TransitionRequest, WorkflowEvent, WorkspaceVersion,
+    WorktreeId,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::deliberation_store::load_workflow_state;
 use crate::event_store::{open_error_to_port, sqlite_error_to_port};
 use crate::SqliteStore;
 
@@ -1001,34 +1000,16 @@ fn record_workspace_mutation_with_authority(
 ) -> Result<WorkspaceMutationResult, PortError> {
     validate_mutation_request(&request)?;
     verify_mutation_evidence(transaction, &request)?;
-    let task: Option<(String, String, String, i64, i64, i64)> = transaction
+    let state = load_workflow_state(transaction, &request.task_id)?;
+    let current_sequence: Option<i64> = transaction
         .query_row(
-            "SELECT phase, condition, operation_state, current_sequence,
-                    workspace_version, fencing_epoch
-             FROM tasks WHERE id = ?1",
+            "SELECT current_sequence FROM tasks WHERE id = ?1",
             [request.task_id.as_str()],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
+            |row| row.get(0),
         )
         .optional()
         .map_err(sqlite_error_to_port)?;
-    let Some((
-        phase_name,
-        condition_name,
-        operation_name,
-        current_sequence,
-        workspace_version,
-        fencing_epoch,
-    )) = task
-    else {
+    let Some(current_sequence) = current_sequence else {
         return Err(not_found());
     };
     let expected_sequence =
@@ -1039,7 +1020,8 @@ fn record_workspace_mutation_with_authority(
             Sequence::try_from(current_sequence).map_err(|_| integrity_failure())?,
         ));
     }
-    let current_token = FencingToken::try_from(fencing_epoch).map_err(|_| integrity_failure())?;
+    let current_token = state.fencing_token();
+    let fencing_epoch = i64::try_from(current_token.get()).map_err(|_| integrity_failure())?;
     let lease: Option<(String, i64, String)> = transaction
         .query_row(
             "SELECT holder_run_id, fencing_token, status
@@ -1062,15 +1044,6 @@ fn record_workspace_mutation_with_authority(
         return Err(PortError::stale_lease(current_token, request.claim.token()));
     }
 
-    let state = WorkflowState::new(
-        Phase::from_str(&phase_name).map_err(|_| integrity_failure())?,
-        Condition::from_str(&condition_name).map_err(|_| integrity_failure())?,
-        OperationState::from_str(&operation_name).map_err(|_| integrity_failure())?,
-        Sequence::try_from(current_sequence).map_err(|_| integrity_failure())?,
-        WorkspaceVersion::try_from(workspace_version).map_err(|_| integrity_failure())?,
-        current_token,
-    )
-    .map_err(|_| integrity_failure())?;
     let event = WorkflowEvent::new("workspace.mutated").map_err(|_| invalid_input())?;
     let transition = reduce(
         &state,
