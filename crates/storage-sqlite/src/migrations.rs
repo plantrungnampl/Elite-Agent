@@ -14,10 +14,28 @@ const SQLITE_V7: &str =
 const MIGRATE_V6_TO_V7: &str =
     include_str!("../../../docs/multi-agent-terminal-design/schemas/migrate-v6-to-v7.sql");
 const APP_PROJECTION_SCHEMA: &str = include_str!("app_projection_schema.sql");
+const RUN_CONFIGURATION_BINDING_REPAIR: &str = r#"
+BEGIN IMMEDIATE;
+DROP TRIGGER run_configuration_binding_scope;
+CREATE TRIGGER run_configuration_binding_scope BEFORE INSERT ON run_configuration_bindings FOR EACH ROW BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM agent_runs r
+        JOIN tasks t ON t.id=r.task_id
+        JOIN artifacts a ON a.id=NEW.config_artifact_id
+        WHERE r.id=NEW.run_id
+          AND r.run_config_artifact_id=NEW.config_artifact_id
+          AND a.project_id=t.project_id
+          AND (a.task_id IS NULL OR a.task_id=r.task_id)
+    ) THEN RAISE(ABORT,'run configuration binding must match the exact run artifact') END;
+END;
+COMMIT;
+"#;
 
 static EXPECTED_V6_OBJECTS: OnceLock<SchemaObjects> = OnceLock::new();
 static EXPECTED_V7_OBJECTS: OnceLock<SchemaObjects> = OnceLock::new();
-static EXPECTED_COMPLETE_OBJECTS: OnceLock<SchemaObjects> = OnceLock::new();
+static EXPECTED_PRIOR_COMPLETE_OBJECTS: OnceLock<SchemaObjects> = OnceLock::new();
+static EXPECTED_REPAIRED_COMPLETE_OBJECTS: OnceLock<SchemaObjects> = OnceLock::new();
 static EXPECTED_WORKFLOW_RULE_AUTHORITY: OnceLock<WorkflowRuleAuthority> = OnceLock::new();
 
 const WORKFLOW_RULE_TABLES: [&str; 6] = [
@@ -138,7 +156,7 @@ pub(crate) fn validate_or_migrate(connection: &mut Connection) -> Result<(), Ope
 }
 
 pub(crate) fn verify_required_schema(connection: &Connection) -> Result<(), OpenError> {
-    if schema_objects(connection)? != *expected_complete_objects()? {
+    if schema_objects(connection)? != *expected_repaired_complete_objects()? {
         return Err(unsupported_schema());
     }
     verify_workflow_rule_authority(connection)?;
@@ -156,7 +174,10 @@ fn recognize_schema(connection: &Connection) -> Result<SchemaKind, OpenError> {
     if actual == *expected_v6_objects()? {
         return Ok(SchemaKind::NormativeV6);
     }
-    if actual == *expected_v7_objects()? || actual == *expected_complete_objects()? {
+    if actual == *expected_v7_objects()?
+        || actual == *expected_prior_complete_objects()?
+        || actual == *expected_repaired_complete_objects()?
+    {
         verify_workflow_rule_authority(connection)?;
         return Ok(SchemaKind::NormativeV7);
     }
@@ -175,15 +196,18 @@ fn migrate_v6_to_v7(connection: &Connection) -> Result<(), OpenError> {
 
 fn install_or_verify_app_projections(connection: &Connection) -> Result<(), OpenError> {
     let actual = schema_objects(connection)?;
-    if actual == *expected_complete_objects()? {
+    if actual == *expected_repaired_complete_objects()? {
         return Ok(());
     }
-    if actual != *expected_v7_objects()? {
+    if actual == *expected_v7_objects()? {
+        connection.execute_batch(APP_PROJECTION_SCHEMA)?;
+        connection.execute_batch(RUN_CONFIGURATION_BINDING_REPAIR)?;
+    } else if actual == *expected_prior_complete_objects()? {
+        connection.execute_batch(RUN_CONFIGURATION_BINDING_REPAIR)?;
+    } else {
         return Err(unsupported_schema());
     }
-
-    connection.execute_batch(APP_PROJECTION_SCHEMA)?;
-    verify_exact_objects(connection, expected_complete_objects()?)
+    verify_exact_objects(connection, expected_repaired_complete_objects()?)
 }
 
 fn verify_exact_objects(
@@ -205,10 +229,21 @@ fn expected_v7_objects() -> Result<&'static SchemaObjects, OpenError> {
     cached_schema(&EXPECTED_V7_OBJECTS, &[SQLITE_V7])
 }
 
-fn expected_complete_objects() -> Result<&'static SchemaObjects, OpenError> {
+fn expected_prior_complete_objects() -> Result<&'static SchemaObjects, OpenError> {
     cached_schema(
-        &EXPECTED_COMPLETE_OBJECTS,
+        &EXPECTED_PRIOR_COMPLETE_OBJECTS,
         &[SQLITE_V7, APP_PROJECTION_SCHEMA],
+    )
+}
+
+fn expected_repaired_complete_objects() -> Result<&'static SchemaObjects, OpenError> {
+    cached_schema(
+        &EXPECTED_REPAIRED_COMPLETE_OBJECTS,
+        &[
+            SQLITE_V7,
+            APP_PROJECTION_SCHEMA,
+            RUN_CONFIGURATION_BINDING_REPAIR,
+        ],
     )
 }
 

@@ -12,6 +12,20 @@ const SQLITE_V6: &str =
     include_str!("../../../docs/multi-agent-terminal-design/schemas/sqlite-v6.sql");
 const SQLITE_V7: &str =
     include_str!("../../../docs/multi-agent-terminal-design/schemas/sqlite-v7.sql");
+const REPAIRED_RUN_CONFIGURATION_BINDING_SCOPE: &str = r#"
+CREATE TRIGGER run_configuration_binding_scope BEFORE INSERT ON run_configuration_bindings FOR EACH ROW BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM agent_runs r
+        JOIN tasks t ON t.id=r.task_id
+        JOIN artifacts a ON a.id=NEW.config_artifact_id
+        WHERE r.id=NEW.run_id
+          AND r.run_config_artifact_id=NEW.config_artifact_id
+          AND a.project_id=t.project_id
+          AND (a.task_id IS NULL OR a.task_id=r.task_id)
+    ) THEN RAISE(ABORT,'run configuration binding must match the exact run artifact') END;
+END;
+"#;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -49,7 +63,7 @@ impl Drop for TempDirectory {
 
 #[test]
 fn clean_v7_and_migrated_v7_have_identical_authority_objects() {
-    let expected = normative_v7_objects();
+    let expected = runtime_v7_objects();
     assert_eq!(expected.len(), 481);
 
     let clean_directory = TempDirectory::new();
@@ -66,8 +80,8 @@ fn clean_v7_and_migrated_v7_have_identical_authority_objects() {
 }
 
 #[test]
-fn exact_normative_v7_reopens_without_changing_authority_objects() {
-    let expected = normative_v7_objects();
+fn exact_normative_v7_reopens_with_only_the_approved_trigger_repair() {
+    let expected = runtime_v7_objects();
     let directory = TempDirectory::new();
     let path = directory.database_path();
     install_script(&path, SQLITE_V7);
@@ -390,6 +404,21 @@ fn normative_v7_objects() -> SchemaObjects {
     let connection = Connection::open_in_memory().unwrap();
     connection.execute_batch(SQLITE_V7).unwrap();
     schema_objects(&connection)
+}
+
+fn runtime_v7_objects() -> SchemaObjects {
+    let mut objects = normative_v7_objects();
+    let repaired_scope = REPAIRED_RUN_CONFIGURATION_BINDING_SCOPE
+        .trim()
+        .trim_end_matches(';');
+    objects
+        .get_mut(&(
+            "trigger".to_owned(),
+            "run_configuration_binding_scope".to_owned(),
+        ))
+        .expect("normative v7 run configuration trigger exists")
+        .sql = normalize_sql(repaired_scope);
+    objects
 }
 
 fn install_script(path: &Path, script: &str) {

@@ -94,6 +94,40 @@ fn every_initialized_connection_enables_required_pragmas() {
 }
 
 #[test]
+fn v7_run_configuration_scope_repair_installs_and_reopens_exactly() {
+    let directory = TempDirectory::new();
+    let raw_path = directory.0.join("raw-v7.sqlite3");
+    let prior_path = directory.0.join("prior-complete-v7.sqlite3");
+    let v7 = include_str!("../../../docs/multi-agent-terminal-design/schemas/sqlite-v7.sql");
+    let app = include_str!("../src/app_projection_schema.sql");
+
+    Connection::open(&raw_path)
+        .unwrap()
+        .execute_batch(v7)
+        .unwrap();
+    Connection::open(&prior_path)
+        .unwrap()
+        .execute_batch(&format!("{v7}\n{app}"))
+        .unwrap();
+
+    for path in [raw_path, prior_path] {
+        SqliteStore::open(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let trigger: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type='trigger' AND name='run_configuration_binding_scope'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!trigger.contains("a.content_hash=NEW.config_digest"));
+        drop(connection);
+        SqliteStore::open(&path).unwrap();
+    }
+}
+
+#[test]
 fn database_and_artifact_root_health_are_typed() {
     let directory = TempDirectory::new();
     let database_path = directory.0.join("state.sqlite3");

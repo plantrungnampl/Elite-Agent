@@ -6,6 +6,7 @@ mod deliberation;
 mod event;
 mod identity;
 mod policy;
+mod run_configuration;
 mod tool;
 mod workflow;
 mod workspace;
@@ -40,6 +41,14 @@ pub use policy::{
     combine_policy_rules, ActorLocality, MatchedPolicyRule, PolicyAction, PolicyActor,
     PolicyDecisionDraft, PolicyEffect, PolicyError, PolicyRequest, PolicyResource, PolicyRuleId,
     PolicyVersion, RedactionDirective, ResourceClass, TaskRisk, TrustTier,
+};
+pub use run_configuration::{
+    AdapterConfiguration, AdapterProtocol, AdapterTransport, AgentProfileConfiguration, AgentRole,
+    AllowedDataClass, CapabilitySnapshot, DataPolicySnapshot, EndpointClass, FallbackCandidate,
+    FallbackMode, FallbackPolicy, GenerationParameters, IndependenceConfiguration,
+    IndependenceDimensions, ModelEndpointConfiguration, NetworkScope, ProviderTrainingUse,
+    RetentionClass, RunBudgetReservation, RunConfiguration, RunConfigurationError,
+    UnsignedRunConfiguration,
 };
 pub use tool::{
     ArtifactCapability, CapabilityRef, EnvironmentProfile, ExpectedWrite, NetworkProfile,

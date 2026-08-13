@@ -15,6 +15,7 @@ mod migrations;
 mod plan_approval_store;
 mod policy_store;
 mod project_store;
+mod run_configuration_store;
 mod task_query;
 mod tool_activity;
 mod tool_execution_store;
@@ -36,6 +37,7 @@ pub use context_store::StoredContextPackageView;
 pub use health::{artifact_root_health, ArtifactRootIssue, DatabaseHealth, DatabaseIssue};
 pub use lease_store::CoreSystemRunRequest;
 pub use migrations::{migration_checksum, OpenError};
+pub use run_configuration_store::StoredRunConfigurationBinding;
 
 #[derive(Clone)]
 pub struct SqliteStore {

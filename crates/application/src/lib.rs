@@ -1,17 +1,22 @@
 #![forbid(unsafe_code)]
 
 pub use local_agent_terminal_domain::{
-    ActorId, ActorLocality, AgentCancellationReceipt, AgentClaim, AgentDescriptor, AgentError,
-    AgentEvidenceRef, AgentFamilyKey, AgentRunLimits, AgentRunMessage, AgentRunReceipt,
-    AgentRunSnapshot, AgentRunStatus, AgentRunTerminal, AgentUsage, ArtifactId,
-    BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters,
-    BoundRunConfig, CancelAgentRun, ClaimVerification, ContextBudget, ContextError,
-    ContextPackageArtifact, ContextPackageBinding, ContextPackageDescriptor,
-    ContextPackageIdentity, ContextPackageMember, ContextVersionSet, DeliberationBudget,
-    DeliberationError, EventId, EvidenceFreshness, FencingToken, GitObjectId, LeaseClaim,
-    LineRange, Phase, PolicyAction, PolicyActor, PolicyDecisionSet, PolicyResource, ProjectId,
-    RepositoryId, ResourceClass, RunId, Sequence, Sha256Digest, SourceIdentity, SpecialistBudget,
-    SpecialistRequest, TaskBranch, TaskId, TaskRisk, Timestamp, TrustTier, WorkspaceFingerprint,
+    ActorId, ActorLocality, AdapterConfiguration, AdapterProtocol, AdapterTransport,
+    AgentCancellationReceipt, AgentClaim, AgentDescriptor, AgentError, AgentEvidenceRef,
+    AgentFamilyKey, AgentProfileConfiguration, AgentRole, AgentRunLimits, AgentRunMessage,
+    AgentRunReceipt, AgentRunSnapshot, AgentRunStatus, AgentRunTerminal, AgentUsage,
+    AllowedDataClass, ArtifactId, BoundAgentConnection, BoundAgentRunRequest,
+    BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, CancelAgentRun,
+    CapabilitySnapshot, ClaimVerification, ContextBudget, ContextError, ContextPackageArtifact,
+    ContextPackageBinding, ContextPackageDescriptor, ContextPackageIdentity, ContextPackageMember,
+    ContextVersionSet, DataPolicySnapshot, DeliberationBudget, DeliberationError, EndpointClass,
+    EventId, EvidenceFreshness, FallbackCandidate, FallbackMode, FallbackPolicy, FencingToken,
+    GenerationParameters, GitObjectId, IndependenceConfiguration, IndependenceDimensions,
+    LeaseClaim, LineRange, ModelEndpointConfiguration, NetworkScope, Phase, PolicyAction,
+    PolicyActor, PolicyDecisionSet, PolicyResource, ProjectId, ProviderTrainingUse, RepositoryId,
+    ResourceClass, RetentionClass, RunBudgetReservation, RunConfiguration, RunConfigurationError,
+    RunId, Sequence, Sha256Digest, SourceIdentity, SpecialistBudget, SpecialistRequest, TaskBranch,
+    TaskId, TaskRisk, Timestamp, TrustTier, UnsignedRunConfiguration, WorkspaceFingerprint,
     WorkspaceVersion, WorktreeId, MAX_GENERATION_PARAMETERS_BYTES,
 };
 
@@ -33,6 +38,7 @@ mod policy;
 mod ports;
 mod repository;
 mod resume;
+mod run_configuration;
 mod tool;
 mod workflow_authority;
 mod workspace;
@@ -162,6 +168,10 @@ pub use repository::{
 pub use resume::{
     validate_approval_resume_relation, validate_pending_approval_resume, ApprovalResumeSnapshot,
     ApprovalResumeStore, ToolExecutionResumeSnapshot, ToolExecutionResumeStore,
+};
+pub use run_configuration::{
+    BindRunConfiguration, PublishedRunConfigurationArtifact, RunConfigurationArtifactPublisher,
+    RunConfigurationStore,
 };
 pub use tool::{
     bind_tool_approval_payload, canonical_file_write_recovery_request,
