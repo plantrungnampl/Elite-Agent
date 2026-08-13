@@ -534,25 +534,25 @@ pub trait RunConfigurationStore: Send + Sync {
 }
 ```
 
-- [ ] **Step 1: Write RED shape, digest, and credential-exclusion tests**
+- [x] **Step 1: Write RED shape, digest, and credential-exclusion tests**
 
 Validate all required top-level sections, bounded values, exact enums, fallback rules, and independence dimensions. Deserialize a hostile object with `apiKey`, `token`, or `credential` keys and assert rejection. Assert changing any section changes `configDigest`.
 
-- [ ] **Step 2: Write RED v7 binding tests**
+- [x] **Step 2: Write RED v7 binding tests**
 
 Test exact run/task/artifact scope, immutable binding, one configuration per run, provider/model/fingerprint round-trip, cross-task rejection, unavailable artifact rejection, and changed digest conflict.
 
-- [ ] **Step 3: Implement immutable domain configuration values**
+- [x] **Step 3: Implement immutable domain configuration values**
 
 Define closed serde shapes matching the normative camelCase schema. `RunConfiguration::issue` canonicalizes the unsigned object without `configDigest`, hashes it, inserts `credentialsExcluded=true` and the digest, then stores final canonical bytes. Do not retain a generic `serde_json::Value` field that could hide credential material.
 
-- [ ] **Step 4: Implement the application builder and SQLite binding**
+- [x] **Step 4: Implement the application builder and SQLite binding**
 
 The application builder resolves the provider/model/capability/policy/budget facts before issuance. Publish bytes through the artifact store, then insert one v7 `run_configuration_bindings` row tied to the preallocated run.
 
 Remove `agent-run-config.v1` and `agent-run-config.v2` from production parsing; historical test fixtures may remain under tests only.
 
-- [ ] **Step 5: Verify run configuration contracts**
+- [x] **Step 5: Verify run configuration contracts**
 
 ```powershell
 cargo fmt --all -- --check
@@ -564,7 +564,7 @@ cargo test -p local-agent-terminal-storage-sqlite --test agent_store
 
 Expected: all commands exit 0.
 
-- [ ] **Step 6: Commit RunConfiguration v1**
+- [x] **Step 6: Commit RunConfiguration v1**
 
 ```powershell
 git add crates/domain/src/run_configuration.rs crates/domain/src/lib.rs crates/domain/src/agent.rs crates/application/src/run_configuration.rs crates/application/src/lib.rs crates/application/tests/run_configuration.rs crates/storage-sqlite/src/agent_store.rs crates/storage-sqlite/src/run_configuration_store.rs crates/storage-sqlite/src/lib.rs crates/storage-sqlite/tests/agent_store.rs crates/storage-sqlite/tests/run_configuration_store.rs

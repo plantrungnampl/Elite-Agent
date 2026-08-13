@@ -26,3 +26,12 @@ Task 4: implementation verified locally (focused tests 6+7; application and stor
 Task 4: review round 0 (3 Important open - trusted-core actor was caller-asserted; timestamp fallback was not RFC3339; direct-SQL bypass tests did not reach intended triggers)
 Task 4: fix round 1/5 (3 addressed, 0 known open - composition-bound trusted actor verified before publication and persistence; monotonic RFC3339 fallback; exact profile-route, accepted-replay, and cross-task-receipt trigger tests; commits aae9f23..3524620; re-review pending)
 Task 4: complete (commits 6d9c539..3524620, review clean; fresh application and storage-sqlite all-features package gates green)
+Task 5: dispatched (base ea53dd2)
+Task 5: RED authority contradiction - semantic configDigest excludes its field, physical artifact hash includes final bytes, but v7 trigger equates both
+Task 5: Ruling approved by user - expand ownership to storage migrations/schema-health regression; preserve deployed v7 and install a supplemental exact-scope trigger repair while adapter verifies both digests independently
+Task 5: implementation committed (ed3db88; focused domain 1, application 6, run-configuration store 7, agent store 23, schema v7 13; domain/application/storage-sqlite all-features green; review pending)
+Task 5: review round 0 (2 Important, 1 Minor open - fact reconstructibility; publish/run/bind sequencing; coupled physical hash-size regression)
+Task 5: fix round 1/5 (3 addressed, 0 open - typed fact accessor; separate publish and bind use cases; independent hash and size tests; commits ebd2335..9a8b500)
+Task 5: compatibility repair (d8c0e77 - repository identity and operation-attempt readers aligned with v7; stale specialist regression proves missing-budget fail-closed)
+Task 5: full workspace runtime gate inconclusive after 15-minute timeout; known v6 bootstrap fixture cutover remains assigned to Task 8; workspace check, Clippy, doc tests and all Task 5 package gates green
+Task 5: complete (commits ea53dd2..d8c0e77, independent Task 5 review clean; fresh exact gates 1+8+7+23; no owned file over 2,000 lines)
