@@ -437,11 +437,11 @@ pub trait WorkflowAuthorityStore: Send + Sync {
 }
 ```
 
-- [ ] **Step 1: Write RED application tests for canonical command preparation**
+- [x] **Step 1: Write RED application tests for canonical command preparation**
 
 Test `WF-P015` with exact approval evidence and both required effects. Assert omission, substitution, duplicate kind, wrong stream version, and non-canonical ordering return `Conflict` before storage dispatch. Assert `commandDigest` is SHA-256 of RFC 8785 bytes with the digest field omitted, then inserted into the final artifact.
 
-- [ ] **Step 2: Write RED SQLite tests for structural bypasses**
+- [x] **Step 2: Write RED SQLite tests for structural bypasses**
 
 Add direct SQL negative cases for raw projection update, prepared event without a required guard, prepared event without a required effect, wrong profile route, accepted-event replay, and cross-task evidence. Add one positive transaction for `WF-P015`.
 
@@ -454,15 +454,15 @@ cargo test -p local-agent-terminal-storage-sqlite --test workflow_authority_stor
 
 Expected: RED because the use case/store do not exist.
 
-- [ ] **Step 3: Implement canonical preparation in application**
+- [x] **Step 3: Implement canonical preparation in application**
 
 Sort guard/effect records by `(kind, reference)`, reject duplicates, ask the domain reducer for the exact transition, construct the schema-v1 command object, canonicalize without `commandDigest`, compute SHA-256, insert the digest, and canonicalize the final artifact.
 
-- [ ] **Step 4: Implement the one-transaction SQLite store**
+- [x] **Step 4: Implement the one-transaction SQLite store**
 
 Use `TransactionBehavior::Immediate`. Insert the command artifact before the transition transaction through the existing artifact operation protocol. Inside the transaction perform prepared event, exact guard rows, exact effect rows, accepted status, and projection CAS in that order. Convert trigger/CAS failures to `SafeErrorClassification::Conflict` without retrying.
 
-- [ ] **Step 5: Verify application and SQLite authority tests**
+- [x] **Step 5: Verify application and SQLite authority tests**
 
 ```powershell
 cargo fmt --all -- --check
@@ -472,7 +472,7 @@ cargo test -p local-agent-terminal-storage-sqlite --test workflow_authority_stor
 
 Expected: all tests pass, including every negative bypass.
 
-- [ ] **Step 6: Commit the workflow authority vertical slice**
+- [x] **Step 6: Commit the workflow authority vertical slice**
 
 ```powershell
 git add crates/application/src/workflow_authority.rs crates/application/src/lib.rs crates/application/tests/workflow_authority.rs crates/storage-sqlite/src/workflow_authority_store.rs crates/storage-sqlite/src/lib.rs crates/storage-sqlite/tests/workflow_authority_store.rs
