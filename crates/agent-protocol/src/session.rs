@@ -304,6 +304,30 @@ impl ProtocolSession {
         Ok(())
     }
 
+    /// Validates a response to an agent-originated request without completing correlation.
+    pub fn validate_outbound_response(&self, frame: &ProtocolFrame) -> Result<(), ProtocolError> {
+        self.ensure_connected()?;
+        let value = frame_value(frame)?;
+        self.validate_outbound_response_value(&value)
+    }
+
+    fn validate_outbound_response_value(&self, value: &Value) -> Result<(), ProtocolError> {
+        let id = request_id(value)?;
+        if !is_agent_id(id) {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        let pending = self
+            .pending_responses
+            .get(id)
+            .ok_or(ProtocolError::InvalidRequest)?;
+        if pending.origin != RequestOrigin::Agent
+            || pending.connection_id != self.binding.connection_id
+        {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        validate_response_for_method(value, &pending.method)
+    }
+
     pub fn receive(
         &mut self,
         frame: ProtocolFrame,
@@ -462,21 +486,13 @@ impl ProtocolSession {
     }
 
     fn outbound_response(&mut self, value: &Value) -> Result<(), ProtocolError> {
+        self.validate_outbound_response_value(value)?;
         let id = request_id(value)?;
-        if !is_agent_id(id) {
-            return Err(ProtocolError::InvalidRequest);
-        }
         let pending = self
             .pending_responses
             .get(id)
             .cloned()
             .ok_or(ProtocolError::InvalidRequest)?;
-        if pending.origin != RequestOrigin::Agent
-            || pending.connection_id != self.binding.connection_id
-        {
-            return Err(ProtocolError::InvalidRequest);
-        }
-        validate_response_for_method(value, &pending.method)?;
         self.complete_request(id, pending);
         Ok(())
     }

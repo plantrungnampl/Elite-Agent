@@ -27,6 +27,20 @@ enum PreparedRequestCommit {
     Specialist(Box<local_agent_terminal_application::AgentSpecialistCommit>),
 }
 
+struct PreparedRequestAudit {
+    request_id: String,
+    kind: AgentRequestKind,
+    request_digest: Sha256Digest,
+    decision: AgentRequestAuditDecision,
+    reason_code: Option<String>,
+    commit: PreparedRequestCommit,
+}
+
+struct PreparedAgentResponse {
+    frame: ProtocolFrame,
+    audit: Option<PreparedRequestAudit>,
+}
+
 impl RuntimeSink {
     fn receive_frame(&self, frame: ProtocolFrame) -> Result<InboundDisposition, ProtocolError> {
         self.gate.wait_until_ready()?;
@@ -110,15 +124,8 @@ impl RuntimeSink {
                 return self.replay_terminal_response(&terminal);
             }
             Ok(ProtocolRequestBeginResult::Pending) => {
-                let response = error_response(&id, "internal_error", false)
-                    .map_err(|_| ProtocolError::InternalAgentFailure)?;
-                let response = self.finalize_terminal_response(
-                    &begin,
-                    response,
-                    &now.text,
-                )?;
                 drop(request_guard);
-                return Ok(response);
+                return Err(ProtocolError::InternalAgentFailure);
             }
             Ok(ProtocolRequestBeginResult::Begun) => {}
             Err(error) if error.safe_classification() == SafeErrorClassification::Conflict => {
@@ -129,21 +136,14 @@ impl RuntimeSink {
             Err(_) => return Err(ProtocolError::InternalAgentFailure),
         }
         if let Some(reason) = self.preflight_request(&frame, &id)? {
-            let response = self.request_error(&frame, &id, request_digest, reason);
-            return match response {
-                Ok(response) => {
-                    let response = self.finalize_terminal_response(
-                        &begin,
-                        response,
-                        &now.text,
-                    )?;
+            let prepared = self.request_error(&frame, &id, request_digest, reason);
+            return match prepared {
+                Ok(prepared) => {
+                    let response = self.commit_prepared_response(&begin, prepared, &now.text)?;
                     drop(request_guard);
                     Ok(response)
                 }
-                Err(error) => {
-                    drop(request_guard);
-                    self.fail_request(&begin, &id, error, now)
-                }
+                Err(error) => Err(error),
             };
         }
 
@@ -151,47 +151,55 @@ impl RuntimeSink {
             Ok(mut session) => session.receive(frame.clone(), now.date_time),
             Err(_) => {
                 drop(request_guard);
-                return self.fail_request(&begin, &id, ProtocolError::InternalAgentFailure, now);
+                return Err(ProtocolError::InternalAgentFailure);
             }
         };
         let disposition = match received {
             Ok(InboundDisposition::Request(frame)) => frame,
             Ok(InboundDisposition::ReplayRequest(_)) => {
                 drop(request_guard);
-                return self.fail_request(&begin, &id, ProtocolError::InternalAgentFailure, now);
+                return Err(ProtocolError::InternalAgentFailure);
             }
             Ok(_) => return Err(ProtocolError::InvalidRequest),
             Err(error) => {
                 let reason = protocol_request_error_category(error);
-                let response = self.request_error(&frame, &id, request_digest, reason);
+                let prepared = self.request_error(&frame, &id, request_digest, reason);
                 if error == ProtocolError::OutputLimitExceeded {
                     let _ = self.handle_protocol_error(error, now.clone());
                     drop(request_guard);
-                    return match response {
-                        Ok(response) => self.finalize_terminal_response(
-                            &begin,
-                            response,
-                            &now.text,
-                        ),
-                        Err(audit_error) => self.fail_request(&begin, &id, audit_error, now),
+                    return match prepared {
+                        Ok(prepared) => self.commit_prepared_response(&begin, prepared, &now.text),
+                        Err(audit_error) => Err(audit_error),
                     };
                 }
                 drop(request_guard);
-                return match response {
-                    Ok(response) => self.finalize_terminal_response(
-                        &begin,
-                        response,
-                        &now.text,
-                    ),
-                    Err(audit_error) => self.fail_request(&begin, &id, audit_error, now),
+                return match prepared {
+                    Ok(prepared) => self.commit_prepared_response(&begin, prepared, &now.text),
+                    Err(audit_error) => Err(audit_error),
                 };
             }
         };
-        let routed = match disposition {
-            ProtocolFrame::RunCompleteRequest(_) => {
+        if matches!(disposition, ProtocolFrame::RunCompleteRequest(_)) {
+            let terminal_result = (|| {
                 let content = terminal_content(&frame)?;
                 let message_id =
                     required_string(&frame_value(&frame)?, "/params/message/messageId")?;
+                let terminal_status = required_string(&frame_value(&frame)?, "/params/status")?;
+                let response = success_response(
+                    &id,
+                    json!({
+                        "runId": self.request.run_id.as_str(),
+                        "recorded": true,
+                        "terminalStatus": terminal_status
+                    }),
+                )
+                .map_err(|_| ProtocolError::InternalAgentFailure)?;
+                self.session
+                    .lock()
+                    .map_err(|_| ProtocolError::InternalAgentFailure)?
+                    .validate_outbound_response(&response)?;
+                let (durable_response, artifact) =
+                    self.publish_terminal_response(&begin, response)?;
                 let content_artifact_id = self
                     .artifacts
                     .publish_agent_message(&AgentMessageArtifact {
@@ -211,16 +219,26 @@ impl RuntimeSink {
                     .map_err(|_| ProtocolError::InternalAgentFailure)?
                     .remove(self.request.run_id.as_str());
                 self.slot.release();
-                success_response(
-                    &id,
-                    json!({
-                        "runId": self.request.run_id.as_str(),
-                        "recorded": true,
-                        "terminalStatus": required_string(&frame_value(&frame)?, "/params/status")?
-                    }),
-                )
-                    .map_err(|_| ProtocolError::InternalAgentFailure)
-            }
+                let response =
+                    self.complete_terminal_response(&begin, artifact, &now.text)?;
+                if serde_json::to_vec(&response)
+                    .map_err(|_| ProtocolError::InternalAgentFailure)?
+                    != serde_json::to_vec(&durable_response)
+                        .map_err(|_| ProtocolError::InternalAgentFailure)?
+                {
+                    return Err(ProtocolError::ProtocolConflict);
+                }
+                self.session
+                    .lock()
+                    .map_err(|_| ProtocolError::InternalAgentFailure)?
+                    .outbound(response.clone(), now.date_time)?;
+                Ok(response)
+            })();
+            drop(request_guard);
+            return terminal_result.map_err(|error| self.abort_request(error, &now));
+        }
+        let routed = match disposition {
+            ProtocolFrame::RunCompleteRequest(_) => unreachable!("handled above"),
             ProtocolFrame::ContextQueryRequest(_) => {
                 self.route_context_query(&frame, &id, request_digest.clone(), now.timestamp)
             }
@@ -228,42 +246,44 @@ impl RuntimeSink {
                 self.route_specialist_request(&frame, &id, request_digest.clone(), now.timestamp)
             }
             ProtocolFrame::ToolRequest(_) => error_response(&id, "policy_denied", false)
+                .map(|frame| PreparedAgentResponse { frame, audit: None })
                 .map_err(|_| ProtocolError::InternalAgentFailure),
             _ => return Err(ProtocolError::InvalidRequest),
         };
-        let response = match routed {
+        let prepared = match routed {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                drop(request_guard);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .session
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .validate_outbound_response(&prepared.frame)
+        {
+            drop(request_guard);
+            return Err(self.abort_request(error, &now));
+        }
+        let response = match self.commit_prepared_response(&begin, prepared, &now.text) {
             Ok(response) => response,
             Err(error) => {
                 drop(request_guard);
-                return self.fail_request(&begin, &id, error, now);
+                return Err(self.abort_request(error, &now));
             }
         };
-        let response_time = match runtime_time(self.clock.as_ref()) {
-            Ok(response_time) => response_time,
-            Err(_) => {
-                drop(request_guard);
-                return self.fail_request(&begin, &id, ProtocolError::InternalAgentFailure, now);
-            }
-        };
-        let outbound = match self.session.lock() {
-            Ok(mut session) => session.outbound(response.clone(), response_time.date_time),
-            Err(_) => {
-                drop(request_guard);
-                return self.fail_request(
-                    &begin,
-                    &id,
-                    ProtocolError::InternalAgentFailure,
-                    response_time,
-                );
-            }
-        };
-        if let Err(error) = outbound {
-            drop(request_guard);
-            return self.fail_request(&begin, &id, error, response_time);
-        }
-        let response = self.finalize_terminal_response(&begin, response, &response_time.text)?;
+        self.session
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .outbound(response.clone(), now.date_time)?;
         drop(request_guard);
         Ok(response)
+    }
+
+    fn abort_request(&self, error: ProtocolError, now: &RuntimeTime) -> ProtocolError {
+        let _ = self.handle_protocol_error(error, now.clone());
+        error
     }
 
     fn preflight_request(
@@ -323,12 +343,11 @@ impl RuntimeSink {
         self.codec.decode(response.bytes())
     }
 
-    fn finalize_terminal_response(
+    fn publish_terminal_response(
         &self,
         begin: &ProtocolRequestBegin,
         response: ProtocolFrame,
-        completed_at: &str,
-    ) -> Result<ProtocolFrame, ProtocolError> {
+    ) -> Result<(ProtocolFrame, ProtocolResponseArtifact), ProtocolError> {
         let bytes = serde_json::to_vec(&response).map_err(|_| ProtocolError::InternalAgentFailure)?;
         let artifact = ProtocolResponseArtifact::new(
             protocol_response_artifact_id(begin.identity())?,
@@ -339,6 +358,16 @@ impl RuntimeSink {
             .response_artifacts
             .publish_protocol_response(begin, &artifact)
             .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        let durable_response = self.replay_response_artifact(&artifact)?;
+        Ok((durable_response, artifact))
+    }
+
+    fn complete_terminal_response(
+        &self,
+        begin: &ProtocolRequestBegin,
+        artifact: ProtocolResponseArtifact,
+        completed_at: &str,
+    ) -> Result<ProtocolFrame, ProtocolError> {
         let durable_response = self.replay_response_artifact(&artifact)?;
         let terminal = ProtocolRequestTerminal::new(
             begin.identity().clone(),
@@ -357,13 +386,41 @@ impl RuntimeSink {
         self.replay_terminal_response(&stored)
     }
 
+    fn commit_prepared_response(
+        &self,
+        begin: &ProtocolRequestBegin,
+        prepared: PreparedAgentResponse,
+        completed_at: &str,
+    ) -> Result<ProtocolFrame, ProtocolError> {
+        let (durable_response, artifact) =
+            self.publish_terminal_response(begin, prepared.frame)?;
+        if let Some(audit) = prepared.audit {
+            self.persist_request_audit_with_commit(
+                &audit.request_id,
+                audit.kind,
+                audit.request_digest,
+                audit.decision,
+                audit.reason_code,
+                audit.commit,
+            )?;
+        }
+        let stored = self.complete_terminal_response(begin, artifact, completed_at)?;
+        if serde_json::to_vec(&stored).map_err(|_| ProtocolError::InternalAgentFailure)?
+            != serde_json::to_vec(&durable_response)
+                .map_err(|_| ProtocolError::InternalAgentFailure)?
+        {
+            return Err(ProtocolError::ProtocolConflict);
+        }
+        Ok(stored)
+    }
+
     fn request_error(
         &self,
         frame: &ProtocolFrame,
         request_id: &str,
         request_digest: Sha256Digest,
         reason: &str,
-    ) -> Result<ProtocolFrame, ProtocolError> {
+    ) -> Result<PreparedAgentResponse, ProtocolError> {
         match frame {
             ProtocolFrame::ContextQueryRequest(_) => self.audited_error(
                 request_id,
@@ -379,28 +436,11 @@ impl RuntimeSink {
             ),
             ProtocolFrame::RunCompleteRequest(_) | ProtocolFrame::ToolRequest(_) => {
                 error_response(request_id, reason, false)
+                    .map(|frame| PreparedAgentResponse { frame, audit: None })
                     .map_err(|_| ProtocolError::InternalAgentFailure)
             }
             _ => Err(ProtocolError::InvalidRequest),
         }
-    }
-
-    fn fail_request(
-        &self,
-        begin: &ProtocolRequestBegin,
-        request_id: &str,
-        error: ProtocolError,
-        now: RuntimeTime,
-    ) -> Result<ProtocolFrame, ProtocolError> {
-        let response = error_response(request_id, "internal_error", false)
-            .map_err(|_| ProtocolError::InternalAgentFailure)?;
-        let response = self.finalize_terminal_response(
-            begin,
-            response,
-            &now.text,
-        )?;
-        let _ = self.handle_protocol_error(error, now);
-        Ok(response)
     }
 
     fn route_context_query(
@@ -409,7 +449,7 @@ impl RuntimeSink {
         request_id: &str,
         request_digest: Sha256Digest,
         requested_at: Timestamp,
-    ) -> Result<ProtocolFrame, ProtocolError> {
+    ) -> Result<PreparedAgentResponse, ProtocolError> {
         let value = frame_value(frame)?;
         let run_id = required_string(&value, "/params/runId")?;
         if run_id != self.request.run_id.as_str() {
@@ -583,15 +623,17 @@ impl RuntimeSink {
             .map(Box::new)
             .map(PreparedRequestCommit::Context)
             .unwrap_or(PreparedRequestCommit::None);
-        self.persist_request_audit_with_commit(
-            request_id,
-            AgentRequestKind::ContextQuery,
-            request_digest,
-            AgentRequestAuditDecision::Accepted,
-            None,
-            prepared_commit,
-        )?;
-        Ok(response_frame)
+        Ok(PreparedAgentResponse {
+            frame: response_frame,
+            audit: Some(PreparedRequestAudit {
+                request_id: request_id.to_owned(),
+                kind: AgentRequestKind::ContextQuery,
+                request_digest,
+                decision: AgentRequestAuditDecision::Accepted,
+                reason_code: None,
+                commit: prepared_commit,
+            }),
+        })
     }
 
     fn route_specialist_request(
@@ -600,7 +642,7 @@ impl RuntimeSink {
         request_id: &str,
         request_digest: Sha256Digest,
         requested_at: Timestamp,
-    ) -> Result<ProtocolFrame, ProtocolError> {
+    ) -> Result<PreparedAgentResponse, ProtocolError> {
         let value = frame_value(frame)?;
         let run_id = required_string(&value, "/params/runId")?;
         if run_id != self.request.run_id.as_str() {
@@ -762,15 +804,17 @@ impl RuntimeSink {
             .map(Box::new)
             .map(PreparedRequestCommit::Specialist)
             .unwrap_or(PreparedRequestCommit::None);
-        self.persist_request_audit_with_commit(
-            request_id,
-            AgentRequestKind::SpecialistRequest,
-            request_digest,
-            decision,
-            audit_reason,
-            prepared_commit,
-        )?;
-        Ok(response_frame)
+        Ok(PreparedAgentResponse {
+            frame: response_frame,
+            audit: Some(PreparedRequestAudit {
+                request_id: request_id.to_owned(),
+                kind: AgentRequestKind::SpecialistRequest,
+                request_digest,
+                decision,
+                reason_code: audit_reason,
+                commit: prepared_commit,
+            }),
+        })
     }
 
     fn audited_error(
@@ -779,34 +823,20 @@ impl RuntimeSink {
         kind: AgentRequestKind,
         request_digest: Sha256Digest,
         reason_code: &str,
-    ) -> Result<ProtocolFrame, ProtocolError> {
-        self.persist_request_audit(
-            request_id,
-            kind,
-            request_digest,
-            AgentRequestAuditDecision::Rejected,
-            Some(reason_code.to_owned()),
-        )?;
-        error_response(request_id, reason_code, false)
-            .map_err(|_| ProtocolError::InternalAgentFailure)
-    }
-
-    fn persist_request_audit(
-        &self,
-        request_id: &str,
-        kind: AgentRequestKind,
-        request_digest: Sha256Digest,
-        decision: AgentRequestAuditDecision,
-        reason_code: Option<String>,
-    ) -> Result<(), ProtocolError> {
-        self.persist_request_audit_with_commit(
-            request_id,
-            kind,
-            request_digest,
-            decision,
-            reason_code,
-            PreparedRequestCommit::None,
-        )
+    ) -> Result<PreparedAgentResponse, ProtocolError> {
+        let frame = error_response(request_id, reason_code, false)
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        Ok(PreparedAgentResponse {
+            frame,
+            audit: Some(PreparedRequestAudit {
+                request_id: request_id.to_owned(),
+                kind,
+                request_digest,
+                decision: AgentRequestAuditDecision::Rejected,
+                reason_code: Some(reason_code.to_owned()),
+                commit: PreparedRequestCommit::None,
+            }),
+        })
     }
 
     fn persist_request_audit_with_commit(

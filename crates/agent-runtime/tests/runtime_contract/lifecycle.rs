@@ -86,9 +86,9 @@ fn start_returns_after_durable_acceptance_and_scripted_output_is_deterministic()
             "protocol.response.completed",
             "protocol.response.published",
             "protocol.response.completed",
+            "protocol.response.published",
             "artifact.message.published",
             "store.terminal.committed",
-            "protocol.response.published",
             "protocol.response.completed",
             "peer.terminal.acknowledged"
         ]
@@ -705,7 +705,7 @@ fn terminal_store_failure_is_never_acknowledged() {
 
     assert_eq!(peer.drive(), Err(ProtocolError::InternalAgentFailure));
     assert_eq!(peer.terminal_acknowledgements(), 0);
-    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
 }
 
 #[test]
@@ -726,7 +726,7 @@ fn terminal_artifact_publication_failure_is_never_persisted_or_acknowledged() {
     assert_eq!(peer.drive(), Err(ProtocolError::InternalAgentFailure));
     assert_eq!(peer.terminal_acknowledgements(), 0);
     assert_eq!(store.terminal_count(), 0);
-    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
 }
 
 #[test]
@@ -1098,19 +1098,11 @@ fn accepted_handler_result_is_not_disclosed_when_durable_audit_fails() {
     request.run_config.limits.max_context_queries = 1;
     runtime.start_run(request).unwrap();
 
-    let response = peer
-        .request(
-            0,
-            context_query_frame("agent:audit-failure", "run-1", "query-audit", 1),
-        )
-        .unwrap();
-    assert_eq!(
-        serde_json::to_value(response)
-            .unwrap()
-            .pointer("/error/data/category")
-            .unwrap(),
-        "internal_error"
+    let response = peer.request(
+        0,
+        context_query_frame("agent:audit-failure", "run-1", "query-audit", 1),
     );
+    assert!(matches!(response, Err(ProtocolError::InternalAgentFailure)));
     assert_eq!(handler.context_requests().len(), 1);
     assert!(handler.audits().is_empty());
     assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
@@ -1151,7 +1143,7 @@ fn initial_request_clock_failure_returns_no_unpersisted_response_and_poisoned_st
 }
 
 #[test]
-fn response_clock_failure_after_accepted_audit_interrupts_the_run() {
+fn response_commit_does_not_need_a_second_clock_read_after_the_effect() {
     let store = Arc::new(RecordingStore::default());
     let artifacts = Arc::new(RecordingArtifacts::default());
     let clock = Arc::new(ManualClock::new(1_800_000_000));
@@ -1181,16 +1173,16 @@ fn response_clock_failure_after_accepted_audit_interrupts_the_run() {
     assert_eq!(
         serde_json::to_value(response)
             .unwrap()
-            .pointer("/error/data/category")
+            .pointer("/result/queryId")
             .unwrap(),
-        "internal_error"
+        "query-clock"
     );
     assert_eq!(handler.audits().len(), 1);
     assert_eq!(
         handler.audits()[0].decision,
         AgentRequestAuditDecision::Accepted
     );
-    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Interrupted));
+    assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
 }
 
 #[test]

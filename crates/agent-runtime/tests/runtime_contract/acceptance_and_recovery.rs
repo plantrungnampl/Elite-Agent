@@ -1,5 +1,5 @@
 #[test]
-fn reconstructed_runtime_replays_core_start_and_cancel_without_peer_side_effects() {
+fn reconstructed_runtime_does_not_resurrect_or_cancel_an_interrupted_run() {
     let store = Arc::new(RecordingStore::default());
     let artifacts = Arc::new(RecordingArtifacts::default());
     let clock = Arc::new(ManualClock::new(1_800_000_000));
@@ -23,20 +23,61 @@ fn reconstructed_runtime_replays_core_start_and_cancel_without_peer_side_effects
     assert_eq!(peer.start_requests().len(), 1);
     assert_eq!(peer.cancel_count(), 1);
 
-    let reconstructed = runtime_with_artifacts(store, artifacts, clock, Arc::clone(&peer));
-    reconstructed
+    let reconstructed =
+        runtime_with_artifacts(Arc::clone(&store), artifacts, clock, Arc::clone(&peer));
+    let start_error = reconstructed
         .start_run(run_request("run-durable-replay", None))
-        .unwrap();
-    reconstructed
+        .unwrap_err();
+    let cancel_error = reconstructed
         .cancel(CancelAgentRun {
             run_id: run_id("run-durable-replay"),
             reason: "replay-cancel".to_owned(),
             deadline_ms: 1_000,
         })
-        .unwrap();
+        .unwrap_err();
 
+    assert_eq!(start_error.safe_classification(), SafeErrorClassification::Conflict);
+    assert_eq!(cancel_error.safe_classification(), SafeErrorClassification::NotFound);
+    assert_eq!(store.status("run-durable-replay"), Some(AgentRunStatus::Interrupted));
     assert_eq!(peer.start_requests().len(), 1);
     assert_eq!(peer.cancel_count(), 1);
+}
+
+#[test]
+fn reconstructed_pending_core_start_is_not_redispatched_or_reported_success() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+    let first_runtime = runtime_with_artifacts(
+        Arc::clone(&store),
+        Arc::clone(&artifacts),
+        Arc::clone(&clock),
+        Arc::clone(&peer),
+    );
+    first_runtime
+        .start_run(run_request("run-pending-start", None))
+        .unwrap();
+    store.mark_protocol_request_pending(
+        "connection-1",
+        "core:run-start:run-pending-start",
+    );
+    drop(first_runtime);
+
+    let reconstructed = runtime_with_artifacts(store.clone(), artifacts, clock, Arc::clone(&peer));
+    let error = reconstructed
+        .start_run(run_request("run-pending-start", None))
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(peer.start_requests().len(), 1);
+    assert_eq!(
+        store.status("run-pending-start"),
+        Some(AgentRunStatus::Interrupted)
+    );
 }
 
 #[test]
@@ -501,14 +542,6 @@ impl MultiRunPeer {
         sink.request(frame)
     }
 
-    fn receive(
-        &self,
-        index: usize,
-        frame: ProtocolFrame,
-    ) -> Result<InboundDisposition, ProtocolError> {
-        let sink = Arc::clone(&self.sinks.lock().unwrap()[index]);
-        sink.receive(frame)
-    }
 }
 
 impl ProtocolPeer for MultiRunPeer {
@@ -897,9 +930,17 @@ struct RecordingRequestHandler {
     leaking_context_response: bool,
     leaking_specialist_response: bool,
     fail_clock_after_audit: Option<Arc<ManualClock>>,
+    log: ScriptLog,
 }
 
 impl RecordingRequestHandler {
+    fn new(log: ScriptLog) -> Self {
+        Self {
+            log,
+            ..Self::default()
+        }
+    }
+
     fn failing_context() -> Self {
         Self {
             fail_context: true,
@@ -1154,7 +1195,17 @@ impl AgentRequestHandler for RecordingRequestHandler {
         if let Some(gate) = &self.audit_commit_gate {
             gate.block();
         }
-        self.audits.lock().unwrap().push(audit);
+        let mut audits = self.audits.lock().unwrap();
+        if audits.iter().any(|existing| {
+            existing.run_id == audit.run_id
+                && existing.request_id == audit.request_id
+                && existing.request_digest == audit.request_digest
+        }) {
+            fence.finish_commit();
+            return Ok(());
+        }
+        audits.push(audit);
+        self.log.lock().unwrap().push("request.effect.committed");
         if let Some(clock) = &self.fail_clock_after_audit {
             clock.fail();
         }
@@ -1233,6 +1284,10 @@ impl RecordingArtifacts {
     fn fail_protocol_response_publish(&self) {
         *self.fail_protocol_response_publish.lock().unwrap() = true;
     }
+
+    fn allow_protocol_response_publish(&self) {
+        *self.fail_protocol_response_publish.lock().unwrap() = false;
+    }
 }
 
 impl AgentArtifactStore for RecordingArtifacts {
@@ -1301,6 +1356,14 @@ impl RecordingStore {
 
     fn terminal_count(&self) -> usize {
         self.terminals.lock().unwrap().len()
+    }
+
+    fn protocol_request_is_pending(&self, connection_id: &str, request_id: &str) -> bool {
+        self.protocol_requests
+            .lock()
+            .unwrap()
+            .get(&(connection_id.to_owned(), request_id.to_owned()))
+            .is_some_and(|request| request.terminal.is_none())
     }
 
     fn mark_protocol_request_pending(&self, connection_id: &str, request_id: &str) {
@@ -1400,6 +1463,12 @@ impl AgentRunStore for RecordingStore {
             .cloned();
         if let Some((_, gate)) = creation_gate {
             gate.block();
+        }
+        if let Some(existing) = self.runs.lock().unwrap().get(request.run_id.as_str()).cloned() {
+            if existing.request == *request {
+                return Ok(existing);
+            }
+            return Err(protocol_conflict());
         }
         let snapshot = AgentRunSnapshot::created(request.clone()).map_err(|_| invalid_input())?;
         self.runs

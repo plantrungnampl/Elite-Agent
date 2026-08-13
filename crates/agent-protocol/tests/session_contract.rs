@@ -134,6 +134,53 @@ fn validates_responses_against_the_durable_pending_method() {
 }
 
 #[test]
+fn outbound_response_validation_is_method_specific_and_non_mutating() {
+    let mut session = ready_session();
+    start_run(&mut session, "run-1");
+    let request = context_query("run-1", "agent:validate-only", "query-1", "query");
+    session
+        .receive(request, at(0))
+        .expect("context query is pending");
+
+    let wrong_method = response(
+        "agent:validate-only",
+        json!({
+            "requestId": "specialist-1",
+            "decision": "accepted",
+            "specialistRunId": "run-specialist-1"
+        }),
+    );
+    assert!(matches!(
+        session.validate_outbound_response(&wrong_method),
+        Err(ProtocolError::InvalidFrame)
+    ));
+
+    let exact = response(
+        "agent:validate-only",
+        json!({
+            "queryId": "query-1",
+            "items": [],
+            "truncated": false,
+            "effectivePayloadDigest": CONTEXT_DIGEST,
+            "redactionReportDigest": BINDING_DIGEST
+        }),
+    );
+    session
+        .validate_outbound_response(&exact)
+        .expect("validation leaves the pending correlation intact");
+    session
+        .validate_outbound_response(&exact)
+        .expect("repeated validation remains non-mutating");
+    session
+        .outbound(exact.clone(), at(0))
+        .expect("the validated response completes correlation");
+    assert!(matches!(
+        session.validate_outbound_response(&exact),
+        Err(ProtocolError::InvalidRequest)
+    ));
+}
+
+#[test]
 fn restores_pending_run_start_for_method_specific_response() {
     let mut session = ready_session();
     session

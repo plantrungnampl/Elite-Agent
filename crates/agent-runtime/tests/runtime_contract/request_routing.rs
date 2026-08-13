@@ -154,13 +154,13 @@ fn terminal_response_is_not_returned_until_artifact_and_terminal_row_are_durable
     let mut descriptor = peer_descriptor();
     descriptor.capabilities.context_query = true;
     let peer = Arc::new(MultiRunPeer::new(descriptor));
-    let handler = Arc::new(RecordingRequestHandler::default());
+    let handler = Arc::new(RecordingRequestHandler::new(Arc::clone(&log)));
     let runtime = runtime_with_protocol_peer_and_handler(
         Arc::clone(&store),
         Arc::clone(&artifacts),
         clock,
         peer.clone(),
-        handler,
+        Arc::clone(&handler),
     );
     let mut run = run_request("run-1", None);
     run.run_config.limits.max_context_queries = 1;
@@ -175,61 +175,128 @@ fn terminal_response_is_not_returned_until_artifact_and_terminal_row_are_durable
     ));
     assert_eq!(
         log.lock().unwrap().as_slice(),
-        ["protocol.response.published"]
+        ["protocol.response.published", "request.effect.committed"]
     );
 
     store.allow_protocol_complete();
-    let replay = peer.request(0, request).unwrap();
-    assert_eq!(
-        serde_json::to_value(replay)
-            .unwrap()
-            .pointer("/result/queryId")
-            .unwrap(),
-        "query-1"
-    );
+    assert!(matches!(
+        peer.request(0, request),
+        Err(ProtocolError::InternalAgentFailure)
+    ));
     assert_eq!(
         log.lock().unwrap().as_slice(),
-        ["protocol.response.published", "protocol.response.completed"]
+        [
+            "protocol.response.published",
+            "request.effect.committed"
+        ]
     );
+    assert_eq!(handler.context_requests().len(), 1);
+    assert_eq!(handler.audits().len(), 1);
+    assert!(store.protocol_request_is_pending("connection-1", "agent:commit-order"));
 }
 
 #[test]
-fn reconstructed_runtime_restores_stream_head_and_accepts_the_next_sequence() {
-    let store = Arc::new(RecordingStore::default());
-    let artifacts = Arc::new(RecordingArtifacts::default());
+fn response_artifact_failure_commits_no_agent_effect_and_pending_retry_fails_closed() {
+    let log = script_log();
+    let store = Arc::new(RecordingStore::new(Arc::clone(&log)));
+    let artifacts = Arc::new(RecordingArtifacts::new(Arc::clone(&log)));
     let clock = Arc::new(ManualClock::new(1_800_000_000));
     let mut descriptor = peer_descriptor();
-    descriptor.capabilities.max_concurrent_runs = 2;
-    let first_peer = Arc::new(MultiRunPeer::new(descriptor.clone()));
-    let first_clock: Arc<dyn Clock> = clock.clone();
-    let first_runtime = runtime_with_protocol_peer(
+    descriptor.capabilities.context_query = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let handler = Arc::new(RecordingRequestHandler::new(Arc::clone(&log)));
+    let runtime = runtime_with_protocol_peer_and_handler(
         Arc::clone(&store),
-        first_clock,
-        first_peer.clone(),
+        Arc::clone(&artifacts),
+        clock,
+        peer.clone(),
+        Arc::clone(&handler),
     );
-    first_runtime.start_run(run_request("run-1", None)).unwrap();
-    assert!(matches!(
-        first_peer.receive(0, stream_delta_frame("run-1", 1, "content", "first")),
-        Ok(InboundDisposition::Notification(_))
-    ));
-    drop(first_runtime);
-    store.mark_protocol_request_pending("connection-1", "core:run-start:run-1");
+    let mut run = run_request("run-artifact-first", None);
+    run.run_config.limits.max_context_queries = 1;
+    runtime.start_run(run).unwrap();
+    log.lock().unwrap().clear();
+    artifacts.fail_protocol_response_publish();
 
-    let second_peer = Arc::new(MultiRunPeer::new(descriptor));
-    let second_clock: Arc<dyn Clock> = clock;
-    let second_runtime = runtime_with_ports(
+    let request = context_query_frame(
+        "agent:artifact-before-effect",
+        "run-artifact-first",
+        "query-artifact",
+        1,
+    );
+    assert!(matches!(
+        peer.request(0, request.clone()),
+        Err(ProtocolError::InternalAgentFailure)
+    ));
+    assert!(handler.audits().is_empty());
+    assert!(log.lock().unwrap().is_empty());
+
+    artifacts.allow_protocol_response_publish();
+    assert!(matches!(
+        peer.request(0, request),
+        Err(ProtocolError::InternalAgentFailure)
+    ));
+    assert_eq!(handler.context_requests().len(), 1);
+    assert!(handler.audits().is_empty());
+    assert!(log.lock().unwrap().is_empty());
+    assert!(store.protocol_request_is_pending(
+        "connection-1",
+        "agent:artifact-before-effect"
+    ));
+}
+
+#[test]
+fn run_complete_pending_retry_fails_closed_without_recommitting_terminal() {
+    let log = script_log();
+    let store = Arc::new(RecordingStore::new(Arc::clone(&log)));
+    let artifacts = Arc::new(RecordingArtifacts::new(Arc::clone(&log)));
+    let peer = Arc::new(MultiRunPeer::new(peer_descriptor()));
+    let protocol_peer: Arc<dyn ProtocolPeer> = peer.clone();
+    let runtime = runtime_with_ports(
         Arc::clone(&store),
-        artifacts,
-        second_clock,
-        vec![agent_registration(second_peer.clone())],
+        Arc::clone(&artifacts),
+        Arc::new(ManualClock::new(1_800_000_000)),
+        vec![agent_registration(protocol_peer)],
     )
     .unwrap();
-    second_runtime.start_run(run_request("run-1", None)).unwrap();
-    assert_eq!(second_peer.start_count(), 1);
+    runtime.start_run(run_request("run-terminal-retry", None)).unwrap();
+    log.lock().unwrap().clear();
+    store.fail_protocol_complete();
 
+    let request = threaded_terminal("run-terminal-retry");
     assert!(matches!(
-        second_peer.receive(0, stream_delta_frame("run-1", 2, "content", "second")),
-        Ok(InboundDisposition::Notification(_))
+        peer.request(0, request.clone()),
+        Err(ProtocolError::InternalAgentFailure)
+    ));
+    assert_eq!(store.terminal_count(), 1);
+    assert_eq!(store.status("run-terminal-retry"), Some(AgentRunStatus::Succeeded));
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        [
+            "protocol.response.published",
+            "artifact.message.published",
+            "store.terminal.committed"
+        ]
+    );
+
+    store.allow_protocol_complete();
+    assert!(matches!(
+        peer.request(0, request),
+        Err(ProtocolError::InternalAgentFailure)
+    ));
+    assert_eq!(store.terminal_count(), 1);
+    assert_eq!(artifacts.published_contents().len(), 1);
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        [
+            "protocol.response.published",
+            "artifact.message.published",
+            "store.terminal.committed"
+        ]
+    );
+    assert!(store.protocol_request_is_pending(
+        "connection-1",
+        "agent:threaded-terminal"
     ));
 }
 
@@ -478,7 +545,7 @@ fn blocked_audit_is_revoked_at_deadline_and_cannot_commit_after_release() {
     clock.advance(301);
 
     let response = match response_receiver.recv_timeout(Duration::from_secs(1)) {
-        Ok(response) => response.unwrap(),
+        Ok(response) => response,
         Err(error) => {
             audit_gate.release();
             request_thread.join().unwrap();
@@ -491,13 +558,7 @@ fn blocked_audit_is_revoked_at_deadline_and_cannot_commit_after_release() {
     assert!(handler.wait_for_audit_return(Duration::from_secs(1)));
     request_thread.join().unwrap();
 
-    assert_eq!(
-        serde_json::to_value(response)
-            .unwrap()
-            .pointer("/error/data/category")
-            .unwrap(),
-        "internal_error"
-    );
+    assert!(matches!(response, Err(ProtocolError::InternalAgentFailure)));
     assert!(handler.audits().is_empty());
 }
 

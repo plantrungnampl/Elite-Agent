@@ -281,7 +281,11 @@ impl ProtocolAgentRuntime {
             &request.run_id,
             peer.descriptor().capabilities.max_concurrent_runs,
         )?;
-        self.store.create_bound_run(&request)?;
+        let created = self.store.create_bound_run(&request)?;
+        if created.status.is_terminal() {
+            slot.release();
+            return Err(conflict());
+        }
 
         let deadline = timestamp_date_time(request.run_config.limits.deadline)?;
         let gate = Arc::new(SinkGate::new());
@@ -318,6 +322,9 @@ impl ProtocolAgentRuntime {
                     None,
                     Ok(run_start_acceptance_from_response(response)?),
                 ));
+            }
+            if matches!(&begun, DurableCoreRequestBegin::Pending(_)) {
+                return Err(conflict());
             }
             let run_start = RunStart::new(
                 start,
@@ -541,10 +548,11 @@ impl ProtocolAgentRuntime {
             DurableCoreRequestBegin::Replayed { response } => {
                 cancel_acceptance_from_response(response)?
             }
-            DurableCoreRequestBegin::Begun(_) | DurableCoreRequestBegin::Pending(_) => active
+            DurableCoreRequestBegin::Begun(_) => active
                 .peer
                 .cancel(RunCancel::try_from(frame).map_err(protocol_port_error)?)
                 .map_err(protocol_port_error)?,
+            DurableCoreRequestBegin::Pending(_) => return Err(conflict()),
         };
         if !acceptance.accepted || acceptance.run_id != request.run_id.as_str() {
             return Err(invalid_input());

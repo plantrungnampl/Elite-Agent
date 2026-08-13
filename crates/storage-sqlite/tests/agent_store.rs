@@ -682,6 +682,105 @@ fn protocol_terminal_response_replays_exact_bytes_after_reopen_and_conflicts_on_
 }
 
 #[test]
+fn completed_start_receipt_survives_reopen_while_interrupted_run_requires_superseding_retry() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let descriptor = descriptor();
+    store.register_descriptor(&descriptor).unwrap();
+    let old = bound_run("reopen-old", "reopen-old-key");
+    seed_default_artifacts(&database, &old, &descriptor);
+    store.create_bound_run(&old).unwrap();
+    store.accept_run(&old.run_id, timestamp(10)).unwrap();
+    store.mark_running(&old.run_id, timestamp(11)).unwrap();
+
+    let identity = ProtocolRequestIdentity::new(
+        old.connection.connection_id.clone(),
+        format!("core:run-start:{}", old.run_id.as_str()),
+        "agent.run.start",
+        digest('a'),
+    )
+    .unwrap();
+    let begin = ProtocolRequestBegin::new(
+        identity.clone(),
+        Some(old.task_id.clone()),
+        Some(old.run_id.clone()),
+        timestamp(5),
+    )
+    .unwrap();
+    assert_eq!(
+        store.begin(&begin).unwrap(),
+        ProtocolRequestBeginResult::Begun
+    );
+    let exact_bytes = format!(
+        r#"{{"jsonrpc":"2.0","id":"{}","result":{{"accepted":true,"runId":"{}"}}}}"#,
+        identity.request_id(),
+        old.run_id.as_str(),
+    )
+    .into_bytes();
+    let response = ProtocolResponseArtifact::new(
+        artifact_id("protocol-response-reopen-start"),
+        exact_bytes.clone(),
+    )
+    .unwrap();
+    database.put_artifact(
+        response.artifact_id(),
+        old.task_id.as_str(),
+        "protocol-response",
+        response.bytes(),
+    );
+    let terminal = ProtocolRequestTerminal::new(
+        identity.clone(),
+        ProtocolRequestTerminalStatus::Completed,
+        response,
+        timestamp(9),
+    )
+    .unwrap();
+    store.complete(&terminal).unwrap();
+    drop(store);
+
+    let reopened = database.store();
+    assert_eq!(
+        reopened
+            .interrupt_connection(old.connection.binding_digest.as_str(), timestamp(12))
+            .unwrap(),
+        vec![old.run_id.clone()]
+    );
+    let interrupted = reopened.load_run(&old.run_id).unwrap().unwrap();
+    assert_eq!(interrupted.status, AgentRunStatus::Interrupted);
+    assert_eq!(reopened.create_bound_run(&old).unwrap(), interrupted);
+    let replayed = match reopened.begin(&begin).unwrap() {
+        ProtocolRequestBeginResult::Replayed(replayed) => replayed,
+        state => panic!("expected exact completed replay, got {state:?}"),
+    };
+    assert_eq!(replayed.response().bytes(), exact_bytes);
+
+    let changed = ProtocolRequestBegin::new(
+        ProtocolRequestIdentity::new(
+            identity.connection_id(),
+            identity.request_id(),
+            identity.method(),
+            digest('b'),
+        )
+        .unwrap(),
+        Some(old.task_id.clone()),
+        Some(old.run_id.clone()),
+        timestamp(5),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.begin(&changed).unwrap_err().safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+
+    let mut retry = bound_run("reopen-retry", "reopen-retry-key");
+    retry.supersedes_run_id = Some(old.run_id.clone());
+    seed_default_artifacts(&database, &retry, &descriptor);
+    let created = reopened.create_bound_run(&retry).unwrap();
+    assert_eq!(created.status, AgentRunStatus::Created);
+    assert_eq!(created.request.supersedes_run_id, Some(old.run_id));
+}
+
+#[test]
 fn terminal_run_can_be_superseded_by_a_new_bound_run() {
     let database = TestDatabase::new();
     let store = database.store();
