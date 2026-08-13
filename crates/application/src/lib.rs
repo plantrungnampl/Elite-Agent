@@ -170,8 +170,8 @@ pub use resume::{
     ApprovalResumeStore, ToolExecutionResumeSnapshot, ToolExecutionResumeStore,
 };
 pub use run_configuration::{
-    BindRunConfiguration, PublishedRunConfigurationArtifact, RunConfigurationArtifactPublisher,
-    RunConfigurationStore,
+    BindRunConfiguration, PublishRunConfiguration, PublishedRunConfigurationArtifact,
+    RunConfigurationArtifactPublisher, RunConfigurationStore,
 };
 pub use tool::{
     bind_tool_approval_payload, canonical_file_write_recovery_request,

@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use local_agent_terminal_application::{
@@ -6,8 +5,8 @@ use local_agent_terminal_application::{
     AllowedDataClass, BindRunConfiguration, CapabilitySnapshot, DataPolicySnapshot, EndpointClass,
     FallbackCandidate, FallbackMode, FallbackPolicy, GenerationParameters,
     IndependenceConfiguration, IndependenceDimensions, ModelEndpointConfiguration, NetworkScope,
-    PortError, ProviderTrainingUse, PublishedRunConfigurationArtifact, RetentionClass,
-    RunBudgetReservation, RunConfiguration, RunConfigurationArtifactPublisher,
+    PortError, ProviderTrainingUse, PublishRunConfiguration, PublishedRunConfigurationArtifact,
+    RetentionClass, RunBudgetReservation, RunConfiguration, RunConfigurationArtifactPublisher,
     RunConfigurationStore, UnsignedRunConfiguration,
 };
 use local_agent_terminal_domain::{ArtifactId, RunId, Sha256Digest, TaskId, Timestamp};
@@ -107,7 +106,8 @@ fn unsigned() -> UnsignedRunConfiguration {
 
 #[test]
 fn issue_produces_closed_canonical_v1_without_credentials() {
-    let configuration = RunConfiguration::issue(unsigned()).unwrap();
+    let source = unsigned();
+    let configuration = RunConfiguration::issue(source.clone()).unwrap();
     let value: serde_json::Value = serde_json::from_slice(configuration.canonical_bytes()).unwrap();
 
     assert_eq!(value["schemaVersion"], "1.0");
@@ -151,6 +151,9 @@ fn issue_produces_closed_canonical_v1_without_credentials() {
     assert!(String::from_utf8_lossy(configuration.canonical_bytes())
         .find("apiKey")
         .is_none());
+
+    let parsed = RunConfiguration::from_canonical_bytes(configuration.canonical_bytes()).unwrap();
+    assert_eq!(parsed.unsigned(), &source);
 }
 
 #[test]
@@ -323,18 +326,23 @@ impl RunConfigurationStore for RecordingBoundary {
 }
 
 #[test]
-fn application_publishes_before_binding_a_preallocated_run() {
+fn application_exposes_run_creation_boundary_between_publish_and_bind() {
     let boundary = RecordingBoundary::default();
-    let use_case = BindRunConfiguration::new(&boundary, &boundary);
-    let result = use_case
-        .execute(
-            &RunId::new("run-1").unwrap(),
-            ArtifactId::new("artifact-config-1").unwrap(),
-            unsigned(),
-        )
+    let publisher = PublishRunConfiguration::new(&boundary);
+    let (artifact, configuration) = publisher
+        .execute(ArtifactId::new("artifact-config-1").unwrap(), unsigned())
         .unwrap();
-    assert_eq!(result.task_id().as_str(), "task-1");
-    assert_eq!(*boundary.calls.lock().unwrap(), ["publish", "bind"]);
+    assert_eq!(*boundary.calls.lock().unwrap(), ["publish"]);
+
+    boundary.calls.lock().unwrap().push("create_run");
+    BindRunConfiguration::new(&boundary)
+        .execute(&RunId::new("run-1").unwrap(), &artifact, &configuration)
+        .unwrap();
+    assert_eq!(configuration.task_id().as_str(), "task-1");
+    assert_eq!(
+        *boundary.calls.lock().unwrap(),
+        ["publish", "create_run", "bind"]
+    );
 }
 
 struct WrongPhysicalDigestPublisher;
@@ -343,34 +351,59 @@ impl RunConfigurationArtifactPublisher for WrongPhysicalDigestPublisher {
     fn publish(
         &self,
         _artifact_id: &ArtifactId,
-        _configuration: &RunConfiguration,
+        configuration: &RunConfiguration,
     ) -> Result<local_agent_terminal_application::ArtifactRef, PortError> {
         Ok(local_agent_terminal_application::ArtifactRef {
             content_hash: digest('e').as_str().to_owned(),
             storage_key: "sha256/wrong".to_owned(),
-            size_bytes: 1,
+            size_bytes: configuration.canonical_bytes().len() as u64,
         })
     }
 }
 
 #[test]
-fn publication_with_wrong_physical_digest_never_reaches_binding() {
-    let store = CountingStore::default();
-    let use_case = BindRunConfiguration::new(&WrongPhysicalDigestPublisher, &store);
+fn publication_with_wrong_physical_digest_is_rejected_independently() {
+    let use_case = PublishRunConfiguration::new(&WrongPhysicalDigestPublisher);
 
     let error = use_case
-        .execute(
-            &RunId::new("run-1").unwrap(),
-            ArtifactId::new("artifact-config-1").unwrap(),
-            unsigned(),
-        )
+        .execute(ArtifactId::new("artifact-config-1").unwrap(), unsigned())
         .unwrap_err();
 
     assert_eq!(
         error.safe_classification(),
         local_agent_terminal_application::SafeErrorClassification::IntegrityFailure
     );
-    assert_eq!(store.0.load(Ordering::Relaxed), 0);
+}
+
+struct WrongPhysicalSizePublisher;
+
+impl RunConfigurationArtifactPublisher for WrongPhysicalSizePublisher {
+    fn publish(
+        &self,
+        _artifact_id: &ArtifactId,
+        configuration: &RunConfiguration,
+    ) -> Result<local_agent_terminal_application::ArtifactRef, PortError> {
+        Ok(local_agent_terminal_application::ArtifactRef {
+            content_hash: format!(
+                "sha256:{:x}",
+                Sha256::digest(configuration.canonical_bytes())
+            ),
+            storage_key: "sha256/wrong-size".to_owned(),
+            size_bytes: configuration.canonical_bytes().len() as u64 + 1,
+        })
+    }
+}
+
+#[test]
+fn publication_with_wrong_physical_size_is_rejected_independently() {
+    let error = PublishRunConfiguration::new(&WrongPhysicalSizePublisher)
+        .execute(ArtifactId::new("artifact-config-1").unwrap(), unsigned())
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::IntegrityFailure
+    );
 }
 
 struct FailingPublisher;
@@ -388,31 +421,10 @@ impl RunConfigurationArtifactPublisher for FailingPublisher {
     }
 }
 
-#[derive(Default)]
-struct CountingStore(AtomicUsize);
-
-impl RunConfigurationStore for CountingStore {
-    fn bind_run_configuration(
-        &self,
-        _run_id: &RunId,
-        _artifact: &PublishedRunConfigurationArtifact,
-        _configuration: &RunConfiguration,
-    ) -> Result<(), PortError> {
-        self.0.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-}
-
 #[test]
 fn publication_failure_never_creates_a_run_binding() {
-    let store = CountingStore::default();
-    let use_case = BindRunConfiguration::new(&FailingPublisher, &store);
+    let use_case = PublishRunConfiguration::new(&FailingPublisher);
     assert!(use_case
-        .execute(
-            &RunId::new("run-1").unwrap(),
-            ArtifactId::new("artifact-config-1").unwrap(),
-            unsigned(),
-        )
+        .execute(ArtifactId::new("artifact-config-1").unwrap(), unsigned(),)
         .is_err());
-    assert_eq!(store.0.load(Ordering::Relaxed), 0);
 }

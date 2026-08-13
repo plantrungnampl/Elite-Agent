@@ -26,41 +26,66 @@ pub trait RunConfigurationStore: Send + Sync {
     ) -> Result<(), PortError>;
 }
 
-pub struct BindRunConfiguration<'a> {
+pub struct PublishRunConfiguration<'a> {
     publisher: &'a dyn RunConfigurationArtifactPublisher,
+}
+
+impl<'a> PublishRunConfiguration<'a> {
+    #[must_use]
+    pub const fn new(publisher: &'a dyn RunConfigurationArtifactPublisher) -> Self {
+        Self { publisher }
+    }
+
+    pub fn execute(
+        &self,
+        artifact_id: ArtifactId,
+        unsigned: UnsignedRunConfiguration,
+    ) -> Result<(PublishedRunConfigurationArtifact, RunConfiguration), PortError> {
+        let configuration = RunConfiguration::issue(unsigned).map_err(|_| invalid_input())?;
+        let reference = self.publisher.publish(&artifact_id, &configuration)?;
+        validate_physical_reference(&reference, &configuration)?;
+        Ok((
+            PublishedRunConfigurationArtifact {
+                artifact_id,
+                reference,
+            },
+            configuration,
+        ))
+    }
+}
+
+pub struct BindRunConfiguration<'a> {
     store: &'a dyn RunConfigurationStore,
 }
 
 impl<'a> BindRunConfiguration<'a> {
     #[must_use]
-    pub const fn new(
-        publisher: &'a dyn RunConfigurationArtifactPublisher,
-        store: &'a dyn RunConfigurationStore,
-    ) -> Self {
-        Self { publisher, store }
+    pub const fn new(store: &'a dyn RunConfigurationStore) -> Self {
+        Self { store }
     }
 
     pub fn execute(
         &self,
         run_id: &RunId,
-        artifact_id: ArtifactId,
-        unsigned: UnsignedRunConfiguration,
-    ) -> Result<RunConfiguration, PortError> {
-        let configuration = RunConfiguration::issue(unsigned).map_err(|_| invalid_input())?;
-        let reference = self.publisher.publish(&artifact_id, &configuration)?;
-        if reference.content_hash != physical_digest(configuration.canonical_bytes())
-            || reference.size_bytes != configuration.canonical_bytes().len() as u64
-        {
-            return Err(integrity_failure());
-        }
-        let artifact = PublishedRunConfigurationArtifact {
-            artifact_id,
-            reference,
-        };
+        artifact: &PublishedRunConfigurationArtifact,
+        configuration: &RunConfiguration,
+    ) -> Result<(), PortError> {
+        validate_physical_reference(&artifact.reference, configuration)?;
         self.store
-            .bind_run_configuration(run_id, &artifact, &configuration)?;
-        Ok(configuration)
+            .bind_run_configuration(run_id, artifact, configuration)
     }
+}
+
+fn validate_physical_reference(
+    reference: &ArtifactRef,
+    configuration: &RunConfiguration,
+) -> Result<(), PortError> {
+    if reference.content_hash != physical_digest(configuration.canonical_bytes())
+        || reference.size_bytes != configuration.canonical_bytes().len() as u64
+    {
+        return Err(integrity_failure());
+    }
+    Ok(())
 }
 
 fn physical_digest(bytes: &[u8]) -> String {

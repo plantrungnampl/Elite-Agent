@@ -339,6 +339,9 @@ impl RunConfiguration {
     pub fn config_digest(&self) -> &Sha256Digest {
         &self.config_digest
     }
+    pub fn unsigned(&self) -> &UnsignedRunConfiguration {
+        &self.unsigned
+    }
     pub fn task_id(&self) -> &TaskId {
         &self.unsigned.task_id
     }
