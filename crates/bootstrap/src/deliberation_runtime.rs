@@ -958,19 +958,6 @@ fn integrity_failure() -> PortError {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::is_published_proposal;
-
-    #[test]
-    fn private_proposal_is_not_visible_after_a_different_quorum_is_published() {
-        let published = ["proposal-selected-a", "proposal-selected-b"];
-
-        assert!(is_published_proposal("proposal-selected-a", &published));
-        assert!(!is_published_proposal("proposal-private", &published));
-    }
-}
-
 fn invalid_input() -> PortError {
     PortError::failure(
         SafeErrorClassification::InvalidInput,
@@ -990,4 +977,17 @@ fn unavailable() -> PortError {
         SafeErrorClassification::Unavailable,
         Retryability::Retryable,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_published_proposal;
+
+    #[test]
+    fn private_proposal_is_not_visible_after_a_different_quorum_is_published() {
+        let published = ["proposal-selected-a", "proposal-selected-b"];
+
+        assert!(is_published_proposal("proposal-selected-a", &published));
+        assert!(!is_published_proposal("proposal-private", &published));
+    }
 }
