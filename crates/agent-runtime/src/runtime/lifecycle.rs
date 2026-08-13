@@ -159,8 +159,7 @@ impl ProtocolAgentRuntime {
                     .remove(run.request.run_id.as_str());
                 run.slot.release();
                 drop(_request_guard);
-                if let Ok(frame) =
-                    cancel_frame(&run.request.run_id, &self.request_id(), "deadline", 1)
+                if let Ok(frame) = cancel_frame(&run.request.run_id, &self.request_id(), "deadline")
                 {
                     if let Ok(cancel) = RunCancel::try_from(frame) {
                         let _ = run.peer.cancel(cancel);
@@ -258,7 +257,7 @@ impl ProtocolAgentRuntime {
         let started = self.slots.start_handshake(&slot, || {
             let session = self.session(&request, &peer.descriptor(), now.date_time)?;
             let request_id = self.request_id();
-            let start = run_start_frame(&request, &peer.descriptor(), &request_id)?;
+            let start = run_start_frame(&request, &request_id)?;
             session
                 .lock()
                 .map_err(|_| internal_failure())?
@@ -269,6 +268,7 @@ impl ProtocolAgentRuntime {
                 RunExecutionBinding {
                     provider_id: request.run_config.provider_id.clone(),
                     model_id: request.run_config.model_id.clone(),
+                    max_output_tokens: request.run_config.limits.max_output_tokens,
                     generation_parameters: request
                         .run_config
                         .generation_parameters
@@ -433,12 +433,7 @@ impl ProtocolAgentRuntime {
         }
         let now = self.now()?;
         let request_id = self.request_id();
-        let frame = cancel_frame(
-            &request.run_id,
-            &request_id,
-            &request.reason,
-            request.deadline_ms,
-        )?;
+        let frame = cancel_frame(&request.run_id, &request_id, &request.reason)?;
         active
             .session
             .lock()
@@ -471,7 +466,10 @@ impl ProtocolAgentRuntime {
             .receive_response(
                 success_response(
                     &request_id,
-                    json!({ "accepted": true, "runId": acceptance.run_id }),
+                    json!({
+                        "runId": acceptance.run_id,
+                        "outcome": "cancellation_requested"
+                    }),
                 )?,
                 now.date_time,
             )
@@ -493,8 +491,9 @@ impl ProtocolAgentRuntime {
         if let Some(session) = sessions.get(session_key) {
             return Ok(Arc::clone(session));
         }
-        let mut session = ProtocolSession::new(
+        let mut session = ProtocolSession::new_with_binding_digest(
             descriptor.binding.clone(),
+            request.connection.binding_digest.as_str().to_owned(),
             ProtocolOffer {
                 protocol_versions: BTreeSet::from([descriptor.protocol_version.clone()]),
                 capabilities: descriptor.capabilities.clone(),
@@ -510,7 +509,14 @@ impl ProtocolAgentRuntime {
         );
         let initialize_id = self.request_id();
         session
-            .outbound(initialize_frame(descriptor, &initialize_id)?, now)
+            .outbound(
+                initialize_frame(
+                    descriptor,
+                    &initialize_id,
+                    request.connection.binding_digest.as_str(),
+                )?,
+                now,
+            )
             .map_err(protocol_port_error)?;
         session
             .receive_response(initialize_response(descriptor, &initialize_id)?, now)
@@ -558,12 +564,7 @@ impl ProtocolAgentRuntime {
         status: AgentRunStatus,
         error: &str,
     ) {
-        if let Ok(frame) = cancel_frame(
-            &request.run_id,
-            "core:start-compensation",
-            "start_failed",
-            1,
-        ) {
+        if let Ok(frame) = cancel_frame(&request.run_id, "core:start-compensation", "start_failed") {
             if let Ok(cancel) = RunCancel::try_from(frame) {
                 let _ = peer.cancel(cancel);
             }

@@ -42,3 +42,6 @@ Task 6: independent re-review ship; minor hostile parse-boundary regression adde
 Task 6: scoped gates green (domain 1, application 5, assurance store 7, schema v7 13, schema health 8; domain/application/storage-sqlite all-features green; fmt/check/Clippy/doc green)
 Task 6: full workspace runtime gate failed only in legacy v6 fixture paths assigned to Task 8 (bootstrap authority seeding and storage-files repository identity)
 Task 6: complete (no owned file over 2,000 lines; design package kept read-only)
+Task 7: dispatched (base effa850; MACP v2 protocol/runtime/provider cutover)
+Task 7: ruling - canonical agent-protocol.v2 runStartRequest and approved plan govern over prose in design section 39.3; do not add runConfigurationRef because the closed v2 schema permits only runId/taskId/contextPackageRef/idempotencyKey and optional role
+Task 7: complete (MACP v2 local package gates 28/76/28/32 green; code-only commit requires the preserved docs/schema companion package for clean-checkout builds)

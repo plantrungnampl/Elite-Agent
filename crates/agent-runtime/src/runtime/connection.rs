@@ -11,8 +11,8 @@ use std::{
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use local_agent_terminal_agent_protocol::{
-    InboundDisposition, NdjsonCodec, PeerDescriptor, PeerEventSink, ProtocolCapabilities,
-    ProtocolError, ProtocolFrame, ProtocolOffer, ProtocolPeer, ProtocolSession, ProtocolTrustTier,
+    InboundDisposition, NdjsonCodec, PeerDescriptor, PeerEventSink, ProtocolError, ProtocolFrame,
+    ProtocolOffer, ProtocolPeer, ProtocolSession, ProtocolTrustTier,
     RunCancel, RunExecutionBinding, RunStart, SessionLimits, DEFAULT_MAX_FRAME_BYTES,
 };
 use local_agent_terminal_application::{
@@ -22,7 +22,7 @@ use local_agent_terminal_application::{
     AgentSpecialistResponse, Clock, PortError, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
-    AgentCancellationReceipt, AgentClaim, AgentDescriptor, AgentEvidenceRef, AgentRunMessage,
+    AgentCancellationReceipt, AgentClaim, AgentDescriptor, AgentRunMessage,
     AgentRunReceipt, AgentRunStatus, AgentRunTerminal, AgentUsage, ArtifactId,
     BoundAgentRunRequest, CancelAgentRun, RunId, Sha256Digest, Timestamp, TrustTier,
 };
@@ -71,7 +71,14 @@ struct RunRequestState {
     context_queries: u64,
     specialist_requests: u64,
     context_query_ids: BTreeSet<String>,
-    request_ids: BTreeSet<String>,
+    replayed_responses: BTreeMap<String, ReplayResponse>,
+}
+
+#[derive(Clone)]
+struct ReplayResponse {
+    method: String,
+    request_digest: String,
+    response: ProtocolFrame,
 }
 
 struct DenyAgentRequestHandler;

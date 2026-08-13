@@ -58,9 +58,5 @@ fn reject_forbidden_parameters(parameters: &Map<String, Value>) -> Result<(), Pr
 }
 
 fn output_limit(request: &RunStart) -> Result<u64, ProtocolError> {
-    serde_json::to_value(request.as_frame())
-        .map_err(|_| ProtocolError::InvalidRequest)?
-        .pointer("/params/limits/maxOutputTokens")
-        .and_then(Value::as_u64)
-        .ok_or(ProtocolError::InvalidRequest)
+    Ok(request.execution_binding().max_output_tokens)
 }

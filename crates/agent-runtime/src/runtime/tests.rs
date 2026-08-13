@@ -2,13 +2,13 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use local_agent_terminal_agent_protocol::ConnectionBinding;
+    use local_agent_terminal_agent_protocol::{ConnectionBinding, ProtocolCapabilities};
     use std::sync::mpsc;
 
     #[test]
-    fn initialized_frame_uses_the_fixed_effective_capabilities_digest() {
+    fn initialized_frame_contains_only_the_v2_connection_identifier() {
         let descriptor = PeerDescriptor {
-            protocol_version: "1.0".to_owned(),
+            protocol_version: "2.0".to_owned(),
             binding: ConnectionBinding {
                 agent_id: "worker-1".to_owned(),
                 connection_id: "connection-1".to_owned(),
@@ -34,16 +34,14 @@ mod tests {
 
         let frame = initialized_frame(&descriptor).expect("initialized frame must encode");
         let frame_value = frame_value(&frame).expect("initialized frame must decode");
-        let digest = frame_value
-            .pointer("/params/effectiveCapabilitiesDigest")
-            .and_then(Value::as_str)
-            .expect("initialized frame must include a capabilities digest");
-
         assert_eq!(
-            digest,
-            "sha256:607f4ad4a579f35b688ea51f65b4adee3a15cd967e551864791fe042e2c3a29f"
+            frame_value,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "initialized",
+                "params": { "connectionId": "connection-1" }
+            })
         );
-        assert_ne!(digest, descriptor.binding.manifest_digest);
     }
 
     #[test]

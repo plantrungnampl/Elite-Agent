@@ -81,6 +81,7 @@ fn run_start_carries_provider_neutral_execution_bytes_outside_the_wire_frame() {
     assert_eq!(start.execution_binding(), &binding);
     let wire = serde_json::to_value(start.as_frame()).unwrap();
     assert!(wire.pointer("/params/providerId").is_none());
+    assert!(wire.pointer("/params/runConfigurationRef").is_none());
 }
 
 #[test]
@@ -117,6 +118,7 @@ fn valid_execution_binding() -> RunExecutionBinding {
     RunExecutionBinding {
         provider_id: "provider-1".to_owned(),
         model_id: "model-1".to_owned(),
+        max_output_tokens: 100,
         generation_parameters: br#"{"temperature":0}"#.to_vec(),
         generation_parameters_digest:
             "sha256:e4ff491169b8a9ea78518a7972422b5a24d5e3790e0d9a9e5cbfb384d9b621e0".to_owned(),
@@ -317,7 +319,11 @@ fn emit_scenario(
             expect_context_response(&context_response, context_id)?;
             let specialist_id = "agent:conformance-specialist";
             let specialist_response = sink.request(specialist_request(run_id, specialist_id))?;
-            expect_specialist_response(&specialist_response, specialist_id)?;
+            expect_specialist_response(
+                &specialist_response,
+                specialist_id,
+                "specialist-request-conformance",
+            )?;
             calls
                 .lock()
                 .map_err(|_| ProtocolError::InternalAgentFailure)?
@@ -365,13 +371,10 @@ fn emit_scenario(
             expect_rejection(sink.receive(stream_delta(run_id, 2)))?;
         }
         ConformanceScenario::DuplicateTerminal => {
-            sink.request(terminal(run_id, "agent:conformance-complete-1"))?;
-            if sink
-                .request(terminal(run_id, "agent:conformance-complete-2"))
-                .is_ok()
-            {
-                return Err(ProtocolError::InternalAgentFailure);
-            }
+            sink.receive(stream_delta(run_id, 1))?;
+            let terminal = terminal(run_id, "agent:conformance-complete");
+            sink.request(terminal.clone())?;
+            sink.request(terminal)?;
         }
         ConformanceScenario::Slow | ConformanceScenario::Cancelled => {}
     }
@@ -429,7 +432,7 @@ fn descriptor() -> PeerDescriptor {
                 "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
             trust_tier: ProtocolTrustTier::CoreAdapter,
         },
-        protocol_version: "1.0".to_owned(),
+        protocol_version: "2.0".to_owned(),
         capabilities: ProtocolCapabilities {
             roles: strings(["critic"]),
             skills: strings(["testing"]),
@@ -486,6 +489,7 @@ fn specialist_request(run_id: &str, id: &str) -> ProtocolFrame {
         "method": "specialist.request",
         "params": {
             "runId": run_id,
+            "requestId": "specialist-request-conformance",
             "capability": "review",
             "reason": "Need review",
             "requiredContext": ["artifact-context-1"]
@@ -496,12 +500,11 @@ fn specialist_request(run_id: &str, id: &str) -> ProtocolFrame {
 fn expect_context_response(response: &ProtocolFrame, expected: &str) -> Result<(), ProtocolError> {
     let value = serde_json::to_value(response).map_err(|_| ProtocolError::InvalidRequest)?;
     if value.get("id").and_then(serde_json::Value::as_str) == Some(expected)
-        && value.pointer("/result/supplementId").is_some()
-        && value.pointer("/result/contentDigest").is_some()
+        && value.pointer("/result/queryId").is_some()
         && value.pointer("/result/items").is_some()
-        && value.pointer("/result/provenance").is_some()
-        && value.pointer("/result/redactions").is_some()
-        && value.pointer("/result/policyDecisionIds").is_some()
+        && value.pointer("/result/truncated").is_some()
+        && value.pointer("/result/effectivePayloadDigest").is_some()
+        && value.pointer("/result/redactionReportDigest").is_some()
     {
         Ok(())
     } else {
@@ -511,16 +514,17 @@ fn expect_context_response(response: &ProtocolFrame, expected: &str) -> Result<(
 
 fn expect_specialist_response(
     response: &ProtocolFrame,
-    expected: &str,
+    expected_response_id: &str,
+    expected_request_id: &str,
 ) -> Result<(), ProtocolError> {
     let value = serde_json::to_value(response).map_err(|_| ProtocolError::InvalidRequest)?;
-    if value.get("id").and_then(serde_json::Value::as_str) == Some(expected)
+    if value.get("id").and_then(serde_json::Value::as_str) == Some(expected_response_id)
         && value
             .pointer("/result/requestId")
             .and_then(serde_json::Value::as_str)
-            == Some(expected)
-        && value.pointer("/result/accepted").is_some()
-        && value.pointer("/result/reasonCode").is_some()
+            == Some(expected_request_id)
+        && value.pointer("/result/decision").is_some()
+        && value.pointer("/result/specialistRunId").is_some()
     {
         Ok(())
     } else {
@@ -553,23 +557,10 @@ fn run_start_frame() -> ProtocolFrame {
         "method": "agent.run.start",
         "params": {
             "runId": "run-1",
-            "idempotencyKey": "test-key",
             "taskId": "task-1",
+            "contextPackageRef": "artifact:context-1",
+            "idempotencyKey": "test-key",
             "role": "critic",
-            "objective": "Test",
-            "contextPackage": {
-                "packageId": "context-1",
-                "contentDigest": "sha256:7ce2a62fec3ddf55f1cede952bdcd4170bb0b01fa53da3ded734e531337d2b58",
-                "manifestRef": "artifact:context-1"
-            },
-            "permissions": { "contextQuery": true, "toolRequest": true, "writeFiles": false },
-            "responseSchema": "agent-message.v1",
-            "limits": {
-                "deadline": "2026-07-23T13:30:00Z",
-                "maxOutputTokens": 100,
-                "maxToolRequests": 1
-            },
-            "supersedesRunId": "run-previous"
         }
     }))
 }

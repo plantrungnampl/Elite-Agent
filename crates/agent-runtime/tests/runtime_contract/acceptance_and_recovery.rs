@@ -415,7 +415,7 @@ fn threaded_terminal(run_id: &str) -> ProtocolFrame {
             "usage": {
                 "inputTokens": 1,
                 "outputTokens": 1,
-                "providerReportedCost": 0.0
+                "providerReportedCostMicrounits": 0
             }
         }
     }))
@@ -453,6 +453,7 @@ fn specialist_request_frame(
         "method": "specialist.request",
         "params": {
             "runId": run_id,
+            "requestId": "specialist-request-1",
             "capability": "review",
             "reason": "Need review",
             "requiredContext": required_context
@@ -464,6 +465,10 @@ fn decode_protocol_frame(value: serde_json::Value) -> ProtocolFrame {
     NdjsonCodec::default()
         .decode(&serde_json::to_vec(&value).unwrap())
         .unwrap()
+}
+
+fn deserialize_protocol_frame(value: serde_json::Value) -> ProtocolFrame {
+    serde_json::from_value(value).unwrap()
 }
 
 fn runtime(
@@ -585,7 +590,7 @@ fn peer_descriptor() -> PeerDescriptor {
             executable_digest: EXECUTABLE_DIGEST.to_owned(),
             trust_tier: ProtocolTrustTier::CoreAdapter,
         },
-        protocol_version: "1.0".to_owned(),
+        protocol_version: "2.0".to_owned(),
         capabilities: ProtocolCapabilities {
             roles: ["reviewer".to_owned()].into_iter().collect(),
             skills: ["testing".to_owned()].into_iter().collect(),
@@ -633,7 +638,7 @@ fn run_request(run: &str, supersedes: Option<&str>) -> BoundAgentRunRequest {
             trust_tier: TrustTier::CoreAdapter,
             manifest_digest: digest(EMPTY_JSON_DIGEST),
             executable_digest: Some(digest(EXECUTABLE_DIGEST)),
-            contract_version: "1.0".to_owned(),
+            contract_version: "2.0".to_owned(),
             adapter_version: "adapter-1".to_owned(),
             provider_id: "provider-1".to_owned(),
             model_id: "model-1".to_owned(),
@@ -658,7 +663,7 @@ fn run_request(run: &str, supersedes: Option<&str>) -> BoundAgentRunRequest {
             trust_tier: TrustTier::CoreAdapter,
             manifest_digest: digest(EMPTY_JSON_DIGEST),
             executable_digest: Some(digest(EXECUTABLE_DIGEST)),
-            contract_version: "1.0".to_owned(),
+            contract_version: "2.0".to_owned(),
             adapter_version: "adapter-1".to_owned(),
             binding_digest: digest(CONNECTION_BINDING_DIGEST),
         },

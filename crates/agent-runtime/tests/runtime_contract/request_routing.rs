@@ -1,6 +1,6 @@
 
 #[test]
-fn request_routing_returns_typed_errors_for_duplicate_rpc_id_wrong_origin_and_terminal_run() {
+fn request_routing_replays_exact_rpc_ids_and_rejects_conflicts_wrong_origins_and_terminal_runs() {
     let store = Arc::new(RecordingStore::default());
     let artifacts = Arc::new(RecordingArtifacts::default());
     let clock = Arc::new(ManualClock::new(1_800_000_000));
@@ -19,22 +19,38 @@ fn request_routing_returns_typed_errors_for_duplicate_rpc_id_wrong_origin_and_te
     request.run_config.limits.max_context_queries = 4;
     runtime.start_run(request).unwrap();
 
-    peer.request(
-        0,
-        context_query_frame("agent:duplicate-rpc", "run-1", "query-1", 1),
-    )
-    .unwrap();
-    let duplicate = peer
+    let first = peer
+        .request(
+            0,
+            context_query_frame("agent:duplicate-rpc", "run-1", "query-1", 1),
+        )
+        .unwrap();
+    let replay = peer
+        .request(
+            0,
+            context_query_frame("agent:duplicate-rpc", "run-1", "query-1", 1),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(first).unwrap(),
+        serde_json::to_value(replay).unwrap()
+    );
+    let conflict = peer
         .request(
             0,
             context_query_frame("agent:duplicate-rpc", "run-1", "query-2", 1),
         )
         .unwrap();
+    let mut wrong_origin_frame = serde_json::to_value(context_query_frame(
+        "agent:wrong-origin",
+        "run-1",
+        "query-3",
+        1,
+    ))
+    .unwrap();
+    wrong_origin_frame["id"] = serde_json::json!("core:wrong-origin");
     let wrong_origin = peer
-        .request(
-            0,
-            context_query_frame("core:wrong-origin", "run-1", "query-3", 1),
-        )
+        .request(0, deserialize_protocol_frame(wrong_origin_frame))
         .unwrap();
     peer.request(0, threaded_terminal("run-1")).unwrap();
     let after_terminal = peer
@@ -45,7 +61,7 @@ fn request_routing_returns_typed_errors_for_duplicate_rpc_id_wrong_origin_and_te
         .unwrap();
 
     for (response, category) in [
-        (duplicate, "conflicting_duplicate"),
+        (conflict, "protocol_conflict"),
         (wrong_origin, "invalid_request_origin"),
         (after_terminal, "run_not_active"),
     ] {
@@ -202,7 +218,7 @@ fn slow_context_handler_does_not_block_another_run_on_the_same_connection() {
 
     assert!(serde_json::to_value(independent)
         .unwrap()
-        .pointer("/result/supplementId")
+        .pointer("/result/queryId")
         .is_some());
 }
 
@@ -373,7 +389,7 @@ fn claimed_audit_commit_finishes_before_the_runtime_responds() {
 
     assert!(serde_json::to_value(response)
         .unwrap()
-        .pointer("/result/supplementId")
+        .pointer("/result/queryId")
         .is_some());
     assert_eq!(handler.audits().len(), 1);
     assert_eq!(
@@ -415,10 +431,10 @@ fn specialist_request_rejects_context_not_bound_to_the_parent_run() {
         .unwrap();
     let value = serde_json::to_value(response).unwrap();
 
-    assert_eq!(value.pointer("/result/accepted").unwrap(), false);
+    assert_eq!(value.pointer("/result/decision").unwrap(), "rejected");
     assert_eq!(
-        value.pointer("/result/reasonCode").unwrap(),
-        "unrequested_context"
+        value.pointer("/result/specialistRunId").unwrap(),
+        &serde_json::Value::Null
     );
     assert_eq!(handler.specialist_requests().len(), 1);
     assert_eq!(
@@ -548,7 +564,7 @@ fn deterministic_request_peers_cover_context_specialist_overflow_duplicate_and_c
                 assert_eq!(handler.context_requests().len(), 1);
                 assert!(serde_json::to_value(&responses[0])
                     .unwrap()
-                    .pointer("/result/supplementId")
+                    .pointer("/result/queryId")
                     .is_some());
             }
             RequestScript::SpecialistRequest => {
@@ -556,9 +572,9 @@ fn deterministic_request_peers_cover_context_specialist_overflow_duplicate_and_c
                 assert_eq!(
                     serde_json::to_value(&responses[0])
                         .unwrap()
-                        .pointer("/result/accepted")
+                        .pointer("/result/decision")
                         .unwrap(),
-                    true
+                    "accepted"
                 );
             }
             RequestScript::ContextOverflow => assert_eq!(

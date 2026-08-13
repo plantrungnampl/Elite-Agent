@@ -915,7 +915,7 @@ mod lifecycle_tests {
                             .to_owned(),
                     trust_tier: ProtocolTrustTier::CoreAdapter,
                 },
-                protocol_version: "1.0".to_owned(),
+                protocol_version: "2.0".to_owned(),
                 capabilities: ProtocolCapabilities {
                     roles: BTreeSet::from(["critic".to_owned()]),
                     skills: BTreeSet::from(["testing".to_owned()]),
@@ -963,22 +963,10 @@ mod lifecycle_tests {
                     "method": "agent.run.start",
                     "params": {
                         "runId": run_id,
-                        "idempotencyKey": format!("key-{run_id}"),
                         "taskId": "task-1",
+                        "contextPackageRef": "context-1",
+                        "idempotencyKey": format!("key-{run_id}"),
                         "role": "critic",
-                        "objective": "Test lifecycle serialization",
-                        "contextPackage": {
-                            "packageId": "context-1",
-                            "contentDigest": context_digest,
-                            "manifestRef": "artifact:context-1"
-                        },
-                        "permissions": { "contextQuery": false, "toolRequest": false, "writeFiles": false },
-                        "responseSchema": "agent-message.v1",
-                        "limits": {
-                            "deadline": "2026-07-23T13:30:00Z",
-                            "maxOutputTokens": 17,
-                            "maxToolRequests": 0
-                        }
                     }
                 }))
                 .unwrap(),
@@ -989,6 +977,7 @@ mod lifecycle_tests {
             RunExecutionBinding {
                 provider_id: "openai".to_owned(),
                 model_id: "gpt-test-model".to_owned(),
+                max_output_tokens: 17,
                 generation_parameters: generation_parameters.to_vec(),
                 generation_parameters_digest,
                 effective_context: context.to_vec(),

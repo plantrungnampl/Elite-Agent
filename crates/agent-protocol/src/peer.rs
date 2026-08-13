@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
@@ -8,6 +8,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::session::binding_digest;
 use crate::{
     ConnectionBinding, InboundDisposition, NdjsonCodec, ProtocolCapabilities, ProtocolError,
     ProtocolFrame, ProtocolOffer, ProtocolSession, SessionLimits,
@@ -29,18 +30,7 @@ impl RunStart {
             return Err(ProtocolError::InvalidRequest);
         }
         let run_id = run_id(&frame)?;
-        let value = serde_json::to_value(&frame).map_err(|_| ProtocolError::InvalidRequest)?;
-        let wire_context_digest = value
-            .pointer("/params/contextPackage/contentDigest")
-            .and_then(Value::as_str)
-            .ok_or(ProtocolError::InvalidRequest)?;
-        let wire_supersedes = value
-            .pointer("/params/supersedesRunId")
-            .and_then(Value::as_str);
-        if !execution_binding.is_valid()
-            || wire_context_digest != execution_binding.effective_context_digest
-            || wire_supersedes != execution_binding.supersedes_run_id.as_deref()
-        {
+        if !execution_binding.is_valid() {
             return Err(ProtocolError::InvalidRequest);
         }
         Ok(Self {
@@ -67,6 +57,7 @@ impl RunStart {
 pub struct RunExecutionBinding {
     pub provider_id: String,
     pub model_id: String,
+    pub max_output_tokens: u64,
     pub generation_parameters: Vec<u8>,
     pub generation_parameters_digest: String,
     pub effective_context: Vec<u8>,
@@ -79,6 +70,7 @@ impl RunExecutionBinding {
     fn is_valid(&self) -> bool {
         !self.provider_id.trim().is_empty()
             && !self.model_id.trim().is_empty()
+            && (1..=1_000_000).contains(&self.max_output_tokens)
             && canonical_json(&self.generation_parameters)
             && digest_matches(
                 &self.generation_parameters,
@@ -240,7 +232,7 @@ pub fn run_conformance(factory: &dyn ConformancePeerFactory) -> Result<(), Proto
     for case in conformance_cases() {
         let peer = factory.peer_for(*case)?;
         let descriptor = peer.descriptor();
-        let result = if descriptor.protocol_version == "1.0" {
+        let result = if descriptor.protocol_version == "2.0" {
             run_case(peer.as_ref(), factory, &descriptor, *case)
         } else {
             Err(ProtocolError::ProtocolIncompatible)
@@ -276,9 +268,10 @@ fn run_case(
         ConformanceScenario::Oversize => {
             sink.wait_for_error(ProtocolError::FrameTooLarge { max_frame_bytes: 1 }, true)
         }
-        ConformanceScenario::SequenceGap | ConformanceScenario::DuplicateTerminal => {
+        ConformanceScenario::SequenceGap => {
             sink.wait_for_error(ProtocolError::InvalidRequest, false)
         }
+        ConformanceScenario::DuplicateTerminal => sink.wait_for_happy_events(),
     }
 }
 
@@ -306,7 +299,7 @@ fn start_case(
 }
 
 fn run_cancelled(peer: &dyn ProtocolPeer, sink: &ConformanceSink) -> Result<(), ProtocolError> {
-    let cancel = cancel("conformance-run", "core:conformance-cancel", 10)?;
+    let cancel = cancel("conformance-run", "core:conformance-cancel")?;
     sink.outbound(cancel.clone())?;
     let acceptance = peer.cancel(RunCancel::try_from(cancel)?)?;
     if acceptance.accepted && acceptance.run_id == "conformance-run" {
@@ -351,6 +344,7 @@ struct ConformanceSink {
     session: Arc<Mutex<ProtocolSession>>,
     codec: NdjsonCodec,
     observations: Arc<(Mutex<ConformanceObservations>, Condvar)>,
+    replayed_responses: Arc<Mutex<BTreeMap<String, ProtocolFrame>>>,
 }
 
 #[derive(Default)]
@@ -370,6 +364,7 @@ impl ConformanceSink {
                 Mutex::new(ConformanceObservations::default()),
                 Condvar::new(),
             )),
+            replayed_responses: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -485,6 +480,7 @@ impl ConformanceSink {
                 observations.saw_terminal = true;
             }
             InboundDisposition::Request(_)
+            | InboundDisposition::ReplayRequest(_)
             | InboundDisposition::Notification(_)
             | InboundDisposition::DuplicateStreamDelta => {}
         }
@@ -548,39 +544,62 @@ impl PeerEventSink for ConformanceSink {
     }
 
     fn request(&self, request_frame: ProtocolFrame) -> Result<ProtocolFrame, ProtocolError> {
+        let value =
+            serde_json::to_value(&request_frame).map_err(|_| ProtocolError::InvalidRequest)?;
+        let request_id = frame_request_id(&value)?.to_owned();
         let disposition = self.receive(request_frame.clone())?;
+        if matches!(disposition, InboundDisposition::ReplayRequest(_)) {
+            return self
+                .replayed_responses
+                .lock()
+                .map_err(|_| ProtocolError::InternalAgentFailure)?
+                .get(&request_id)
+                .cloned()
+                .ok_or(ProtocolError::InvalidRequest);
+        }
         if !matches!(disposition, InboundDisposition::Request(_)) {
             return Err(ProtocolError::InvalidRequest);
         }
-        let value =
-            serde_json::to_value(&request_frame).map_err(|_| ProtocolError::InvalidRequest)?;
-        let request_id = frame_request_id(&value)?;
         let response = match request_frame {
             ProtocolFrame::ContextQueryRequest(_) => success_response(
-                request_id,
+                &request_id,
                 json!({
-                    "supplementId": "ctx-conformance-supplement",
-                    "contentDigest": "sha256:ea7792a26f405e2ae9c6f49ca93bbe6076ceac0a1fc53d83426c7d7f2d9377e4",
-                    "items": ["artifact-context-1"],
-                    "provenance": [],
-                    "redactions": [],
-                    "policyDecisionIds": ["policy-conformance-1"]
+                    "queryId": value.pointer("/params/queryId").and_then(Value::as_str)
+                        .ok_or(ProtocolError::InvalidRequest)?,
+                    "items": [{
+                        "itemId": "ctx-conformance-item",
+                        "contentRef": "artifact-conformance-context",
+                        "contentDigest": "sha256:cf5515229a79d1eeed0c2281346c68418af289215570fe3135a624217bec0c29",
+                        "sourceRefs": ["artifact-conformance-context"],
+                        "observationClass": "core_observed"
+                    }],
+                    "truncated": false,
+                    "effectivePayloadDigest": "sha256:cf5515229a79d1eeed0c2281346c68418af289215570fe3135a624217bec0c29",
+                    "redactionReportDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 }),
             )?,
             ProtocolFrame::SpecialistRequest(_) => success_response(
-                request_id,
+                &request_id,
                 json!({
-                    "requestId": request_id,
-                    "accepted": true,
-                    "reasonCode": "specialist_approved"
+                    "requestId": value.pointer("/params/requestId").and_then(Value::as_str)
+                        .ok_or(ProtocolError::InvalidRequest)?,
+                    "decision": "accepted",
+                    "specialistRunId": "specialist-conformance-run"
                 }),
             )?,
-            ProtocolFrame::RunCompleteRequest(_) => {
-                success_response(request_id, json!({ "accepted": true }))?
-            }
+            ProtocolFrame::RunCompleteRequest(_) => success_response(
+                &request_id,
+                json!({
+                    "runId": value.pointer("/params/runId").and_then(Value::as_str)
+                        .ok_or(ProtocolError::InvalidRequest)?,
+                    "recorded": true,
+                    "terminalStatus": value.pointer("/params/status").and_then(Value::as_str)
+                        .ok_or(ProtocolError::InvalidRequest)?
+                }),
+            )?,
             ProtocolFrame::ToolRequest(_) => frame(json!({
                 "jsonrpc": "2.0",
-                "id": request_id,
+                "id": request_id.clone(),
                 "error": {
                     "code": -32600,
                     "message": "request rejected",
@@ -589,8 +608,11 @@ impl PeerEventSink for ConformanceSink {
             }))?,
             _ => return Err(ProtocolError::InvalidRequest),
         };
-        validate_conformance_response(&value, &response)?;
         self.outbound(response.clone())?;
+        self.replayed_responses
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .insert(request_id, response.clone());
         Ok(response)
     }
 
@@ -598,72 +620,6 @@ impl PeerEventSink for ConformanceSink {
         self.close_connection()?;
         self.record_error(ProtocolError::InternalAgentFailure)?;
         Ok(())
-    }
-}
-
-fn validate_conformance_response(
-    request: &Value,
-    response: &ProtocolFrame,
-) -> Result<(), ProtocolError> {
-    let response = serde_json::to_value(response).map_err(|_| ProtocolError::InvalidRequest)?;
-    if response.get("id").and_then(Value::as_str) != request.get("id").and_then(Value::as_str) {
-        return Err(ProtocolError::InvalidRequest);
-    }
-    match request.get("method").and_then(Value::as_str) {
-        Some("context.query")
-            if response
-                .pointer("/result/supplementId")
-                .and_then(Value::as_str)
-                .is_some()
-                && response
-                    .pointer("/result/contentDigest")
-                    .and_then(Value::as_str)
-                    .is_some()
-                && response
-                    .pointer("/result/items")
-                    .and_then(Value::as_array)
-                    .is_some()
-                && response
-                    .pointer("/result/provenance")
-                    .and_then(Value::as_array)
-                    .is_some()
-                && response
-                    .pointer("/result/redactions")
-                    .and_then(Value::as_array)
-                    .is_some()
-                && response
-                    .pointer("/result/policyDecisionIds")
-                    .and_then(Value::as_array)
-                    .is_some() =>
-        {
-            Ok(())
-        }
-        Some("specialist.request")
-            if response
-                .pointer("/result/requestId")
-                .and_then(Value::as_str)
-                == request.get("id").and_then(Value::as_str)
-                && response
-                    .pointer("/result/accepted")
-                    .and_then(Value::as_bool)
-                    .is_some()
-                && response
-                    .pointer("/result/reasonCode")
-                    .and_then(Value::as_str)
-                    .is_some() =>
-        {
-            Ok(())
-        }
-        Some("tool.request") if response.pointer("/error/data/category").is_some() => Ok(()),
-        Some("agent.run.complete")
-            if response
-                .pointer("/result/accepted")
-                .and_then(Value::as_bool)
-                == Some(true) =>
-        {
-            Ok(())
-        }
-        _ => Err(ProtocolError::InvalidRequest),
     }
 }
 
@@ -720,6 +676,7 @@ fn conformance_execution_binding() -> RunExecutionBinding {
     RunExecutionBinding {
         provider_id: "conformance-provider".to_owned(),
         model_id: "conformance-model".to_owned(),
+        max_output_tokens: 100,
         generation_parameters: b"{}".to_vec(),
         generation_parameters_digest:
             "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".to_owned(),
@@ -738,15 +695,8 @@ fn initialize(descriptor: &PeerDescriptor) -> Result<ProtocolFrame, ProtocolErro
         "method": "initialize",
         "params": {
             "protocolVersions": [descriptor.protocol_version],
-            "client": { "name": "conformance", "version": "1" },
-            "transport": { "type": "stdio-ndjson", "maxFrameBytes": 1024 },
-            "features": features(&descriptor.capabilities),
-            "launchBinding": {
-                "connectionId": descriptor.binding.connection_id,
-                "manifestDigest": descriptor.binding.manifest_digest,
-                "executableDigest": descriptor.binding.executable_digest,
-                "trustTier": descriptor.binding.trust_tier.as_str()
-            }
+            "capabilities": descriptor.capabilities.advertised(),
+            "connectionBindingDigest": binding_digest(&descriptor.binding)
         }
     }))
 }
@@ -756,12 +706,14 @@ fn initialize_response(descriptor: &PeerDescriptor) -> Result<ProtocolFrame, Pro
         "core:conformance-initialize",
         json!({
             "protocolVersion": descriptor.protocol_version,
-            "agent": {
-                "id": descriptor.binding.agent_id,
-                "displayName": "Conformance Peer",
-                "implementationVersion": "1"
-            },
-            "capabilities": capabilities_json(&descriptor.capabilities)
+            "capabilities": descriptor.capabilities.advertised(),
+            "connectionId": descriptor.binding.connection_id,
+            "limits": {
+                "maxFrameBytes": 8388608,
+                "maxPendingRequests": 128,
+                "streamHighWatermark": 512,
+                "streamLowWatermark": 256
+            }
         }),
     )
 }
@@ -771,8 +723,7 @@ fn initialized(connection_id: &str) -> Result<ProtocolFrame, ProtocolError> {
         "jsonrpc": "2.0",
         "method": "initialized",
         "params": {
-            "connectionId": connection_id,
-            "effectiveCapabilitiesDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            "connectionId": connection_id
         }
     }))
 }
@@ -784,32 +735,20 @@ fn start(run_id: &str) -> Result<ProtocolFrame, ProtocolError> {
         "method": "agent.run.start",
         "params": {
             "runId": run_id,
-            "idempotencyKey": "conformance-key",
             "taskId": "conformance-task",
-            "role": "critic",
-            "objective": "Conformance check",
-            "contextPackage": {
-                "packageId": "conformance-context",
-                "contentDigest": "sha256:cf5515229a79d1eeed0c2281346c68418af289215570fe3135a624217bec0c29",
-                "manifestRef": "artifact:conformance-context"
-            },
-            "permissions": { "contextQuery": true, "toolRequest": true, "writeFiles": false },
-            "responseSchema": "agent-message.v1",
-            "limits": {
-                "deadline": (conformance_time() + chrono::Duration::seconds(30)).to_rfc3339(),
-                "maxOutputTokens": 100,
-                "maxToolRequests": 1
-            }
+            "contextPackageRef": "artifact-conformance-context",
+            "idempotencyKey": "conformance-key",
+            "role": "critic"
         }
     }))
 }
 
-fn cancel(run_id: &str, id: &str, deadline_ms: u64) -> Result<ProtocolFrame, ProtocolError> {
+fn cancel(run_id: &str, id: &str) -> Result<ProtocolFrame, ProtocolError> {
     frame(json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "agent.run.cancel",
-        "params": { "runId": run_id, "reason": "conformance", "deadlineMs": deadline_ms }
+        "params": { "runId": run_id, "reason": "conformance" }
     }))
 }
 
@@ -820,36 +759,6 @@ fn success_response(id: &str, result: Value) -> Result<ProtocolFrame, ProtocolEr
 fn frame(value: Value) -> Result<ProtocolFrame, ProtocolError> {
     NdjsonCodec::default()
         .decode(&serde_json::to_vec(&value).map_err(|_| ProtocolError::InvalidRequest)?)
-}
-
-fn features(capabilities: &ProtocolCapabilities) -> Vec<&'static str> {
-    let mut features = Vec::new();
-    if capabilities.streaming {
-        features.push("streaming");
-    }
-    if capabilities.context_query {
-        features.push("context-query");
-    }
-    if capabilities.tool_requests {
-        features.push("tool-request");
-    }
-    if capabilities.specialist_requests {
-        features.push("specialist-request");
-    }
-    features
-}
-
-fn capabilities_json(capabilities: &ProtocolCapabilities) -> Value {
-    json!({
-        "roles": capabilities.roles,
-        "skills": capabilities.skills,
-        "streaming": capabilities.streaming,
-        "contextQuery": capabilities.context_query,
-        "toolRequests": capabilities.tool_requests,
-        "specialistRequests": capabilities.specialist_requests,
-        "maxConcurrentRuns": capabilities.max_concurrent_runs,
-        "maxContextTokens": capabilities.max_context_tokens
-    })
 }
 
 fn conformance_time() -> DateTime<Utc> {

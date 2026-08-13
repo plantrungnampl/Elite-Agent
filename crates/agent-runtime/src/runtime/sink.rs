@@ -64,6 +64,7 @@ impl RuntimeSink {
             .map_err(|_| ProtocolError::InternalAgentFailure)?;
         let value = frame_value(&frame)?;
         let id = required_string(&value, "/id")?;
+        let method = required_string(&value, "/method")?;
         let request_bytes =
             serde_json::to_vec(&frame).map_err(|_| ProtocolError::InternalAgentFailure)?;
         let request_digest = digest_bytes(&request_bytes);
@@ -79,6 +80,19 @@ impl RuntimeSink {
                     .map_err(|_| ProtocolError::InternalAgentFailure);
             }
         };
+        match self.replay_response(&id, &method, request_digest.as_str()) {
+            Ok(Some(response)) => return Ok(response),
+            Ok(None) => {}
+            Err(error) => {
+                drop(request_guard);
+                return self.request_error(
+                    &frame,
+                    &id,
+                    request_digest,
+                    protocol_request_error_category(error),
+                );
+            }
+        }
         if let Some(reason) = self.preflight_request(&frame, &id)? {
             let response = self.request_error(&frame, &id, request_digest, reason);
             return match response {
@@ -99,6 +113,12 @@ impl RuntimeSink {
         };
         let disposition = match received {
             Ok(InboundDisposition::Request(frame)) => frame,
+            Ok(InboundDisposition::ReplayRequest(_)) => {
+                drop(request_guard);
+                return self
+                    .replay_response(&id, &method, request_digest.as_str())?
+                    .ok_or(ProtocolError::InvalidRequest);
+            }
             Ok(_) => return Err(ProtocolError::InvalidRequest),
             Err(error) => {
                 let reason = protocol_request_error_category(error);
@@ -139,14 +159,21 @@ impl RuntimeSink {
                     .map_err(|_| ProtocolError::InternalAgentFailure)?
                     .remove(self.request.run_id.as_str());
                 self.slot.release();
-                success_response(&id, json!({ "accepted": true }))
+                success_response(
+                    &id,
+                    json!({
+                        "runId": self.request.run_id.as_str(),
+                        "recorded": true,
+                        "terminalStatus": required_string(&frame_value(&frame)?, "/params/status")?
+                    }),
+                )
                     .map_err(|_| ProtocolError::InternalAgentFailure)
             }
             ProtocolFrame::ContextQueryRequest(_) => {
-                self.route_context_query(&frame, &id, request_digest, now.timestamp)
+                self.route_context_query(&frame, &id, request_digest.clone(), now.timestamp)
             }
             ProtocolFrame::SpecialistRequest(_) => {
-                self.route_specialist_request(&frame, &id, request_digest, now.timestamp)
+                self.route_specialist_request(&frame, &id, request_digest.clone(), now.timestamp)
             }
             ProtocolFrame::ToolRequest(_) => error_response(&id, "policy_denied", false)
                 .map_err(|_| ProtocolError::InternalAgentFailure),
@@ -177,6 +204,7 @@ impl RuntimeSink {
             drop(request_guard);
             return self.fail_request(&id, error, response_time);
         }
+        self.remember_replay_response(&id, &method, request_digest.as_str(), &response)?;
         Ok(response)
     }
 
@@ -196,15 +224,6 @@ impl RuntimeSink {
         }
         if !request_id.starts_with("agent:") {
             return Ok(Some("invalid_request_origin"));
-        }
-        let duplicate = !self
-            .request_state
-            .lock()
-            .map_err(|_| ProtocolError::InternalAgentFailure)?
-            .request_ids
-            .insert(request_id.to_owned());
-        if duplicate {
-            return Ok(Some("conflicting_duplicate"));
         }
         let value = frame_value(frame)?;
         if required_string(&value, "/params/runId")? != self.request.run_id.as_str() {
@@ -230,6 +249,49 @@ impl RuntimeSink {
             return Ok(Some("capability_not_negotiated"));
         }
         Ok(None)
+    }
+
+    fn replay_response(
+        &self,
+        request_id: &str,
+        method: &str,
+        request_digest: &str,
+    ) -> Result<Option<ProtocolFrame>, ProtocolError> {
+        let state = self
+            .request_state
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        match state.replayed_responses.get(request_id) {
+            Some(replay)
+                if replay.method == method && replay.request_digest == request_digest =>
+            {
+                Ok(Some(replay.response.clone()))
+            }
+            Some(_) => Err(ProtocolError::ProtocolConflict),
+            None => Ok(None),
+        }
+    }
+
+    fn remember_replay_response(
+        &self,
+        request_id: &str,
+        method: &str,
+        request_digest: &str,
+        response: &ProtocolFrame,
+    ) -> Result<(), ProtocolError> {
+        self.request_state
+            .lock()
+            .map_err(|_| ProtocolError::InternalAgentFailure)?
+            .replayed_responses
+            .insert(
+                request_id.to_owned(),
+                ReplayResponse {
+                    method: method.to_owned(),
+                    request_digest: request_digest.to_owned(),
+                    response: response.clone(),
+                },
+            );
+        Ok(())
     }
 
     fn request_error(
@@ -413,15 +475,36 @@ impl RuntimeSink {
                 reason,
             );
         }
+        let source_refs = if response.provenance.is_empty() {
+            vec![response.supplement_id.clone()]
+        } else {
+            response.provenance.clone()
+        };
+        let items = response
+            .item_ids
+            .iter()
+            .map(|item_id| {
+                json!({
+                    "itemId": item_id,
+                    "contentRef": response.supplement_id,
+                    "contentDigest": response.content_digest.as_str(),
+                    "sourceRefs": source_refs,
+                    "observationClass": "core_observed"
+                })
+            })
+            .collect::<Vec<_>>();
+        let redaction_report_digest = digest_bytes(
+            &serde_json::to_vec(&response.redactions)
+                .map_err(|_| ProtocolError::InternalAgentFailure)?,
+        );
         let response_frame = success_response(
             request_id,
             json!({
-                "supplementId": &response.supplement_id,
-                "contentDigest": response.content_digest.as_str(),
-                "items": &response.item_ids,
-                "provenance": &response.provenance,
-                "redactions": &response.redactions,
-                "policyDecisionIds": &response.policy_decision_ids,
+                "queryId": query_id,
+                "items": items,
+                "truncated": false,
+                "effectivePayloadDigest": response.content_digest.as_str(),
+                "redactionReportDigest": redaction_report_digest.as_str(),
             }),
         )
         .map_err(|_| ProtocolError::InternalAgentFailure)?;
@@ -475,6 +558,7 @@ impl RuntimeSink {
                 "request_deadline_exceeded",
             );
         }
+        let specialist_request_id = required_string(&value, "/params/requestId")?;
         let over_budget = {
             let mut state = self
                 .request_state
@@ -517,7 +601,7 @@ impl RuntimeSink {
             connection_id: self.request.connection.connection_id.clone(),
             connection_binding_digest: self.request.connection.binding_digest.clone(),
             phase: self.request.phase.clone(),
-            request_id: request_id.to_owned(),
+            request_id: specialist_request_id.clone(),
             capability: required_string(&value, "/params/capability")?,
             reason: required_string(&value, "/params/reason")?,
             required_context_ids,
@@ -565,7 +649,7 @@ impl RuntimeSink {
         };
         if response.run_id != self.request.run_id
             || response.task_id != self.request.task_id
-            || response.request_id != request_id
+            || response.request_id != specialist_request_id
             || !valid_specialist_reason(response.accepted, &response.reason_code)
             || response.accepted != response.prepared_commit.is_some()
         {
@@ -590,12 +674,16 @@ impl RuntimeSink {
             AgentRequestAuditDecision::Rejected
         };
         let audit_reason = (!response.accepted).then(|| response.reason_code.clone());
+        let specialist_run_id = response
+            .prepared_commit
+            .as_ref()
+            .map(|commit| commit.assignment.run_id().as_str().to_owned());
         let response_frame = success_response(
             request_id,
             json!({
                 "requestId": response.request_id,
-                "accepted": response.accepted,
-                "reasonCode": response.reason_code,
+                "decision": if response.accepted { "accepted" } else { "rejected" },
+                "specialistRunId": specialist_run_id,
             }),
         )
         .map_err(|_| ProtocolError::InternalAgentFailure)?;
@@ -811,7 +899,7 @@ impl RuntimeSink {
                 .map_err(|_| ProtocolError::InternalAgentFailure)?
                 .remove(self.request.run_id.as_str());
             self.slot.release();
-            let frame = cancel_frame(&self.request.run_id, "core:limit", "output_limit", 1)
+            let frame = cancel_frame(&self.request.run_id, "core:limit", "output_limit")
                 .map_err(|_| ProtocolError::InternalAgentFailure)?;
             let cancel = RunCancel::try_from(frame)?;
             let _ = self.peer.cancel(cancel);

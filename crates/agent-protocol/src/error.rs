@@ -10,6 +10,8 @@ pub enum ProtocolError {
     InvalidFrame,
     Encode,
     ProtocolIncompatible,
+    ProtocolConflict,
+    PendingLimitExceeded,
     InvalidRequest,
     IdentityBindingFailed,
     ProviderUnavailable,
@@ -36,10 +38,16 @@ impl fmt::Display for ProtocolError {
             Self::MultipleFrames => formatter.write_str("NDJSON input contains multiple frames"),
             Self::InvalidUtf8 => formatter.write_str("NDJSON frame is not valid UTF-8"),
             Self::InvalidJson => formatter.write_str("NDJSON frame is not valid JSON"),
-            Self::InvalidFrame => formatter.write_str("NDJSON frame does not match protocol v1"),
-            Self::Encode => formatter.write_str("protocol v1 frame could not be encoded"),
+            Self::InvalidFrame => formatter.write_str("NDJSON frame does not match protocol v2"),
+            Self::Encode => formatter.write_str("protocol v2 frame could not be encoded"),
             Self::ProtocolIncompatible => {
                 formatter.write_str("protocol negotiation is incompatible")
+            }
+            Self::ProtocolConflict => {
+                formatter.write_str("protocol request replay conflicts with durable state")
+            }
+            Self::PendingLimitExceeded => {
+                formatter.write_str("protocol pending request limit was exceeded")
             }
             Self::InvalidRequest => formatter.write_str("protocol request violates session state"),
             Self::IdentityBindingFailed => {

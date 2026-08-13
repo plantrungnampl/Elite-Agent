@@ -314,7 +314,7 @@ fn descriptor() -> PeerDescriptor {
                 "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
             trust_tier: ProtocolTrustTier::CoreAdapter,
         },
-        protocol_version: "1.0".to_owned(),
+        protocol_version: "2.0".to_owned(),
         capabilities: ProtocolCapabilities {
             roles: strings(["critic"]),
             skills: strings(["testing"]),

@@ -66,7 +66,7 @@ struct ScriptedPeerInner {
 struct PendingRun {
     request_id: String,
     run_id: String,
-    context_digest: String,
+    context_package_ref: String,
     sink: Box<dyn PeerEventSink>,
 }
 
@@ -165,7 +165,10 @@ impl ScriptedPeer {
     }
 
     fn emit_success(&self, pending: PendingRun, role: &str) -> Result<(), ProtocolError> {
-        let output = format!("{role}:{}:{}", pending.request_id, pending.context_digest);
+        let output = format!(
+            "{role}:{}:{}",
+            pending.request_id, pending.context_package_ref
+        );
         self.inner
             .outputs
             .lock()
@@ -211,9 +214,12 @@ impl ScriptedPeer {
                 &"x".repeat(MAX_OUTPUT_BYTES + 1),
             )?)),
             MaliciousScript::DuplicateTerminal => {
-                let terminal = terminal(&pending, "succeeded", "done", "one")?;
-                self.acknowledge_terminal(&pending, terminal.clone())?;
-                self.record_request_response(pending.sink.request(terminal))
+                pending
+                    .sink
+                    .receive(stream_delta(&pending.run_id, 1, "ok")?)?;
+                let frame = terminal(&pending, "succeeded", "done", "one")?;
+                self.acknowledge_terminal(&pending, frame.clone())?;
+                self.record_request_response(pending.sink.request(frame))
             }
             MaliciousScript::ConflictingTerminal => {
                 self.acknowledge_terminal(
@@ -342,7 +348,7 @@ impl ProtocolPeer for ScriptedPeer {
             .push(request.clone());
         let value = frame_value(request.as_frame())?;
         let request_id = required_string(&value, "/id")?;
-        let context_digest = required_string(&value, "/params/contextPackage/contentDigest")?;
+        let context_package_ref = required_string(&value, "/params/contextPackageRef")?;
         let run_id = request.run_id();
         let mut pending = self
             .inner
@@ -355,7 +361,7 @@ impl ProtocolPeer for ScriptedPeer {
         *pending = Some(PendingRun {
             request_id,
             run_id: run_id.clone(),
-            context_digest,
+            context_package_ref,
             sink,
         });
         Ok(RunAcceptance {
@@ -446,14 +452,7 @@ impl ConformancePeerFactory for ScriptedPeerFactory {
             .find(|(scenario, _)| *scenario == case.scenario)
             .map(|(_, peer)| peer.clone())
             .ok_or(ProtocolError::InternalAgentFailure)?;
-        match peer.drive() {
-            Err(ProtocolError::InvalidRequest)
-                if case.scenario == ConformanceScenario::DuplicateTerminal =>
-            {
-                Ok(())
-            }
-            result => result,
-        }
+        peer.drive()
     }
 }
 
@@ -476,7 +475,11 @@ fn terminal(
                 "content": content,
                 "claims": []
             },
-            "usage": { "inputTokens": 1, "outputTokens": 1, "providerReportedCost": 0.0 }
+            "usage": {
+                "inputTokens": 1,
+                "outputTokens": 1,
+                "providerReportedCostMicrounits": 0
+            }
         }
     }))
 }
@@ -534,6 +537,7 @@ fn tool_request(run_id: &str) -> Result<ProtocolFrame, ProtocolError> {
             "executorFencingToken": null,
             "tool": "git.diff",
             "arguments": {},
+            "argumentsDigest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
             "reason": "Verify"
         }
     }))
@@ -546,6 +550,7 @@ fn specialist_request(run_id: &str) -> Result<ProtocolFrame, ProtocolError> {
         "method": "specialist.request",
         "params": {
             "runId": run_id,
+            "requestId": "specialist-request-1",
             "capability": "review",
             "reason": "Need review",
             "requiredContext": ["artifact-context-1"]

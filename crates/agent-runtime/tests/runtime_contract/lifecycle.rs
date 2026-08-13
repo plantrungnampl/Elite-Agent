@@ -32,7 +32,7 @@ use local_agent_terminal_domain::{
 const EMPTY_JSON_DIGEST: &str =
     "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 const CONNECTION_BINDING_DIGEST: &str =
-    "sha256:6e171d4e7a1d7b7db1c14807e8a2a5cc9093eac495d66a2ca76439264d09b7d5";
+    "sha256:b26578733a878b45c3f6526cb937d53f11d13e35c7428d914cc06babb43ad729";
 const ALTERNATE_CONNECTION_BINDING_DIGEST: &str =
     "sha256:19c626cd039614b089a6696156e732bc42c438da19ce49ae9f0380b2224f568d";
 const EXECUTABLE_DIGEST: &str =
@@ -74,7 +74,7 @@ fn start_returns_after_durable_acceptance_and_scripted_output_is_deterministic()
     assert_eq!(peer.terminal_acknowledgements(), 1);
     assert_eq!(
         peer.outputs(),
-        vec![format!("proposer:core:2:{CONTEXT_DIGEST}")]
+        vec!["proposer:core:2:context-1".to_owned()]
     );
     assert_eq!(
         log.lock().unwrap().as_slice(),
@@ -91,7 +91,7 @@ fn start_returns_after_durable_acceptance_and_scripted_output_is_deterministic()
 }
 
 #[test]
-fn peer_receives_every_bound_execution_field_and_wire_limit_exactly() {
+fn peer_receives_execution_binding_out_of_band_and_exact_v2_start_frame() {
     let store = Arc::new(RecordingStore::default());
     let artifacts = Arc::new(RecordingArtifacts::default());
     let clock = Arc::new(ManualClock::new(1_800_000_000));
@@ -115,16 +115,25 @@ fn peer_receives_every_bound_execution_field_and_wire_limit_exactly() {
     assert_eq!(binding.supersedes_run_id.as_deref(), Some("run-1"));
 
     let wire = serde_json::to_value(start.as_frame()).unwrap();
-    assert_eq!(wire.pointer("/params/supersedesRunId").unwrap(), "run-1");
     assert_eq!(
-        wire.pointer("/params/limits/deadline").unwrap(),
-        "2027-01-15T08:05:00Z"
+        wire.pointer("/params").unwrap(),
+        &serde_json::json!({
+            "runId": "run-2",
+            "taskId": "task-1",
+            "contextPackageRef": "context-1",
+            "idempotencyKey": "task-1:reviewer:run-2",
+            "role": "reviewer"
+        })
     );
-    assert_eq!(
-        wire.pointer("/params/limits/maxOutputTokens").unwrap(),
-        8_000
-    );
-    assert_eq!(wire.pointer("/params/limits/maxToolRequests").unwrap(), 8);
+    for forbidden in [
+        "/params/supersedesRunId",
+        "/params/runConfigurationRef",
+        "/params/limits",
+        "/params/permissions",
+        "/params/responseSchema",
+    ] {
+        assert!(wire.pointer(forbidden).is_none(), "{forbidden} must stay out of v2 wire");
+    }
 }
 
 #[test]
@@ -254,7 +263,7 @@ fn proposer_critic_and_verifier_outputs_are_stable_for_the_same_bound_input() {
 
         assert_eq!(
             peer.outputs(),
-            vec![format!("{role}:core:2:{CONTEXT_DIGEST}")]
+            vec![format!("{role}:core:2:context-1")]
         );
     }
 }
@@ -869,25 +878,22 @@ fn negotiated_context_and_specialist_requests_are_bound_audited_and_typed() {
         .map(|response| serde_json::to_value(response).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(values.len(), 3);
+    assert_eq!(values[0].pointer("/result/queryId").unwrap(), "query-1");
     assert_eq!(
-        values[0].pointer("/result/supplementId").unwrap(),
-        "supplement-query-1"
-    );
-    assert_eq!(
-        values[0].pointer("/result/contentDigest").unwrap(),
+        values[0].pointer("/result/items/0/contentDigest").unwrap(),
         CONTEXT_DIGEST
     );
-    assert_eq!(values[0].pointer("/result/items/0").unwrap(), "item-1");
+    assert_eq!(values[0].pointer("/result/items/0/itemId").unwrap(), "item-1");
     assert_eq!(
         values[1]
             .pointer("/error/data/category")
             .and_then(serde_json::Value::as_str),
         Some("policy_denied")
     );
-    assert_eq!(values[2].pointer("/result/accepted").unwrap(), true);
+    assert_eq!(values[2].pointer("/result/decision").unwrap(), "accepted");
     assert_eq!(
-        values[2].pointer("/result/reasonCode").unwrap(),
-        "specialist_approved"
+        values[2].pointer("/result/specialistRunId").unwrap(),
+        "specialist-specialist-request-1"
     );
 
     let context_requests = handler.context_requests();
@@ -1312,11 +1318,11 @@ fn concurrent_runs_have_independent_request_counters() {
 
     assert!(serde_json::to_value(first_response)
         .unwrap()
-        .pointer("/result/supplementId")
+        .pointer("/result/queryId")
         .is_some());
     assert!(serde_json::to_value(second_response)
         .unwrap()
-        .pointer("/result/supplementId")
+        .pointer("/result/queryId")
         .is_some());
     assert_eq!(
         handler
@@ -1370,9 +1376,9 @@ fn request_routing_rejects_duplicate_query_ids_and_context_token_overflow() {
     assert_eq!(
         serde_json::to_value(accepted)
             .unwrap()
-            .pointer("/result/supplementId")
+            .pointer("/result/queryId")
             .unwrap(),
-        "supplement-query-1"
+        "query-1"
     );
     assert_eq!(
         serde_json::to_value(duplicate)

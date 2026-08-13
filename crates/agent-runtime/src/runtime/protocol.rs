@@ -76,6 +76,7 @@ fn protocol_request_error_category(error: ProtocolError) -> &'static str {
         ProtocolError::PolicyDenied => "policy_denied",
         ProtocolError::ApprovalRequired => "approval_required",
         ProtocolError::StaleFencingToken => "stale_fencing_token",
+        ProtocolError::ProtocolConflict => "protocol_conflict",
         _ => "invalid_request",
     }
 }
@@ -92,6 +93,7 @@ fn trust_tier(value: TrustTier) -> ProtocolTrustTier {
 fn initialize_frame(
     descriptor: &PeerDescriptor,
     request_id: &str,
+    connection_binding_digest: &str,
 ) -> Result<ProtocolFrame, PortError> {
     decode_frame(json!({
         "jsonrpc": "2.0",
@@ -99,15 +101,8 @@ fn initialize_frame(
         "method": "initialize",
         "params": {
             "protocolVersions": [descriptor.protocol_version],
-            "client": { "name": "local-agent-terminal", "version": "0.1.0" },
-            "transport": { "type": "stdio-ndjson", "maxFrameBytes": DEFAULT_MAX_FRAME_BYTES },
-            "features": features(&descriptor.capabilities),
-            "launchBinding": {
-                "connectionId": descriptor.binding.connection_id,
-                "manifestDigest": descriptor.binding.manifest_digest,
-                "executableDigest": descriptor.binding.executable_digest,
-                "trustTier": descriptor.binding.trust_tier.as_str()
-            }
+            "capabilities": descriptor.capabilities.advertised(),
+            "connectionBindingDigest": connection_binding_digest
         }
     }))
 }
@@ -120,12 +115,14 @@ fn initialize_response(
         request_id,
         json!({
             "protocolVersion": descriptor.protocol_version,
-            "agent": {
-                "id": descriptor.binding.agent_id,
-                "displayName": descriptor.binding.agent_id,
-                "implementationVersion": "1"
-            },
-            "capabilities": capabilities_json(&descriptor.capabilities)
+            "capabilities": descriptor.capabilities.advertised(),
+            "connectionId": descriptor.binding.connection_id,
+            "limits": {
+                "maxFrameBytes": DEFAULT_MAX_FRAME_BYTES,
+                "maxPendingRequests": 128,
+                "streamHighWatermark": 512,
+                "streamLowWatermark": 256
+            }
         }),
     )
 }
@@ -135,69 +132,39 @@ fn initialized_frame(descriptor: &PeerDescriptor) -> Result<ProtocolFrame, PortE
         "jsonrpc": "2.0",
         "method": "initialized",
         "params": {
-            "connectionId": descriptor.binding.connection_id,
-            "effectiveCapabilitiesDigest": effective_capabilities_digest(&descriptor.capabilities)
+            "connectionId": descriptor.binding.connection_id
         }
     }))
 }
 
 fn run_start_frame(
     request: &BoundAgentRunRequest,
-    descriptor: &PeerDescriptor,
     request_id: &str,
 ) -> Result<ProtocolFrame, PortError> {
-    let mut value = json!({
+    decode_frame(json!({
         "jsonrpc": "2.0",
         "id": request_id,
         "method": "agent.run.start",
         "params": {
             "runId": request.run_id.as_str(),
-            "idempotencyKey": request.idempotency_key,
             "taskId": request.task_id.as_str(),
+            "contextPackageRef": request.context.context_package_id,
+            "idempotencyKey": request.idempotency_key,
             "role": request.role,
-            "objective": request.context.objective,
-            "contextPackage": {
-                "packageId": request.context.context_package_id,
-                "contentDigest": request.context.content_digest.as_str(),
-                "manifestRef": request.context.manifest_artifact_id.as_str()
-            },
-            "permissions": {
-                "contextQuery": descriptor.capabilities.context_query,
-                "toolRequest": descriptor.capabilities.tool_requests,
-                "writeFiles": false
-            },
-            "responseSchema": request.run_config.response_schema_version,
-            "limits": {
-                "deadline": timestamp_date_time(request.run_config.limits.deadline)?.to_rfc3339(),
-                "maxOutputTokens": request.run_config.limits.max_output_tokens,
-                "maxToolRequests": request.run_config.limits.max_tool_requests
-            }
         }
-    });
-    if let Some(supersedes_run_id) = &request.supersedes_run_id {
-        value
-            .pointer_mut("/params")
-            .and_then(Value::as_object_mut)
-            .ok_or_else(internal_failure)?
-            .insert(
-                "supersedesRunId".to_owned(),
-                Value::String(supersedes_run_id.as_str().to_owned()),
-            );
-    }
-    decode_frame(value)
+    }))
 }
 
 fn cancel_frame(
     run_id: &RunId,
     request_id: &str,
     reason: &str,
-    deadline_ms: u64,
 ) -> Result<ProtocolFrame, PortError> {
     decode_frame(json!({
         "jsonrpc": "2.0",
         "id": request_id,
         "method": "agent.run.cancel",
-        "params": { "runId": run_id.as_str(), "reason": reason, "deadlineMs": deadline_ms }
+        "params": { "runId": run_id.as_str(), "reason": reason }
     }))
 }
 
@@ -228,42 +195,6 @@ fn decode_frame(value: Value) -> Result<ProtocolFrame, PortError> {
         .map_err(protocol_port_error)
 }
 
-fn features(capabilities: &ProtocolCapabilities) -> Vec<&'static str> {
-    let mut features = Vec::new();
-    if capabilities.streaming {
-        features.push("streaming");
-    }
-    if capabilities.context_query {
-        features.push("context-query");
-    }
-    if capabilities.tool_requests {
-        features.push("tool-request");
-    }
-    if capabilities.specialist_requests {
-        features.push("specialist-request");
-    }
-    features
-}
-
-fn capabilities_json(capabilities: &ProtocolCapabilities) -> Value {
-    json!({
-        "roles": capabilities.roles,
-        "skills": capabilities.skills,
-        "streaming": capabilities.streaming,
-        "contextQuery": capabilities.context_query,
-        "toolRequests": capabilities.tool_requests,
-        "specialistRequests": capabilities.specialist_requests,
-        "maxConcurrentRuns": capabilities.max_concurrent_runs,
-        "maxContextTokens": capabilities.max_context_tokens
-    })
-}
-
-fn effective_capabilities_digest(capabilities: &ProtocolCapabilities) -> String {
-    let bytes = serde_json::to_vec(&capabilities_json(capabilities))
-        .expect("capabilities JSON must be serializable");
-    format!("sha256:{:x}", Sha256::digest(bytes))
-}
-
 fn terminal_from_frame(
     frame: &ProtocolFrame,
     request: &BoundAgentRunRequest,
@@ -291,25 +222,14 @@ fn terminal_from_frame(
         .and_then(Value::as_array)
         .ok_or(ProtocolError::InvalidRequest)?
         .iter()
-        .map(parse_claim)
+        .enumerate()
+        .map(|(index, claim)| parse_claim(claim, &message_id, index))
         .collect::<Result<Vec<_>, _>>()?;
     let usage = params
         .get("usage")
         .and_then(Value::as_object)
-        .map(|usage| AgentUsage {
-            input_tokens: usage
-                .get("inputTokens")
-                .and_then(Value::as_i64)
-                .unwrap_or(0),
-            output_tokens: usage
-                .get("outputTokens")
-                .and_then(Value::as_i64)
-                .unwrap_or(0),
-            cost_microunits: usage
-                .get("providerReportedCost")
-                .and_then(Value::as_f64)
-                .map(|cost| (cost * 1_000_000.0).round() as i64),
-        });
+        .map(parse_usage)
+        .transpose()?;
     let terminal = AgentRunTerminal {
         run_id: request.run_id.clone(),
         task_id: request.task_id.clone(),
@@ -343,52 +263,60 @@ fn terminal_from_frame(
     Ok(terminal)
 }
 
-fn parse_claim(value: &Value) -> Result<AgentClaim, ProtocolError> {
+fn parse_claim(
+    value: &Value,
+    message_id: &str,
+    index: usize,
+) -> Result<AgentClaim, ProtocolError> {
     let object = value.as_object().ok_or(ProtocolError::InvalidRequest)?;
-    let evidence = object
-        .get("evidenceRefs")
-        .and_then(Value::as_array)
-        .ok_or(ProtocolError::InvalidRequest)?
-        .iter()
-        .map(parse_evidence)
-        .collect::<Result<Vec<_>, _>>()?;
+    let statement = required_object_string(object, "statement")?;
+    match required_object_string(object, "observationClass")?.as_str() {
+        "agent_claimed" | "provider_reported" | "tool_verified" | "core_observed" => {}
+        _ => return Err(ProtocolError::InvalidRequest),
+    }
+    if let Some(evidence_refs) = object.get("evidenceRefs") {
+        let evidence_refs = evidence_refs
+            .as_array()
+            .ok_or(ProtocolError::InvalidRequest)?;
+        if evidence_refs.iter().any(|reference| {
+            reference
+                .as_str()
+                .is_none_or(|reference| reference.trim().is_empty())
+        }) {
+            return Err(ProtocolError::InvalidRequest);
+        }
+    }
     Ok(AgentClaim {
-        claim_id: required_object_string(object, "claimId")?,
-        text: required_object_string(object, "text")?,
-        evidence,
-        confidence: object
-            .get("confidence")
-            .and_then(Value::as_f64)
-            .ok_or(ProtocolError::InvalidRequest)?,
+        claim_id: stable_id("claim", &format!("{message_id}:{index}:{statement}")),
+        text: statement,
+        // MACP v2 carries opaque evidence references and no confidence scalar. The domain
+        // evidence model requires verified content digests, so preserve no fabricated evidence
+        // or confidence at this wire boundary.
+        evidence: Vec::new(),
+        confidence: 0.0,
     })
 }
 
-fn parse_evidence(value: &Value) -> Result<AgentEvidenceRef, ProtocolError> {
-    let object = value.as_object().ok_or(ProtocolError::InvalidRequest)?;
-    Ok(AgentEvidenceRef {
-        source_type: required_object_string(object, "sourceType")?,
-        source_id: required_object_string(object, "sourceId")?,
-        revision: required_object_string(object, "revision")?,
-        content_digest: Sha256Digest::new(required_object_string(object, "contentDigest")?)
-            .map_err(|_| ProtocolError::InvalidRequest)?,
-        start_line: optional_u32(object.get("startLine"))?,
-        end_line: optional_u32(object.get("endLine"))?,
-        symbol: object
-            .get("symbol")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+fn parse_usage(usage: &serde_json::Map<String, Value>) -> Result<AgentUsage, ProtocolError> {
+    Ok(AgentUsage {
+        input_tokens: optional_nonnegative_i64(usage, "inputTokens")?.unwrap_or(0),
+        output_tokens: optional_nonnegative_i64(usage, "outputTokens")?.unwrap_or(0),
+        cost_microunits: optional_nonnegative_i64(usage, "providerReportedCostMicrounits")?,
     })
 }
 
-fn optional_u32(value: Option<&Value>) -> Result<Option<u32>, ProtocolError> {
-    value
-        .map(|value| {
-            value
-                .as_u64()
-                .and_then(|value| u32::try_from(value).ok())
-                .ok_or(ProtocolError::InvalidRequest)
-        })
-        .transpose()
+fn optional_nonnegative_i64(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<i64>, ProtocolError> {
+    match object.get(field) {
+        None => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .filter(|value| *value >= 0)
+            .map(Some)
+            .ok_or(ProtocolError::InvalidRequest),
+    }
 }
 
 fn runtime_terminal(
@@ -589,6 +517,10 @@ fn protocol_port_error(error: ProtocolError) -> PortError {
             SafeErrorClassification::PermissionDenied,
             Retryability::NonRetryable,
         ),
+        ProtocolError::ProtocolConflict => (
+            SafeErrorClassification::Conflict,
+            Retryability::NonRetryable,
+        ),
         ProtocolError::EmptyFrame
         | ProtocolError::FrameTooLarge { .. }
         | ProtocolError::MultipleFrames
@@ -597,6 +529,7 @@ fn protocol_port_error(error: ProtocolError) -> PortError {
         | ProtocolError::InvalidFrame
         | ProtocolError::Encode
         | ProtocolError::ProtocolIncompatible
+        | ProtocolError::PendingLimitExceeded
         | ProtocolError::InvalidRequest
         | ProtocolError::IdentityBindingFailed
         | ProtocolError::ContextTooLarge

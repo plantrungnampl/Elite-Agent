@@ -128,12 +128,17 @@ impl PeerEventSink for RecordingRequestSink {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
-                    "supplementId": "ctx-fake-supplement",
-                    "contentDigest": "sha256:ea7792a26f405e2ae9c6f49ca93bbe6076ceac0a1fc53d83426c7d7f2d9377e4",
-                    "items": ["artifact-context-1"],
-                    "provenance": [],
-                    "redactions": [],
-                    "policyDecisionIds": ["policy-fake-1"]
+                    "queryId": value.pointer("/params/queryId").and_then(Value::as_str).unwrap(),
+                    "items": [{
+                        "itemId": "ctx-fake-item",
+                        "contentRef": "ctx-fake-supplement",
+                        "contentDigest": "sha256:ea7792a26f405e2ae9c6f49ca93bbe6076ceac0a1fc53d83426c7d7f2d9377e4",
+                        "sourceRefs": ["ctx-fake-supplement"],
+                        "observationClass": "core_observed"
+                    }],
+                    "truncated": false,
+                    "effectivePayloadDigest": "sha256:ea7792a26f405e2ae9c6f49ca93bbe6076ceac0a1fc53d83426c7d7f2d9377e4",
+                    "redactionReportDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 }
             }))
         } else if method == "specialist.request" {
@@ -141,9 +146,9 @@ impl PeerEventSink for RecordingRequestSink {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
-                    "requestId": request_id,
-                    "accepted": true,
-                    "reasonCode": "specialist_approved"
+                    "requestId": value.pointer("/params/requestId").and_then(Value::as_str).unwrap(),
+                    "decision": "accepted",
+                    "specialistRunId": "specialist-fake-run"
                 }
             }))
         } else {
@@ -161,9 +166,9 @@ impl PeerEventSink for RecordingRequestSink {
             }))
         };
         let response_value = serde_json::to_value(&response).unwrap();
-        let response_shape = if response_value.pointer("/result/supplementId").is_some() {
+        let response_shape = if response_value.pointer("/result/queryId").is_some() {
             "context"
-        } else if response_value.pointer("/result/reasonCode").is_some() {
+        } else if response_value.pointer("/result/decision").is_some() {
             "specialist"
         } else {
             "error"
@@ -192,31 +197,16 @@ fn run_start() -> RunStart {
             "method": "agent.run.start",
             "params": {
                 "runId": "conformance-run",
-                "idempotencyKey": "fake-start",
                 "taskId": "task-1",
+                "contextPackageRef": "context-1",
+                "idempotencyKey": "fake-start",
                 "role": "critic",
-                "objective": "Test request scripts",
-                "contextPackage": {
-                    "packageId": "context-1",
-                    "contentDigest": "sha256:ea7792a26f405e2ae9c6f49ca93bbe6076ceac0a1fc53d83426c7d7f2d9377e4",
-                    "manifestRef": "artifact:context-1"
-                },
-                "permissions": {
-                    "contextQuery": true,
-                    "toolRequest": false,
-                    "writeFiles": false
-                },
-                "responseSchema": "agent-message.v1",
-                "limits": {
-                    "deadline": "2026-07-23T13:30:00Z",
-                    "maxOutputTokens": 100,
-                    "maxToolRequests": 0
-                }
             }
         })),
         RunExecutionBinding {
             provider_id: "provider-1".to_owned(),
             model_id: "model-1".to_owned(),
+            max_output_tokens: 100,
             generation_parameters: b"{}".to_vec(),
             generation_parameters_digest:
                 "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
@@ -249,7 +239,7 @@ fn descriptor() -> PeerDescriptor {
                 "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
             trust_tier: ProtocolTrustTier::CoreAdapter,
         },
-        protocol_version: "1.0".to_owned(),
+        protocol_version: "2.0".to_owned(),
         capabilities: ProtocolCapabilities {
             roles: BTreeSet::from(["critic".to_owned()]),
             skills: BTreeSet::from(["testing".to_owned()]),

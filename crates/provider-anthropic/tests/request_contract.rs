@@ -325,7 +325,7 @@ fn descriptor() -> PeerDescriptor {
                 "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
             trust_tier: ProtocolTrustTier::CoreAdapter,
         },
-        protocol_version: "1.0".to_owned(),
+        protocol_version: "2.0".to_owned(),
         capabilities: ProtocolCapabilities {
             roles: strings(["critic"]),
             skills: strings(["testing"]),
@@ -373,26 +373,10 @@ fn try_run_start(
                 "method": "agent.run.start",
                 "params": {
                     "runId": "run-1",
-                    "idempotencyKey": "key-1",
                     "taskId": "task-1",
+                    "contextPackageRef": "context-1",
+                    "idempotencyKey": "key-1",
                     "role": "critic",
-                    "objective": "Test Anthropic request",
-                    "contextPackage": {
-                        "packageId": "context-1",
-                        "contentDigest": context_digest,
-                        "manifestRef": "artifact:context-1"
-                    },
-                    "permissions": {
-                        "contextQuery": false,
-                        "toolRequest": false,
-                        "writeFiles": false
-                    },
-                    "responseSchema": "agent-message.v1",
-                    "limits": {
-                        "deadline": "2026-07-23T13:30:00Z",
-                        "maxOutputTokens": max_output_tokens,
-                        "maxToolRequests": 0
-                    }
                 }
             }))
             .unwrap(),
@@ -403,6 +387,7 @@ fn try_run_start(
         RunExecutionBinding {
             provider_id: "anthropic".to_owned(),
             model_id: model.to_owned(),
+            max_output_tokens,
             generation_parameters: generation_parameters.to_vec(),
             generation_parameters_digest,
             effective_context: context.to_vec(),
@@ -441,18 +426,16 @@ impl PeerEventSink for RecordingSink {
     }
 
     fn request(&self, frame: ProtocolFrame) -> Result<ProtocolFrame, ProtocolError> {
-        let id = serde_json::to_value(&frame)
-            .unwrap()
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap()
-            .to_owned();
+        let value = serde_json::to_value(&frame).unwrap();
+        let id = value.get("id").and_then(Value::as_str).unwrap().to_owned();
+        let result = json!({
+            "runId": value.pointer("/params/runId").and_then(Value::as_str).unwrap(),
+            "recorded": true,
+            "terminalStatus": value.pointer("/params/status").and_then(Value::as_str).unwrap(),
+        });
         self.frames.lock().unwrap().push(frame);
         NdjsonCodec::default().decode(
-            &serde_json::to_vec(
-                &json!({ "jsonrpc": "2.0", "id": id, "result": { "accepted": true } }),
-            )
-            .unwrap(),
+            &serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": id, "result": result })).unwrap(),
         )
     }
 

@@ -780,7 +780,7 @@ fn descriptor() -> PeerDescriptor {
                 "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
             trust_tier: ProtocolTrustTier::CoreAdapter,
         },
-        protocol_version: "1.0".to_owned(),
+        protocol_version: "2.0".to_owned(),
         capabilities: ProtocolCapabilities {
             roles: strings(["critic"]),
             skills: strings(["testing"]),
@@ -810,22 +810,10 @@ fn run_start(run_id: &str) -> RunStart {
         "method": "agent.run.start",
         "params": {
             "runId": run_id,
-            "idempotencyKey": format!("key-{run_id}"),
             "taskId": "task-1",
+            "contextPackageRef": "context-1",
+            "idempotencyKey": format!("key-{run_id}"),
             "role": "critic",
-            "objective": "Test adapter streaming",
-            "contextPackage": {
-                "packageId": "context-1",
-                "contentDigest": context_digest,
-                "manifestRef": "artifact:context-1"
-            },
-            "permissions": { "contextQuery": false, "toolRequest": false, "writeFiles": false },
-            "responseSchema": "agent-message.v1",
-            "limits": {
-                "deadline": "2026-07-23T13:30:00Z",
-                "maxOutputTokens": 17,
-                "maxToolRequests": 0
-            }
         }
     }));
     RunStart::new(
@@ -833,6 +821,7 @@ fn run_start(run_id: &str) -> RunStart {
         RunExecutionBinding {
             provider_id: "openai".to_owned(),
             model_id: "gpt-test-model".to_owned(),
+            max_output_tokens: 17,
             generation_parameters: generation_parameters.to_vec(),
             generation_parameters_digest,
             effective_context: context.to_vec(),
@@ -849,7 +838,7 @@ fn run_cancel(run_id: &str) -> RunCancel {
         "jsonrpc": "2.0",
         "id": format!("core:cancel-{run_id}"),
         "method": "agent.run.cancel",
-        "params": { "runId": run_id, "reason": "test", "deadlineMs": 1 }
+        "params": { "runId": run_id, "reason": "test" }
     })))
     .unwrap()
 }
@@ -948,9 +937,15 @@ impl PeerEventSink for RecordingSink {
             .and_then(Value::as_str)
             .unwrap()
             .to_owned();
+        let value = frame_value(&frame);
+        let result = json!({
+            "runId": value.pointer("/params/runId").and_then(Value::as_str).unwrap(),
+            "recorded": true,
+            "terminalStatus": value.pointer("/params/status").and_then(Value::as_str).unwrap(),
+        });
         self.record(frame);
         Ok(decode(
-            json!({ "jsonrpc": "2.0", "id": id, "result": { "accepted": true } }),
+            json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         ))
     }
 
