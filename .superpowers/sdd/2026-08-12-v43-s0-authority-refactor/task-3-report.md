@@ -212,5 +212,6 @@ Focused evidence from the same remediation state:
   `plan_approval_store`: 11 passed; `policy_tool_store`: 9 passed;
   `workspace_recovery`: 14 passed.
 
-The Task 3 implementation is verification-green but remains unchecked in the
-plan until the independent Fix Round 1 review returns clean.
+The independent Fix Round 1 re-review found all five findings addressed, no
+new Critical/Important breakage, and no out-of-scope observations. Task 3 is
+therefore checked complete in the plan.

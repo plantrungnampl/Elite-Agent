@@ -298,7 +298,7 @@ Empty databases install v7; exact normative v6 databases migrate to v7; v7 datab
 
 The completed schema must expose `task_workflow_authority.workflow_profile`, `outcome_mode`, `stream_version`, `profile_revision`, `last_transition_event_id`, and `last_profile_revision_id` as the only trusted persistence source for Task 2's production rehydration fix. Do not populate clean-v7 task authority with compatibility defaults: initial profile/outcome selection remains an explicit trusted application command in later tasks. Exact normative v6 rows migrate according to `migrate-v6-to-v7.sql`; unrelated application v9 data is reset/rejected per the approved policy.
 
-- [ ] **Step 1: Write RED clean/migration/rejection tests**
+- [x] **Step 1: Write RED clean/migration/rejection tests**
 
 Create tests that install the normative scripts into temporary SQLite files and assert:
 
@@ -330,7 +330,7 @@ fn application_version_marker_is_not_accepted_as_normative_v7() {
 
 Add a separate non-empty unknown-object rejection test, plus tests for runtime `foreign_keys=ON`, WAL, synchronous mode, busy timeout, and `integrity_check=ok`. Together the marker and unknown-object cases prove that the old application version number or an arbitrary non-empty schema cannot be mistaken for normative v7.
 
-- [ ] **Step 2: Run schema tests and confirm RED**
+- [x] **Step 2: Run schema tests and confirm RED**
 
 ```powershell
 cargo test -p local-agent-terminal-storage-sqlite --test schema_v7 -- --nocapture
@@ -338,7 +338,7 @@ cargo test -p local-agent-terminal-storage-sqlite --test schema_v7 -- --nocaptur
 
 Expected: FAIL because the store still installs historical v1 plus internal migrations.
 
-- [ ] **Step 3: Implement exact schema recognition and installation**
+- [x] **Step 3: Implement exact schema recognition and installation**
 
 Embed the three normative scripts with `include_str!`. Build expected v6/v7 object maps by applying the embedded scripts to in-memory SQLite connections; compare `(type, name, table, SQL)` for every non-internal object. Do not identify a schema from an untrusted version integer alone.
 
@@ -358,11 +358,11 @@ install_or_verify_app_projections(connection)?;
 verify_required_schema(connection)
 ```
 
-- [ ] **Step 4: Extract only non-authoritative application projections**
+- [x] **Step 4: Extract only non-authoritative application projections**
 
 Move the current app-only tables and immutable/projection guards required by existing adapters into `app_projection_schema.sql`. Exclude every table/trigger already supplied by v7. Add a trigger test proving no app projection can update `task_workflow_authority`.
 
-- [ ] **Step 5: Run storage schema and existing adapter tests**
+- [x] **Step 5: Run storage schema and existing adapter tests**
 
 ```powershell
 cargo fmt --all -- --check
@@ -373,7 +373,7 @@ cargo test -p local-agent-terminal-storage-sqlite --tests
 
 Expected: all commands exit 0; clean and migrated v7 expose the same 481 authority objects before app projections.
 
-- [ ] **Step 6: Commit the v7 storage foundation**
+- [x] **Step 6: Commit the v7 storage foundation**
 
 ```powershell
 git add crates/storage-sqlite/src/migrations.rs crates/storage-sqlite/src/app_projection_schema.sql crates/storage-sqlite/src/lib.rs crates/storage-sqlite/tests/schema_v7.rs crates/storage-sqlite/tests/schema_health.rs
