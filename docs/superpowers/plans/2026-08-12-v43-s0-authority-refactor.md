@@ -182,7 +182,7 @@ pub fn reduce_condition(
 
 `reduce` resolves only the 33 command-authoritative `WF-P`, `WF-W`, and `WF-G` rules accepted by `WorkflowTransitionCommand v1` and normalized by SQLite v7. `reduce_condition` resolves the six ID-less condition rules against their declared guard while preserving phase, profile, outcome, and operation. Do not invent `WF-C` IDs.
 
-- [ ] **Step 1: Write RED tests for the v3 state and route surface**
+- [x] **Step 1: Write RED tests for the v3 state and route surface**
 
 Add tests that assert:
 
@@ -212,7 +212,7 @@ fn v3_state_retains_profile_outcome_and_authority_versions() {
 
 Add RED cases for `WF-P003`, `WF-P008`, `WF-P009`, `WF-P015`, all terminal paths, missing required effects, wrong-profile severe-objection routing, and all six condition transitions through `reduce_condition`.
 
-- [ ] **Step 2: Run the workflow contract and confirm the v1 implementation is red**
+- [x] **Step 2: Run the workflow contract and confirm the v1 implementation is red**
 
 Run:
 
@@ -222,7 +222,7 @@ cargo test -p local-agent-terminal-domain --test workflow_contract -- --nocaptur
 
 Expected: compile/test failure because v3 types and signatures do not exist and production still loads `workflow-transitions.v1.json`.
 
-- [ ] **Step 3: Split workflow responsibilities and implement the v3 parser**
+- [x] **Step 3: Split workflow responsibilities and implement the v3 parser**
 
 Move value/state declarations to `types.rs`, JSON parsing and structural validation to `specification.rs`, and reduction to `reducer.rs`. Keep `workflow.rs` as the public module facade.
 
@@ -236,7 +236,7 @@ const WORKFLOW_JSON: &str = include_str!(
 
 Parse all four profiles, three outcome modes, 30 phase rules, two global rules, six condition rules, profile escalations, and the workspace-dirty rule. Reject unknown fields, duplicate selectors, missing IDs on ID-bearing `WF-P/W/G` rules, and ambiguous profile routes. Condition rules are structurally validated by `(from, event, to, guard)` and intentionally have no rule ID or effect set.
 
-- [ ] **Step 4: Implement the pure v3 reducer**
+- [x] **Step 4: Implement the pure v3 reducer**
 
 The command reducer must resolve the caller-supplied `rule_id` among the 33 `WF-P/W/G` rules, verify source/profile/outcome/event, require the exact declared guard/effect kind sets, apply only the declared axis/effects, increment stream version once, and preserve profile revision unless the separate escalation reducer is used. The condition reducer must select exactly one of the six ID-less rules by current condition and event, require its declared guard evaluation, change only condition plus stream version, and never produce a transition-command rule ID.
 
@@ -250,7 +250,7 @@ fn exact_set(actual: &BTreeSet<String>, required: &[String]) -> bool {
 
 Do not infer approval evidence from a Boolean guard.
 
-- [ ] **Step 5: Update domain callers and run focused tests**
+- [x] **Step 5: Update domain callers and run focused tests**
 
 Update the four production `reduce` callers identified by the code graph (`plan_approval.rs`, deliberation `commands.rs`, deliberation `ports.rs`, and `workspace_store.rs`) to construct `TransitionRequest` with exact rule/evidence/effect kinds. Make only the compile-preserving support edits required by the expanded v3 phase/state shape: map the new post-approval phases to the existing recovery `PostApproval` category and clone non-`Copy` workflow state/event IDs only at existing owned DTO/record/test boundaries. Adapt only the named regression tests. Run:
 
@@ -262,7 +262,7 @@ cargo test -p local-agent-terminal-application --tests
 
 Expected: all commands exit 0.
 
-- [ ] **Step 6: Commit the v3 pure workflow slice**
+- [x] **Step 6: Commit the v3 pure workflow slice**
 
 ```powershell
 git add crates/domain/src/lib.rs crates/domain/src/workflow.rs crates/domain/src/workflow/types.rs crates/domain/src/workflow/specification.rs crates/domain/src/workflow/reducer.rs crates/domain/tests/workflow_contract.rs crates/application/src/plan_approval.rs crates/application/src/deliberation/commands.rs crates/application/src/deliberation/ports.rs crates/application/src/deliberation/records.rs crates/orchestration/src/recovery.rs crates/storage-sqlite/src/workspace_store.rs crates/application/tests/plan_approval_digest.rs crates/application/tests/deliberation_ports/objections_and_approval.rs crates/application/tests/deliberation_ports/persistence.rs crates/bootstrap/tests/deliberation_e2e.rs crates/orchestration/tests/workflow_contract.rs crates/storage-sqlite/tests/deliberation_store.rs crates/storage-sqlite/tests/workspace_recovery.rs

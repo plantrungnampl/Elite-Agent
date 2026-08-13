@@ -155,3 +155,9 @@ The atomic workspace regression was also RED before the writer change. A trigger
 
 - Only Task 2 storage source/tests and this report are staged. User-owned `docs/multi-agent-terminal-design/**` changes remain untouched.
 - The `WorkspaceMutationRequest` interface has no field for the mandatory v7 transition command artifact or its guard/effect bindings. The storage layer therefore fails closed unless a trusted reducer has already persisted an exact prepared `WF-W001`; adding an application command-issuance surface remains a follow-up interface task rather than an opportunity for the storage writer to fabricate authority.
+
+The independent Fix Round 2 re-review found all three open findings addressed:
+causal bindings are complete, missing authority is covered by an exact
+no-mutation boundary, and workspace projection plus authority are committed
+atomically and reload successfully. It reported no new Critical/Important
+breakage or out-of-scope observations. Task 2 is therefore checked complete.
