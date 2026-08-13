@@ -9,8 +9,8 @@ use local_agent_terminal_application::{
 };
 use local_agent_terminal_domain::{
     reduce, ArtifactId, Condition, FencingToken, GitObjectId, OperationState, Phase, ProjectId,
-    RepositoryId, Sequence, TaskBranch, TaskId, TransitionRequest, WorkflowEvent, WorkspaceVersion,
-    WorktreeId,
+    RepositoryId, Sequence, TaskBranch, TaskId, TransitionRequest, WorkflowEvent, WorkflowState,
+    WorkflowStateSnapshot, WorkspaceVersion, WorktreeId,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
@@ -1070,6 +1070,8 @@ fn record_workspace_mutation_with_authority(
     )
     .map_err(|_| conflict())?;
     let next_state = transition.state().clone();
+    let workflow_transition_id =
+        prepared_workspace_mutation_transition(transaction, &request, &state, &next_state)?;
     let next_sequence = current_sequence.checked_add(1).ok_or_else(invalid_input)?;
     let now: String = transaction
         .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
@@ -1095,6 +1097,7 @@ fn record_workspace_mutation_with_authority(
     };
     let payload = json!({
         "taskId": request.task_id.as_str(),
+        "workflowTransitionId": workflow_transition_id,
         "preFingerprint": fingerprint_json(&request.pre_fingerprint),
         "postFingerprint": fingerprint_json(&request.post_fingerprint),
         "preEvidenceArtifactId": request.pre_evidence.artifact_id.as_str(),
@@ -1106,6 +1109,15 @@ fn record_workspace_mutation_with_authority(
         "workspace.mutated:{}:{next_sequence}",
         request.task_id.as_str()
     );
+    accept_workspace_mutation_transition(transaction, &workflow_transition_id, &now)?;
+    update_workspace_mutation_authority(
+        transaction,
+        &request,
+        &state,
+        &next_state,
+        &workflow_transition_id,
+        &now,
+    )?;
     insert_task_event(
         transaction,
         TaskEvent {
@@ -1173,6 +1185,12 @@ fn record_workspace_mutation_with_authority(
         return Err(conflict());
     }
 
+    let next_state = WorkflowState::rehydrate(WorkflowStateSnapshot {
+        last_transition_event_id: Some(workflow_transition_id),
+        ..next_state.snapshot()
+    })
+    .map_err(|_| integrity_failure())?;
+
     Ok(WorkspaceMutationResult {
         event_id: local_agent_terminal_domain::EventId::new(event_id)
             .map_err(|_| integrity_failure())?,
@@ -1181,6 +1199,107 @@ fn record_workspace_mutation_with_authority(
         resume_target: Some(state.phase()),
         invalidated_approval_ids: invalidated_ids,
     })
+}
+
+fn prepared_workspace_mutation_transition(
+    transaction: &Transaction<'_>,
+    request: &WorkspaceMutationRequest,
+    state: &local_agent_terminal_domain::WorkflowState,
+    next_state: &local_agent_terminal_domain::WorkflowState,
+) -> Result<String, PortError> {
+    transaction
+        .query_row(
+            "SELECT transition.id
+             FROM workflow_transition_events AS transition
+             JOIN workflow_transition_guard_bindings AS guard
+               ON guard.transition_event_id = transition.id
+             WHERE transition.task_id = ?1
+               AND transition.rule_id = 'WF-W001'
+               AND transition.expected_stream_version = ?2
+               AND transition.from_phase = ?3
+               AND transition.event_type = 'workspace.mutated'
+               AND transition.to_phase = ?4
+               AND transition.workflow_profile = ?5
+               AND transition.outcome_mode = ?6
+               AND transition.status = 'prepared'
+               AND guard.evidence_kind = 'workspace_mutation_evidence'
+               AND guard.evidence_ref = ?7
+               AND guard.evidence_digest = ?8
+               AND guard.artifact_id = ?7",
+            params![
+                request.task_id.as_str(),
+                i64::try_from(state.stream_version()).map_err(|_| integrity_failure())?,
+                state.phase().as_str(),
+                next_state.phase().as_str(),
+                state.workflow_profile().as_str(),
+                state.outcome_mode().as_str(),
+                request.post_evidence.artifact_id.as_str(),
+                request.post_evidence.content_hash,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => integrity_failure(),
+            error => sqlite_error_to_port(error),
+        })
+}
+
+fn accept_workspace_mutation_transition(
+    transaction: &Transaction<'_>,
+    transition_id: &str,
+    accepted_at: &str,
+) -> Result<(), PortError> {
+    let accepted = transaction
+        .execute(
+            "UPDATE workflow_transition_events
+             SET status = 'accepted', accepted_at = ?1
+             WHERE id = ?2 AND status = 'prepared'",
+            params![accepted_at, transition_id],
+        )
+        .map_err(sqlite_error_to_port)?;
+    if accepted == 1 {
+        Ok(())
+    } else {
+        Err(conflict())
+    }
+}
+
+fn update_workspace_mutation_authority(
+    transaction: &Transaction<'_>,
+    request: &WorkspaceMutationRequest,
+    state: &local_agent_terminal_domain::WorkflowState,
+    next_state: &local_agent_terminal_domain::WorkflowState,
+    transition_id: &str,
+    updated_at: &str,
+) -> Result<(), PortError> {
+    let updated = transaction
+        .execute(
+            "UPDATE task_workflow_authority
+             SET phase = ?1, stream_version = ?2, last_transition_event_id = ?3,
+                 updated_at = ?4
+             WHERE task_id = ?5
+               AND phase = ?6
+               AND workflow_profile = ?7
+               AND outcome_mode = ?8
+               AND stream_version = ?9",
+            params![
+                next_state.phase().as_str(),
+                i64::try_from(next_state.stream_version()).map_err(|_| integrity_failure())?,
+                transition_id,
+                updated_at,
+                request.task_id.as_str(),
+                state.phase().as_str(),
+                state.workflow_profile().as_str(),
+                state.outcome_mode().as_str(),
+                i64::try_from(state.stream_version()).map_err(|_| integrity_failure())?,
+            ],
+        )
+        .map_err(sqlite_error_to_port)?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(conflict())
+    }
 }
 
 fn validate_mutation_request(request: &WorkspaceMutationRequest) -> Result<(), PortError> {

@@ -798,52 +798,165 @@ fn validate_workflow_authority_references(
     if snapshot.phase != Phase::Intake && snapshot.last_transition_event_id.is_none() {
         return Err(integrity_failure());
     }
-    if let Some(transition_event_id) = &snapshot.last_transition_event_id {
-        let transition_matches: bool = connection
+    let transition = if let Some(transition_event_id) = &snapshot.last_transition_event_id {
+        let transition: Option<(String, i64)> = connection
             .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM workflow_transition_events
-                    WHERE id = ?1
-                      AND task_id = ?2
-                      AND status = 'accepted'
-                      AND to_phase = ?3
-                      AND outcome_mode = ?4
-                )",
+                "SELECT workflow_profile, expected_stream_version
+                 FROM workflow_transition_events
+                 WHERE id = ?1
+                   AND task_id = ?2
+                   AND status = 'accepted'
+                   AND to_phase = ?3
+                   AND outcome_mode = ?4",
                 params![
                     transition_event_id,
                     task_id.as_str(),
                     snapshot.phase.as_str(),
                     snapshot.outcome_mode.as_str(),
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
+            .optional()
             .map_err(sqlite_error_to_port)?;
-        if !transition_matches {
+        let Some((workflow_profile, expected_stream_version)) = transition else {
             return Err(integrity_failure());
-        }
-    }
-    if let Some(profile_revision_id) = &snapshot.last_profile_revision_id {
+        };
+        Some((
+            WorkflowProfile::from_str(&workflow_profile).map_err(|_| integrity_failure())?,
+            u64::try_from(expected_stream_version).map_err(|_| integrity_failure())?,
+        ))
+    } else {
+        None
+    };
+    let profile_revision = if let Some(profile_revision_id) = &snapshot.last_profile_revision_id {
         let profile_revision =
             i64::try_from(snapshot.profile_revision).map_err(|_| integrity_failure())?;
-        let revision_matches: bool = connection
+        let revision: Option<(String, i64)> = connection
             .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM workflow_profile_revisions
-                    WHERE id = ?1
-                      AND task_id = ?2
-                      AND revision_no = ?3
-                      AND to_profile = ?4
-                )",
+                "SELECT from_profile, expected_stream_version
+                 FROM workflow_profile_revisions
+                 WHERE id = ?1
+                   AND task_id = ?2
+                   AND revision_no = ?3
+                   AND to_profile = ?4",
                 params![
                     profile_revision_id,
                     task_id.as_str(),
                     profile_revision,
                     snapshot.workflow_profile.as_str(),
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
+            .optional()
             .map_err(sqlite_error_to_port)?;
-        if !revision_matches {
+        let Some((from_profile, expected_stream_version)) = revision else {
+            return Err(integrity_failure());
+        };
+        Some((
+            WorkflowProfile::from_str(&from_profile).map_err(|_| integrity_failure())?,
+            u64::try_from(expected_stream_version).map_err(|_| integrity_failure())?,
+        ))
+    } else {
+        None
+    };
+    validate_causal_authority_bindings(connection, task_id, snapshot, transition, profile_revision)
+}
+
+fn validate_causal_authority_bindings(
+    connection: &Connection,
+    task_id: &TaskId,
+    snapshot: &WorkflowStateSnapshot,
+    transition: Option<(WorkflowProfile, u64)>,
+    profile_revision: Option<(WorkflowProfile, u64)>,
+) -> Result<(), PortError> {
+    if snapshot.stream_version == 0 && transition.is_none() && profile_revision.is_none() {
+        return Ok(());
+    }
+    let latest_version = snapshot
+        .stream_version
+        .checked_sub(1)
+        .ok_or_else(integrity_failure)?;
+    if let Some((_, revision_version)) = &profile_revision {
+        validate_causal_authority_stream(connection, task_id, *revision_version, latest_version)?;
+    }
+    match (transition, profile_revision) {
+        (Some((transition_profile, transition_version)), None)
+            if transition_version == latest_version
+                && transition_profile == snapshot.workflow_profile =>
+        {
+            Ok(())
+        }
+        (None, Some((_, revision_version))) if revision_version == latest_version => Ok(()),
+        (
+            Some((transition_profile, transition_version)),
+            Some((_revision_from_profile, revision_version)),
+        ) if transition_version == latest_version
+            && transition_version > revision_version
+            && transition_profile == snapshot.workflow_profile =>
+        {
+            Ok(())
+        }
+        (
+            Some((transition_profile, transition_version)),
+            Some((revision_from_profile, revision_version)),
+        ) if revision_version == latest_version
+            && revision_version > transition_version
+            && transition_profile == revision_from_profile =>
+        {
+            Ok(())
+        }
+        _ => Err(integrity_failure()),
+    }
+}
+
+fn validate_causal_authority_stream(
+    connection: &Connection,
+    task_id: &TaskId,
+    start_version: u64,
+    latest_version: u64,
+) -> Result<(), PortError> {
+    if start_version > latest_version {
+        return Err(integrity_failure());
+    }
+    let start_version = i64::try_from(start_version).map_err(|_| integrity_failure())?;
+    let latest_version = i64::try_from(latest_version).map_err(|_| integrity_failure())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT expected_stream_version
+             FROM workflow_transition_events
+             WHERE task_id = ?1
+               AND status = 'accepted'
+               AND expected_stream_version BETWEEN ?2 AND ?3
+             UNION ALL
+             SELECT expected_stream_version
+             FROM workflow_profile_revisions
+             WHERE task_id = ?1
+               AND expected_stream_version BETWEEN ?2 AND ?3
+             ORDER BY expected_stream_version",
+        )
+        .map_err(sqlite_error_to_port)?;
+    let versions = statement
+        .query_map(
+            params![task_id.as_str(), start_version, latest_version],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(sqlite_error_to_port)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error_to_port)?;
+    let expected_count = latest_version
+        .checked_sub(start_version)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(integrity_failure)?;
+    if i64::try_from(versions.len()).map_err(|_| integrity_failure())? != expected_count {
+        return Err(integrity_failure());
+    }
+    for (offset, version) in versions.into_iter().enumerate() {
+        let offset = i64::try_from(offset).map_err(|_| integrity_failure())?;
+        if version
+            != start_version
+                .checked_add(offset)
+                .ok_or_else(integrity_failure)?
+        {
             return Err(integrity_failure());
         }
     }

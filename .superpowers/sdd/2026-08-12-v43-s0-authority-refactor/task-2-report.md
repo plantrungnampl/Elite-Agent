@@ -116,3 +116,42 @@ The first complete SQLite package run then exposed five RED `plan_approval_store
 | `cargo clippy -p local-agent-terminal-storage-sqlite --all-targets -- -D warnings` | PASS |
 
 One interim package attempt timed out at the initial two-minute runner limit. A later attempt encountered transient `agent_store` temporary-database `UnsupportedSchema { found: 0, supported: 7 }` setup failures; the isolated `agent_store` binary passed, and the final normal package rerun passed end-to-end. The final complete package gate above is the completion evidence.
+
+## Fix Round 2: causal authority bindings and atomic workspace authority
+
+Status: complete.
+
+### Delivered behavior
+
+- Workflow rehydration now loads the referenced accepted transition's profile and expected stream version and the referenced profile revision's source profile and expected stream version. It rejects a causal row unless the latest causal command is exactly `stream_version - 1`; when a transition is newest, its profile must equal the current authority profile, and when an escalation is newest, the last transition must use that escalation's source profile.
+- `WorkspaceMutationStore::record_workspace_mutation` now requires an already prepared, exact `WF-W001` v7 transition. The existing request supplies mutation evidence but not a command artifact, transition ID, guard set, or effect set, so the store consumes only a command previously created by the trusted reducer. It never invents an authority event or revision ID.
+- In the same SQLite transaction, the store accepts that prepared command, updates `task_workflow_authority` to `WorkspaceDirty` with the next stream version and the accepted transition ID, writes the task projection/event, invalidates approvals, and revokes the lease. Profile, outcome, profile revision, and profile-revision causal ID are preserved. Any failure rolls the entire transaction back.
+- A mutation without an authority row or without an exact prepared `WF-W001` returns `IntegrityFailure` before projection, approval, lease, or mutation-event changes. This is the current user-visible v3 contract until the application layer can issue the complete transition command authority.
+
+### RED evidence
+
+The three causal regressions were written and run before the reader change:
+
+```powershell
+cargo test -p local-agent-terminal-storage-sqlite --test deliberation_store causal_ -- --nocapture
+```
+
+All three were RED: an accepted transition with a substituted profile, that transition with a substituted expected stream version, and a profile revision with a substituted expected stream version all rehydrated successfully before the fix. A final self-review regression also showed that an older profile revision with a gap in the accepted causal stream could pass; the reader now verifies the complete causal span from that revision through the newest authority version.
+
+The atomic workspace regression was also RED before the writer change. A trigger-valid prepared `WF-W001` command still produced a result whose `last_transition_event_id` remained the previous transition; a fresh store then rejected the committed task/authority phase mismatch. The new no-prepared-command regression was RED as well: the legacy request committed `workspace.mutated` without a v7 authority command. The absent-authority/no-mutation regression was immediately green because Fix Round 1 had already made the shared reader fail closed.
+
+### Final verification
+
+| Command | Result |
+| --- | --- |
+| `cargo test -p local-agent-terminal-storage-sqlite --test deliberation_store -- --nocapture` | PASS; 18 tests |
+| `cargo test -p local-agent-terminal-storage-sqlite --test workspace_recovery -- --nocapture` | PASS; 18 tests |
+| `cargo fmt --all -- --check` | PASS |
+| `cargo check -p local-agent-terminal-storage-sqlite --all-targets` | PASS |
+| `cargo clippy -p local-agent-terminal-storage-sqlite --all-targets -- -D warnings` | PASS |
+| `cargo test -p local-agent-terminal-storage-sqlite` | PASS; complete package, schema-v7, recovery, and doc-test suites |
+
+### Scope and concern
+
+- Only Task 2 storage source/tests and this report are staged. User-owned `docs/multi-agent-terminal-design/**` changes remain untouched.
+- The `WorkspaceMutationRequest` interface has no field for the mandatory v7 transition command artifact or its guard/effect bindings. The storage layer therefore fails closed unless a trusted reducer has already persisted an exact prepared `WF-W001`; adding an application command-issuance surface remains a follow-up interface task rather than an opportunity for the storage writer to fabricate authority.

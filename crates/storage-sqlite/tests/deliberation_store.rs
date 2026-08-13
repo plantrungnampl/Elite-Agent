@@ -557,6 +557,81 @@ fn deliberation_load_fails_closed_when_authority_transition_is_mismatched() {
 }
 
 #[test]
+fn deliberation_load_fails_closed_when_causal_transition_profile_is_mismatched() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let connection = database.connection();
+    connection
+        .execute_batch("DROP TRIGGER workflow_transition_event_identity_immutable;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE workflow_transition_events
+             SET workflow_profile = 'HighAssurance'
+             WHERE id = 'workflow-transition-p2'",
+            [],
+        )
+        .unwrap();
+
+    let error = store.load(&TaskId::new("task-1").unwrap()).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+}
+
+#[test]
+fn deliberation_load_fails_closed_when_causal_transition_stream_is_mismatched() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let connection = database.connection();
+    connection
+        .execute_batch("DROP TRIGGER workflow_transition_event_identity_immutable;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE workflow_transition_events
+             SET expected_stream_version = 2
+             WHERE id = 'workflow-transition-p2'",
+            [],
+        )
+        .unwrap();
+
+    let error = store.load(&TaskId::new("task-1").unwrap()).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+}
+
+#[test]
+fn deliberation_load_fails_closed_when_causal_profile_revision_stream_is_mismatched() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let connection = database.connection();
+    connection
+        .execute_batch("DROP TRIGGER workflow_profile_revision_update_forbidden;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE workflow_profile_revisions
+             SET expected_stream_version = 3
+             WHERE id = 'workflow-profile-revision-2'",
+            [],
+        )
+        .unwrap();
+
+    let error = store.load(&TaskId::new("task-1").unwrap()).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+}
+
+#[test]
 fn repository_boundary_is_idempotent_and_invalidates_task_context_packages() {
     let database = TestDatabase::new();
     let store = database.store();

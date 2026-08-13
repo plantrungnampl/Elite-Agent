@@ -29,6 +29,9 @@ const DIGEST_C: &str = "sha256:ccccccccccccccccccccccccccccccccccccccccccccccccc
 const REPOSITORY_IDENTITY: &str =
     "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
+type WorkspaceMutationProjection = (String, String, String, i64, i64, i64);
+type WorkspaceMutationAuthority = (String, String, String, i64, i64, String, String);
+
 struct TempDatabase {
     directory: PathBuf,
     path: PathBuf,
@@ -577,7 +580,7 @@ fn mutation_request(store: &SqliteStore) -> WorkspaceMutationRequest {
     }
 }
 
-fn seed_mutation_state(path: &Path, store: &SqliteStore) {
+fn seed_mutation_state_without_workflow_authority(path: &Path, store: &SqliteStore) {
     seed_task(store);
     seed_core_run(store, "run-1", "one");
     store.acquire(acquire("run-1", 0)).unwrap();
@@ -622,12 +625,40 @@ fn seed_mutation_state(path: &Path, store: &SqliteStore) {
             )
             .unwrap();
     }
-    drop(connection);
+}
+
+fn seed_mutation_state(path: &Path, store: &SqliteStore) {
+    seed_mutation_state_without_workflow_authority(path, store);
+    publish_workflow_transition_command(store);
     seed_authoritative_mutation_workflow(path);
 }
 
 fn seed_authoritative_mutation_workflow(path: &Path) {
     let connection = Connection::open(path).unwrap();
+    let task_insert_guard: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'task_workflow_insert_guard'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let transition_insert_guard: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'workflow_transition_event_insert_guard'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let profile_revision_insert_guard: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'workflow_profile_revision_insert_guard'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     connection
         .execute_batch(
             "DROP TRIGGER task_workflow_insert_guard;
@@ -681,6 +712,115 @@ fn seed_authoritative_mutation_workflow(path: &Path) {
             [DIGEST_A],
         )
         .unwrap();
+    connection.execute_batch(&task_insert_guard).unwrap();
+    connection.execute_batch(&transition_insert_guard).unwrap();
+    connection
+        .execute_batch(&profile_revision_insert_guard)
+        .unwrap();
+}
+
+fn publish_workflow_transition_command(store: &SqliteStore) {
+    let mut command = reservation(
+        "artifact-operation-workflow-transition-w001",
+        "artifact-workflow-transition-w001",
+        Some(TaskId::new("task-1").unwrap()),
+    );
+    command.artifact.artifact_type = "workflow_transition_command".to_owned();
+    store.reserve(command).unwrap();
+    for (expected_status, next_status, completed_at) in [
+        (
+            ArtifactJournalStatus::Intent,
+            ArtifactJournalStatus::Staging,
+            None,
+        ),
+        (
+            ArtifactJournalStatus::Staging,
+            ArtifactJournalStatus::Renamed,
+            None,
+        ),
+        (
+            ArtifactJournalStatus::Renamed,
+            ArtifactJournalStatus::Completed,
+            Some("2026-07-26T00:00:03Z".to_owned()),
+        ),
+    ] {
+        store
+            .transition(ArtifactJournalTransition {
+                operation_id: "artifact-operation-workflow-transition-w001".to_owned(),
+                expected_status,
+                next_status,
+                updated_at: "2026-07-26T00:00:03Z".to_owned(),
+                completed_at,
+                error: None,
+            })
+            .unwrap();
+    }
+}
+
+fn prepare_workspace_mutation_transition(path: &Path, request: &WorkspaceMutationRequest) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO workflow_transition_events (
+                id, task_id, rule_id, expected_stream_version, from_phase, event_type,
+                to_phase, workflow_profile, outcome_mode, transition_command_artifact_id,
+                guard_set_digest, effect_set_digest, core_actor_digest, reducer_version,
+                status, prepared_at, accepted_at, rejected_at
+             ) VALUES (
+                'workflow-transition-w001', 'task-1', 'WF-W001', 7,
+                'Implementation', 'workspace.mutated', 'WorkspaceDirty',
+                'HighAssurance', 'LocalCommit', 'artifact-workflow-transition-w001',
+                ?1, ?1, ?1, 'v3', 'prepared', '2026-07-26T00:00:10Z', NULL, NULL
+             )",
+            [DIGEST_A],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO workflow_transition_guard_bindings (
+                transition_event_id, evidence_kind, evidence_ref, subject_digest,
+                evidence_digest, artifact_id, approval_receipt_id, acceptance_receipt_id,
+                verification_receipt_id, ref_promotion_receipt_id
+             ) VALUES (
+                'workflow-transition-w001', 'workspace_mutation_evidence', ?1, NULL,
+                ?2, ?1, NULL, NULL, NULL, NULL
+             )",
+            params![
+                request.post_evidence.artifact_id.as_str(),
+                request.post_evidence.content_hash,
+            ],
+        )
+        .unwrap();
+    for (effect_kind, effect_ref) in [
+        ("revoke_executor_lease", "run-1"),
+        ("increment_fencing_epoch", "2"),
+        ("invalidate_affected_approvals", "task-1"),
+        ("discard_candidate_tree", SHA1),
+        ("discard_candidate_commit", "none"),
+        ("stop_write_capable_tools", "task-1"),
+        (
+            "capture_workspace_evidence",
+            request.post_evidence.artifact_id.as_str(),
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO workflow_transition_effect_bindings (
+                    transition_event_id, effect_kind, effect_ref, effect_digest, artifact_id
+                 ) VALUES ('workflow-transition-w001', ?1, ?2, ?3, NULL)",
+                params![effect_kind, effect_ref, DIGEST_A],
+            )
+            .unwrap();
+    }
+}
+
+fn authorized_mutation_request(path: &Path, store: &SqliteStore) -> WorkspaceMutationRequest {
+    let request = mutation_request(store);
+    prepare_workspace_mutation_transition(path, &request);
+    request
 }
 
 fn acquire(run: &str, expected_fencing_epoch: u64) -> AcquireLease {
@@ -862,10 +1002,9 @@ fn workspace_mutation_is_atomic_and_invalidates_candidate_approvals() {
     let database = TempDatabase::new();
     let store = SqliteStore::open(&database.path).unwrap();
     seed_mutation_state(&database.path, &store);
+    let request = authorized_mutation_request(&database.path, &store);
 
-    let result = store
-        .record_workspace_mutation(mutation_request(&store))
-        .unwrap();
+    let result = store.record_workspace_mutation(request).unwrap();
     assert_eq!(result.new_sequence.get(), 3);
     assert_eq!(
         result.task_state.phase(),
@@ -927,14 +1066,13 @@ fn workspace_mutation_is_atomic_and_invalidates_candidate_approvals() {
 }
 
 #[test]
-fn workspace_mutation_rehydrates_exact_v7_workflow_authority() {
+fn workspace_mutation_commits_a_coherent_v7_authority_row_that_reopens() {
     let database = TempDatabase::new();
     let store = SqliteStore::open(&database.path).unwrap();
     seed_mutation_state(&database.path, &store);
+    let request = authorized_mutation_request(&database.path, &store);
 
-    let result = store
-        .record_workspace_mutation(mutation_request(&store))
-        .unwrap();
+    let result = store.record_workspace_mutation(request.clone()).unwrap();
 
     assert_eq!(
         result.task_state.workflow_profile(),
@@ -946,14 +1084,277 @@ fn workspace_mutation_rehydrates_exact_v7_workflow_authority() {
     );
     assert_eq!(result.task_state.stream_version(), 8);
     assert_eq!(result.task_state.profile_revision(), 2);
+    let reopened = SqliteStore::open(&database.path).unwrap();
+    let error = reopened.record_workspace_mutation(request).unwrap_err();
+    assert!(matches!(
+        error,
+        local_agent_terminal_application::PortError::VersionConflict { .. }
+    ));
+
+    let connection = Connection::open(&database.path).unwrap();
+    let (projection, authority): (WorkspaceMutationProjection, WorkspaceMutationAuthority) =
+        connection
+            .query_row(
+                "SELECT t.phase, t.condition, t.operation_state, t.workspace_version,
+                    t.fencing_epoch, t.current_sequence, w.phase, w.workflow_profile,
+                    w.outcome_mode, w.stream_version, w.profile_revision,
+                    w.last_transition_event_id, w.last_profile_revision_id
+             FROM tasks t
+             JOIN task_workflow_authority w ON w.task_id = t.id
+             WHERE t.id = 'task-1'",
+                [],
+                |row| {
+                    Ok((
+                        (
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ),
+                        (
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                            row.get(10)?,
+                            row.get(11)?,
+                            row.get(12)?,
+                        ),
+                    ))
+                },
+            )
+            .unwrap();
     assert_eq!(
-        result.task_state.last_transition_event_id(),
-        Some("workflow-transition-7")
+        projection,
+        (
+            "WorkspaceDirty".to_owned(),
+            "Active".to_owned(),
+            "None".to_owned(),
+            0,
+            2,
+            3,
+        )
     );
     assert_eq!(
-        result.task_state.last_profile_revision_id(),
-        Some("workflow-profile-revision-2")
+        authority,
+        (
+            "WorkspaceDirty".to_owned(),
+            "HighAssurance".to_owned(),
+            "LocalCommit".to_owned(),
+            8,
+            2,
+            "workflow-transition-w001".to_owned(),
+            "workflow-profile-revision-2".to_owned(),
+        )
     );
+}
+
+#[test]
+fn workspace_mutation_without_v7_authority_fails_closed_without_projection_changes() {
+    let database = TempDatabase::new();
+    let store = SqliteStore::open(&database.path).unwrap();
+    seed_mutation_state_without_workflow_authority(&database.path, &store);
+    let request = mutation_request(&store);
+    let connection = Connection::open(&database.path).unwrap();
+    let before: (String, String, String, i64, i64, i64, Option<String>, String, i64, i64) =
+        connection
+            .query_row(
+                "SELECT t.phase, t.condition, t.operation_state, t.workspace_version,
+                        t.fencing_epoch, t.current_sequence, t.active_candidate_tree,
+                        l.status,
+                        (SELECT COUNT(*) FROM approvals WHERE task_id = t.id AND status = 'pending'),
+                        (SELECT COUNT(*) FROM events WHERE event_type = 'workspace.mutated')
+                 FROM tasks t
+                 JOIN executor_leases l ON l.task_id = t.id
+                 WHERE t.id = 'task-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+    let error = store.record_workspace_mutation(request).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    let after: (String, String, String, i64, i64, i64, Option<String>, String, i64, i64) =
+        connection
+            .query_row(
+                "SELECT t.phase, t.condition, t.operation_state, t.workspace_version,
+                        t.fencing_epoch, t.current_sequence, t.active_candidate_tree,
+                        l.status,
+                        (SELECT COUNT(*) FROM approvals WHERE task_id = t.id AND status = 'pending'),
+                        (SELECT COUNT(*) FROM events WHERE event_type = 'workspace.mutated')
+                 FROM tasks t
+                 JOIN executor_leases l ON l.task_id = t.id
+                 WHERE t.id = 'task-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn workspace_mutation_without_a_prepared_v7_transition_fails_closed() {
+    let database = TempDatabase::new();
+    let store = SqliteStore::open(&database.path).unwrap();
+    seed_mutation_state(&database.path, &store);
+    let request = mutation_request(&store);
+    let connection = Connection::open(&database.path).unwrap();
+    let before: (String, i64, i64, i64, String, i64) = connection
+        .query_row(
+            "SELECT t.phase, t.fencing_epoch, t.current_sequence,
+                    (SELECT COUNT(*) FROM events WHERE event_type = 'workspace.mutated'),
+                    l.status,
+                    w.stream_version
+             FROM tasks t
+             JOIN executor_leases l ON l.task_id = t.id
+             JOIN task_workflow_authority w ON w.task_id = t.id
+             WHERE t.id = 'task-1'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+
+    let error = store.record_workspace_mutation(request).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    let after: (String, i64, i64, i64, String, i64) = connection
+        .query_row(
+            "SELECT t.phase, t.fencing_epoch, t.current_sequence,
+                    (SELECT COUNT(*) FROM events WHERE event_type = 'workspace.mutated'),
+                    l.status,
+                    w.stream_version
+             FROM tasks t
+             JOIN executor_leases l ON l.task_id = t.id
+             JOIN task_workflow_authority w ON w.task_id = t.id
+             WHERE t.id = 'task-1'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn workspace_mutation_fails_closed_when_causal_profile_revision_stream_has_a_gap() {
+    let database = TempDatabase::new();
+    let store = SqliteStore::open(&database.path).unwrap();
+    seed_mutation_state(&database.path, &store);
+    let request = authorized_mutation_request(&database.path, &store);
+    let connection = Connection::open(&database.path).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER workflow_profile_revision_update_forbidden;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE workflow_profile_revisions
+             SET expected_stream_version = 4
+             WHERE id = 'workflow-profile-revision-2'",
+            [],
+        )
+        .unwrap();
+    let before: (String, i64, i64, i64, String, i64) = connection
+        .query_row(
+            "SELECT t.phase, t.fencing_epoch, t.current_sequence,
+                    (SELECT COUNT(*) FROM events WHERE event_type = 'workspace.mutated'),
+                    w.phase, w.stream_version
+             FROM tasks t
+             JOIN task_workflow_authority w ON w.task_id = t.id
+             WHERE t.id = 'task-1'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+
+    let error = store.record_workspace_mutation(request).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    let after: (String, i64, i64, i64, String, i64) = connection
+        .query_row(
+            "SELECT t.phase, t.fencing_epoch, t.current_sequence,
+                    (SELECT COUNT(*) FROM events WHERE event_type = 'workspace.mutated'),
+                    w.phase, w.stream_version
+             FROM tasks t
+             JOIN task_workflow_authority w ON w.task_id = t.id
+             WHERE t.id = 'task-1'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(after, before);
 }
 
 #[test]
@@ -961,6 +1362,7 @@ fn mutation_rolls_back_event_projection_approvals_candidate_and_lease_together()
     let database = TempDatabase::new();
     let store = SqliteStore::open(&database.path).unwrap();
     seed_mutation_state(&database.path, &store);
+    let request = authorized_mutation_request(&database.path, &store);
     let connection = Connection::open(&database.path).unwrap();
     connection
         .execute_batch(
@@ -974,9 +1376,7 @@ fn mutation_rolls_back_event_projection_approvals_candidate_and_lease_together()
         .unwrap();
     drop(connection);
 
-    let error = store
-        .record_workspace_mutation(mutation_request(&store))
-        .unwrap_err();
+    let error = store.record_workspace_mutation(request).unwrap_err();
     assert!(matches!(
         error.safe_classification(),
         SafeErrorClassification::Internal | SafeErrorClassification::InvalidInput
