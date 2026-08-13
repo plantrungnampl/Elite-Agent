@@ -337,6 +337,42 @@ fn application_publishes_before_binding_a_preallocated_run() {
     assert_eq!(*boundary.calls.lock().unwrap(), ["publish", "bind"]);
 }
 
+struct WrongPhysicalDigestPublisher;
+
+impl RunConfigurationArtifactPublisher for WrongPhysicalDigestPublisher {
+    fn publish(
+        &self,
+        _artifact_id: &ArtifactId,
+        _configuration: &RunConfiguration,
+    ) -> Result<local_agent_terminal_application::ArtifactRef, PortError> {
+        Ok(local_agent_terminal_application::ArtifactRef {
+            content_hash: digest('e').as_str().to_owned(),
+            storage_key: "sha256/wrong".to_owned(),
+            size_bytes: 1,
+        })
+    }
+}
+
+#[test]
+fn publication_with_wrong_physical_digest_never_reaches_binding() {
+    let store = CountingStore::default();
+    let use_case = BindRunConfiguration::new(&WrongPhysicalDigestPublisher, &store);
+
+    let error = use_case
+        .execute(
+            &RunId::new("run-1").unwrap(),
+            ArtifactId::new("artifact-config-1").unwrap(),
+            unsigned(),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        local_agent_terminal_application::SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(store.0.load(Ordering::Relaxed), 0);
+}
+
 struct FailingPublisher;
 
 impl RunConfigurationArtifactPublisher for FailingPublisher {
