@@ -214,17 +214,6 @@ fn terminal_event_payload(receipt: &DurableToolExecutionReceipt) -> serde_json::
     })
 }
 
-fn cancellation_event_payload(authority: &ToolExecutionClaimAuthority) -> serde_json::Value {
-    json!({
-        "attempt": authority.attempt(),
-        "executionId": authority.execution_id().as_str(),
-        "executorFencingToken": authority.executor_fencing_token().map(FencingToken::get),
-        "operationDigest": authority.operation_digest().as_str(),
-        "ownerRunId": authority.owner_run_id().as_str(),
-        "schema": "tool-execution-cancellation.v1",
-    })
-}
-
 fn parse_terminal_receipt(value: &str) -> Result<DurableToolExecutionReceipt, PortError> {
     let value: serde_json::Value = serde_json::from_str(value).map_err(|_| integrity_failure())?;
     let schema = required_string(&value, "schema")?;
@@ -759,7 +748,6 @@ fn load_terminal_receipt(
             execution_id.as_str(),
             parsed.audit_payload.clone(),
         )?
-        .payload
     } else {
         parsed.audit_payload.clone()
     };
@@ -792,12 +780,6 @@ fn load_terminal_receipt(
     Ok(receipt)
 }
 
-struct AuditedToolEvent {
-    payload: Value,
-    actor_id: String,
-    policy_decision_id: String,
-}
-
 struct ToolAuditContext {
     actor_id: String,
     actor_json: String,
@@ -817,7 +799,7 @@ fn audited_tool_event_payload(
     task_id: &str,
     execution_id: &str,
     mut payload: Value,
-) -> Result<AuditedToolEvent, PortError> {
+) -> Result<Value, PortError> {
     let context = connection
         .query_row(
             "SELECT ar.agent_id, pd.actor_json, pd.actor_binding_digest, ar.role,
@@ -881,79 +863,7 @@ fn audited_tool_event_payload(
         }
         object.insert(field.to_owned(), value);
     }
-    Ok(AuditedToolEvent {
-        payload,
-        actor_id: context.actor_id,
-        policy_decision_id: context.policy_decision_id,
-    })
-}
-
-fn append_tool_event(
-    transaction: &Transaction<'_>,
-    task_id: &str,
-    execution_id: &str,
-    event_type: &str,
-    operation_state: &str,
-    payload: serde_json::Value,
-) -> Result<(), PortError> {
-    let audited = audited_tool_event_payload(transaction, task_id, execution_id, payload)?;
-    let payload = audited.payload;
-    let causation_id = transaction
-        .query_row(
-            "SELECT event_id FROM events
-             WHERE stream_id = ?1
-               AND json_extract(payload_json, '$.executionId') = ?2
-             ORDER BY sequence DESC LIMIT 1",
-            params![task_id, execution_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(sqlite_error_to_port)?
-        .unwrap_or_else(|| format!("policy-decision:{}", audited.policy_decision_id));
-    let correlation_id = format!("tool-execution:{execution_id}");
-    let (sequence, updated_at): (i64, String) = transaction
-        .query_row(
-            "SELECT current_sequence + 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             FROM tasks WHERE id = ?1",
-            [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(sqlite_error_to_port)?
-        .ok_or_else(not_found)?;
-    transaction
-        .execute(
-            "INSERT INTO events (
-                event_id, stream_id, sequence, event_type, schema_version, actor_type,
-                actor_id, observation_class, payload_json, metadata_json, causation_id,
-                correlation_id, created_at
-             ) VALUES (?1, ?2, ?3, ?4, 1, 'tool', ?5, 'tool_verified',
-                ?6, '{}', ?7, ?8, ?9)",
-            params![
-                format!("{event_type}:{execution_id}:{sequence}"),
-                task_id,
-                sequence,
-                event_type,
-                audited.actor_id,
-                payload.to_string(),
-                causation_id,
-                correlation_id,
-                updated_at,
-            ],
-        )
-        .map_err(sqlite_error_to_port)?;
-    let changed = transaction
-        .execute(
-            "UPDATE tasks SET current_sequence = ?1, operation_state = ?2, updated_at = ?3
-             WHERE id = ?4 AND current_sequence = ?5",
-            params![sequence, operation_state, updated_at, task_id, sequence - 1],
-        )
-        .map_err(sqlite_error_to_port)?;
-    if changed == 1 {
-        Ok(())
-    } else {
-        Err(conflict())
-    }
+    Ok(payload)
 }
 
 fn safe_artifact_path(root: &Path, storage_key: &str) -> Result<PathBuf, PortError> {

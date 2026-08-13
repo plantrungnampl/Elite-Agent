@@ -82,7 +82,8 @@ impl TestDatabase {
                 "INSERT INTO projects (
                     id, name, repository_path, repository_identity, created_at, updated_at,
                     policy_profile_id, artifact_root_mode, artifact_root_path
-                 ) VALUES ('project-1', 'Project', 'C:/repo', 'repo-identity',
+                 ) VALUES ('project-1', 'Project', 'C:/repo',
+                    'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                     '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z', 'default',
                     'application_data', ?1)",
                 [self.artifact_root.to_string_lossy().as_ref()],
@@ -104,10 +105,10 @@ impl TestDatabase {
             .execute(
                 "INSERT INTO agent_descriptors (
                     id, display_name, transport_type, trust_tier, manifest_json,
-                    manifest_digest, executable_digest, enabled, containment_verified,
+                    manifest_digest, executable_digest, enabled,
                     last_health_status, updated_at
                  ) VALUES ('agent-1', 'Agent', 'in_process', 'core_adapter', '{}', ?1,
-                    NULL, 1, 1, 'healthy', '2026-08-09T00:00:00Z')",
+                    NULL, 1, 'healthy', '2026-08-09T00:00:00Z')",
                 [digest(b"{}").as_str()],
             )
             .unwrap();
@@ -138,6 +139,27 @@ impl TestDatabase {
                 content: bytes.to_vec(),
             })?;
         let connection = self.connection();
+        let exact: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM artifacts
+                    WHERE id = ?1 AND task_id = 'task-1' AND artifact_type = ?2
+                      AND content_hash = ?3 AND storage_key = ?4 AND size_bytes = ?5
+                 )",
+                params![
+                    artifact_id.as_str(),
+                    artifact_type,
+                    content_hash.as_str(),
+                    physical.storage_key,
+                    i64::try_from(bytes.len())
+                        .map_err(|_| failure(SafeErrorClassification::InvalidInput))?,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|_| failure(SafeErrorClassification::Internal))?;
+        if exact {
+            return Ok(());
+        }
         connection
             .execute(
                 "INSERT OR IGNORE INTO artifacts (

@@ -188,7 +188,7 @@ impl SqliteStore {
         let registered: Option<RegisteredDescriptor> = transaction
             .query_row(
                 "SELECT transport_type, trust_tier, manifest_json, manifest_digest,
-                            executable_digest, enabled, containment_verified
+                            executable_digest, enabled
                      FROM agent_descriptors WHERE id = ?1",
                 [descriptor.agent_id.as_str()],
                 |row| {
@@ -199,7 +199,6 @@ impl SqliteStore {
                         manifest_digest: row.get(3)?,
                         executable_digest: row.get(4)?,
                         enabled: row.get(5)?,
-                        containment_verified: row.get(6)?,
                     })
                 },
             )
@@ -221,7 +220,6 @@ impl SqliteStore {
             || registered.manifest != manifest
             || registered.manifest_digest != descriptor.manifest_digest.as_str()
             || !registered.enabled
-            || !registered.containment_verified
         {
             return Err(conflict());
         }
@@ -259,30 +257,37 @@ impl AgentRunStore for SqliteStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO agent_descriptors (
-                    id, display_name, transport_type, trust_tier, manifest_json,
-                    manifest_digest, executable_digest, enabled, containment_verified,
-                    last_health_status, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL,
-                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-                params![
-                    descriptor.agent_id,
-                    descriptor.display_name,
-                    transport_type(descriptor.trust_tier),
-                    descriptor.trust_tier.as_str(),
-                    manifest_text,
-                    descriptor.manifest_digest.as_str(),
-                    descriptor
-                        .executable_digest
-                        .as_ref()
-                        .map(Sha256Digest::as_str),
-                    descriptor.enabled,
-                    descriptor.containment_verified,
-                ],
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_descriptors WHERE id = ?1)",
+                [&descriptor.agent_id],
+                |row| row.get(0),
             )
             .map_err(sqlite_error_to_port)?;
+        if !exists {
+            transaction
+                .execute(
+                    "INSERT INTO agent_descriptors (
+                    id, display_name, transport_type, trust_tier, manifest_json,
+                    manifest_digest, executable_digest, enabled, last_health_status, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                    params![
+                        descriptor.agent_id,
+                        descriptor.display_name,
+                        transport_type(descriptor.trust_tier),
+                        descriptor.trust_tier.as_str(),
+                        manifest_text,
+                        descriptor.manifest_digest.as_str(),
+                        descriptor
+                            .executable_digest
+                            .as_ref()
+                            .map(Sha256Digest::as_str),
+                        descriptor.enabled,
+                    ],
+                )
+                .map_err(sqlite_error_to_port)?;
+        }
         let matches: bool = transaction
             .query_row(
                 "SELECT EXISTS(
@@ -290,7 +295,6 @@ impl AgentRunStore for SqliteStore {
                     WHERE id = ?1 AND display_name = ?2 AND transport_type = ?3
                       AND trust_tier = ?4 AND manifest_json = ?5 AND manifest_digest = ?6
                       AND executable_digest IS ?7 AND enabled = ?8
-                      AND containment_verified = ?9
                  )",
                 params![
                     descriptor.agent_id,
@@ -304,7 +308,6 @@ impl AgentRunStore for SqliteStore {
                         .as_ref()
                         .map(Sha256Digest::as_str),
                     descriptor.enabled,
-                    descriptor.containment_verified,
                 ],
                 |row| row.get(0),
             )
@@ -620,7 +623,6 @@ struct RegisteredDescriptor {
     manifest_digest: String,
     executable_digest: Option<String>,
     enabled: bool,
-    containment_verified: bool,
 }
 
 struct ActiveRun {

@@ -11,7 +11,7 @@ use local_agent_terminal_application::{
     OperationIntentStatus, ProjectSettings, RepositoryHealth, RepositoryInspectionRecord,
     RepositorySnapshot, RevokeLease, RiskLevel, SafeErrorClassification, TaskQuery,
     WorkspaceMutationRequest, WorkspaceMutationStore, WorkspaceRecoveryStore, WorkspaceStateStore,
-    WorktreeIntent, WorktreeSnapshot, WorktreeState,
+    WorktreeIntent,
 };
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, FencingToken, GitObjectId, LeaseClaim, ProjectId, RepositoryId, RunId,
@@ -26,6 +26,8 @@ const DIGEST_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const DIGEST_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const SHA1_POST: &str = "2222222222222222222222222222222222222222";
 const DIGEST_C: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const REPOSITORY_IDENTITY: &str =
+    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 struct TempDatabase {
     directory: PathBuf,
@@ -65,7 +67,7 @@ fn repository_snapshot() -> RepositorySnapshot {
     RepositorySnapshot {
         repository_id: RepositoryId::new("repository-1").unwrap(),
         health: RepositoryHealth::Healthy,
-        stable_identity: "repository-identity-1".to_owned(),
+        stable_identity: REPOSITORY_IDENTITY.to_owned(),
         default_branch: Some(TaskBranch::new("main").unwrap()),
         base_commit: Some(GitObjectId::new(SHA1).unwrap()),
         original_checkout: local_agent_terminal_application::OriginalCheckoutState::Clean,
@@ -223,7 +225,7 @@ fn worktree_intent() -> WorktreeIntent {
         operation: operation_intent(),
         worktree_id: WorktreeId::new("worktree-1").unwrap(),
         repository_id: RepositoryId::new("repository-1").unwrap(),
-        repository_identity: "repository-identity-1".to_owned(),
+        repository_identity: REPOSITORY_IDENTITY.to_owned(),
         branch: TaskBranch::new("codex/task-1").unwrap(),
         base_commit: GitObjectId::new(SHA1).unwrap(),
         target_path_display: "<workspace>/task-1".to_owned(),
@@ -257,7 +259,7 @@ fn project_onboarding_persists_identity_health_and_canonical_evidence() {
         project,
         (
             "D:/source/project".to_owned(),
-            "repository-identity-1".to_owned(),
+            REPOSITORY_IDENTITY.to_owned(),
             "default".to_owned(),
             "D:/application-data/artifacts".to_owned(),
         )
@@ -291,7 +293,7 @@ fn legacy_v1_project_created_payload_is_queryable_and_exactly_retryable() {
                 "project-1",
                 "Local Agent Terminal",
                 "D:/source/project",
-                "repository-identity-1",
+                REPOSITORY_IDENTITY,
                 "2026-07-26T00:00:00Z",
                 "default",
                 "application_data",
@@ -313,7 +315,7 @@ fn legacy_v1_project_created_payload_is_queryable_and_exactly_retryable() {
             [serde_json::json!({
                 "projectId": "project-1",
                 "repositoryId": "repository-1",
-                "repositoryIdentity": "repository-identity-1",
+                "repositoryIdentity": REPOSITORY_IDENTITY,
             })
             .to_string()],
         )
@@ -375,7 +377,7 @@ fn pending_onboarding_is_queryable_and_exact_project_retry_is_idempotent() {
         serde_json::json!({
             "projectId": "project-1",
             "repositoryId": "repository-1",
-            "repositoryIdentity": "repository-identity-1",
+            "repositoryIdentity": REPOSITORY_IDENTITY,
         })
     );
 }
@@ -582,23 +584,33 @@ fn seed_mutation_state(path: &Path, store: &SqliteStore) {
     let connection = Connection::open(path).unwrap();
     connection
         .execute(
-            "UPDATE tasks SET phase = 'Implementation', active_candidate_tree = ?1
+            "UPDATE tasks SET phase = 'Implementation', active_candidate_tree = ?1,
+                row_version = row_version + 1
              WHERE id = 'task-1'",
             [SHA1],
         )
         .unwrap();
-    for (id, approval_type) in [
-        ("approval-plan", "plan"),
-        ("approval-tool", "tool"),
-        ("approval-commit", "final_commit"),
-    ] {
+    connection
+        .execute(
+            "INSERT INTO operation_intents (
+                id, task_id, operation_kind, idempotency_class, idempotency_key,
+                canonical_request_artifact_id, operation_digest, actor_binding_digest,
+                status, current_attempt_no, created_at, updated_at
+             ) VALUES ('workspace-mutation-intent', 'task-1', 'workspace.mutate',
+                'non_repeatable', 'workspace-mutation', 'artifact-repository', ?1, ?1,
+                'pending', 0, '2026-07-26T00:00:09Z', '2026-07-26T00:00:09Z')",
+            [DIGEST_A],
+        )
+        .unwrap();
+    for (id, approval_type) in [("approval-plan", "plan"), ("approval-tool", "tool")] {
         connection
             .execute(
                 "INSERT INTO approvals (
-                    id, task_id, approval_type, schema_version, operation_digest, status,
-                    requested_at, resolved_at, resolved_by, expires_at, request_artifact_id,
-                    invalidation_reason
-                 ) VALUES (?1, 'task-1', ?2, 'v1', ?3, 'pending', ?4, NULL, NULL, ?5, ?6, NULL)",
+                    id, task_id, operation_intent_id, approval_type, schema_version,
+                    operation_digest, actor_binding_digest, nonce, status, requested_at,
+                    resolved_at, expires_at, request_artifact_id, invalidation_reason
+                 ) VALUES (?1, 'task-1', 'workspace-mutation-intent', ?2, 'v1',
+                    ?3, ?3, ?1, 'pending', ?4, NULL, ?5, ?6, NULL)",
                 params![
                     id,
                     approval_type,
@@ -731,7 +743,8 @@ fn lease_replacement_increments_token_and_stale_claim_cannot_write() {
     let lease: (String, i64, String) = connection
         .query_row(
             "SELECT holder_run_id, fencing_token, status
-             FROM executor_leases WHERE task_id = 'task-1'",
+             FROM executor_leases WHERE task_id = 'task-1'
+             ORDER BY fencing_token DESC LIMIT 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -803,11 +816,7 @@ fn workspace_mutation_is_atomic_and_invalidates_candidate_approvals() {
     assert_eq!(result.task_state.fencing_token().get(), 2);
     assert_eq!(
         result.invalidated_approval_ids,
-        vec![
-            "approval-commit".to_owned(),
-            "approval-plan".to_owned(),
-            "approval-tool".to_owned()
-        ]
+        vec!["approval-plan".to_owned(), "approval-tool".to_owned()]
     );
     assert_eq!(
         result.resume_target,
@@ -834,7 +843,7 @@ fn workspace_mutation_is_atomic_and_invalidates_candidate_approvals() {
             },
         )
         .unwrap();
-    assert_eq!(task, ("WorkspaceDirty".to_owned(), 0, 2, 3, None, 3));
+    assert_eq!(task, ("WorkspaceDirty".to_owned(), 0, 2, 3, None, 2));
     assert_eq!(
         connection
             .query_row(
@@ -927,7 +936,7 @@ fn mutation_rolls_back_event_projection_approvals_candidate_and_lease_together()
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        3
+        2
     );
 }
 
@@ -962,7 +971,7 @@ fn stale_mutation_claim_is_rejected_before_projection_changes() {
 }
 
 #[test]
-fn started_unknown_and_non_repeatable_intents_become_indeterminate_without_retry() {
+fn legacy_start_transitions_fail_closed_without_policy_attempt_authority() {
     let database = TempDatabase::new();
     let store = SqliteStore::open(&database.path).unwrap();
     seed_task(&store);
@@ -995,7 +1004,7 @@ fn started_unknown_and_non_repeatable_intents_become_indeterminate_without_retry
         intent.operation.idempotency_key = key.to_owned();
         intent.operation.canonical_request_artifact_id = ArtifactId::new(artifact).unwrap();
         store.begin_worktree_intent(intent.clone()).unwrap();
-        store
+        let error = store
             .transition_worktree_intent(local_agent_terminal_application::IntentTransition {
                 intent_id: id.to_owned(),
                 expected_status: OperationIntentStatus::Pending,
@@ -1006,29 +1015,21 @@ fn started_unknown_and_non_repeatable_intents_become_indeterminate_without_retry
                 error: None,
                 observed_fingerprint: None,
             })
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(
+            error.safe_classification(),
+            SafeErrorClassification::IntegrityFailure
+        );
     }
 
     let candidates = store.reconcile_intents().unwrap();
-    assert_eq!(candidates.len(), 2);
-    for candidate in &candidates {
-        assert!(!candidate.actions.contains(
-            &local_agent_terminal_application::RecoveryAction::RetryAfterAuthoritativeAbsence
-        ));
-    }
-    assert!(candidates.iter().any(|candidate| {
-        candidate.reason == local_agent_terminal_application::RecoveryReason::UnknownOperation
-    }));
-    assert!(candidates.iter().any(|candidate| {
-        candidate.reason
-            == local_agent_terminal_application::RecoveryReason::IndeterminateNonRepeatable
-    }));
+    assert!(candidates.is_empty());
     let connection = Connection::open(&database.path).unwrap();
     assert_eq!(
         connection
             .query_row(
                 "SELECT COUNT(*) FROM operation_intents
-                 WHERE status = 'indeterminate'",
+                 WHERE status = 'pending'",
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -1038,7 +1039,7 @@ fn started_unknown_and_non_repeatable_intents_become_indeterminate_without_retry
 }
 
 #[test]
-fn recovery_candidate_keeps_every_exact_worktree_identity_for_adoption() {
+fn recovery_candidate_requires_policy_attempt_authority_before_start() {
     let database = TempDatabase::new();
     let store = SqliteStore::open(&database.path).unwrap();
     seed_task(&store);
@@ -1050,7 +1051,7 @@ fn recovery_candidate_keeps_every_exact_worktree_identity_for_adoption() {
     );
     let intent = worktree_intent();
     store.begin_worktree_intent(intent.clone()).unwrap();
-    store
+    let error = store
         .transition_worktree_intent(local_agent_terminal_application::IntentTransition {
             intent_id: intent.operation.id.clone(),
             expected_status: OperationIntentStatus::Pending,
@@ -1061,39 +1062,12 @@ fn recovery_candidate_keeps_every_exact_worktree_identity_for_adoption() {
             error: None,
             observed_fingerprint: None,
         })
-        .unwrap();
-
-    let candidate = store
-        .reconcile_intents()
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
-    let expected = candidate.expected_worktree.unwrap();
-    let observed = WorktreeSnapshot {
-        worktree_id: expected.worktree_id.clone(),
-        repository_id: expected.repository_id.clone(),
-        repository_identity: expected.repository_identity.clone(),
-        task_id: expected.operation.task_id.clone(),
-        branch: expected.branch.clone(),
-        base_commit: expected.base_commit.clone(),
-        target_path_display: expected.target_path_display.clone(),
-        state: WorktreeState::Present,
-        expected_presence: ExpectedPresence::Present,
-        fingerprint: fingerprint(),
-    };
+        .unwrap_err();
     assert_eq!(
-        expected.compare_observation(&observed),
-        local_agent_terminal_application::WorktreeMatch::Exact
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
     );
-    let mut conflicting = observed;
-    conflicting.target_path_display = "<workspace>/other".to_owned();
-    assert_eq!(
-        expected.compare_observation(&conflicting),
-        local_agent_terminal_application::WorktreeMatch::Conflict(
-            local_agent_terminal_application::RecoveryReason::PathMismatch
-        )
-    );
+    assert!(store.reconcile_intents().unwrap().is_empty());
 }
 
 #[test]

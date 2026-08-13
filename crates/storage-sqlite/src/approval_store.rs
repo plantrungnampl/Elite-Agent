@@ -57,19 +57,24 @@ impl ApprovalStore for SqliteStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
+        let (operation_intent_id, actor_binding_digest) =
+            approval_intent_authority(&transaction, &approval.task_id, &approval.operation_digest)?;
         let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO approvals (
-                    id, task_id, approval_type, schema_version, operation_digest, status,
-                    requested_at, resolved_at, resolved_by, expires_at, request_artifact_id,
-                    invalidation_reason
-                 ) VALUES (?1, ?2, ?3, 'approval-digest.v1', ?4, 'pending',
-                    ?5, NULL, NULL, ?6, ?7, NULL)",
+                    id, task_id, operation_intent_id, approval_type, schema_version,
+                    operation_digest, actor_binding_digest, nonce, status, requested_at,
+                    resolved_at, expires_at, request_artifact_id, invalidation_reason
+                 ) VALUES (?1, ?2, ?3, ?4, 'approval-digest.v1', ?5, ?6, ?7,
+                    'pending', ?8, NULL, ?9, ?10, NULL)",
                 params![
                     approval.approval_id.as_str(),
                     approval.task_id.as_str(),
+                    operation_intent_id,
                     approval_type,
                     approval.operation_digest.as_str(),
+                    actor_binding_digest,
+                    approval.nonce,
                     payload_requested_at(&payload),
                     approval.expires_at,
                     artifact.id,
@@ -102,48 +107,10 @@ impl ApprovalStore for SqliteStore {
         Ok(snapshot_from_new(approval, ApprovalState::Requested))
     }
 
-    fn resolve(&self, resolution: ApprovalResolution) -> Result<ApprovalSnapshot, PortError> {
-        let mut connection = self.connection().map_err(open_error_to_port)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sqlite_error_to_port)?;
-        let target = if resolution.approved {
-            "granted"
-        } else {
-            "denied"
-        };
-        let changed = transaction
-            .execute(
-                "UPDATE approvals
-                 SET status = ?1, resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                     resolved_by = 'user'
-                 WHERE id = ?2 AND status = 'pending'
-                   AND julianday(expires_at) > julianday('now')",
-                params![target, resolution.approval_id.as_str()],
-            )
-            .map_err(sqlite_error_to_port)?;
-        if changed != 1 {
-            return Err(conflict());
-        }
-        let task_id = approval_task_id(&transaction, &resolution.approval_id)?;
-        append_approval_event(
-            &transaction,
-            &task_id,
-            &resolution.approval_id,
-            if resolution.approved {
-                "approval.granted"
-            } else {
-                "approval.denied"
-            },
-            Some("None"),
-            json!({
-                "approvalId": resolution.approval_id.as_str(),
-                "status": target,
-            }),
-        )?;
-        let snapshot = load_snapshot(&transaction, &resolution.approval_id, None)?;
-        transaction.commit().map_err(sqlite_error_to_port)?;
-        Ok(snapshot)
+    fn resolve(&self, _resolution: ApprovalResolution) -> Result<ApprovalSnapshot, PortError> {
+        // The legacy command carries no credential evidence or immutable decision-receipt
+        // artifacts. Normative v7 requires those authorities before grant or denial.
+        Err(integrity_failure())
     }
 
     fn valid_for(&self, check: ApprovalCheck) -> Result<Option<ApprovalSnapshot>, PortError> {
@@ -421,20 +388,31 @@ impl SqliteStore {
         validate_tool_approval_publication(&transaction, &request)?;
         let payload = request.payload();
         let task_id = TaskId::new(payload.task_id.clone()).map_err(|_| integrity_failure())?;
+        let actor_binding_digest: String = transaction
+            .query_row(
+                "SELECT actor_binding_digest FROM operation_intents
+                 WHERE id = ?1 AND task_id = ?2",
+                params![request.execution_id().as_str(), task_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_error_to_port)?;
         let approval_type = "tool";
         let inserted = transaction
             .execute(
                 "INSERT INTO approvals (
-                    id, task_id, approval_type, schema_version, operation_digest, status,
-                    requested_at, resolved_at, resolved_by, expires_at, request_artifact_id,
-                    invalidation_reason
-                 ) VALUES (?1, ?2, ?3, 'approval-digest.v1', ?4, 'pending',
-                    ?5, NULL, NULL, ?6, ?7, NULL)",
+                    id, task_id, operation_intent_id, approval_type, schema_version,
+                    operation_digest, actor_binding_digest, nonce, status, requested_at,
+                    resolved_at, expires_at, request_artifact_id, invalidation_reason
+                 ) VALUES (?1, ?2, ?3, ?4, 'approval-digest.v1', ?5, ?6, ?7,
+                    'pending', ?8, NULL, ?9, ?10, NULL)",
                 params![
                     request.approval_id().as_str(),
                     task_id.as_str(),
+                    request.execution_id().as_str(),
                     approval_type,
                     request.canonical_payload().operation_digest.as_str(),
+                    actor_binding_digest,
+                    payload.nonce,
                     payload.requested_at,
                     payload.expires_at,
                     request.approval_artifact_id().as_str(),
@@ -600,8 +578,15 @@ fn validate_tool_approval_publication(
                 WHERE id = ?1 AND task_id = ?2 AND run_id = ?3
                   AND canonical_request_artifact_id = ?4 AND operation_digest = ?5
                   AND operation_kind = 'process.exec' AND status = 'pending'
-                  AND attempt_count = 0 AND lease_owner IS NULL
-                  AND executor_fencing_token IS ?6
+                  AND current_attempt_no = 0
+                  AND (
+                    ?6 IS NULL OR EXISTS (
+                        SELECT 1 FROM executor_leases lease
+                        WHERE lease.task_id = operation_intents.task_id
+                          AND lease.holder_run_id = operation_intents.run_id
+                          AND lease.fencing_token = ?6 AND lease.status = 'active'
+                    )
+                  )
              )",
             params![
                 request.execution_id().as_str(),
@@ -794,9 +779,7 @@ struct RawToolApprovalRelation {
     request_artifact_id: String,
     intent_operation_digest: String,
     intent_status: String,
-    intent_fencing_token: Option<i64>,
-    intent_attempt_count: i64,
-    intent_lease_owner: Option<String>,
+    intent_current_attempt_no: i64,
     intent_task_id: String,
 }
 
@@ -836,8 +819,7 @@ fn load_tool_approval_relation(
                     e.payload_json,
                     oi.id, oi.run_id, oi.operation_kind, oi.idempotency_class,
                     oi.idempotency_key, oi.canonical_request_artifact_id,
-                    oi.operation_digest, oi.status, oi.executor_fencing_token,
-                    oi.attempt_count, oi.lease_owner, oi.task_id
+                    oi.operation_digest, oi.status, oi.current_attempt_no, oi.task_id
              FROM approvals a
              JOIN events e
                ON e.stream_id = a.task_id
@@ -874,10 +856,8 @@ fn load_tool_approval_relation(
                     request_artifact_id: row.get(13)?,
                     intent_operation_digest: row.get(14)?,
                     intent_status: row.get(15)?,
-                    intent_fencing_token: row.get(16)?,
-                    intent_attempt_count: row.get(17)?,
-                    intent_lease_owner: row.get(18)?,
-                    intent_task_id: row.get(19)?,
+                    intent_current_attempt_no: row.get(16)?,
+                    intent_task_id: row.get(17)?,
                 })
             },
         )
@@ -912,8 +892,7 @@ fn load_tool_approval_relation(
                 raw.run_id.as_deref().unwrap_or_default(),
                 raw.intent_id
             )
-        || (raw.intent_status == "pending"
-            && (raw.intent_attempt_count != 0 || raw.intent_lease_owner.is_some()))
+        || (raw.intent_status == "pending" && raw.intent_current_attempt_no != 0)
     {
         return Err(integrity_failure());
     }
@@ -940,14 +919,7 @@ fn load_tool_approval_relation(
             .map_err(|_| integrity_failure())?;
     let workspace_version = WorkspaceVersion::new(payload_u64(&payload, "workspaceVersion")?);
     let fencing_token = payload_optional_fencing_token(&payload, "fencingToken")?;
-    let intent_fencing_token = raw
-        .intent_fencing_token
-        .map(FencingToken::try_from)
-        .transpose()
-        .map_err(|_| integrity_failure())?;
-    if fencing_token != intent_fencing_token
-        || payload_u64(&payload, "workspaceVersion")? > 9_007_199_254_740_991
-    {
+    if payload_u64(&payload, "workspaceVersion")? > 9_007_199_254_740_991 {
         return Err(integrity_failure());
     }
     let expires_at =
@@ -955,7 +927,7 @@ fn load_tool_approval_relation(
     let state = approval_state_from_row(&raw.approval_status, raw.invalidation_reason.as_deref())?;
     let intent_status =
         OperationIntentStatus::parse(&raw.intent_status).ok_or_else(integrity_failure)?;
-    if intent_status == OperationIntentStatus::Pending && raw.intent_attempt_count != 0 {
+    if intent_status == OperationIntentStatus::Pending && raw.intent_current_attempt_no != 0 {
         return Err(integrity_failure());
     }
     Ok(ToolApprovalRelation {
@@ -1056,6 +1028,33 @@ pub(crate) fn parse_canonical_approval_payload(
     Ok(payload)
 }
 
+fn approval_intent_authority(
+    transaction: &Transaction<'_>,
+    task_id: &TaskId,
+    operation_digest: &Sha256Digest,
+) -> Result<(String, String), PortError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT id, actor_binding_digest
+             FROM operation_intents
+             WHERE task_id = ?1 AND operation_digest = ?2
+             ORDER BY id",
+        )
+        .map_err(sqlite_error_to_port)?;
+    let rows = statement
+        .query_map(
+            params![task_id.as_str(), operation_digest.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(sqlite_error_to_port)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error_to_port)?;
+    let [authority] = rows.as_slice() else {
+        return Err(integrity_failure());
+    };
+    Ok(authority.clone())
+}
+
 fn request_matches(
     transaction: &Transaction<'_>,
     approval: &NewApproval,
@@ -1090,14 +1089,6 @@ fn request_matches(
             |row| row.get(0),
         )
         .map_err(sqlite_error_to_port)
-}
-
-fn load_snapshot(
-    transaction: &Transaction<'_>,
-    approval_id: &ApprovalId,
-    binding: Option<local_agent_terminal_application::ToolRequestBindingDigest>,
-) -> Result<ApprovalSnapshot, PortError> {
-    load_snapshot_optional(transaction, approval_id, binding)?.ok_or_else(not_found)
 }
 
 fn load_snapshot_optional(
@@ -1261,8 +1252,7 @@ fn invalidate_one(
         .execute(
             "UPDATE approvals
              SET status = ?1, invalidation_reason = ?2,
-                 resolved_at = COALESCE(resolved_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-                 resolved_by = COALESCE(resolved_by, 'core')
+                  resolved_at = COALESCE(resolved_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
              WHERE id = ?3 AND status IN ('pending', 'granted')",
             params![target_status, reason, approval_id.as_str()],
         )
@@ -1334,7 +1324,8 @@ pub(crate) fn append_approval_event(
     let changed = transaction
         .execute(
             "UPDATE tasks SET current_sequence = ?1,
-                operation_state = COALESCE(?2, operation_state), updated_at = ?3
+                operation_state = COALESCE(?2, operation_state), updated_at = ?3,
+                row_version = row_version + 1
              WHERE id = ?4 AND current_sequence = ?5",
             params![
                 sequence,

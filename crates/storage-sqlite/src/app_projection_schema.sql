@@ -57,49 +57,6 @@ FOR EACH ROW BEGIN
     SELECT RAISE(ABORT, 'deliberation recovery records are immutable');
 END;
 
-CREATE TABLE deliberation_task_budgets (
-    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
-    max_threads INTEGER NOT NULL CHECK (max_threads BETWEEN 1 AND 4096),
-    max_tokens INTEGER NOT NULL CHECK (max_tokens BETWEEN 1 AND 1000000),
-    max_cost_microunits INTEGER NOT NULL
-        CHECK (max_cost_microunits BETWEEN 1 AND 1000000000000),
-    deadline_unix_seconds INTEGER NOT NULL CHECK (deadline_unix_seconds > 0),
-    reserved_threads INTEGER NOT NULL DEFAULT 0
-        CHECK (reserved_threads BETWEEN 0 AND max_threads),
-    reserved_tokens INTEGER NOT NULL DEFAULT 0
-        CHECK (reserved_tokens BETWEEN 0 AND max_tokens),
-    reserved_cost_microunits INTEGER NOT NULL DEFAULT 0
-        CHECK (reserved_cost_microunits BETWEEN 0 AND max_cost_microunits)
-) STRICT;
-
-CREATE TRIGGER deliberation_task_budget_authority_immutable
-BEFORE UPDATE ON deliberation_task_budgets
-FOR EACH ROW
-WHEN NEW.task_id IS NOT OLD.task_id
-    OR NEW.max_threads IS NOT OLD.max_threads
-    OR NEW.max_tokens IS NOT OLD.max_tokens
-    OR NEW.max_cost_microunits IS NOT OLD.max_cost_microunits
-    OR NEW.deadline_unix_seconds IS NOT OLD.deadline_unix_seconds
-BEGIN
-    SELECT RAISE(ABORT, 'deliberation task budget authority is immutable');
-END;
-
-CREATE TRIGGER deliberation_task_budget_reservations_monotonic
-BEFORE UPDATE ON deliberation_task_budgets
-FOR EACH ROW
-WHEN NEW.reserved_threads < OLD.reserved_threads
-    OR NEW.reserved_tokens < OLD.reserved_tokens
-    OR NEW.reserved_cost_microunits < OLD.reserved_cost_microunits
-BEGIN
-    SELECT RAISE(ABORT, 'deliberation task budget reservations must increase');
-END;
-
-CREATE TRIGGER deliberation_task_budget_delete_forbidden
-BEFORE DELETE ON deliberation_task_budgets
-FOR EACH ROW BEGIN
-    SELECT RAISE(ABORT, 'deliberation task budget authority is immutable');
-END;
-
 CREATE TABLE deliberation_dispatch_reservations (
     run_id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,

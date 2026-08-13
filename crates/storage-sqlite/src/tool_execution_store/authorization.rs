@@ -20,100 +20,36 @@ impl ProcessExecutionBindingStore for SqliteStore {
 
     fn record_process_binding(
         &self,
-        binding: AuthoritativeProcessBinding,
+        _binding: AuthoritativeProcessBinding,
     ) -> Result<(), PortError> {
-        let mut connection = self.connection().map_err(open_error_to_port)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sqlite_error_to_port)?;
-        let execution_id = binding.authority().execution_id();
-        let intent = load_intent(&transaction, execution_id)?;
-        validate_tool_intent(&transaction, execution_id, &intent)?;
-        if authority_from_intent(execution_id, &intent)? != *binding.authority() {
-            return Err(integrity_failure());
-        }
-        let execution = load_tool_execution(&transaction, execution_id)?;
-        validate_tool_execution_identity(execution_id, &intent, &execution)?;
-        let binding_value = process_binding_value(&binding);
-        if intent.status == "started" {
-            let persisted = intent
-                .external_receipt_json
-                .as_deref()
-                .ok_or_else(integrity_failure)
-                .and_then(|value| {
-                    serde_json::from_str::<Value>(value).map_err(|_| integrity_failure())
-                })?;
-            if execution.status != "running" || persisted != binding_value {
-                return Err(integrity_failure());
-            }
-            transaction.rollback().map_err(sqlite_error_to_port)?;
-            return Ok(());
-        }
-        if intent.status != "claimed"
-            || execution.status != "pending"
-            || intent.external_receipt_json.is_some()
-        {
-            return Err(conflict());
-        }
-        let binding_json =
-            serde_json::to_string(&binding_value).map_err(|_| integrity_failure())?;
-        let fencing_token = binding
-            .authority()
-            .executor_fencing_token()
-            .map(FencingToken::get)
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|_| integrity_failure())?;
-        let intent_changed = transaction
-            .execute(
-                "UPDATE operation_intents
-                 SET status = 'started', external_receipt_json = ?1,
-                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE id = ?2 AND status = 'claimed' AND operation_digest = ?3
-                   AND lease_owner = ?4 AND attempt_count = ?5
-                   AND executor_fencing_token IS ?6",
-                params![
-                    binding_json,
-                    execution_id.as_str(),
-                    binding.authority().operation_digest().as_str(),
-                    binding.authority().owner_run_id().as_str(),
-                    binding.authority().attempt(),
-                    fencing_token,
-                ],
-            )
-            .map_err(sqlite_error_to_port)?;
-        let execution_changed = transaction
-            .execute(
-                "UPDATE tool_executions
-                 SET status = 'running',
-                     started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE id = ?1 AND status = 'pending' AND started_at IS NULL",
-                [execution_id.as_str()],
-            )
-            .map_err(sqlite_error_to_port)?;
-        if intent_changed != 1 || execution_changed != 1 {
-            return Err(conflict());
-        }
-        append_tool_event(
-            &transaction,
-            &intent.task_id,
-            execution_id.as_str(),
-            "tool.execution.started",
-            "Running",
-            json!({
-                "executionId": execution_id.as_str(),
-                "operationDigest": binding.authority().operation_digest().as_str(),
-                "policyDecisionId": execution.policy_decision_id,
-                "approvalId": execution.approval_id,
-                "executorFencingToken": fencing_token,
-                "ownerRunId": binding.authority().owner_run_id().as_str(),
-                "attempt": binding.authority().attempt(),
-                "rootPid": binding.root_pid(),
-                "jobId": binding.job_id(),
-            }),
-        )?;
-        transaction.commit().map_err(sqlite_error_to_port)
+        // Normative v7 has no trustworthy column for this process-binding receipt.
+        // Refuse dispatch until the caller supplies a persisted receipt artifact vertical.
+        Err(integrity_failure())
     }
+}
+
+#[derive(Debug)]
+struct ExactPolicyRow {
+    task_id: Option<String>,
+    actor_json: String,
+    actor_binding_digest: String,
+    action: String,
+    resource_json: String,
+    resource_digest: String,
+    purpose: String,
+    workflow_phase: String,
+    effect: String,
+    policy_snapshot_digest: String,
+    operation_digest: String,
+    recorded_at: Option<i64>,
+    live: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyValidationMode {
+    Fresh,
+    Approval,
+    Consumed,
 }
 
 fn validate_authorized_request(
@@ -164,327 +100,6 @@ fn validate_authorized_request(
         return Err(integrity_failure());
     }
     Ok(immutable)
-}
-
-fn validate_denial_request_artifact(
-    transaction: &Transaction<'_>,
-    request_artifact_id: &ArtifactId,
-    request: &ImmutableToolRequest,
-    intent: &IntentRow,
-) -> Result<(), PortError> {
-    let tool_request = request.request();
-    let execution_id = tool_request.execution_id();
-    let process = tool_request.process().process();
-    let binding = process.binding();
-    validate_tool_intent(transaction, execution_id, intent)?;
-    let fencing_token = process
-        .executor_fencing_token()
-        .map(FencingToken::get)
-        .map(i64::try_from)
-        .transpose()
-        .map_err(|_| integrity_failure())?;
-    if intent.artifact_id != request_artifact_id.as_str()
-        || intent.operation_digest != request.binding_digest().as_sha256().as_str()
-        || intent.task_id != binding.task_id().as_str()
-        || intent.run_id != binding.run_id().as_str()
-        || intent.operation_kind != "process.exec"
-        || intent.fencing_token != fencing_token
-    {
-        return Err(integrity_failure());
-    }
-    validate_artifact_type(transaction, request_artifact_id.as_str(), "tool-request")?;
-    let logical_path: String = transaction
-        .query_row(
-            "SELECT logical_path FROM artifacts WHERE id = ?1",
-            [request_artifact_id.as_str()],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(sqlite_error_to_port)?
-        .ok_or_else(not_found)?;
-    if logical_path != format!("tool-requests/{}.json", execution_id.as_str()) {
-        return Err(integrity_failure());
-    }
-    let artifact = artifact_by_id_on_connection(
-        transaction,
-        request_artifact_id.as_str(),
-        request.binding_digest().as_sha256(),
-        binding.task_id().as_str(),
-    )?;
-    let persisted = parse_tool_request(&artifact.bytes).map_err(|_| integrity_failure())?;
-    if persisted != *request {
-        return Err(integrity_failure());
-    }
-    Ok(())
-}
-
-fn validate_denial_policy(
-    transaction: &Transaction<'_>,
-    request: &ToolExecutionDenialRequest,
-    mode: PolicyValidationMode,
-) -> Result<(), PortError> {
-    if !matches!(
-        request.effect,
-        PolicyEffect::Deny | PolicyEffect::AllowWithRedaction
-    ) {
-        return Err(integrity_failure());
-    }
-    let expected_binding = canonical_policy_binding_digest(&policy_request_for_tool(
-        request.request.request(),
-        request.checked_at,
-    ))
-    .map_err(|_| integrity_failure())?;
-    if expected_binding != request.policy_request_binding_digest {
-        return Err(integrity_failure());
-    }
-    validate_policy_identity(
-        transaction,
-        &request.policy_decision_id,
-        &request.policy_request_binding_digest,
-        request.request.request(),
-        request.checked_at,
-        effect_name(request.effect),
-        mode,
-    )
-}
-
-fn persist_denied_projection(
-    transaction: &Transaction<'_>,
-    request: &ToolExecutionDenialRequest,
-    intent: &IntentRow,
-) -> Result<(), PortError> {
-    let execution_id = request.request.request().execution_id();
-    let error = denial_error(
-        execution_id,
-        &request.request_artifact_id,
-        &request.policy_decision_id,
-    );
-    let changed = transaction
-        .execute(
-            "UPDATE operation_intents
-             SET status = 'cancelled', error_json = ?1,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = ?2 AND status = 'pending' AND attempt_count = 0
-               AND lease_owner IS NULL",
-            params![error.to_string(), execution_id.as_str()],
-        )
-        .map_err(sqlite_error_to_port)?;
-    if changed != 1 {
-        return Err(conflict());
-    }
-    transaction
-        .execute(
-            "INSERT INTO tool_executions (
-                id, task_id, run_id, request_id, tool_name, arguments_artifact_id,
-                policy_decision_id, approval_id, operation_intent_id,
-                executor_fencing_token, status, started_at, completed_at, exit_code,
-                stdout_artifact_id, stderr_artifact_id
-             ) VALUES (?1, ?2, ?3, ?1, ?4, ?5, ?6, NULL, ?1, ?7, 'denied',
-                NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL, NULL, NULL)",
-            params![
-                execution_id.as_str(),
-                intent.task_id,
-                intent.run_id,
-                intent.operation_kind,
-                request.request_artifact_id.as_str(),
-                request.policy_decision_id.as_str(),
-                intent.fencing_token,
-            ],
-        )
-        .map_err(sqlite_error_to_port)?;
-    append_tool_event(
-        transaction,
-        &intent.task_id,
-        execution_id.as_str(),
-        "tool.execution.denied",
-        "None",
-        denial_event_payload(
-            request,
-            request.request.binding_digest().as_sha256().as_str(),
-        ),
-    )
-}
-
-fn load_denied_projection(
-    transaction: &Transaction<'_>,
-    execution_id: &ToolExecutionId,
-    request_artifact_id: &ArtifactId,
-    request: &ImmutableToolRequest,
-    intent: &IntentRow,
-) -> Result<DeniedToolExecution, PortError> {
-    if intent.status != "cancelled"
-        || intent.attempt_count != 0
-        || intent.lease_owner.is_some()
-        || intent.result_artifact_id.is_some()
-        || intent.external_receipt_json.is_some()
-    {
-        return Err(integrity_failure());
-    }
-    let execution = load_tool_execution(transaction, execution_id)?;
-    validate_tool_execution_identity(execution_id, intent, &execution)?;
-    if execution.status != "denied"
-        || execution.approval_id.is_some()
-        || execution.started_at.is_some()
-        || execution.completed_at.as_deref().is_none_or(str::is_empty)
-        || execution.exit_code.is_some()
-        || execution.stdout_artifact_id.is_some()
-        || execution.stderr_artifact_id.is_some()
-    {
-        return Err(integrity_failure());
-    }
-    let (policy_decision_id, effect, evaluated_at, policy_binding) =
-        load_denied_policy(transaction, &execution.policy_decision_id, request)?;
-    let expected_error = denial_error(execution_id, request_artifact_id, &policy_decision_id);
-    let actual_error: Value =
-        serde_json::from_str(intent.error_json.as_deref().ok_or_else(integrity_failure)?)
-            .map_err(|_| integrity_failure())?;
-    if actual_error != expected_error {
-        return Err(integrity_failure());
-    }
-    let expected_event = audited_tool_event_payload(
-        transaction,
-        &intent.task_id,
-        execution_id.as_str(),
-        denial_event_payload(
-            &ToolExecutionDenialRequest {
-                request_artifact_id: request_artifact_id.clone(),
-                request: request.clone(),
-                policy_decision_id: policy_decision_id.clone(),
-                policy_request_binding_digest: policy_binding,
-                effect,
-                checked_at: evaluated_at,
-            },
-            request.binding_digest().as_sha256().as_str(),
-        ),
-    )?
-    .payload;
-    let mut statement = transaction
-        .prepare(
-            "SELECT payload_json FROM events
-             WHERE stream_id = ?1 AND event_type = 'tool.execution.denied'
-               AND json_extract(payload_json, '$.executionId') = ?2
-             ORDER BY sequence",
-        )
-        .map_err(sqlite_error_to_port)?;
-    let payloads = statement
-        .query_map(params![intent.task_id, execution_id.as_str()], |row| {
-            row.get::<_, String>(0)
-        })
-        .map_err(sqlite_error_to_port)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(sqlite_error_to_port)?;
-    let [payload] = payloads.as_slice() else {
-        return Err(integrity_failure());
-    };
-    let payload: Value = serde_json::from_str(payload).map_err(|_| integrity_failure())?;
-    if payload != expected_event {
-        return Err(integrity_failure());
-    }
-    Ok(DeniedToolExecution::new(
-        execution_id.clone(),
-        request_artifact_id.clone(),
-        policy_decision_id,
-    ))
-}
-
-fn load_denied_policy(
-    transaction: &Transaction<'_>,
-    policy_decision_id: &str,
-    request: &ImmutableToolRequest,
-) -> Result<
-    (
-        PolicyDecisionId,
-        PolicyEffect,
-        Timestamp,
-        PolicyRequestBindingDigest,
-    ),
-    PortError,
-> {
-    let (effect, evaluated_at): (String, i64) = transaction
-        .query_row(
-            "SELECT effect, unixepoch(created_at) FROM policy_decisions WHERE id = ?1",
-            [policy_decision_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(sqlite_error_to_port)?
-        .ok_or_else(not_found)?;
-    let effect = denial_effect(&effect)?;
-    let evaluated_at = Timestamp::from_unix_seconds(evaluated_at);
-    let policy_decision_id = PolicyDecisionId::from_persisted(policy_decision_id.to_owned())
-        .map_err(|_| integrity_failure())?;
-    let policy_binding =
-        canonical_policy_binding_digest(&policy_request_for_tool(request.request(), evaluated_at))
-            .map_err(|_| integrity_failure())?;
-    validate_policy_identity(
-        transaction,
-        &policy_decision_id,
-        &policy_binding,
-        request.request(),
-        evaluated_at,
-        effect_name(effect),
-        PolicyValidationMode::Terminal,
-    )?;
-    Ok((policy_decision_id, effect, evaluated_at, policy_binding))
-}
-
-fn denial_effect(value: &str) -> Result<PolicyEffect, PortError> {
-    match value {
-        "deny" => Ok(PolicyEffect::Deny),
-        "allow_with_redaction" => Ok(PolicyEffect::AllowWithRedaction),
-        _ => Err(integrity_failure()),
-    }
-}
-
-fn denial_error(
-    execution_id: &ToolExecutionId,
-    request_artifact_id: &ArtifactId,
-    policy_decision_id: &PolicyDecisionId,
-) -> Value {
-    json!({
-        "kind": "policy_denied",
-        "executionId": execution_id.as_str(),
-        "requestArtifactId": request_artifact_id.as_str(),
-        "policyDecisionId": policy_decision_id.as_str(),
-    })
-}
-
-fn denial_event_payload(request: &ToolExecutionDenialRequest, operation_digest: &str) -> Value {
-    json!({
-        "executionId": request.request.request().execution_id().as_str(),
-        "requestArtifactId": request.request_artifact_id.as_str(),
-        "operationDigest": operation_digest,
-        "requestBindingDigest": request.request.binding_digest().as_sha256().as_str(),
-        "policyDecisionId": request.policy_decision_id.as_str(),
-        "policyRequestBindingDigest": request.policy_request_binding_digest.as_sha256().as_str(),
-        "policyEffect": effect_name(request.effect),
-        "evaluatedAtUnix": request.checked_at.unix_seconds(),
-    })
-}
-
-#[derive(Debug)]
-struct ExactPolicyRow {
-    task_id: Option<String>,
-    actor_json: String,
-    actor_binding_digest: String,
-    action: String,
-    resource_json: String,
-    resource_digest: String,
-    purpose: String,
-    workflow_phase: String,
-    effect: String,
-    policy_snapshot_digest: String,
-    operation_digest: String,
-    recorded_at: Option<i64>,
-    live: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PolicyValidationMode {
-    Fresh,
-    Approval,
-    Consumed,
-    Terminal,
 }
 
 fn validate_exact_policy(
@@ -582,7 +197,6 @@ fn validate_policy_identity_at(
         PolicyValidationMode::Fresh => (Some(checked_at.unix_seconds()), true),
         PolicyValidationMode::Approval => (None, true),
         PolicyValidationMode::Consumed => (None, false),
-        PolicyValidationMode::Terminal => (Some(checked_at.unix_seconds()), false),
     };
     let actor: Value = serde_json::from_str(&row.actor_json).map_err(|_| integrity_failure())?;
     let resource: Value =
@@ -713,7 +327,7 @@ fn validate_exact_approval(
     if row.task_id != request.task_id.as_str()
         || row.approval_type != "tool"
         || row.schema_version != "approval-digest.v1"
-        || row.operation_digest != approval.canonical_payload().operation_digest.as_str()
+        || row.operation_digest != request.request_content_digest.as_str()
         || row.requested_at != approval.payload().requested_at
         || row.expires_at != approval.payload().expires_at
         || row.request_artifact_id != approval.approval_artifact_id().as_str()
@@ -725,7 +339,21 @@ fn validate_exact_approval(
     let state_matches = match expected_state {
         ExactApprovalState::Granted => row.status == "granted" && row.invalidation_reason.is_none(),
         ExactApprovalState::Consumed => {
-            row.status == "invalidated" && row.invalidation_reason.as_deref() == Some("consumed")
+            row.status == "granted"
+                && row.invalidation_reason.is_none()
+                && transaction
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM approval_effect_consumptions consumption
+                            JOIN approval_decision_receipts receipt
+                              ON receipt.id = consumption.approval_receipt_id
+                            WHERE receipt.approval_id = ?1
+                              AND consumption.operation_intent_id = ?2
+                         )",
+                        params![approval.approval_id().as_str(), request.execution_id.as_str()],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(sqlite_error_to_port)?
         }
     };
     if !state_matches || (expected_state == ExactApprovalState::Granted && !row.live) {
@@ -768,7 +396,7 @@ fn validate_exact_approval(
     let expected = json!({
         "approvalId": approval.approval_id().as_str(),
         "approvalType": "tool",
-        "operationDigest": approval.canonical_payload().operation_digest.as_str(),
+        "operationDigest": request.request_content_digest.as_str(),
         "executionId": request.execution_id.as_str(),
         "approvalPolicyDecisionId": approval.policy_decision_id().as_str(),
         "policyRequestBindingDigest": request.policy_request_binding_digest.as_sha256().as_str(),
@@ -834,13 +462,27 @@ fn consume_exact_approval(
     approval: &local_agent_terminal_application::ToolApprovalRequest,
 ) -> Result<(), PortError> {
     let approval_checked_at = request.approval_checked_at.ok_or_else(integrity_failure)?;
+    let receipt_id: String = transaction
+        .query_row(
+            "SELECT id FROM approval_decision_receipts
+             WHERE approval_id = ?1 AND decision = 'granted'",
+            [approval.approval_id().as_str()],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error_to_port)?;
     let changed = transaction
         .execute(
-            "UPDATE approvals
-             SET status = 'invalidated', invalidation_reason = 'consumed'
-             WHERE id = ?1 AND status = 'granted'
-               AND unixepoch(expires_at) > ?2",
+            "INSERT OR IGNORE INTO approval_effect_consumptions (
+                id, approval_receipt_id, operation_intent_id, consumed_at
+             ) SELECT ?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE EXISTS (
+                SELECT 1 FROM approvals
+                WHERE id = ?4 AND status = 'granted' AND unixepoch(expires_at) > ?5
+             )",
             params![
+                format!("approval-consumption:{}", approval.approval_id().as_str()),
+                receipt_id,
+                request.execution_id.as_str(),
                 approval.approval_id().as_str(),
                 approval_checked_at.unix_seconds(),
             ],
@@ -934,6 +576,49 @@ fn replay_existing_claim(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn insert_operation_attempt(
+    transaction: &Transaction<'_>,
+    attempt_id: &str,
+    execution_id: &ToolExecutionId,
+    intent: &IntentRow,
+    attempt: u32,
+    policy_decision_id: &str,
+    approval_id: Option<&str>,
+    status: &str,
+) -> Result<(), PortError> {
+    let inserted = transaction
+        .execute(
+            "INSERT INTO operation_attempts (
+                id, operation_intent_id, task_id, attempt_no, owner_run_id,
+                fencing_token, policy_decision_id, approval_id, status,
+                external_request_id, boundary_crossed_at, started_at, terminal_at,
+                result_artifact_id, receipt_artifact_id, error_artifact_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5,
+                (SELECT fencing_token FROM executor_leases
+                 WHERE task_id = ?3 AND holder_run_id = ?5 AND status = 'active'
+                 ORDER BY fencing_token DESC LIMIT 1),
+                ?6, ?7, ?8, ?2, NULL,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL, NULL, NULL, NULL)",
+            params![
+                attempt_id,
+                execution_id.as_str(),
+                intent.task_id,
+                i64::from(attempt),
+                intent.run_id,
+                policy_decision_id,
+                approval_id,
+                status,
+            ],
+        )
+        .map_err(sqlite_error_to_port)?;
+    if inserted == 1 {
+        Ok(())
+    } else {
+        Err(conflict())
+    }
+}
+
 fn claim_tool_execution(
     transaction: &Transaction<'_>,
     execution_id: &ToolExecutionId,
@@ -941,11 +626,27 @@ fn claim_tool_execution(
     policy_decision_id: &str,
     approval_id: Option<&str>,
 ) -> Result<ToolExecutionClaimAuthority, PortError> {
+    let attempt = intent
+        .attempt_count
+        .checked_add(1)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(integrity_failure)?;
+    let attempt_id = format!("{}:attempt:{attempt}", execution_id.as_str());
+    insert_operation_attempt(
+        transaction,
+        &attempt_id,
+        execution_id,
+        intent,
+        attempt,
+        policy_decision_id,
+        approval_id,
+        "claimed",
+    )?;
     let changed = transaction
         .execute(
             "UPDATE operation_intents
-             SET status = 'claimed', lease_owner = run_id, attempt_count = attempt_count + 1,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             SET status = 'claimed', current_attempt_no = current_attempt_no + 1,
+                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1 AND status = 'pending'",
             [execution_id.as_str()],
         )
@@ -953,20 +654,16 @@ fn claim_tool_execution(
     if changed != 1 {
         return Err(conflict());
     }
-    let attempt = intent
-        .attempt_count
-        .checked_add(1)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(integrity_failure)?;
-    let authority = claim_authority(execution_id, intent, attempt)?;
+    let current = load_intent(transaction, execution_id)?;
+    let authority = claim_authority(execution_id, &current, attempt)?;
     transaction
         .execute(
             "INSERT INTO tool_executions (
                 id, task_id, run_id, request_id, tool_name, arguments_artifact_id,
-                policy_decision_id, approval_id, operation_intent_id,
+                policy_decision_id, approval_id, operation_intent_id, operation_attempt_id,
                 executor_fencing_token, status, started_at, completed_at, exit_code,
                 stdout_artifact_id, stderr_artifact_id
-             ) VALUES (?1, ?2, ?3, ?1, ?4, ?5, ?6, ?7, ?1, ?8, 'pending',
+             ) VALUES (?1, ?2, ?3, ?1, ?4, ?5, ?6, ?7, ?1, ?8, ?9, 'pending',
                 NULL, NULL, NULL, NULL, NULL)",
             params![
                 execution_id.as_str(),
@@ -976,74 +673,10 @@ fn claim_tool_execution(
                 intent.artifact_id,
                 policy_decision_id,
                 approval_id,
-                intent.fencing_token,
+                attempt_id,
+                current.fencing_token,
             ],
         )
         .map_err(sqlite_error_to_port)?;
-    Ok(authority)
-}
-
-fn start_tool_execution(
-    transaction: &Transaction<'_>,
-    execution_id: &ToolExecutionId,
-    intent: &IntentRow,
-    policy_decision_id: &str,
-    approval_id: Option<&str>,
-) -> Result<ToolExecutionClaimAuthority, PortError> {
-    let changed = transaction
-        .execute(
-            "UPDATE operation_intents
-             SET status = 'started', lease_owner = run_id, attempt_count = attempt_count + 1,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = ?1 AND status = 'pending'",
-            [execution_id.as_str()],
-        )
-        .map_err(sqlite_error_to_port)?;
-    if changed != 1 {
-        return Err(conflict());
-    }
-    let attempt = intent
-        .attempt_count
-        .checked_add(1)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(integrity_failure)?;
-    let authority = claim_authority(execution_id, intent, attempt)?;
-    transaction
-        .execute(
-            "INSERT INTO tool_executions (
-                id, task_id, run_id, request_id, tool_name, arguments_artifact_id,
-                policy_decision_id, approval_id, operation_intent_id,
-                executor_fencing_token, status, started_at, completed_at, exit_code,
-                stdout_artifact_id, stderr_artifact_id
-             ) VALUES (?1, ?2, ?3, ?1, ?4, ?5, ?6, ?7, ?1, ?8, 'running',
-                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL, NULL, NULL, NULL)",
-            params![
-                execution_id.as_str(),
-                intent.task_id,
-                intent.run_id,
-                intent.operation_kind,
-                intent.artifact_id,
-                policy_decision_id,
-                approval_id,
-                intent.fencing_token,
-            ],
-        )
-        .map_err(sqlite_error_to_port)?;
-    append_tool_event(
-        transaction,
-        &intent.task_id,
-        execution_id.as_str(),
-        "tool.execution.started",
-        "Running",
-        json!({
-            "executionId": execution_id.as_str(),
-            "operationDigest": intent.operation_digest,
-            "policyDecisionId": policy_decision_id,
-            "approvalId": approval_id,
-            "executorFencingToken": intent.fencing_token,
-            "ownerRunId": authority.owner_run_id().as_str(),
-            "attempt": authority.attempt(),
-        }),
-    )?;
     Ok(authority)
 }

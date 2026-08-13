@@ -138,4 +138,79 @@ caller and fixture cutover tasks. No out-of-scope test was weakened or edited.
 
 - No file under `docs/multi-agent-terminal-design/**` was edited or staged.
 - The implementation plan and its checkboxes were not modified.
-- Only the five Task 3 code/test paths and this report are intended for staging.
+- The initial Task 3 commit staged only its five foundation paths and this
+  report; Fix Round 1 expands the scoped staging set to the storage callers and
+  fixtures required for a package-wide v7 cutover.
+
+## Fix Round 1: review remediation
+
+Date: 2026-08-13
+
+This round supersedes the earlier regression blocker. The initial review found
+two critical and three important authority defects; each was addressed without
+changing the normative design package:
+
+- SQL structural comparison now tokenizes quoted literals and token
+  boundaries instead of lowercasing/removing whitespace inside literals.
+  Regression tests reject both a changed v7 string literal and `IS NULL`
+  changed to `ISNULL`.
+- Structural verification now compares the exact seeded mutable workflow
+  authority in all six rule/source/profile/outcome/guard/effect tables.
+- Exact-v6 foreign-key preflight runs before the migration transaction can
+  commit, and an orphaned v6 database is rejected without mutation.
+- `deliberation_task_budgets` was removed from app projections. The legacy
+  budget port fails closed with `IntegrityFailure` instead of creating a
+  second budget authority.
+- Storage callers and fixtures were cut over to exact v7 authority. Legacy
+  mutation ports that cannot carry mandatory decision, attempt, process, or
+  terminal receipt identities fail closed before mutation; only the explicit
+  authorized execution path creates an operation attempt.
+
+The tool-recovery tests were consolidated around valid v7 state transitions.
+Historical v6 success expectations were replaced with explicit
+`IntegrityFailure` and no-mutation assertions; tests for exact policy,
+approval, concurrency, replay, rollback, canonical artifact paths, and
+snapshot consistency remain.
+
+The refactor removed 6,421 lines and added 1,630 lines across the scoped
+storage implementation and tests. Every modified source/test file is below
+2,000 lines; the largest is `tests/agent_store.rs` at 1,671 lines and the
+largest production file is `src/agent_store.rs` at 1,651 lines.
+
+Clean-code assessment after remediation: 8/10. Unreachable legacy mutation
+branches and their orphan helpers are gone, authority-bearing paths are
+explicit, and all files satisfy the requested size ceiling. The remaining
+deduction is for large but cohesive adapter/test modules above 1,000 lines;
+splitting them further is outside this authority correction.
+
+## Fix Round 1 verification
+
+```text
+cargo fmt --all -- --check
+Exit code: 0
+
+cargo check -p local-agent-terminal-storage-sqlite --all-targets
+Exit code: 0
+
+cargo clippy -p local-agent-terminal-storage-sqlite --all-targets -- -D warnings
+Exit code: 0
+
+cargo test -p local-agent-terminal-storage-sqlite
+1 lib + 123 integration tests passed; 0 failed
+Doc-tests: 0 passed; 0 failed
+Exit code: 0
+```
+
+Focused evidence from the same remediation state:
+
+- `schema_v7`: 13 passed, including literal/token tamper detection, exact
+  seeded workflow authority, v6 orphan preflight, and projection isolation.
+- `schema_health`: 6 passed.
+- `tool_recovery`: 20 passed.
+- `agent_store`: 23 passed; `context_store`: 7 passed;
+  `deliberation_store`: 12 passed; `event_store`: 8 passed;
+  `plan_approval_store`: 11 passed; `policy_tool_store`: 9 passed;
+  `workspace_recovery`: 14 passed.
+
+The Task 3 implementation is verification-green but remains unchecked in the
+plan until the independent Fix Round 1 review returns clean.

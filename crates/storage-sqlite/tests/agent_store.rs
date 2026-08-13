@@ -24,7 +24,7 @@ use local_agent_terminal_storage_files::{
     ContentAddressedArtifactReader, ContentAddressedArtifactStore,
 };
 use local_agent_terminal_storage_sqlite::{canonical_agent_run_config_artifact, SqliteStore};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -88,7 +88,8 @@ impl TestDatabase {
                 "INSERT OR IGNORE INTO projects (
                     id, name, repository_path, repository_identity, created_at, updated_at,
                     policy_profile_id, artifact_root_mode, artifact_root_path
-                 ) VALUES ('project-1', 'Project', 'C:/repo', 'repo-identity',
+                 ) VALUES ('project-1', 'Project', 'C:/repo',
+                    'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                     '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z', 'default',
                     'application_data', ?1)",
                 [self.artifact_root.to_string_lossy().as_ref()],
@@ -139,9 +140,24 @@ impl TestDatabase {
             )
             .unwrap();
         }
-        self.connection()
+        let connection = self.connection();
+        let existing: Option<(String, String, i64)> = connection
+            .query_row(
+                "SELECT content_hash, storage_key, size_bytes FROM artifacts WHERE id = ?1",
+                [artifact_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .unwrap();
+        if let Some((existing_hash, existing_key, existing_size)) = existing {
+            assert_eq!(existing_hash, content_hash.as_str());
+            assert_eq!(existing_key, storage_key);
+            assert_eq!(existing_size, i64::try_from(bytes.len()).unwrap());
+            return;
+        }
+        connection
             .execute(
-                "INSERT OR REPLACE INTO artifacts (
+                "INSERT INTO artifacts (
                     id, task_id, project_id, artifact_type, logical_path, content_hash,
                     storage_key, size_bytes, mime_type, availability, created_by_type,
                     created_by_id, created_at, supersedes, verification_state
@@ -413,14 +429,17 @@ fn create_bound_run_rejects_missing_foreign_mismatched_or_wrong_kind_artifacts()
     assert_integrity_failure(store.create_bound_run(&wrong_kind));
 
     let mismatched_config = bound_run("mismatched-config", "mismatched-config-key");
-    seed_bound_artifacts(
-        &database,
-        &mismatched_config,
-        &descriptor,
+    database.put_artifact(
+        &mismatched_config.context.manifest_artifact_id,
         "task-1",
+        "manifest",
+        &descriptor.manifest_json,
+    );
+    database.put_artifact(
+        &mismatched_config.context.effective_context_artifact_id,
         "task-1",
-        "task-1",
-        "run-config",
+        "content",
+        CONTEXT_BYTES,
     );
     database.put_artifact(
         &mismatched_config.run_config.run_config_artifact_id,
@@ -812,7 +831,9 @@ fn interruption_uses_only_lifecycle_state_when_bound_artifacts_are_unavailable()
     store.register_descriptor(&descriptor).unwrap();
     let created = bound_run("artifact-blind-created", "artifact-blind-created-key");
     let running = bound_run("artifact-blind-running", "artifact-blind-running-key");
-    let unaffected = bound_run("artifact-blind-unaffected", "artifact-blind-unaffected-key");
+    let mut unaffected = bound_run("artifact-blind-unaffected", "artifact-blind-unaffected-key");
+    unaffected.connection.connection_id = "connection-2".to_owned();
+    unaffected.connection.binding_digest = connection_digest(&unaffected.connection);
     for request in [&created, &running, &unaffected] {
         seed_default_artifacts(&database, request, &descriptor);
         store.create_bound_run(request).unwrap();
@@ -821,12 +842,6 @@ fn interruption_uses_only_lifecycle_state_when_bound_artifacts_are_unavailable()
     store.mark_running(&running.run_id, timestamp(11)).unwrap();
 
     let connection = database.connection();
-    connection
-        .execute(
-            "UPDATE agent_runs SET connection_binding_digest = ?1 WHERE id = ?2",
-            params![digest('e').as_str(), unaffected.run_id.as_str()],
-        )
-        .unwrap();
     connection
         .execute(
             "UPDATE artifacts SET availability = 'missing'
@@ -1032,10 +1047,10 @@ fn artifact_and_terminal_store_failures_do_not_mutate_real_task_workflow_state()
         let request = bound_run(suffix, &format!("{suffix}-key"));
         let descriptor = descriptor();
         seed_default_artifacts(&database, &request, &descriptor);
+        let store = Arc::new(database.store());
         if !fail_artifact_publication {
             fail_agent_run_status(&database, "succeeded");
         }
-        let store = Arc::new(database.store());
         let artifacts = Arc::new(RuntimeArtifacts::new(&database));
         if fail_artifact_publication {
             artifacts.fail_publication();
@@ -1070,8 +1085,8 @@ fn post_start_store_failures_do_not_mutate_real_task_workflow_state() {
         let request = bound_run(&suffix, &format!("{suffix}-key"));
         let descriptor = descriptor();
         seed_default_artifacts(&database, &request, &descriptor);
-        fail_agent_run_status(&database, failed_status);
         let store = Arc::new(database.store());
+        fail_agent_run_status(&database, failed_status);
         let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
         let runtime = ProtocolAgentRuntime::new(
             store,
@@ -1458,6 +1473,22 @@ fn bound_run(suffix: &str, idempotency_key: &str) -> BoundAgentRunRequest {
     request
 }
 
+fn connection_digest(connection: &BoundAgentConnection) -> Sha256Digest {
+    let value = serde_json::json!({
+        "schema": "agent-connection-binding.v1",
+        "identity": {
+            "connectionId": connection.connection_id,
+            "agentId": connection.agent_id,
+        },
+        "manifestDigest": connection.manifest_digest.as_str(),
+        "executableDigest": connection.executable_digest.as_ref().map(Sha256Digest::as_str),
+        "trustTier": connection.trust_tier.as_str(),
+        "contractVersion": connection.contract_version,
+        "adapterVersion": connection.adapter_version,
+    });
+    digest_bytes(&serde_json_canonicalizer::to_vec(&value).unwrap())
+}
+
 fn terminal(suffix: &str, message_id: &str, status: AgentRunStatus) -> AgentRunTerminal {
     AgentRunTerminal {
         run_id: run_id(&format!("run-{suffix}")),
@@ -1535,7 +1566,9 @@ fn seed_workflow_event(database: &TestDatabase) {
         .unwrap();
     transaction
         .execute(
-            "UPDATE tasks SET current_sequence = 1 WHERE id = 'task-1'",
+            "UPDATE tasks
+             SET current_sequence = 1, row_version = row_version + 1
+             WHERE id = 'task-1'",
             [],
         )
         .unwrap();

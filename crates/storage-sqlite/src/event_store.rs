@@ -89,7 +89,7 @@ pub(crate) fn append_in_transaction(
     let new_version_i64 = i64::try_from(new_version).map_err(|_| invalid_input())?;
     let advanced = transaction
         .execute(
-            "UPDATE tasks SET current_sequence = ?1
+            "UPDATE tasks SET current_sequence = ?1, row_version = row_version + 1
                  WHERE id = ?2 AND current_sequence = ?3",
             params![
                 new_version_i64,
@@ -123,7 +123,8 @@ pub(crate) fn append_in_transaction(
             transaction.execute(
                 "UPDATE tasks SET
                         phase = ?1, condition = ?2, operation_state = ?3,
-                        workspace_version = ?4, updated_at = ?5
+                        workspace_version = ?4, updated_at = ?5,
+                        row_version = row_version + 1
                      WHERE id = ?6",
                 params![
                     state.phase().as_str(),
@@ -138,7 +139,8 @@ pub(crate) fn append_in_transaction(
             transaction.execute(
                 "UPDATE tasks SET
                         phase = ?1, condition = ?2, operation_state = ?3,
-                        workspace_version = ?4, fencing_epoch = ?5, updated_at = ?6
+                        workspace_version = ?4, fencing_epoch = ?5, updated_at = ?6,
+                        row_version = row_version + 1
                      WHERE id = ?7",
                 params![
                     state.phase().as_str(),

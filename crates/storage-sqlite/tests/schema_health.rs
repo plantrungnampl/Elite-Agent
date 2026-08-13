@@ -69,8 +69,8 @@ fn enabled_external_agents_require_current_exact_containment_attestation() {
             .execute(
                 "INSERT INTO agent_descriptors (
                     id, display_name, transport_type, trust_tier, manifest_json, manifest_digest,
-                    executable_digest, enabled, containment_verified, last_health_status, updated_at
-                 ) VALUES (?1, 'agent', 'local', ?2, '{}', ?3, NULL, 1, 0, NULL,
+                    executable_digest, enabled, last_health_status, updated_at
+                 ) VALUES (?1, 'agent', 'local', ?2, '{}', ?3, NULL, 1, NULL,
                     '2026-08-12T00:00:00.000Z')",
                 params![format!("{trust_tier}-agent"), trust_tier, digest('a'),],
             )

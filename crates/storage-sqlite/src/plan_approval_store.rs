@@ -60,61 +60,7 @@ impl PlanApprovalStore for SqliteStore {
 
     fn compare_and_resolve(&self, command: CompareAndResolvePlanApproval) -> Result<(), PortError> {
         command.validate()?;
-        let task_id =
-            TaskId::new(&command.expected_current.binding.task_id).map_err(|_| conflict())?;
-        let artifact_reader = configured_artifact_reader(self)?;
-        let mut connection = self.connection().map_err(open_error_to_port)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sqlite_error_to_port)?;
-        let live_authority = load_current_authority(self, &task_id)?;
-        compare_expected(
-            &transaction,
-            artifact_reader,
-            &command.expected_approval,
-            &command.expected_current,
-            &live_authority,
-        )?;
-        append_in_transaction(&transaction, &command.resolution.append)?;
-        let (status, action, event_type) = match command.resolution.action {
-            PlanApprovalAction::Approve => ("granted", "approve", "plan.approved"),
-            PlanApprovalAction::Reject => ("denied", "reject", "task.cancelled"),
-            PlanApprovalAction::Revise => ("denied", "revise", "plan.revision.requested"),
-            PlanApprovalAction::Reopen => ("denied", "reopen", "plan.discussion.reopened"),
-            PlanApprovalAction::AddOrReplaceAgent => (
-                "denied",
-                "add_or_replace_agent",
-                "plan.roster_change.requested",
-            ),
-        };
-        let changed = transaction
-            .execute(
-                "UPDATE approvals
-                 SET status = ?1, resolved_at = ?2, resolved_by = ?3,
-                     invalidation_reason = NULL
-                 WHERE id = ?4 AND approval_type = 'plan' AND status = 'pending'
-                   AND operation_digest = ?5",
-                params![
-                    status,
-                    command.resolution.resolved_at,
-                    command.resolution.actor_id.as_str(),
-                    command.resolution.approval_id.as_str(),
-                    command.resolution.operation_digest.as_str(),
-                ],
-            )
-            .map_err(sqlite_error_to_port)?;
-        if changed != 1 {
-            return Err(conflict());
-        }
-        verify_terminal_event(
-            &transaction,
-            &command.expected_current.binding.task_id,
-            command.resolution.approval_id.as_str(),
-            event_type,
-            Some(action),
-        )?;
-        recheck_current_authority(self, &task_id, &live_authority)?;
-        transaction.commit().map_err(sqlite_error_to_port)
+        Err(integrity_failure())
     }
 
     fn compare_and_invalidate(
@@ -141,13 +87,12 @@ impl PlanApprovalStore for SqliteStore {
         let changed = transaction
             .execute(
                 "UPDATE approvals
-                 SET status = 'invalidated', resolved_at = ?1, resolved_by = ?2,
-                     invalidation_reason = ?3
-                 WHERE id = ?4 AND approval_type = 'plan' AND status = 'pending'
-                   AND operation_digest = ?5",
+                 SET status = 'invalidated', resolved_at = ?1,
+                     invalidation_reason = ?2
+                 WHERE id = ?3 AND approval_type = 'plan' AND status = 'pending'
+                   AND operation_digest = ?4",
                 params![
                     command.invalidation.invalidated_at(),
-                    command.invalidation.actor_id().as_str(),
                     command.invalidation.reason_code(),
                     command.invalidation.approval_id().as_str(),
                     command.expected_approval.operation_digest.as_str(),
@@ -189,7 +134,7 @@ impl PlanApprovalStore for SqliteStore {
         let changed = transaction
             .execute(
                 "UPDATE approvals
-                 SET status = 'expired', resolved_at = ?1, resolved_by = 'core',
+                 SET status = 'expired', resolved_at = ?1,
                      invalidation_reason = NULL
                  WHERE id = ?2 AND approval_type = 'plan' AND status = 'pending'
                    AND operation_digest = ?3",
@@ -221,7 +166,6 @@ struct ApprovalRow {
     status: String,
     requested_at: String,
     resolved_at: Option<String>,
-    resolved_by: Option<String>,
     expires_at: String,
     request_artifact_id: String,
     invalidation_reason: Option<String>,
@@ -235,7 +179,7 @@ fn load_approval(
     let row: Option<ApprovalRow> = connection
         .query_row(
             "SELECT task_id, operation_digest, status, requested_at, resolved_at,
-                    resolved_by, expires_at, request_artifact_id, invalidation_reason
+                    expires_at, request_artifact_id, invalidation_reason
              FROM approvals WHERE id = ?1 AND approval_type = 'plan'
                AND schema_version = 'approval-digest.v1'",
             [approval_id.as_str()],
@@ -246,10 +190,9 @@ fn load_approval(
                     status: row.get(2)?,
                     requested_at: row.get(3)?,
                     resolved_at: row.get(4)?,
-                    resolved_by: row.get(5)?,
-                    expires_at: row.get(6)?,
-                    request_artifact_id: row.get(7)?,
-                    invalidation_reason: row.get(8)?,
+                    expires_at: row.get(5)?,
+                    request_artifact_id: row.get(6)?,
+                    invalidation_reason: row.get(7)?,
                 })
             },
         )
@@ -338,11 +281,7 @@ fn terminal_state(
     row: &ApprovalRow,
 ) -> Result<(PlanApprovalState, Option<PlanApprovalTerminal>), PortError> {
     match row.status.as_str() {
-        "pending"
-            if row.resolved_at.is_none()
-                && row.resolved_by.is_none()
-                && row.invalidation_reason.is_none() =>
-        {
+        "pending" if row.resolved_at.is_none() && row.invalidation_reason.is_none() => {
             Ok((PlanApprovalState::Requested, None))
         }
         "granted" | "denied" => {
@@ -377,7 +316,6 @@ fn terminal_state(
             };
             if event.action.as_deref() != Some(expected_action)
                 || row.resolved_at.as_deref() != Some(event.created_at.as_str())
-                || row.resolved_by.as_deref() != Some(event.actor_id.as_str())
                 || row.invalidation_reason.is_some()
             {
                 return Err(integrity_failure());
@@ -400,7 +338,6 @@ fn terminal_state(
             )?;
             let reason = event.reason_code.ok_or_else(integrity_failure)?;
             if row.resolved_at.as_deref() != Some(event.created_at.as_str())
-                || row.resolved_by.as_deref() != Some(event.actor_id.as_str())
                 || row.invalidation_reason.as_deref() != Some(reason.as_str())
             {
                 return Err(integrity_failure());
@@ -422,7 +359,6 @@ fn terminal_state(
                 "approval.expired",
             )?;
             if row.resolved_at.as_deref() != Some(event.created_at.as_str())
-                || row.resolved_by.as_deref() != Some("core")
                 || event.actor_id != "core"
                 || row.invalidation_reason.is_some()
             {

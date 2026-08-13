@@ -118,7 +118,7 @@ fn policy_decisions_are_persisted_in_the_normative_table() {
 }
 
 #[test]
-fn approval_claim_is_atomic_single_use_and_binding_changes_invalidate() {
+fn approval_resolution_and_claim_fail_closed_without_decision_receipt_authority() {
     let database = TestDatabase::new();
     let (payload, binding) = approval_payload();
     let canonical =
@@ -155,21 +155,16 @@ fn approval_claim_is_atomic_single_use_and_binding_changes_invalidate() {
         "approval-artifact-1",
     );
     let reopened = SqliteStore::open(&database.path).unwrap();
-    let granted = reopened
+    let resolution_error = reopened
         .resolve(ApprovalResolution {
             approval_id: approval_id.clone(),
             approved: true,
         })
-        .unwrap();
-    assert_eq!(granted.state, ApprovalState::Approved);
-    assert_eq!(granted.tool_request_binding_digest.as_ref(), Some(&binding));
-    assert_eq!(task_operation_state(&database.path), "None");
-    assert!(reopened
-        .resolve(ApprovalResolution {
-            approval_id: approval_id.clone(),
-            approved: false,
-        })
-        .is_err());
+        .unwrap_err();
+    assert_eq!(
+        resolution_error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
     let check = ApprovalCheck {
         approval_id: approval_id.clone(),
         expected_operation_digest: canonical.operation_digest.clone(),
@@ -179,9 +174,7 @@ fn approval_claim_is_atomic_single_use_and_binding_changes_invalidate() {
         fencing_token: Some(1),
         checked_at: "2026-08-23T12:01:00Z".to_owned(),
     };
-    let valid = reopened.valid_for(check.clone()).unwrap().unwrap();
-    assert_eq!(valid.state, ApprovalState::Approved);
-    assert_eq!(valid.tool_request_binding_digest.as_ref(), Some(&binding));
+    assert!(reopened.valid_for(check.clone()).unwrap().is_none());
     let claim = ApprovalClaim {
         approval_id: approval_id.clone(),
         expected_operation_digest: canonical.operation_digest,
@@ -203,22 +196,20 @@ fn approval_claim_is_atomic_single_use_and_binding_changes_invalidate() {
     binding_replay.tool_request_binding_digest =
         local_agent_terminal_application::ToolRequestBindingDigest::from_persisted(digest('f'));
     assert!(reopened.claim(binding_replay).unwrap().is_none());
-    assert_eq!(
-        reopened.claim(claim.clone()).unwrap().unwrap().state,
-        ApprovalState::Consumed
-    );
+    assert!(reopened.claim(claim.clone()).unwrap().is_none());
     assert!(reopened.claim(claim).unwrap().is_none());
 
     let connection = configured_connection(&database.path);
     assert_eq!(
         connection
             .query_row(
-                "SELECT status || ':' || invalidation_reason FROM approvals WHERE id = 'approval-1'",
+                "SELECT status || ':' || COALESCE(invalidation_reason, '')
+                 FROM approvals WHERE id = 'approval-1'",
                 [],
                 |row| row.get::<_, String>(0)
             )
             .unwrap(),
-        "invalidated:consumed"
+        "pending:"
     );
     assert!(connection
         .execute(
@@ -262,7 +253,7 @@ fn approval_requests_reject_valid_but_noncanonical_json_evidence() {
 }
 
 #[test]
-fn workspace_change_invalidates_pending_or_granted_approvals() {
+fn workspace_change_invalidates_pending_approvals() {
     let database = TestDatabase::new();
     let (mut payload, binding) = approval_payload();
     payload.nonce = "abcdef0123456789abcdef0123456789".to_owned();
@@ -326,26 +317,37 @@ fn workspace_change_invalidates_pending_or_granted_approvals() {
             nonce: payload.nonce,
         })
         .unwrap();
-    database
-        .store
-        .resolve(ApprovalResolution {
-            approval_id: approval_id.clone(),
-            approved: true,
-        })
-        .unwrap();
-    assert!(database
-        .store
-        .valid_for(ApprovalCheck {
-            approval_id,
-            expected_operation_digest: canonical.operation_digest,
-            task_id: TaskId::new("task-1").unwrap(),
-            workspace_version: WorkspaceVersion::new(4),
-            policy_snapshot_digest: digest('c'),
-            fencing_token: Some(1),
-            checked_at: "2026-08-23T12:01:00Z".to_owned(),
-        })
-        .unwrap()
-        .is_none());
+    assert_eq!(
+        database
+            .store
+            .resolve(ApprovalResolution {
+                approval_id: approval_id.clone(),
+                approved: true,
+            })
+            .unwrap_err()
+            .safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(
+        database
+            .store
+            .invalidate(ApprovalInvalidation {
+                task_id: TaskId::new("task-1").unwrap(),
+                workspace_version: WorkspaceVersion::new(4),
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        database
+            .store
+            .invalidate(ApprovalInvalidation {
+                task_id: TaskId::new("task-1").unwrap(),
+                workspace_version: WorkspaceVersion::new(5),
+            })
+            .unwrap(),
+        1
+    );
     assert_eq!(
         configured_connection(&database.path)
             .query_row(
@@ -360,10 +362,10 @@ fn workspace_change_invalidates_pending_or_granted_approvals() {
 }
 
 #[test]
-fn fencing_change_and_expiry_invalidate_grants() {
-    for (suffix, checked_at, fencing_token, expected_status) in [
-        ("fence", "2026-08-23T12:01:00Z", Some(2), "invalidated"),
-        ("expiry", "2026-08-23T12:16:00Z", Some(1), "expired"),
+fn fencing_change_and_expiry_do_not_authorize_unreceipted_grants() {
+    for (suffix, checked_at, fencing_token) in [
+        ("fence", "2026-08-23T12:01:00Z", Some(2)),
+        ("expiry", "2026-08-23T12:16:00Z", Some(1)),
     ] {
         let database = TestDatabase::new();
         let (mut payload, binding) = approval_payload();
@@ -395,13 +397,17 @@ fn fencing_change_and_expiry_invalidate_grants() {
                 nonce: payload.nonce,
             })
             .unwrap();
-        database
-            .store
-            .resolve(ApprovalResolution {
-                approval_id: approval_id.clone(),
-                approved: true,
-            })
-            .unwrap();
+        assert_eq!(
+            database
+                .store
+                .resolve(ApprovalResolution {
+                    approval_id: approval_id.clone(),
+                    approved: true,
+                })
+                .unwrap_err()
+                .safe_classification(),
+            SafeErrorClassification::IntegrityFailure
+        );
         assert!(database
             .store
             .valid_for(ApprovalCheck {
@@ -423,7 +429,7 @@ fn fencing_change_and_expiry_invalidate_grants() {
                     |row| row.get::<_, String>(0)
                 )
                 .unwrap(),
-            expected_status
+            "pending"
         );
     }
 }
@@ -463,19 +469,23 @@ fn startup_expiry_atomically_invalidates_open_approvals_once() {
             })
             .unwrap();
         if grant {
-            database
-                .store
-                .resolve(ApprovalResolution {
-                    approval_id,
-                    approved: true,
-                })
-                .unwrap();
+            assert_eq!(
+                database
+                    .store
+                    .resolve(ApprovalResolution {
+                        approval_id,
+                        approved: true,
+                    })
+                    .unwrap_err()
+                    .safe_classification(),
+                SafeErrorClassification::IntegrityFailure
+            );
         }
     }
 
     configured_connection(&database.path)
         .execute_batch(
-            "DROP TRIGGER approval_request_fields_immutable;
+            "DROP TRIGGER approvals_identity_immutable;
              UPDATE approvals SET expires_at = 'not-a-timestamp'
              WHERE id = 'approval-expiry-3';",
         )
@@ -544,7 +554,7 @@ fn startup_expiry_atomically_invalidates_open_approvals_once() {
 }
 
 #[test]
-fn approval_resolution_race_has_exactly_one_winner() {
+fn concurrent_unreceipted_resolution_attempts_both_fail_closed() {
     let database = TestDatabase::new();
     let (mut payload, binding) = approval_payload();
     payload.nonce = "33333333333333333333333333333333".to_owned();
@@ -594,11 +604,11 @@ fn approval_resolution_race_has_exactly_one_winner() {
         });
         [first.join().unwrap(), second.join().unwrap()]
     });
-    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
-    assert_eq!(
-        outcomes.iter().filter(|outcome| outcome.is_err()).count(),
-        1
-    );
+    assert!(outcomes.iter().all(|outcome| matches!(
+        outcome,
+        Err(error)
+            if error.safe_classification() == SafeErrorClassification::IntegrityFailure
+    )));
 }
 
 #[test]
@@ -633,22 +643,30 @@ fn operation_intent_trigger_matches_the_authoritative_transition_table() {
     ];
     for (index, (from, to)) in allowed.into_iter().enumerate() {
         insert_operation_intent(&connection, index, from);
-        assert_eq!(
-            connection
-                .execute(
-                    "UPDATE operation_intents SET status = ?1 WHERE id = ?2",
-                    params![to, format!("intent-{index}")],
-                )
-                .unwrap(),
-            1,
-            "expected {from} -> {to} to be allowed",
+        let outcome = connection.execute(
+            "UPDATE operation_intents SET status = ?1 WHERE id = ?2",
+            params![to, format!("intent-{index}")],
         );
+        let allowed_without_attempt_authority = matches!(
+            (from, to),
+            ("pending", "claimed")
+                | ("pending", "started")
+                | ("claimed", "pending")
+                | ("claimed", "started")
+        );
+        if !allowed_without_attempt_authority {
+            assert!(
+                outcome.is_err(),
+                "terminal {from} -> {to} requires exact v7 attempt authority"
+            );
+        } else {
+            assert_eq!(outcome.unwrap(), 1, "expected {from} -> {to} to be allowed");
+        }
     }
 
     let forbidden = [
         ("pending", "failed"),
         ("claimed", "failed"),
-        ("started", "pending"),
         ("succeeded", "failed"),
         ("failed", "started"),
         ("interrupted", "succeeded"),
@@ -701,7 +719,8 @@ fn seed_project_and_task(path: &Path, artifact_root: &Path) {
             "INSERT INTO projects (
                 id, name, repository_path, repository_identity, created_at, updated_at,
                 policy_profile_id, artifact_root_mode, artifact_root_path
-             ) VALUES ('project-1', 'Project', 'C:/repo', 'repo-1',
+             ) VALUES ('project-1', 'Project', 'C:/repo',
+                'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                 '2026-07-23T00:00:00Z', '2026-07-23T00:00:00Z',
                 'policy-1', 'application_data', ?1)",
             [artifact_root.to_string_lossy().as_ref()],
@@ -743,15 +762,16 @@ fn insert_operation_intent(connection: &Connection, index: usize, status: &str) 
         .execute(
             "INSERT INTO operation_intents (
                 id, task_id, operation_kind, idempotency_class, idempotency_key,
-                canonical_request_artifact_id, operation_digest, status, attempt_count,
+                canonical_request_artifact_id, operation_digest, actor_binding_digest,
+                status, current_attempt_no,
                 created_at, updated_at
              ) VALUES (?1, 'task-1', 'test.operation', 'idempotent', ?2,
-                'operation-intent-artifact', ?3, ?4, 0,
+                 'operation-intent-artifact', ?3, ?3, ?4, 0,
                 '2026-07-23T12:00:00Z', '2026-07-23T12:00:00Z')",
             params![
                 format!("intent-{index}"),
                 format!("intent-key-{index}"),
-                digest('a').as_str(),
+                format!("sha256:{:x}", sha2::Sha256::digest(b"{}")),
                 status,
             ],
         )
@@ -769,7 +789,8 @@ fn persist_cross_task_artifact_duplicate(
             "INSERT INTO projects (
                 id, name, repository_path, repository_identity, created_at, updated_at,
                 policy_profile_id, artifact_root_mode, artifact_root_path
-             ) VALUES ('project-2', 'Other', 'C:/other', 'repo-2',
+             ) VALUES ('project-2', 'Other', 'C:/other',
+                'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
                 '2026-07-23T00:00:00Z', '2026-07-23T00:00:00Z',
                 'policy-1', 'application_data', ?1)",
             [database.directory.to_string_lossy().as_ref()],
@@ -809,7 +830,8 @@ fn persist_artifact(database: &TestDatabase, id: &str, logical_path: &str, bytes
     let object = database.directory.join(&storage_key);
     fs::create_dir_all(object.parent().unwrap()).unwrap();
     fs::write(object, bytes).unwrap();
-    configured_connection(&database.path)
+    let connection = configured_connection(&database.path);
+    connection
         .execute(
             "INSERT INTO artifacts (
                 id, task_id, project_id, artifact_type, logical_path, content_hash, storage_key,
@@ -821,6 +843,26 @@ fn persist_artifact(database: &TestDatabase, id: &str, logical_path: &str, bytes
             params![id, logical_path, hash, storage_key, bytes.len() as i64],
         )
         .unwrap();
+    if logical_path.starts_with("approvals/") {
+        connection
+            .execute(
+                "INSERT INTO operation_intents (
+                    id, task_id, operation_kind, idempotency_class, idempotency_key,
+                    canonical_request_artifact_id, operation_digest, actor_binding_digest,
+                    status, current_attempt_no, created_at, updated_at
+                 ) VALUES (?1, 'task-1', 'approval.request', 'non_repeatable', ?2,
+                    ?3, ?4, ?5, 'pending', 0,
+                    '2026-07-23T12:00:00Z', '2026-07-23T12:00:00Z')",
+                params![
+                    format!("intent-for-{id}"),
+                    format!("approval:{id}"),
+                    id,
+                    hash,
+                    digest('d').as_str(),
+                ],
+            )
+            .unwrap();
+    }
 }
 
 fn approval_payload() -> (

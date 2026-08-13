@@ -160,15 +160,32 @@ impl TestDatabase {
         let connection = self.connection();
         connection
             .execute(
+                "INSERT INTO operation_intents (
+                    id, task_id, run_id, operation_kind, idempotency_class, idempotency_key,
+                    canonical_request_artifact_id, operation_digest, actor_binding_digest,
+                    status, current_attempt_no, created_at, updated_at
+                 ) VALUES ('plan-intent-1', 'task-1', NULL, 'plan.approve',
+                    'non_repeatable', 'plan-approval:task-1', ?1, ?2, ?3, 'pending', 0, ?4, ?4)",
+                params![
+                    self.approval.request_artifact().artifact_id.as_str(),
+                    self.approval.operation_digest().as_str(),
+                    digest(b"actor-binding").as_str(),
+                    self.approval.binding().requested_at,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
                 "INSERT INTO approvals (
-                    id, task_id, approval_type, schema_version, operation_digest, status,
-                    requested_at, resolved_at, resolved_by, expires_at, request_artifact_id,
-                    invalidation_reason
-                 ) VALUES (?1, 'task-1', 'plan', 'approval-digest.v1', ?2, 'pending', ?3,
-                    NULL, NULL, ?4, ?5, NULL)",
+                    id, task_id, operation_intent_id, approval_type, schema_version,
+                    operation_digest, actor_binding_digest, nonce, status, requested_at,
+                    resolved_at, expires_at, request_artifact_id, invalidation_reason
+                 ) VALUES (?1, 'task-1', 'plan-intent-1', 'plan', 'approval-digest.v1', ?2,
+                    ?3, 'plan-approval-nonce-1', 'pending', ?4, NULL, ?5, ?6, NULL)",
                 params![
                     self.approval.approval_id().as_str(),
                     self.approval.operation_digest().as_str(),
+                    digest(b"actor-binding").as_str(),
                     self.approval.binding().requested_at,
                     self.approval.binding().expires_at,
                     self.approval.request_artifact().artifact_id.as_str(),
@@ -237,7 +254,7 @@ fn sqlite_store_exposes_the_dedicated_plan_approval_port() {
 }
 
 #[test]
-fn pending_plan_request_reloads_and_resolves_exactly_once_across_reopen() {
+fn pending_plan_request_reloads_and_resolution_fails_closed_without_receipt_authority() {
     let database = TestDatabase::new();
     let store = database.store();
     let pending = store
@@ -254,24 +271,21 @@ fn pending_plan_request_reloads_and_resolves_exactly_once_across_reopen() {
         binding()
     );
 
-    ResolvePlanApproval::new(&store, &WithinWindow)
+    let error = ResolvePlanApproval::new(&store, &WithinWindow)
         .execute(resolve_input(&database, PlanApprovalAction::Approve))
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
 
     let reopened = database.store();
-    let resolved = reopened
+    let pending = reopened
         .reload(database.approval.approval_id())
         .unwrap()
         .unwrap();
-    assert_eq!(resolved.state, PlanApprovalState::Resolved);
-    assert!(matches!(
-        resolved.terminal,
-        Some(PlanApprovalTerminal::Resolved {
-            action: PlanApprovalAction::Approve,
-            ref actor_id,
-            ..
-        }) if actor_id.as_str() == "actor-1"
-    ));
+    assert_eq!(pending.state, PlanApprovalState::Requested);
+    assert!(pending.terminal.is_none());
     assert_eq!(
         database
             .connection()
@@ -279,26 +293,13 @@ fn pending_plan_request_reloads_and_resolves_exactly_once_across_reopen() {
                 row.get::<_, String>(0)
             })
             .unwrap(),
-        "Implementation"
+        "AwaitingPlanApproval"
     );
-    assert!(ResolvePlanApproval::new(&reopened, &WithinWindow)
-        .execute(resolve_input(&database, PlanApprovalAction::Approve))
-        .is_err());
-    assert_eq!(
-        database
-            .connection()
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE event_type = 'plan.approved'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-        1
-    );
+    assert_pending_without_terminal_event(&database);
 }
 
 #[test]
-fn concurrent_plan_resolution_has_exactly_one_terminal_winner() {
+fn concurrent_plan_resolution_attempts_both_fail_closed_without_receipt_authority() {
     let database = TestDatabase::new();
     let store = database.store();
     let barrier = Arc::new(Barrier::new(2));
@@ -321,11 +322,11 @@ fn concurrent_plan_resolution_has_exactly_one_terminal_winner() {
         [first.join().unwrap(), second.join().unwrap()]
     });
 
-    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
-    assert_eq!(
-        outcomes.iter().filter(|outcome| outcome.is_err()).count(),
-        1
-    );
+    assert!(outcomes.iter().all(|outcome| matches!(
+        outcome,
+        Err(error)
+            if error.safe_classification() == SafeErrorClassification::IntegrityFailure
+    )));
     let connection = database.connection();
     let (status, current_sequence, terminal_events): (String, i64, i64) = connection
         .query_row(
@@ -338,55 +339,50 @@ fn concurrent_plan_resolution_has_exactly_one_terminal_winner() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert!(matches!(status.as_str(), "granted" | "denied"));
-    assert_eq!(current_sequence, 9);
-    assert_eq!(terminal_events, 1);
+    assert_eq!(status, "pending");
+    assert_eq!(current_sequence, 8);
+    assert_eq!(terminal_events, 0);
 }
 
 #[test]
-fn change_actions_round_trip_with_distinct_events_and_phases() {
-    for (action, expected_phase, expected_event_type) in [(
-        PlanApprovalAction::Revise,
-        "Synthesis",
-        "plan.revision.requested",
-    )] {
-        let database = TestDatabase::new();
-        let store = database.store();
+fn change_actions_fail_closed_without_receipt_authority() {
+    let database = TestDatabase::new();
+    let store = database.store();
 
-        ResolvePlanApproval::new(&store, &WithinWindow)
-            .execute(resolve_input(&database, action))
-            .unwrap();
+    let error = ResolvePlanApproval::new(&store, &WithinWindow)
+        .execute(resolve_input(&database, PlanApprovalAction::Revise))
+        .unwrap_err();
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
 
-        let resolved = database
-            .store()
-            .reload(database.approval.approval_id())
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            resolved.terminal,
-            Some(PlanApprovalTerminal::Resolved { action: resolved_action, .. })
-                if resolved_action == action
-        ));
-        let connection = database.connection();
-        assert_eq!(
-            connection
-                .query_row("SELECT phase FROM tasks WHERE id = 'task-1'", [], |row| {
-                    row.get::<_, String>(0)
-                })
-                .unwrap(),
-            expected_phase
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM events WHERE event_type = ?1",
-                    [expected_event_type],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            1
-        );
-    }
+    let pending = database
+        .store()
+        .reload(database.approval.approval_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.state, PlanApprovalState::Requested);
+    assert!(pending.terminal.is_none());
+    let connection = database.connection();
+    assert_eq!(
+        connection
+            .query_row("SELECT phase FROM tasks WHERE id = 'task-1'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "AwaitingPlanApproval"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_type = ?1",
+                ["plan.revision.requested"],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
 
     for action in [
         PlanApprovalAction::Reopen,
@@ -464,7 +460,7 @@ fn repository_change_after_transaction_check_rolls_back_resolution() {
         .unwrap_err();
     assert_eq!(
         error.safe_classification(),
-        SafeErrorClassification::Conflict
+        SafeErrorClassification::IntegrityFailure
     );
     assert_pending_without_terminal_event(&database);
 }
@@ -584,10 +580,7 @@ fn seed_authority(path: &PathBuf, artifact_root: &PathBuf) {
                 '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z', 'default',
                 'application_data', ?2)",
             params![
-                repository_fingerprint
-                    .as_str()
-                    .strip_prefix("sha256:")
-                    .unwrap(),
+                repository_fingerprint.as_str(),
                 artifact_root.to_string_lossy().as_ref()
             ],
         )
@@ -608,10 +601,10 @@ fn seed_authority(path: &PathBuf, artifact_root: &PathBuf) {
         .execute(
             "INSERT INTO agent_descriptors (
                 id, display_name, transport_type, trust_tier, manifest_json,
-                manifest_digest, executable_digest, enabled, containment_verified,
+                manifest_digest, executable_digest, enabled,
                 last_health_status, updated_at
              ) VALUES ('agent-1', 'Agent', 'in_process', 'core_adapter', '{}', ?1,
-                NULL, 1, 1, 'healthy', '2026-08-09T00:00:00Z')",
+                NULL, 1, 'healthy', '2026-08-09T00:00:00Z')",
             [manifest_digest.as_str()],
         )
         .unwrap();

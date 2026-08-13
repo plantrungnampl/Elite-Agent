@@ -6,7 +6,8 @@ fn seed_authoritative_context(path: &Path, artifact_root: &Path) {
             "INSERT INTO projects (
                 id, name, repository_path, repository_identity, created_at, updated_at,
                 policy_profile_id, artifact_root_mode, artifact_root_path
-             ) VALUES ('project-1', 'Project', 'C:/repo', 'repo-1',
+             ) VALUES ('project-1', 'Project', 'C:/repo',
+                'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                 '2026-07-23T00:00:00Z', '2026-07-23T00:00:00Z',
                 'policy-1', 'application_data', ?1)",
             [artifact_root.to_string_lossy().as_ref()],
@@ -45,9 +46,9 @@ fn seed_authoritative_context(path: &Path, artifact_root: &Path) {
         .execute(
             "INSERT INTO agent_descriptors (
                 id, display_name, transport_type, trust_tier, manifest_json, manifest_digest,
-                executable_digest, enabled, containment_verified, last_health_status, updated_at
+                executable_digest, enabled, last_health_status, updated_at
              ) VALUES ('agent-1', 'Agent', 'in_process', 'core_adapter', '{}', ?1,
-                NULL, 1, 1, 'healthy', '2026-07-23T00:00:00Z')",
+                NULL, 1, 'healthy', '2026-07-23T00:00:00Z')",
             [&seed_hash],
         )
         .unwrap();
@@ -75,8 +76,9 @@ fn seed_authoritative_context(path: &Path, artifact_root: &Path) {
     connection
         .execute(
             "INSERT INTO executor_leases (
-                task_id, holder_run_id, fencing_token, status, acquired_at, expires_at, released_at
-             ) VALUES ('task-1', 'run-1', 19, 'active',
+                id, task_id, holder_run_id, fencing_token, status,
+                acquired_at, expires_at, released_at
+             ) VALUES ('lease-task-1-19', 'task-1', 'run-1', 19, 'active',
                 '2026-07-23T00:00:00Z', '2026-08-23T00:00:00Z', NULL)",
             [],
         )
@@ -177,6 +179,31 @@ fn record_exact_policy_with_expiry(
     digest_marker: char,
     expires_at: Option<Timestamp>,
 ) -> local_agent_terminal_application::PolicyDecisionId {
+    record_exact_policy_for_digest(
+        store,
+        request,
+        evaluated_at,
+        effect,
+        digest_marker,
+        expires_at,
+        canonical_tool_request(request)
+            .unwrap()
+            .binding_digest()
+            .as_sha256()
+            .clone(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_exact_policy_for_digest(
+    store: &SqliteStore,
+    request: &ToolRequest,
+    evaluated_at: Timestamp,
+    effect: PolicyEffect,
+    digest_marker: char,
+    expires_at: Option<Timestamp>,
+    operation_digest: Sha256Digest,
+) -> local_agent_terminal_application::PolicyDecisionId {
     let policy_request = policy_request_for_tool(request, evaluated_at);
     let draft = combine_policy_rules(
         policy_request,
@@ -193,7 +220,7 @@ fn record_exact_policy_with_expiry(
         .record(RecordedPolicyDecision::exact(
             PolicyDecision {
                 draft,
-                operation_digest: digest_char(digest_marker),
+                operation_digest,
             },
             evaluated_at,
         ))
@@ -212,17 +239,10 @@ fn exact_denial_fixture(
     let immutable = store
         .load_request_artifact(&authorized.request_artifact_id)
         .unwrap();
-    let policy_decision_id = record_exact_policy(
-        &store,
-        immutable.request(),
-        authorized.checked_at,
-        PolicyEffect::Deny,
-        '9',
-    );
     let denial = ToolExecutionDenialRequest {
         request_artifact_id: authorized.request_artifact_id.clone(),
         request: immutable,
-        policy_decision_id,
+        policy_decision_id: authorized.policy_decision_id.clone(),
         policy_request_binding_digest: authorized.policy_request_binding_digest.clone(),
         effect: PolicyEffect::Deny,
         checked_at: authorized.checked_at,
@@ -287,12 +307,14 @@ fn exact_approval_claim_fixture_with_overrides(
         .unwrap();
 
     let checked_at = Timestamp::from_unix_seconds(1_753_272_300);
-    let approval_policy_id = record_exact_policy(
+    let approval_policy_id = record_exact_policy_for_digest(
         &store,
         &request,
         Timestamp::from_unix_seconds(checked_at.unix_seconds() - 60),
         PolicyEffect::RequireApproval,
         '3',
+        Some(Timestamp::from_unix_seconds(4_102_444_800)),
+        digest_char('3'),
     );
     let effective_policy_id = record_exact_policy(
         &store,
@@ -358,21 +380,102 @@ fn exact_approval_claim_fixture_with_overrides(
         &approval.canonical_payload().canonical_bytes,
     );
     let connection = configured_connection(&database.path);
+    let actor_binding_digest: String = connection
+        .query_row(
+            "SELECT actor_binding_digest FROM operation_intents WHERE id = ?1",
+            [request.execution_id().as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
     connection
         .execute(
             "INSERT INTO approvals (
-                id, task_id, approval_type, schema_version, operation_digest, status,
-                requested_at, resolved_at, resolved_by, expires_at, request_artifact_id,
-                invalidation_reason
-             ) VALUES (?1, 'task-1', 'tool', 'approval-digest.v1', ?2, 'granted',
-                ?3, '2026-07-30T00:00:00Z', 'user', ?4, ?5, NULL)",
+                id, task_id, operation_intent_id, approval_type, schema_version,
+                operation_digest, actor_binding_digest, nonce, status, requested_at,
+                resolved_at, expires_at, request_artifact_id, invalidation_reason
+             ) VALUES (?1, 'task-1', ?2, 'tool', 'approval-digest.v1', ?3, ?4, ?5,
+                'pending', ?6, NULL, ?7, ?8, NULL)",
             params![
                 approval_id.as_str(),
-                approval.canonical_payload().operation_digest.as_str(),
+                request.execution_id().as_str(),
+                immutable.binding_digest().as_sha256().as_str(),
+                actor_binding_digest,
+                approval.payload().nonce,
                 approval.payload().requested_at,
                 approval.payload().expires_at,
                 approval_artifact_id.as_str(),
             ],
+        )
+        .unwrap();
+    let unique_digest = |label: &str| {
+        format!(
+            "sha256:{:x}",
+            Sha256::digest(format!("{label}:{execution_id}").as_bytes())
+        )
+    };
+    connection
+        .execute_batch(&format!(
+            "INSERT INTO actor_bindings (
+                id, actor_kind, actor_id, session_id, proof_type, binding_digest,
+                issued_at, expires_at, revoked_at, session_epoch
+             ) VALUES ('actor-binding-{execution_id}', 'user', 'user-1', 'session-1',
+                'local_authenticated_session', '{actor_binding_digest}',
+                '2026-07-20T00:00:00Z', '2099-07-30T00:00:00Z', NULL, 1);
+             INSERT INTO credential_challenges (
+                id, actor_binding_id, purpose, operation_digest, nonce,
+                challenge_digest, issued_at, expires_at
+             ) VALUES ('challenge-{execution_id}', 'actor-binding-{execution_id}',
+                'policy_exception.approval', '{}', 'credential-challenge-{execution_id}',
+                '{}', '2026-07-29T00:00:00Z', '2026-07-31T00:00:00Z');
+             INSERT INTO credential_challenge_receipts (
+                id, challenge_id, actor_binding_id, proof_type, proof_artifact_id,
+                verified_at, receipt_digest
+             ) VALUES ('challenge-receipt-{execution_id}', 'challenge-{execution_id}',
+                'actor-binding-{execution_id}', 'local_authenticated_session', '{}',
+                '2026-07-30T00:00:00Z', '{}');",
+            immutable.binding_digest().as_sha256().as_str(),
+            unique_digest("challenge"),
+            approval_artifact_id.as_str(),
+            unique_digest("challenge-receipt"),
+        ))
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO approval_decision_receipts (
+                id, approval_id, task_id, operation_intent_id, operation_digest,
+                actor_binding_digest, nonce, decision, credential_evidence_artifact_id,
+                decided_at, receipt_digest
+             ) VALUES (?1, ?2, 'task-1', ?3, ?4, ?5, ?6, 'granted', ?7,
+                '2026-07-30T00:00:00Z', ?8)",
+            params![
+                format!("approval-receipt-{execution_id}"),
+                approval_id.as_str(),
+                request.execution_id().as_str(),
+                immutable.binding_digest().as_sha256().as_str(),
+                actor_binding_digest,
+                approval.payload().nonce,
+                approval_artifact_id.as_str(),
+                unique_digest("approval-receipt"),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO approval_actor_proof_bindings (
+                approval_receipt_id, actor_binding_id, challenge_receipt_id, created_at
+             ) VALUES (?1, ?2, ?3, '2026-07-30T00:00:00Z')",
+            params![
+                format!("approval-receipt-{execution_id}"),
+                format!("actor-binding-{execution_id}"),
+                format!("challenge-receipt-{execution_id}"),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE approvals SET status = 'granted', resolved_at = '2026-07-30T00:00:00Z'
+             WHERE id = ?1",
+            [approval_id.as_str()],
         )
         .unwrap();
     connection
@@ -389,7 +492,7 @@ fn exact_approval_claim_fixture_with_overrides(
                 serde_json::json!({
                     "approvalId": approval_id.as_str(),
                     "approvalType": "tool",
-                    "operationDigest": approval.canonical_payload().operation_digest.as_str(),
+                    "operationDigest": immutable.binding_digest().as_sha256().as_str(),
                     "executionId": request.execution_id().as_str(),
                     "approvalPolicyDecisionId": approval_policy_id.as_str(),
                     "policyRequestBindingDigest": policy_binding.as_sha256().as_str(),
@@ -432,7 +535,8 @@ fn exact_approval_claim_fixture_with_overrides(
         .unwrap();
     connection
         .execute(
-            "UPDATE tasks SET operation_state = 'None', current_sequence = 2
+            "UPDATE tasks SET operation_state = 'None', current_sequence = 2,
+                row_version = row_version + 1
              WHERE id = 'task-1'",
             [],
         )
@@ -471,17 +575,16 @@ fn resolver_canonical_executable_path() -> &'static str {
     "/approved/cargo"
 }
 
-fn persist_request_artifact(database: &TempDatabase) -> Sha256Digest {
-    let payload = parse_approval_payload(TOOL_FIXTURE).unwrap();
-    let canonical = canonical_approval_payload(&payload).unwrap();
+fn persist_request_artifact(database: &TempDatabase, execution_id: &str) -> Sha256Digest {
+    let canonical = canonical_tool_request(&exact_tool_request(execution_id)).unwrap();
     persist_artifact(
         database,
         "request-artifact",
-        "tool-requests/execution.json",
+        &format!("tool-requests/{execution_id}.json"),
         "tool-request",
-        &canonical.canonical_bytes,
+        canonical.canonical_bytes(),
     );
-    canonical.operation_digest
+    canonical.binding_digest().as_sha256().clone()
 }
 
 fn file_write_recovery(
@@ -639,47 +742,6 @@ fn persist_file_policy_decision(
         .unwrap();
 }
 
-fn seed_other_task(database: &TempDatabase) {
-    let connection = configured_connection(&database.path);
-    connection
-        .execute(
-            "INSERT INTO projects (
-                id, name, repository_path, repository_identity, created_at, updated_at,
-                policy_profile_id, artifact_root_mode, artifact_root_path
-             ) VALUES ('project-2', 'Other', 'C:/other', 'repo-2',
-                '2026-07-23T00:00:00Z', '2026-07-23T00:00:00Z',
-                'policy-1', 'application_data', ?1)",
-            [database.directory.to_string_lossy().as_ref()],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO tasks (
-                id, project_id, title, objective, phase, condition, operation_state,
-                risk_level, base_branch, base_commit, created_at, updated_at
-             ) VALUES ('task-2', 'project-2', 'Other', 'Other', 'Implementation',
-                'Active', 'None', 'low', 'main', ?1,
-                '2026-07-23T00:00:00Z', '2026-07-23T00:00:00Z')",
-            ["b".repeat(40)],
-        )
-        .unwrap();
-}
-
-fn seed_pending_plan_approval(database: &TempDatabase) {
-    configured_connection(&database.path)
-        .execute(
-            "INSERT INTO approvals (
-                id, task_id, approval_type, schema_version, operation_digest, status,
-                requested_at, resolved_at, resolved_by, expires_at, request_artifact_id,
-                invalidation_reason
-             ) VALUES ('plan-pending', 'task-1', 'plan', 'v1', ?1, 'pending',
-                '2026-07-23T12:00:00Z', NULL, NULL, '2099-07-23T12:00:00Z',
-                'manifest', NULL)",
-            [digest_char('5').as_str()],
-        )
-        .unwrap();
-}
-
 fn workspace_fingerprint(
     head: char,
     index_digest: char,
@@ -695,10 +757,6 @@ fn workspace_fingerprint(
 
 fn digest_char(character: char) -> Sha256Digest {
     Sha256Digest::new(format!("sha256:{}", character.to_string().repeat(64))).unwrap()
-}
-
-fn digest_bytes(bytes: &[u8]) -> Sha256Digest {
-    Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
 }
 
 fn persist_artifact(
@@ -767,79 +825,6 @@ fn persist_policy_decision(path: &Path, operation_digest: &Sha256Digest, effect:
             ],
         )
         .unwrap();
-}
-
-fn seed_consumed_approval(path: &Path, operation_digest: &Sha256Digest, expires_at: &str) {
-    let connection = configured_connection(path);
-    connection
-        .execute(
-            "INSERT INTO approvals (
-                id, task_id, approval_type, schema_version, operation_digest, status,
-                requested_at, resolved_at, resolved_by, expires_at, request_artifact_id,
-                invalidation_reason
-             ) VALUES ('approval-consumed', 'task-1', 'tool', 'approval-digest.v1', ?1,
-                'invalidated', '2026-07-23T12:00:00Z', '2026-07-23T12:01:00Z', 'user',
-                ?2, 'request-artifact', 'consumed')",
-            params![operation_digest.as_str(), expires_at],
-        )
-        .unwrap();
-    let ApprovalDigestPayload::Tool(payload) = parse_approval_payload(TOOL_FIXTURE).unwrap() else {
-        unreachable!();
-    };
-    connection
-        .execute(
-            "INSERT INTO events (
-                event_id, stream_id, sequence, event_type, schema_version, actor_type,
-                actor_id, observation_class, payload_json, metadata_json, causation_id,
-                correlation_id, created_at
-             ) VALUES ('approval.requested:approval-consumed:1', 'task-1', 1,
-                'approval.requested', 1, 'core', 'approval-store', 'core_observed',
-                ?1, '{}', 'approval:approval-consumed', 'approval:approval-consumed',
-                '2026-07-23T12:00:00Z')",
-            [serde_json::json!({
-                "approvalId": "approval-consumed",
-                "workspaceVersion": 4,
-                "policySnapshotDigest": payload.policy_snapshot_digest,
-                "fencingToken": 19,
-                "toolRequestBindingDigest": digest_char('f').as_str(),
-            })
-            .to_string()],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "UPDATE tasks SET current_sequence = 1 WHERE id = 'task-1'",
-            [],
-        )
-        .unwrap();
-}
-
-fn insert_status_test_execution(
-    database: &TempDatabase,
-    store: &SqliteStore,
-    operation_digest: &Sha256Digest,
-    index: usize,
-    status: &str,
-    request_id: &str,
-) -> rusqlite::Result<()> {
-    let execution_id = format!("status-execution-{index}");
-    store
-        .reserve(NewToolIntent {
-            execution_id: ToolExecutionId::new(execution_id.clone()).unwrap(),
-            operation_digest: operation_digest.clone(),
-        })
-        .unwrap();
-    configured_connection(&database.path).execute(
-        "INSERT INTO tool_executions (
-            id, task_id, run_id, request_id, tool_name, arguments_artifact_id,
-            policy_decision_id, approval_id, operation_intent_id,
-            executor_fencing_token, status, started_at, completed_at, exit_code,
-            stdout_artifact_id, stderr_artifact_id
-         ) VALUES (?1, 'task-1', 'run-1', ?2, 'process.exec', 'request-artifact',
-            'policy-1', NULL, ?1, 19, ?3, NULL, NULL, NULL, NULL, NULL)",
-        params![execution_id, request_id, status],
-    )?;
-    Ok(())
 }
 
 fn configured_connection(path: &Path) -> Connection {

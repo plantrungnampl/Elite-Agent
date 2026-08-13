@@ -16,9 +16,14 @@ use local_agent_terminal_domain::{
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::event_store::{open_error_to_port, sqlite_error_to_port};
 use crate::SqliteStore;
+
+fn core_actor_binding_digest(actor_id: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(actor_id.as_bytes()))
+}
 
 impl WorkspaceStateStore for SqliteStore {
     fn create_project(&self, project: NewProject) -> Result<ProjectSnapshot, PortError> {
@@ -145,11 +150,15 @@ impl WorkspaceStateStore for SqliteStore {
         }
         let existing: Option<RawOperationIntent> = transaction
             .query_row(
-                "SELECT id, task_id, operation_kind, idempotency_class, idempotency_key,
-                        canonical_request_artifact_id, operation_digest, status,
-                        executor_fencing_token, attempt_count, created_at, updated_at
-                 FROM operation_intents
-                 WHERE idempotency_key = ?1",
+                "SELECT oi.id, oi.task_id, oi.operation_kind, oi.idempotency_class,
+                        oi.idempotency_key, oi.canonical_request_artifact_id,
+                        oi.operation_digest, oi.status, attempt.fencing_token,
+                        oi.current_attempt_no, oi.created_at, oi.updated_at
+                 FROM operation_intents oi
+                 LEFT JOIN operation_attempts attempt
+                   ON attempt.operation_intent_id = oi.id
+                  AND attempt.attempt_no = oi.current_attempt_no
+                 WHERE oi.idempotency_key = ?1",
                 [intent.operation.idempotency_key.as_str()],
                 raw_operation_intent,
             )
@@ -177,12 +186,10 @@ impl WorkspaceStateStore for SqliteStore {
             .execute(
                 "INSERT INTO operation_intents (
                     id, task_id, run_id, operation_kind, idempotency_class, idempotency_key,
-                    canonical_request_artifact_id, operation_digest, status,
-                    executor_fencing_token, lease_owner, lease_expires_at, attempt_count,
-                    result_artifact_id, external_receipt_json, error_json, created_at, updated_at
+                    canonical_request_artifact_id, operation_digest, actor_binding_digest,
+                    status, current_attempt_no, created_at, updated_at
                  ) VALUES (
-                    ?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, 'pending',
-                    NULL, NULL, NULL, 0, NULL, NULL, NULL, ?8, ?8
+                    ?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', 0, ?9, ?9
                  )",
                 params![
                     intent.operation.id,
@@ -192,6 +199,7 @@ impl WorkspaceStateStore for SqliteStore {
                     intent.operation.idempotency_key,
                     intent.operation.canonical_request_artifact_id.as_str(),
                     intent.operation.operation_digest,
+                    core_actor_binding_digest("workspace-coordinator"),
                     intent.operation.created_at,
                 ],
             )
@@ -214,7 +222,7 @@ impl WorkspaceStateStore for SqliteStore {
         let changed = transaction
             .execute(
                 "UPDATE tasks SET task_branch = ?1, worktree_path = ?2,
-                    current_sequence = ?3, updated_at = ?4
+                    current_sequence = ?3, updated_at = ?4, row_version = row_version + 1
                  WHERE id = ?5 AND current_sequence = ?6",
                 params![
                     intent.branch.as_str(),
@@ -271,10 +279,15 @@ impl WorkspaceStateStore for SqliteStore {
         }
         let existing: Option<RawOperationIntent> = transaction
             .query_row(
-                "SELECT id, task_id, operation_kind, idempotency_class, idempotency_key,
-                        canonical_request_artifact_id, operation_digest, status,
-                        executor_fencing_token, attempt_count, created_at, updated_at
-                 FROM operation_intents WHERE idempotency_key = ?1",
+                "SELECT oi.id, oi.task_id, oi.operation_kind, oi.idempotency_class,
+                        oi.idempotency_key, oi.canonical_request_artifact_id,
+                        oi.operation_digest, oi.status, attempt.fencing_token,
+                        oi.current_attempt_no, oi.created_at, oi.updated_at
+                 FROM operation_intents oi
+                 LEFT JOIN operation_attempts attempt
+                   ON attempt.operation_intent_id = oi.id
+                  AND attempt.attempt_no = oi.current_attempt_no
+                 WHERE oi.idempotency_key = ?1",
                 [intent.operation.idempotency_key.as_str()],
                 raw_operation_intent,
             )
@@ -298,12 +311,10 @@ impl WorkspaceStateStore for SqliteStore {
             .execute(
                 "INSERT INTO operation_intents (
                     id, task_id, run_id, operation_kind, idempotency_class, idempotency_key,
-                    canonical_request_artifact_id, operation_digest, status,
-                    executor_fencing_token, lease_owner, lease_expires_at, attempt_count,
-                    result_artifact_id, external_receipt_json, error_json, created_at, updated_at
+                    canonical_request_artifact_id, operation_digest, actor_binding_digest,
+                    status, current_attempt_no, created_at, updated_at
                  ) VALUES (
-                    ?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, 'pending',
-                    NULL, NULL, NULL, 0, NULL, ?8, NULL, ?9, ?9
+                    ?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', 0, ?9, ?9
                  )",
                 params![
                     intent.operation.id,
@@ -313,7 +324,7 @@ impl WorkspaceStateStore for SqliteStore {
                     intent.operation.idempotency_key,
                     intent.operation.canonical_request_artifact_id.as_str(),
                     intent.operation.operation_digest,
-                    receipt.to_string(),
+                    core_actor_binding_digest("workspace-coordinator"),
                     intent.operation.created_at,
                 ],
             )
@@ -334,7 +345,8 @@ impl WorkspaceStateStore for SqliteStore {
         )?;
         let changed = transaction
             .execute(
-                "UPDATE tasks SET current_sequence = ?1, updated_at = ?2
+                "UPDATE tasks SET current_sequence = ?1, updated_at = ?2,
+                    row_version = row_version + 1
                  WHERE id = ?3 AND current_sequence = ?4 AND workspace_version = ?5",
                 params![
                     sequence,
@@ -363,97 +375,9 @@ impl WorkspaceStateStore for SqliteStore {
         {
             return Err(invalid_input());
         }
-
-        let mut connection = self.connection().map_err(open_error_to_port)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sqlite_error_to_port)?;
-        let task_id: Option<String> = transaction
-            .query_row(
-                "SELECT task_id FROM operation_intents WHERE id = ?1",
-                [&transition.intent_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sqlite_error_to_port)?;
-        let task_id = task_id.ok_or_else(not_found)?;
-        let error_json = transition.error.map(|classification| {
-            json!({"classification": error_classification_name(classification)}).to_string()
-        });
-        let fencing_token = transition
-            .executor_fencing_token
-            .map(FencingToken::get)
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|_| invalid_input())?;
-        let changed = transaction
-            .execute(
-                "UPDATE operation_intents SET
-                    status = ?1, executor_fencing_token = ?2, attempt_count = ?3,
-                    error_json = ?4, updated_at = ?5
-                 WHERE id = ?6 AND status = ?7",
-                params![
-                    transition.next_status.as_str(),
-                    fencing_token,
-                    i64::from(transition.attempt_count),
-                    error_json,
-                    transition.updated_at,
-                    transition.intent_id,
-                    transition.expected_status.as_str(),
-                ],
-            )
-            .map_err(sqlite_error_to_port)?;
-        if changed != 1 {
-            return Err(conflict());
-        }
-        let current_sequence: i64 = transaction
-            .query_row(
-                "SELECT current_sequence FROM tasks WHERE id = ?1",
-                [&task_id],
-                |row| row.get(0),
-            )
-            .map_err(sqlite_error_to_port)?;
-        let sequence = current_sequence.checked_add(1).ok_or_else(invalid_input)?;
-        let transition_event_id = format!(
-            "intent.transition:{}:{}:{}",
-            transition.intent_id,
-            transition.next_status.as_str(),
-            transition.attempt_count
-        );
-        let transition_payload = json!({
-            "intentId": transition.intent_id,
-            "from": transition.expected_status.as_str(),
-            "to": transition.next_status.as_str(),
-            "attemptCount": transition.attempt_count,
-            "executorFencingToken": transition.executor_fencing_token.map(FencingToken::get),
-            "errorClassification": transition.error.map(error_classification_name),
-            "observedFingerprint": transition.observed_fingerprint.as_ref().map(fingerprint_json),
-        });
-        let transition_correlation = format!("intent:{}", transition.intent_id);
-        insert_task_event(
-            &transaction,
-            TaskEvent {
-                task_id: &task_id,
-                sequence,
-                event_id: &transition_event_id,
-                event_type: "operation.intent.transitioned",
-                payload: &transition_payload,
-                actor_id: "workspace-coordinator",
-                correlation_id: &transition_correlation,
-                created_at: &transition.updated_at,
-            },
-        )?;
-        let advanced = transaction
-            .execute(
-                "UPDATE tasks SET current_sequence = ?1, updated_at = ?2
-                 WHERE id = ?3 AND current_sequence = ?4",
-                params![sequence, transition.updated_at, task_id, current_sequence],
-            )
-            .map_err(sqlite_error_to_port)?;
-        if advanced != 1 {
-            return Err(conflict());
-        }
-        transaction.commit().map_err(sqlite_error_to_port)
+        // Normative v7 requires a policy-authorized `operation_attempt` before an
+        // intent can transition. This legacy command carries no decision or approval ID.
+        Err(integrity_failure())
     }
 
     fn reconcile_intents(&self) -> Result<Vec<RecoveryCandidate>, PortError> {
@@ -651,152 +575,9 @@ impl WorkspaceMutationStore for SqliteStore {
         {
             return Err(invalid_input());
         }
-        let mut connection = self.connection().map_err(open_error_to_port)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sqlite_error_to_port)?;
-        let task: Option<(i64, i64)> = transaction
-            .query_row(
-                "SELECT current_sequence, fencing_epoch FROM tasks WHERE id = ?1",
-                [request.task_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(sqlite_error_to_port)?;
-        let Some((current_sequence, fencing_epoch)) = task else {
-            return Err(not_found());
-        };
-        let expected_sequence =
-            i64::try_from(request.expected_sequence.get()).map_err(|_| invalid_input())?;
-        if current_sequence != expected_sequence {
-            return Err(PortError::version_conflict(
-                request.expected_sequence,
-                Sequence::try_from(current_sequence).map_err(|_| integrity_failure())?,
-            ));
-        }
-        let current_token =
-            FencingToken::try_from(fencing_epoch).map_err(|_| integrity_failure())?;
-        if request.claim.token() != current_token {
-            return Err(PortError::stale_lease(current_token, request.claim.token()));
-        }
-        let token = i64::try_from(request.claim.token().get()).map_err(|_| invalid_input())?;
-        let error_json = json!({
-            "classification": error_classification_name(request.error)
-        })
-        .to_string();
-        let intent_changed = transaction
-            .execute(
-                "UPDATE operation_intents
-                 SET status = ?1, executor_fencing_token = ?2,
-                     error_json = ?3, updated_at = ?4
-                 WHERE id = ?5 AND task_id = ?6 AND status = 'succeeded'",
-                params![
-                    request.next_status.as_str(),
-                    token,
-                    error_json,
-                    request.observed_at,
-                    request.operation.id,
-                    request.task_id.as_str(),
-                ],
-            )
-            .map_err(sqlite_error_to_port)?;
-        if intent_changed != 1 {
-            return Err(conflict());
-        }
-        let transition_sequence = current_sequence.checked_add(1).ok_or_else(invalid_input)?;
-        let transition_event_id = format!(
-            "intent.transition:{}:{}:{}",
-            request.operation.id,
-            request.next_status.as_str(),
-            request.operation.attempt_count
-        );
-        let transition_payload = json!({
-            "intentId": request.operation.id,
-            "from": OperationIntentStatus::Succeeded.as_str(),
-            "to": request.next_status.as_str(),
-            "attemptCount": request.operation.attempt_count,
-            "executorFencingToken": request.claim.token().get(),
-            "errorClassification": error_classification_name(request.error),
-            "observedFingerprint": Value::Null,
-        });
-        let transition_correlation = format!("intent:{}", request.operation.id);
-        insert_task_event(
-            &transaction,
-            TaskEvent {
-                task_id: request.task_id.as_str(),
-                sequence: transition_sequence,
-                event_id: &transition_event_id,
-                event_type: "operation.intent.transitioned",
-                payload: &transition_payload,
-                actor_id: "workspace-monitor",
-                correlation_id: &transition_correlation,
-                created_at: &request.observed_at,
-            },
-        )?;
-        let revoked = transaction
-            .execute(
-                "UPDATE executor_leases SET status = 'revoked', released_at = ?1
-                 WHERE task_id = ?2 AND holder_run_id = ?3
-                   AND fencing_token = ?4 AND status = 'active'",
-                params![
-                    request.observed_at,
-                    request.task_id.as_str(),
-                    request.claim.holder_run_id().as_str(),
-                    token,
-                ],
-            )
-            .map_err(sqlite_error_to_port)?;
-        if revoked != 1 {
-            return Err(PortError::stale_lease(current_token, request.claim.token()));
-        }
-        let revoke_sequence = transition_sequence
-            .checked_add(1)
-            .ok_or_else(invalid_input)?;
-        let revoke_event_id = format!(
-            "executor.lease.revoked:{}:{}",
-            request.task_id.as_str(),
-            request.claim.token().get()
-        );
-        let revoke_payload = json!({
-            "taskId": request.task_id.as_str(),
-            "holderRunId": request.claim.holder_run_id().as_str(),
-            "fencingToken": request.claim.token().get(),
-        });
-        let revoke_correlation = format!(
-            "executor-lease:revoke:{}:{}",
-            request.task_id.as_str(),
-            request.claim.token().get()
-        );
-        insert_task_event(
-            &transaction,
-            TaskEvent {
-                task_id: request.task_id.as_str(),
-                sequence: revoke_sequence,
-                event_id: &revoke_event_id,
-                event_type: "executor.lease.revoked",
-                payload: &revoke_payload,
-                actor_id: "core",
-                correlation_id: &revoke_correlation,
-                created_at: &request.observed_at,
-            },
-        )?;
-        let task_changed = transaction
-            .execute(
-                "UPDATE tasks SET current_sequence = ?1, updated_at = ?2
-                 WHERE id = ?3 AND current_sequence = ?4 AND fencing_epoch = ?5",
-                params![
-                    revoke_sequence,
-                    request.observed_at,
-                    request.task_id.as_str(),
-                    current_sequence,
-                    fencing_epoch,
-                ],
-            )
-            .map_err(sqlite_error_to_port)?;
-        if task_changed != 1 {
-            return Err(conflict());
-        }
-        transaction.commit().map_err(sqlite_error_to_port)
+        // v7 makes succeeded attempts terminal and immutable. A later observation-loss
+        // correction needs a new authority-bearing recovery intent, which this command lacks.
+        Err(integrity_failure())
     }
 }
 
@@ -805,10 +586,15 @@ impl SqliteStore {
         let connection = self.connection().map_err(open_error_to_port)?;
         connection
             .query_row(
-                "SELECT id, task_id, operation_kind, idempotency_class, idempotency_key,
-                        canonical_request_artifact_id, operation_digest, status,
-                        executor_fencing_token, attempt_count, created_at, updated_at
-                 FROM operation_intents WHERE id = ?1",
+                "SELECT oi.id, oi.task_id, oi.operation_kind, oi.idempotency_class,
+                        oi.idempotency_key, oi.canonical_request_artifact_id,
+                        oi.operation_digest, oi.status, attempt.fencing_token,
+                        oi.current_attempt_no, oi.created_at, oi.updated_at
+                 FROM operation_intents oi
+                 LEFT JOIN operation_attempts attempt
+                   ON attempt.operation_intent_id = oi.id
+                  AND attempt.attempt_no = oi.current_attempt_no
+                 WHERE oi.id = ?1",
                 [intent_id],
                 raw_operation_intent,
             )
@@ -822,12 +608,16 @@ impl SqliteStore {
         let connection = self.connection().map_err(open_error_to_port)?;
         let mut statement = connection
             .prepare(
-                "SELECT id, task_id, operation_kind, idempotency_class, idempotency_key,
-                        canonical_request_artifact_id, operation_digest, status,
-                        executor_fencing_token, attempt_count, created_at, updated_at
-                 FROM operation_intents
-                 WHERE status = 'started' AND operation_kind <> 'file.write'
-                 ORDER BY created_at, id",
+                "SELECT oi.id, oi.task_id, oi.operation_kind, oi.idempotency_class,
+                        oi.idempotency_key, oi.canonical_request_artifact_id,
+                        oi.operation_digest, oi.status, attempt.fencing_token,
+                        oi.current_attempt_no, oi.created_at, oi.updated_at
+                 FROM operation_intents oi
+                 LEFT JOIN operation_attempts attempt
+                   ON attempt.operation_intent_id = oi.id
+                  AND attempt.attempt_no = oi.current_attempt_no
+                 WHERE oi.status = 'started' AND oi.operation_kind <> 'file.write'
+                 ORDER BY oi.created_at, oi.id",
             )
             .map_err(sqlite_error_to_port)?;
         let rows = statement
@@ -1170,19 +960,6 @@ fn allowed_intent_transition(from: OperationIntentStatus, to: OperationIntentSta
     )
 }
 
-fn error_classification_name(classification: SafeErrorClassification) -> &'static str {
-    match classification {
-        SafeErrorClassification::Conflict => "conflict",
-        SafeErrorClassification::Unavailable => "unavailable",
-        SafeErrorClassification::PermissionDenied => "permission_denied",
-        SafeErrorClassification::NotFound => "not_found",
-        SafeErrorClassification::InvalidInput => "invalid_input",
-        SafeErrorClassification::IntegrityFailure => "integrity_failure",
-        SafeErrorClassification::StorageFull => "storage_full",
-        SafeErrorClassification::Internal => "internal",
-    }
-}
-
 pub(crate) fn invalid_input() -> PortError {
     PortError::failure(
         SafeErrorClassification::InvalidInput,
@@ -1215,34 +992,12 @@ pub(crate) fn record_workspace_mutation_in_transaction(
     transaction: &Transaction<'_>,
     request: WorkspaceMutationRequest,
 ) -> Result<WorkspaceMutationResult, PortError> {
-    record_workspace_mutation_with_authority(
-        transaction,
-        request,
-        WorkspaceMutationAuthority::ActiveLease,
-    )
-}
-
-pub(crate) fn record_recovered_workspace_mutation_in_transaction(
-    transaction: &Transaction<'_>,
-    request: WorkspaceMutationRequest,
-) -> Result<WorkspaceMutationResult, PortError> {
-    record_workspace_mutation_with_authority(
-        transaction,
-        request,
-        WorkspaceMutationAuthority::StartupRecovery,
-    )
-}
-
-#[derive(Clone, Copy)]
-enum WorkspaceMutationAuthority {
-    ActiveLease,
-    StartupRecovery,
+    record_workspace_mutation_with_authority(transaction, request)
 }
 
 fn record_workspace_mutation_with_authority(
     transaction: &Transaction<'_>,
     request: WorkspaceMutationRequest,
-    authority: WorkspaceMutationAuthority,
 ) -> Result<WorkspaceMutationResult, PortError> {
     validate_mutation_request(&request)?;
     verify_mutation_evidence(transaction, &request)?;
@@ -1288,7 +1043,7 @@ fn record_workspace_mutation_with_authority(
     let lease: Option<(String, i64, String)> = transaction
         .query_row(
             "SELECT holder_run_id, fencing_token, status
-             FROM executor_leases WHERE task_id = ?1",
+             FROM executor_leases WHERE task_id = ?1 AND status = 'active'",
             [request.task_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -1298,45 +1053,13 @@ fn record_workspace_mutation_with_authority(
         return Err(PortError::stale_lease(current_token, request.claim.token()));
     };
     let claimed_token = i64::try_from(request.claim.token().get()).map_err(|_| invalid_input())?;
-    match authority {
-        WorkspaceMutationAuthority::ActiveLease => {
-            if lease_status != "active"
-                || holder_run_id != request.claim.holder_run_id().as_str()
-                || lease_token != claimed_token
-                || request.claim.task_id() != &request.task_id
-                || request.claim.token() != current_token
-            {
-                return Err(PortError::stale_lease(current_token, request.claim.token()));
-            }
-        }
-        WorkspaceMutationAuthority::StartupRecovery => {
-            let expected_token = claimed_token.checked_add(1).ok_or_else(invalid_input)?;
-            let fence_event_id = format!(
-                "executor.lease.fenced:{}:{}",
-                request.task_id.as_str(),
-                request.claim.token().get()
-            );
-            let exact_fence: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM events
-                        WHERE stream_id = ?1 AND sequence = ?2
-                          AND event_id = ?3 AND event_type = 'executor.lease.fenced'
-                    )",
-                    params![request.task_id.as_str(), current_sequence, fence_event_id],
-                    |row| row.get(0),
-                )
-                .map_err(sqlite_error_to_port)?;
-            if lease_status != "revoked"
-                || holder_run_id != request.claim.holder_run_id().as_str()
-                || lease_token != claimed_token
-                || request.claim.task_id() != &request.task_id
-                || fencing_epoch != expected_token
-                || !exact_fence
-            {
-                return Err(PortError::stale_lease(current_token, request.claim.token()));
-            }
-        }
+    if lease_status != "active"
+        || holder_run_id != request.claim.holder_run_id().as_str()
+        || lease_token != claimed_token
+        || request.claim.task_id() != &request.task_id
+        || request.claim.token() != current_token
+    {
+        return Err(PortError::stale_lease(current_token, request.claim.token()));
     }
 
     let state = WorkflowState::new(
@@ -1428,7 +1151,8 @@ fn record_workspace_mutation_with_authority(
             "UPDATE tasks SET
                 phase = ?1, condition = ?2, operation_state = ?3,
                 workspace_version = ?4, fencing_epoch = ?5,
-                current_sequence = ?6, active_candidate_tree = NULL, updated_at = ?7
+                current_sequence = ?6, active_candidate_tree = NULL, updated_at = ?7,
+                row_version = row_version + 1
              WHERE id = ?8 AND current_sequence = ?9 AND fencing_epoch = ?10",
             params![
                 next_state.phase().as_str(),
@@ -1459,23 +1183,21 @@ fn record_workspace_mutation_with_authority(
             )
             .map_err(sqlite_error_to_port)?;
     }
-    if matches!(authority, WorkspaceMutationAuthority::ActiveLease) {
-        let revoked = transaction
-            .execute(
-                "UPDATE executor_leases SET status = 'revoked', released_at = ?1
-                 WHERE task_id = ?2 AND holder_run_id = ?3
-                   AND fencing_token = ?4 AND status = 'active'",
-                params![
-                    now,
-                    request.task_id.as_str(),
-                    request.claim.holder_run_id().as_str(),
-                    claimed_token,
-                ],
-            )
-            .map_err(sqlite_error_to_port)?;
-        if revoked != 1 {
-            return Err(conflict());
-        }
+    let revoked = transaction
+        .execute(
+            "UPDATE executor_leases SET status = 'revoked', released_at = ?1
+             WHERE task_id = ?2 AND holder_run_id = ?3
+               AND fencing_token = ?4 AND status = 'active'",
+            params![
+                now,
+                request.task_id.as_str(),
+                request.claim.holder_run_id().as_str(),
+                claimed_token,
+            ],
+        )
+        .map_err(sqlite_error_to_port)?;
+    if revoked != 1 {
+        return Err(conflict());
     }
 
     Ok(WorkspaceMutationResult {

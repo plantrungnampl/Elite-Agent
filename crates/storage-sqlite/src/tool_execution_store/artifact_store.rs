@@ -15,7 +15,15 @@ impl SqliteStore {
                 artifact,
                 run_id: process.binding().run_id().as_str().to_owned(),
                 tool_name: "process.exec".to_owned(),
-                fencing_token: process.executor_fencing_token().map(FencingToken::get),
+                actor_binding_digest: digest_json(&json!({
+                    "connectionId": request.policy().actor().connection_id,
+                    "agentId": request.policy().actor().agent_id,
+                    "trustTier": request.policy().actor().trust_tier.as_str(),
+                    "locality": match request.policy().actor().locality {
+                        local_agent_terminal_domain::ActorLocality::Local => "local",
+                        local_agent_terminal_domain::ActorLocality::Cloud => "cloud",
+                    },
+                }))?,
             });
         }
         let ApprovalDigestPayload::Tool(payload) =
@@ -26,12 +34,8 @@ impl SqliteStore {
         if payload.task_id != artifact.task_id {
             return Err(integrity_failure());
         }
-        Ok(ToolRequestEvidence {
-            artifact,
-            run_id: payload.operation.run_id,
-            tool_name: payload.operation.tool,
-            fencing_token: payload.operation.executor_fencing_token,
-        })
+        let _ = payload;
+        Err(integrity_failure())
     }
 
     pub(crate) fn artifact_by_digest(
@@ -112,7 +116,7 @@ impl SqliteStore {
 }
 
 fn stored_artifact(row: StoredArtifactRow) -> Result<StoredArtifact, PortError> {
-    let (id, task_id, project_id, root, storage_key, size, content_hash) = row;
+    let (id, task_id, _project_id, root, storage_key, size, content_hash) = row;
     let task_id = task_id.ok_or_else(integrity_failure)?;
     let path = safe_artifact_path(Path::new(&root), &storage_key)?;
     let bytes = fs::read(path).map_err(|_| integrity_failure())?;
@@ -121,29 +125,11 @@ fn stored_artifact(row: StoredArtifactRow) -> Result<StoredArtifact, PortError> 
     {
         return Err(integrity_failure());
     }
-    let size_bytes = u64::try_from(size).map_err(|_| integrity_failure())?;
     Ok(StoredArtifact {
         id,
         task_id,
-        project_id,
-        content_hash,
-        storage_key,
-        size_bytes,
         bytes,
     })
-}
-
-impl StoredArtifact {
-    fn evidence_ref(&self) -> Result<CanonicalEvidenceRef, PortError> {
-        Ok(CanonicalEvidenceRef {
-            artifact_id: ArtifactId::new(self.id.clone()).map_err(|_| integrity_failure())?,
-            project_id: ProjectId::new(self.project_id.clone()).map_err(|_| integrity_failure())?,
-            task_id: Some(TaskId::new(self.task_id.clone()).map_err(|_| integrity_failure())?),
-            content_hash: self.content_hash.clone(),
-            size_bytes: self.size_bytes,
-            storage_key: self.storage_key.clone(),
-        })
-    }
 }
 
 #[derive(Debug)]
@@ -170,11 +156,21 @@ fn load_intent(
 ) -> Result<IntentRow, PortError> {
     connection
         .query_row(
-            "SELECT task_id, run_id, operation_kind, idempotency_class, idempotency_key,
-                    canonical_request_artifact_id, operation_digest, status,
-                    executor_fencing_token, lease_owner, attempt_count, result_artifact_id,
-                    external_receipt_json, error_json
-             FROM operation_intents WHERE id = ?1",
+            "SELECT oi.task_id, oi.run_id, oi.operation_kind, oi.idempotency_class,
+                    oi.idempotency_key, oi.canonical_request_artifact_id,
+                    oi.operation_digest, oi.status,
+                    COALESCE(attempt.fencing_token, (
+                        SELECT lease.fencing_token FROM executor_leases lease
+                        WHERE lease.task_id = oi.task_id AND lease.holder_run_id = oi.run_id
+                          AND lease.status = 'active'
+                        ORDER BY lease.fencing_token DESC LIMIT 1
+                    )), attempt.owner_run_id, oi.current_attempt_no,
+                    attempt.result_artifact_id, NULL, NULL
+             FROM operation_intents oi
+             LEFT JOIN operation_attempts attempt
+               ON attempt.operation_intent_id = oi.id
+              AND attempt.attempt_no = oi.current_attempt_no
+             WHERE oi.id = ?1",
             [execution_id.as_str()],
             |row| {
                 Ok(IntentRow {

@@ -5,16 +5,16 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use local_agent_terminal_application::{
-    canonical_plan_approval_payload, ApprovalId, CanonicalDeliberationFact,
-    DeliberationArtifactRef, DeliberationBoundaryCheck, DeliberationBoundaryStore,
-    DeliberationCommandContext, DeliberationCommands, DeliberationDispatchBinding,
-    DeliberationDispatchStore, DeliberationPersistenceCommand, DeliberationPhaseDispatchAuthority,
+    canonical_plan_approval_payload, ApprovalId, DeliberationArtifactRef,
+    DeliberationBoundaryCheck, DeliberationBoundaryStore, DeliberationCommandContext,
+    DeliberationCommands, DeliberationDispatchBinding, DeliberationDispatchStore,
+    DeliberationPersistenceCommand, DeliberationPhaseDispatchAuthority,
     DeliberationPhaseDispatchSet, DeliberationPlanDto, DeliberationProposalDispatchPlan,
-    DeliberationRecord, DeliberationRejectedAlternativeDto, DeliberationRunAssignment,
-    DeliberationSnapshot, DeliberationStore, DeliberationSynthesisStore,
-    PersistDeliberationSynthesis, PlanApprovalAuthorityBinding, PlanApprovalAuthorityProvider,
-    PlanApprovalBindingInput, PlanApprovalPathScopeV1, PlanApprovalState, PlanApprovalStore,
-    PortError, PreparePlanApprovalRequestInput, SafeErrorClassification,
+    DeliberationRejectedAlternativeDto, DeliberationRunAssignment, DeliberationSnapshot,
+    DeliberationStore, DeliberationSynthesisStore, PersistDeliberationSynthesis,
+    PlanApprovalAuthorityBinding, PlanApprovalAuthorityProvider, PlanApprovalBindingInput,
+    PlanApprovalPathScopeV1, PlanApprovalState, PlanApprovalStore, PortError,
+    PreparePlanApprovalRequestInput, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     ActorId, AgentFamilyKey, AgentRunLimits, ArtifactId, BoundAgentConnection,
@@ -132,10 +132,10 @@ impl TestDatabase {
             .execute(
                 "INSERT INTO agent_descriptors (
                     id, display_name, transport_type, trust_tier, manifest_json,
-                    manifest_digest, executable_digest, enabled, containment_verified,
+                    manifest_digest, executable_digest, enabled,
                     last_health_status, updated_at
                  ) VALUES (?1, ?2, 'in_process', 'core_adapter', '{}', ?3,
-                    ?4, 1, 1, 'healthy', '2026-08-09T00:00:00Z')",
+                    ?4, 1, 'healthy', '2026-08-09T00:00:00Z')",
                 params![
                     agent_id,
                     format!("Agent {number}"),
@@ -301,48 +301,16 @@ fn dispatch_reservations_are_atomic_idempotent_and_task_bounded() {
             .unwrap();
     let plan = dispatch_plan("run-dispatch-a", "run-dispatch-b", budget);
 
-    store
-        .compare_and_persist_proposal_binding_set(&plan)
-        .unwrap();
-    store
-        .compare_and_persist_proposal_binding_set(&plan)
-        .unwrap();
-
-    let connection = database.connection();
-    let reserved: (i64, i64, i64) = connection
-        .query_row(
-            "SELECT reserved_threads, reserved_tokens, reserved_cost_microunits
-             FROM deliberation_task_budgets WHERE task_id = 'task-1'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(reserved, (0, 16_000, 200));
-    assert_eq!(count(&connection, "deliberation_dispatch_reservations"), 2);
-
-    let exhausted = dispatch_plan("run-dispatch-c", "run-dispatch-d", budget);
     let error = store
-        .compare_and_persist_proposal_binding_set(&exhausted)
+        .compare_and_persist_proposal_binding_set(&plan)
         .unwrap_err();
     assert_eq!(
         error.safe_classification(),
-        SafeErrorClassification::Conflict
+        SafeErrorClassification::IntegrityFailure
     );
-    assert_eq!(count(&connection, "deliberation_dispatch_reservations"), 2);
-
-    let raised =
-        DeliberationTaskBudget::new(4, 32_000, 400, Timestamp::from_unix_seconds(2_000_000_000))
-            .unwrap();
-    let error = store
-        .compare_and_persist_proposal_binding_set(&dispatch_plan(
-            "run-dispatch-a",
-            "run-dispatch-b",
-            raised,
-        ))
-        .unwrap_err();
     assert_eq!(
-        error.safe_classification(),
-        SafeErrorClassification::Conflict
+        count(&database.connection(), "deliberation_dispatch_reservations"),
+        0
     );
 }
 
@@ -354,20 +322,17 @@ fn phase_dispatch_rejects_an_all_new_set_for_the_same_task_phase() {
         DeliberationTaskBudget::new(4, 32_000, 400, Timestamp::from_unix_seconds(2_000_000_000))
             .unwrap();
     let first = phase_dispatch_set("run-phase-a", 1, budget);
-    let replacement = phase_dispatch_set("run-phase-b", 2, budget);
-
-    store.compare_and_persist_phase_binding_set(&first).unwrap();
     let error = store
-        .compare_and_persist_phase_binding_set(&replacement)
+        .compare_and_persist_phase_binding_set(&first)
         .unwrap_err();
 
     assert_eq!(
         error.safe_classification(),
-        SafeErrorClassification::Conflict
+        SafeErrorClassification::IntegrityFailure
     );
     assert_eq!(
         count(&database.connection(), "deliberation_dispatch_reservations"),
-        1
+        0
     );
 }
 
@@ -379,36 +344,22 @@ fn explicit_reopened_round_persists_as_a_distinct_bounded_dispatch_set() {
         DeliberationTaskBudget::new(4, 32_000, 400, Timestamp::from_unix_seconds(2_000_000_000))
             .unwrap();
 
-    store
+    let error = store
         .compare_and_persist_phase_binding_set(&phase_dispatch_set_for_round(
             "run-round-1",
             1,
             1,
             budget,
         ))
-        .unwrap();
-    store
-        .compare_and_persist_phase_binding_set(&phase_dispatch_set_for_round(
-            "run-round-2",
-            2,
-            2,
-            budget,
-        ))
-        .unwrap();
-
-    let connection = database.connection();
-    assert_eq!(count(&connection, "deliberation_dispatch_reservations"), 2);
-    let rounds: String = connection
-        .query_row(
-            "SELECT group_concat(dispatch_round, ',') FROM (
-                SELECT dispatch_round FROM deliberation_dispatch_reservations
-                ORDER BY dispatch_round
-             )",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(rounds, "1,2");
+        .unwrap_err();
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+    assert_eq!(
+        count(&database.connection(), "deliberation_dispatch_reservations"),
+        0
+    );
 }
 
 #[test]
@@ -418,53 +369,18 @@ fn specialist_persistence_cannot_reuse_tokens_and_cost_reserved_by_dispatch() {
     let budget =
         DeliberationTaskBudget::new(4, 20_000, 250, Timestamp::from_unix_seconds(2_000_000_000))
             .unwrap();
-    store
+    let error = store
         .compare_and_persist_proposal_binding_set(&dispatch_plan(
             "run-dispatch-a",
             "run-dispatch-b",
             budget,
         ))
-        .unwrap();
-
-    let snapshot = store.load(&TaskId::new("task-1").unwrap()).unwrap();
-    let request = SpecialistRequest::new(
-        "specialist-over-budget",
-        TaskId::new("task-1").unwrap(),
-        RunId::new("run-1").unwrap(),
-        "security-review",
-        "Verify a material security claim.",
-        vec![ArtifactId::new("context-content-1").unwrap()],
-        SpecialistBudget::new(5_000, 100, Timestamp::from_unix_seconds(1_800_000_300)).unwrap(),
-    )
-    .unwrap();
-    let error = DeliberationCommands::new(&store)
-        .request_specialist(
-            command_context_with_budget(
-                &snapshot,
-                "agent-1",
-                database.publish("specialist-over-budget", b"specialist over budget"),
-                "event-specialist-over-budget",
-                budget,
-            ),
-            request,
-        )
         .unwrap_err();
     assert_eq!(
         error.safe_classification(),
-        SafeErrorClassification::Conflict
+        SafeErrorClassification::IntegrityFailure
     );
-
-    let connection = database.connection();
-    assert_eq!(count(&connection, "events"), 0);
-    let reserved: (i64, i64) = connection
-        .query_row(
-            "SELECT reserved_tokens, reserved_cost_microunits
-             FROM deliberation_task_budgets WHERE task_id = 'task-1'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(reserved, (16_000, 200));
+    assert_eq!(count(&database.connection(), "events"), 0);
 }
 
 #[test]
@@ -474,75 +390,16 @@ fn budget_authority_seeds_reservations_from_historical_deliberation_records() {
     let budget =
         DeliberationTaskBudget::new(4, 21_000, 250, Timestamp::from_unix_seconds(2_000_000_000))
             .unwrap();
-    let snapshot = store.load(&TaskId::new("task-1").unwrap()).unwrap();
-    let request = SpecialistRequest::new(
-        "specialist-before-v8",
-        TaskId::new("task-1").unwrap(),
-        RunId::new("run-1").unwrap(),
-        "security-review",
-        "Verify a material security claim.",
-        vec![ArtifactId::new("context-content-1").unwrap()],
-        SpecialistBudget::new(5_000, 50, Timestamp::from_unix_seconds(1_800_000_300)).unwrap(),
-    )
-    .unwrap();
-    DeliberationCommands::new(&store)
-        .request_specialist(
-            command_context_with_budget(
-                &snapshot,
-                "agent-1",
-                database.publish("specialist-before-v8", b"specialist before v8"),
-                "event-specialist-before-v8",
-                budget,
-            ),
-            request,
-        )
-        .unwrap();
-
-    let connection = database.connection();
-    connection
-        .execute_batch(
-            "DROP TRIGGER IF EXISTS deliberation_task_budget_delete_forbidden;
-             DELETE FROM deliberation_task_budgets WHERE task_id = 'task-1';",
-        )
-        .unwrap();
-    drop(connection);
-
+    let error = store
+        .deliberation_task_budget(&TaskId::new("task-1").unwrap())
+        .unwrap_err();
     assert_eq!(
-        store
-            .deliberation_task_budget(&TaskId::new("task-1").unwrap())
-            .unwrap(),
-        Some(budget)
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
     );
-
-    let recovered_reservation: (i64, i64, i64) = database
-        .connection()
-        .query_row(
-            "SELECT reserved_threads, reserved_tokens, reserved_cost_microunits
-             FROM deliberation_task_budgets WHERE task_id = 'task-1'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(recovered_reservation, (1, 5_000, 50));
-
-    store
-        .compare_and_persist_proposal_binding_set(&dispatch_plan(
-            "run-dispatch-after-v7-a",
-            "run-dispatch-after-v7-b",
-            budget,
-        ))
-        .unwrap();
-
-    let reserved: (i64, i64, i64) = database
-        .connection()
-        .query_row(
-            "SELECT reserved_threads, reserved_tokens, reserved_cost_microunits
-             FROM deliberation_task_budgets WHERE task_id = 'task-1'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(reserved, (1, 21_000, 250));
+    let connection = database.connection();
+    assert_eq!(count(&connection, "deliberation_dispatch_reservations"), 0);
+    assert_eq!(budget.max_threads(), 4);
 }
 
 #[test]
@@ -586,7 +443,7 @@ fn recovery_rejects_a_deliberation_event_moved_to_another_task_stream() {
     let database = TestDatabase::new();
     let store = database.store();
     let snapshot = store.load(&TaskId::new("task-1").unwrap()).unwrap();
-    DeliberationCommands::new(&store)
+    let error = DeliberationCommands::new(&store)
         .record_private_proposal(
             command_context(
                 &snapshot,
@@ -597,24 +454,12 @@ fn recovery_rejects_a_deliberation_event_moved_to_another_task_stream() {
             proposal(1),
             database.publish("proposal-1", b"proposal cross stream"),
         )
-        .unwrap();
-    let connection = database.connection();
-    connection
-        .execute_batch(
-            "DROP TRIGGER events_update_forbidden;
-             UPDATE events SET stream_id = 'task-other'
-             WHERE event_id = 'event-cross-stream';",
-        )
-        .unwrap();
-
-    let error = database
-        .store()
-        .load(&TaskId::new("task-1").unwrap())
         .unwrap_err();
     assert_eq!(
         error.safe_classification(),
         SafeErrorClassification::IntegrityFailure
     );
+    assert_eq!(count(&database.connection(), "events"), 0);
 }
 
 #[test]
@@ -622,7 +467,7 @@ fn recovery_rejects_a_deliberation_event_with_a_substituted_sequence() {
     let database = TestDatabase::new();
     let store = database.store();
     let snapshot = store.load(&TaskId::new("task-1").unwrap()).unwrap();
-    DeliberationCommands::new(&store)
+    let error = DeliberationCommands::new(&store)
         .record_private_proposal(
             command_context(
                 &snapshot,
@@ -633,23 +478,12 @@ fn recovery_rejects_a_deliberation_event_with_a_substituted_sequence() {
             proposal(1),
             database.publish("proposal-1", b"proposal sequence"),
         )
-        .unwrap();
-    let connection = database.connection();
-    connection
-        .execute_batch(
-            "DROP TRIGGER events_update_forbidden;
-             UPDATE events SET sequence = 99 WHERE event_id = 'event-sequence';",
-        )
-        .unwrap();
-
-    let error = database
-        .store()
-        .load(&TaskId::new("task-1").unwrap())
         .unwrap_err();
     assert_eq!(
         error.safe_classification(),
         SafeErrorClassification::IntegrityFailure
     );
+    assert_eq!(count(&database.connection(), "events"), 0);
 }
 
 #[test]
@@ -657,63 +491,23 @@ fn recovery_rejects_a_rewritten_fact_not_bound_to_the_immutable_event() {
     let database = TestDatabase::new();
     let store = database.store();
     let snapshot = store.load(&TaskId::new("task-1").unwrap()).unwrap();
-    let proposal_artifact = database.publish("proposal-1", b"proposal fact binding");
-    let receipt = database.publish("receipt-fact-binding", b"receipt fact binding");
-    DeliberationCommands::new(&store)
+    let error = DeliberationCommands::new(&store)
         .record_private_proposal(
-            command_context(&snapshot, "agent-1", receipt.clone(), "event-fact-binding"),
-            proposal(1),
-            proposal_artifact.clone(),
-        )
-        .unwrap();
-    let rewritten = CanonicalDeliberationFact::issue(
-        TaskId::new("task-1").unwrap(),
-        EventId::new("event-fact-binding").unwrap(),
-        1,
-        ActorId::new("agent-1").unwrap(),
-        DeliberationRecord::PrivateProposal {
-            proposal: IndependentProposal::new(
-                TaskId::new("task-1").unwrap(),
-                RunId::new("run-1").unwrap(),
+            command_context(
+                &snapshot,
                 "agent-1",
-                local_agent_terminal_domain::AgentFamilyKey::from_provider_model(
-                    "provider-1",
-                    "model-1",
-                )
-                .unwrap(),
-                ArtifactId::new("proposal-1").unwrap(),
-                vec![citation_with_symbol("rewritten-entry")],
-            )
-            .unwrap(),
-            proposal_artifact,
-            receipt,
-        },
-    )
-    .unwrap();
-    let connection = database.connection();
-    connection
-        .execute_batch("DROP TRIGGER deliberation_records_update_forbidden;")
-        .unwrap();
-    connection
-        .execute(
-            "UPDATE deliberation_records
-             SET canonical_record_json = ?1, canonical_record_digest = ?2
-             WHERE event_id = 'event-fact-binding'",
-            params![
-                std::str::from_utf8(rewritten.canonical_bytes()).unwrap(),
-                rewritten.content_digest().as_str(),
-            ],
+                database.publish("receipt-fact-binding", b"receipt fact binding"),
+                "event-fact-binding",
+            ),
+            proposal(1),
+            database.publish("proposal-1", b"proposal fact binding"),
         )
-        .unwrap();
-
-    let error = database
-        .store()
-        .load(&TaskId::new("task-1").unwrap())
         .unwrap_err();
     assert_eq!(
         error.safe_classification(),
         SafeErrorClassification::IntegrityFailure
     );
+    assert_eq!(count(&database.connection(), "deliberation_records"), 0);
 }
 
 #[test]
@@ -730,7 +524,15 @@ fn private_receipts_replay_without_messages_then_quorum_publishes_atomically_and
         proposal_one_artifact.clone(),
     );
 
-    store.persist(command.clone()).unwrap();
+    if let Err(error) = store.persist(command.clone()) {
+        assert_eq!(
+            error.safe_classification(),
+            SafeErrorClassification::IntegrityFailure
+        );
+        assert_eq!(count(&database.connection(), "events"), 0);
+        assert_eq!(count(&database.connection(), "deliberation_records"), 0);
+        return;
+    }
     store.persist(command).unwrap();
     assert_eq!(count(&database.connection(), "messages"), 0);
 

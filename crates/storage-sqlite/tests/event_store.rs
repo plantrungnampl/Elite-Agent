@@ -60,7 +60,7 @@ fn seed_task(path: &Path, task_id: &str) {
                 "project-1",
                 "Project",
                 "C:/repo",
-                "repo-identity",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "2026-07-26T00:00:00Z",
                 "default",
                 "application_data",

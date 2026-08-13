@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use local_agent_terminal_application::SafeErrorClassification;
+use local_agent_terminal_domain::TaskId;
 use local_agent_terminal_storage_sqlite::{OpenError, SqliteStore};
 use rusqlite::{params, Connection};
 
@@ -146,6 +148,32 @@ fn clean_v7_does_not_fabricate_task_workflow_authority() {
 }
 
 #[test]
+fn unavailable_trusted_budget_authority_fails_closed_without_projection() {
+    let directory = TempDirectory::new();
+    let path = directory.database_path();
+    let store = SqliteStore::open(&path).unwrap();
+
+    let error = store
+        .deliberation_task_budget(&TaskId::new("task-1").unwrap())
+        .unwrap_err();
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::IntegrityFailure
+    );
+
+    let connection = Connection::open(path).unwrap();
+    let budget_projection_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table' AND name = 'deliberation_task_budgets'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(budget_projection_count, 0);
+}
+
+#[test]
 fn application_version_marker_is_not_accepted_as_normative_v7() {
     let directory = TempDirectory::new();
     let path = directory.database_path();
@@ -159,6 +187,50 @@ fn application_version_marker_is_not_accepted_as_normative_v7() {
     drop(connection);
 
     let error = SqliteStore::open(path).unwrap_err();
+    assert!(matches!(error, OpenError::UnsupportedSchema { .. }));
+}
+
+#[test]
+fn altered_normative_v7_string_literal_is_rejected() {
+    let directory = TempDirectory::new();
+    let path = directory.database_path();
+    let altered = SQLITE_V7.replacen("'Intake'", "'intake'", 1);
+    install_script(&path, &altered);
+
+    let error = SqliteStore::open(path).unwrap_err();
+
+    assert!(matches!(error, OpenError::UnsupportedSchema { .. }));
+}
+
+#[test]
+fn altered_normative_v7_token_boundary_is_rejected() {
+    let directory = TempDirectory::new();
+    let path = directory.database_path();
+    let altered = SQLITE_V7.replacen(" IS NULL", " ISNULL", 1);
+    install_script(&path, &altered);
+
+    let error = SqliteStore::open(path).unwrap_err();
+
+    assert!(matches!(error, OpenError::UnsupportedSchema { .. }));
+}
+
+#[test]
+fn tampered_workflow_rule_profile_authority_is_rejected() {
+    let directory = TempDirectory::new();
+    let path = directory.database_path();
+    install_script(&path, SQLITE_V7);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO workflow_transition_rule_profiles (rule_id, workflow_profile)
+             VALUES ('WF-P009', 'Standard')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = SqliteStore::open(path).unwrap_err();
+
     assert!(matches!(error, OpenError::UnsupportedSchema { .. }));
 }
 
@@ -185,6 +257,67 @@ fn nonempty_unknown_schema_is_rejected_without_mutation() {
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .unwrap();
     assert_eq!(journal_mode_after, journal_mode_before);
+}
+
+#[test]
+fn exact_v6_with_orphaned_rows_fails_before_migration_without_mutation() {
+    let directory = TempDirectory::new();
+    let path = directory.database_path();
+    install_script(&path, SQLITE_V6);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tasks (
+                id, project_id, title, objective, phase, condition, operation_state,
+                risk_level, base_branch, base_commit, task_branch, worktree_path,
+                current_sequence, workspace_version, fencing_epoch, row_version,
+                active_candidate_commit_oid, active_candidate_tree, created_at, updated_at
+             ) VALUES (
+                'orphan-task', 'missing-project', 'Task', 'Objective', 'Intake', 'Active',
+                'None', 'medium', 'main', ?1, NULL, NULL, 0, 0, 0, 0, NULL, NULL, ?2, ?2
+             )",
+            params![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "2026-08-12T00:00:00.000Z",
+            ],
+        )
+        .unwrap();
+    let before = schema_objects(&connection);
+    drop(connection);
+
+    let error = SqliteStore::open(&path).unwrap_err();
+
+    assert!(matches!(
+        error,
+        OpenError::ForeignKeyViolation { ref table, ref parent, .. }
+            if table == "tasks" && parent == "projects"
+    ));
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(schema_objects(&connection), before);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = 'orphan-task'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'workflow_transition_rules'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -301,10 +434,72 @@ fn schema_objects(connection: &Connection) -> SchemaObjects {
 }
 
 fn normalize_sql(sql: &str) -> String {
-    sql.chars()
-        .filter(|character| !character.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect()
+    let mut normalized = String::with_capacity(sql.len());
+    let mut characters = sql.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            character if character.is_whitespace() => {}
+            '-' if characters.peek() == Some(&'-') => {
+                characters.next();
+                for comment_character in characters.by_ref() {
+                    if comment_character == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if characters.peek() == Some(&'*') => {
+                characters.next();
+                let mut prior = '\0';
+                for comment_character in characters.by_ref() {
+                    if prior == '*' && comment_character == '/' {
+                        break;
+                    }
+                    prior = comment_character;
+                }
+            }
+            '\'' | '"' | '`' | '[' => {
+                let closing = if character == '[' { ']' } else { character };
+                let mut token = String::from(character);
+                while let Some(quoted_character) = characters.next() {
+                    token.push(quoted_character);
+                    if quoted_character == closing {
+                        if characters.peek() == Some(&closing) {
+                            token.push(characters.next().expect("peeked closing quote exists"));
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                append_sql_token(&mut normalized, 'q', &token);
+            }
+            character if is_sql_word_character(character) => {
+                let mut token = String::from(character);
+                while characters
+                    .peek()
+                    .is_some_and(|next| is_sql_word_character(*next))
+                {
+                    token.push(characters.next().expect("peeked word character exists"));
+                }
+                append_sql_token(&mut normalized, 'w', &token.to_lowercase());
+            }
+            character => {
+                let token = String::from(character);
+                append_sql_token(&mut normalized, 'p', &token);
+            }
+        }
+    }
+    normalized
+}
+
+fn is_sql_word_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '$')
+}
+
+fn append_sql_token(normalized: &mut String, kind: char, token: &str) {
+    normalized.push(kind);
+    normalized.push_str(&token.len().to_string());
+    normalized.push(':');
+    normalized.push_str(token);
 }
 
 fn seed_task(connection: &Connection) {

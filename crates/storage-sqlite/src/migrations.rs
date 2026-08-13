@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::OnceLock;
 
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
@@ -17,10 +18,30 @@ const APP_PROJECTION_SCHEMA: &str = include_str!("app_projection_schema.sql");
 static EXPECTED_V6_OBJECTS: OnceLock<SchemaObjects> = OnceLock::new();
 static EXPECTED_V7_OBJECTS: OnceLock<SchemaObjects> = OnceLock::new();
 static EXPECTED_COMPLETE_OBJECTS: OnceLock<SchemaObjects> = OnceLock::new();
+static EXPECTED_WORKFLOW_RULE_AUTHORITY: OnceLock<WorkflowRuleAuthority> = OnceLock::new();
+
+const WORKFLOW_RULE_TABLES: [&str; 6] = [
+    "workflow_transition_rules",
+    "workflow_transition_rule_sources",
+    "workflow_transition_rule_profiles",
+    "workflow_transition_rule_outcomes",
+    "workflow_transition_rule_guard_requirements",
+    "workflow_transition_rule_effect_requirements",
+];
 
 type ObjectKey = (String, String);
 type ObjectDefinition = (String, String);
 type SchemaObjects = BTreeMap<ObjectKey, ObjectDefinition>;
+type WorkflowRuleAuthority = BTreeMap<String, Vec<Vec<AuthorityValue>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum AuthorityValue {
+    Null,
+    Integer(i64),
+    Real(u64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SchemaKind {
@@ -101,6 +122,8 @@ pub(crate) fn validate_or_migrate(connection: &mut Connection) -> Result<(), Ope
     if schema_kind == SchemaKind::Unsupported {
         return Err(unsupported_schema());
     }
+    validate_foreign_keys(connection)?;
+    validate_integrity(connection)?;
     configure_runtime_pragmas(connection)?;
 
     match schema_kind {
@@ -118,14 +141,11 @@ pub(crate) fn verify_required_schema(connection: &Connection) -> Result<(), Open
     if schema_objects(connection)? != *expected_complete_objects()? {
         return Err(unsupported_schema());
     }
+    verify_workflow_rule_authority(connection)?;
 
     verify_runtime_pragmas(connection)?;
     validate_foreign_keys(connection)?;
-    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-    if integrity != "ok" {
-        return Err(unsupported_schema());
-    }
-    Ok(())
+    validate_integrity(connection)
 }
 
 fn recognize_schema(connection: &Connection) -> Result<SchemaKind, OpenError> {
@@ -137,6 +157,7 @@ fn recognize_schema(connection: &Connection) -> Result<SchemaKind, OpenError> {
         return Ok(SchemaKind::NormativeV6);
     }
     if actual == *expected_v7_objects()? || actual == *expected_complete_objects()? {
+        verify_workflow_rule_authority(connection)?;
         return Ok(SchemaKind::NormativeV7);
     }
     Ok(SchemaKind::Unsupported)
@@ -234,9 +255,117 @@ fn schema_objects(connection: &Connection) -> Result<SchemaObjects, OpenError> {
 }
 
 fn normalize_sql(sql: &str) -> String {
-    sql.chars()
-        .filter(|character| !character.is_whitespace())
-        .flat_map(char::to_lowercase)
+    let mut normalized = String::with_capacity(sql.len());
+    let mut characters = sql.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            character if character.is_whitespace() => {}
+            '-' if characters.peek() == Some(&'-') => {
+                characters.next();
+                for comment_character in characters.by_ref() {
+                    if comment_character == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if characters.peek() == Some(&'*') => {
+                characters.next();
+                let mut prior = '\0';
+                for comment_character in characters.by_ref() {
+                    if prior == '*' && comment_character == '/' {
+                        break;
+                    }
+                    prior = comment_character;
+                }
+            }
+            '\'' | '"' | '`' | '[' => {
+                let closing = if character == '[' { ']' } else { character };
+                let mut token = String::from(character);
+                while let Some(quoted_character) = characters.next() {
+                    token.push(quoted_character);
+                    if quoted_character == closing {
+                        if characters.peek() == Some(&closing) {
+                            token.push(characters.next().expect("peeked closing quote exists"));
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                append_sql_token(&mut normalized, 'q', &token);
+            }
+            character if is_sql_word_character(character) => {
+                let mut token = String::from(character);
+                while characters
+                    .peek()
+                    .is_some_and(|next| is_sql_word_character(*next))
+                {
+                    token.push(characters.next().expect("peeked word character exists"));
+                }
+                append_sql_token(&mut normalized, 'w', &token.to_lowercase());
+            }
+            character => {
+                let token = String::from(character);
+                append_sql_token(&mut normalized, 'p', &token);
+            }
+        }
+    }
+    normalized
+}
+
+fn is_sql_word_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '$')
+}
+
+fn append_sql_token(normalized: &mut String, kind: char, token: &str) {
+    normalized.push(kind);
+    normalized.push_str(&token.len().to_string());
+    normalized.push(':');
+    normalized.push_str(token);
+}
+
+fn expected_workflow_rule_authority() -> Result<&'static WorkflowRuleAuthority, OpenError> {
+    if let Some(authority) = EXPECTED_WORKFLOW_RULE_AUTHORITY.get() {
+        return Ok(authority);
+    }
+
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(SQLITE_V7)?;
+    let authority = workflow_rule_authority(&connection)?;
+    let _ = EXPECTED_WORKFLOW_RULE_AUTHORITY.set(authority);
+    Ok(EXPECTED_WORKFLOW_RULE_AUTHORITY
+        .get()
+        .expect("workflow rule authority cache is initialized by this call or a concurrent caller"))
+}
+
+fn verify_workflow_rule_authority(connection: &Connection) -> Result<(), OpenError> {
+    if workflow_rule_authority(connection)? == *expected_workflow_rule_authority()? {
+        Ok(())
+    } else {
+        Err(unsupported_schema())
+    }
+}
+
+fn workflow_rule_authority(connection: &Connection) -> Result<WorkflowRuleAuthority, OpenError> {
+    WORKFLOW_RULE_TABLES
+        .into_iter()
+        .map(|table| {
+            let mut statement = connection.prepare(&format!("SELECT * FROM {table}"))?;
+            let column_count = statement.column_count();
+            let rows = statement.query_map([], |row| {
+                (0..column_count)
+                    .map(|index| match row.get_ref(index)? {
+                        ValueRef::Null => Ok(AuthorityValue::Null),
+                        ValueRef::Integer(value) => Ok(AuthorityValue::Integer(value)),
+                        ValueRef::Real(value) => Ok(AuthorityValue::Real(value.to_bits())),
+                        ValueRef::Text(value) => Ok(AuthorityValue::Text(value.to_vec())),
+                        ValueRef::Blob(value) => Ok(AuthorityValue::Blob(value.to_vec())),
+                    })
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()
+            })?;
+            let mut rows = rows.collect::<Result<Vec<_>, _>>()?;
+            rows.sort();
+            Ok((table.to_owned(), rows))
+        })
         .collect()
 }
 
@@ -291,6 +420,15 @@ fn validate_foreign_keys(connection: &Connection) -> Result<(), OpenError> {
         });
     }
     Ok(())
+}
+
+fn validate_integrity(connection: &Connection) -> Result<(), OpenError> {
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity == "ok" {
+        Ok(())
+    } else {
+        Err(unsupported_schema())
+    }
 }
 
 fn unsupported_schema() -> OpenError {

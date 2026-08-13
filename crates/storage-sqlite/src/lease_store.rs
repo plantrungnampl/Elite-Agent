@@ -55,17 +55,15 @@ impl SqliteStore {
             .execute(
                 "INSERT INTO agent_descriptors (
                     id, display_name, transport_type, trust_tier, manifest_json,
-                    manifest_digest, executable_digest, enabled, containment_verified,
-                    last_health_status, updated_at
+                    manifest_digest, executable_digest, enabled, last_health_status, updated_at
                  ) VALUES (
                     ?1, 'Workspace coordinator', 'in_process', 'core_adapter', ?2,
-                    ?3, NULL, 1, 1, 'healthy', ?4
+                    ?3, NULL, 1, 'healthy', ?4
                  )
                  ON CONFLICT(id) DO UPDATE SET
                     manifest_json = excluded.manifest_json,
                     manifest_digest = excluded.manifest_digest,
                     enabled = 1,
-                    containment_verified = 1,
                     last_health_status = 'healthy',
                     updated_at = excluded.updated_at",
                 params![
@@ -207,7 +205,8 @@ impl ExecutorLeaseStore for SqliteStore {
         let next_sequence = current_sequence.checked_add(1).ok_or_else(invalid_input)?;
         let updated = transaction
             .execute(
-                "UPDATE tasks SET fencing_epoch = ?1, current_sequence = ?2, updated_at = ?3
+                "UPDATE tasks SET fencing_epoch = ?1, current_sequence = ?2, updated_at = ?3,
+                    row_version = row_version + 1
                  WHERE id = ?4 AND fencing_epoch = ?5 AND current_sequence = ?6",
                 params![
                     next_epoch,
@@ -222,39 +221,22 @@ impl ExecutorLeaseStore for SqliteStore {
         if updated != 1 {
             return Err(conflict());
         }
-        if previous.is_some() {
-            transaction
-                .execute(
-                    "UPDATE executor_leases SET
-                        holder_run_id = ?1, fencing_token = ?2, status = 'active',
-                        acquired_at = ?3, expires_at = ?4, released_at = NULL
-                     WHERE task_id = ?5 AND status <> 'active'",
-                    params![
-                        request.holder_run_id.as_str(),
-                        next_epoch,
-                        request.acquired_at,
-                        request.expires_at,
-                        request.task_id.as_str(),
-                    ],
-                )
-                .map_err(sqlite_error_to_port)?;
-        } else {
-            transaction
-                .execute(
-                    "INSERT INTO executor_leases (
-                        task_id, holder_run_id, fencing_token, status,
-                        acquired_at, expires_at, released_at
-                     ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, NULL)",
-                    params![
-                        request.task_id.as_str(),
-                        request.holder_run_id.as_str(),
-                        next_epoch,
-                        request.acquired_at,
-                        request.expires_at,
-                    ],
-                )
-                .map_err(sqlite_error_to_port)?;
-        }
+        transaction
+            .execute(
+                "INSERT INTO executor_leases (
+                    id, task_id, holder_run_id, fencing_token, status,
+                    acquired_at, expires_at, released_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, NULL)",
+                params![
+                    format!("lease:{}:{next_epoch}", request.task_id.as_str()),
+                    request.task_id.as_str(),
+                    request.holder_run_id.as_str(),
+                    next_epoch,
+                    request.acquired_at,
+                    request.expires_at,
+                ],
+            )
+            .map_err(sqlite_error_to_port)?;
         let event_type = if previous.is_some() {
             "executor.lease.replaced"
         } else {
@@ -365,7 +347,8 @@ impl ExecutorLeaseStore for SqliteStore {
         )?;
         transaction
             .execute(
-                "UPDATE tasks SET current_sequence = ?1, updated_at = ?2
+                "UPDATE tasks SET current_sequence = ?1, updated_at = ?2,
+                    row_version = row_version + 1
                  WHERE id = ?3 AND current_sequence = ?4",
                 params![
                     next_sequence,
@@ -457,7 +440,8 @@ impl ExecutorLeaseStore for SqliteStore {
             )?;
             transaction
                 .execute(
-                    "UPDATE tasks SET fencing_epoch = ?1, current_sequence = ?2, updated_at = ?3
+                    "UPDATE tasks SET fencing_epoch = ?1, current_sequence = ?2, updated_at = ?3,
+                        row_version = row_version + 1
                      WHERE id = ?4 AND current_sequence = ?5 AND fencing_epoch = ?6",
                     params![
                         next_epoch,
@@ -492,7 +476,8 @@ impl ExecutorLeaseStore for SqliteStore {
             .query_row(
                 "SELECT task_id, holder_run_id, fencing_token, status,
                         acquired_at, expires_at, released_at
-                 FROM executor_leases WHERE task_id = ?1",
+                 FROM executor_leases WHERE task_id = ?1
+                 ORDER BY fencing_token DESC LIMIT 1",
                 [claim.task_id().as_str()],
                 raw_lease,
             )
@@ -576,7 +561,8 @@ fn load_lease(
         .query_row(
             "SELECT task_id, holder_run_id, fencing_token, status,
                     acquired_at, expires_at, released_at
-             FROM executor_leases WHERE task_id = ?1",
+             FROM executor_leases WHERE task_id = ?1
+             ORDER BY fencing_token DESC LIMIT 1",
             [task_id.as_str()],
             raw_lease,
         )
