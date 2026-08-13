@@ -41,7 +41,7 @@ impl SqliteStore {
                       AND json_extract(payload_json, '$.approvalType') = 'tool'
                  )
                  SELECT oi.id, oi.canonical_request_artifact_id, oi.status,
-                        oi.executor_fencing_token, te.status, te.policy_decision_id,
+                        attempt.fencing_token, te.status, te.policy_decision_id,
                         te.approval_id, te.started_at, te.completed_at, ae.approval_id, a.status,
                         a.operation_digest, a.expires_at,
                         COALESCE(te.policy_decision_id, ae.approval_policy_decision_id),
@@ -54,6 +54,9 @@ impl SqliteStore {
                               AND json_extract(cancel_event.payload_json, '$.executionId') = oi.id
                         )
                  FROM operation_intents oi
+                 LEFT JOIN operation_attempts attempt
+                   ON attempt.operation_intent_id = oi.id
+                  AND attempt.attempt_no = oi.current_attempt_no
                  LEFT JOIN tool_executions te ON te.operation_intent_id = oi.id
                  LEFT JOIN approval_events ae ON ae.execution_id = oi.id
                  LEFT JOIN approvals a ON a.id = ae.approval_id

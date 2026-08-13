@@ -122,12 +122,16 @@ impl SqliteStore {
         let connection = self.connection().map_err(open_error_to_port)?;
         let raw: Option<crate::workspace_store::RawOperationIntent> = connection
             .query_row(
-                "SELECT id, task_id, operation_kind, idempotency_class, idempotency_key,
-                        canonical_request_artifact_id, operation_digest, status,
-                        executor_fencing_token, attempt_count, created_at, updated_at
-                 FROM operation_intents
-                 WHERE task_id = ?1 AND operation_kind = 'worktree.create'
-                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                "SELECT oi.id, oi.task_id, oi.operation_kind, oi.idempotency_class,
+                        oi.idempotency_key, oi.canonical_request_artifact_id,
+                        oi.operation_digest, oi.status, attempt.fencing_token,
+                        oi.current_attempt_no, oi.created_at, oi.updated_at
+                 FROM operation_intents oi
+                 LEFT JOIN operation_attempts attempt
+                   ON attempt.operation_intent_id = oi.id
+                  AND attempt.attempt_no = oi.current_attempt_no
+                 WHERE oi.task_id = ?1 AND oi.operation_kind = 'worktree.create'
+                 ORDER BY oi.created_at DESC, oi.id DESC LIMIT 1",
                 [task_id.as_str()],
                 raw_operation_intent,
             )
@@ -164,11 +168,16 @@ impl SqliteStore {
         )?;
         let discard_status: Option<String> = connection
             .query_row(
-                "SELECT status FROM operation_intents
-                 WHERE task_id = ?1
-                   AND operation_kind = 'workspace.recovery.discard'
-                   AND json_extract(external_receipt_json, '$.candidateId') = ?2
-                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                "SELECT recovery.status
+                 FROM operation_intents recovery
+                 JOIN events recovery_event
+                   ON recovery_event.stream_id = recovery.task_id
+                  AND recovery_event.event_type = 'workspace.recovery.requested'
+                  AND recovery_event.correlation_id = recovery.idempotency_key
+                 WHERE recovery.task_id = ?1
+                   AND recovery.operation_kind = 'workspace.recovery.discard'
+                   AND json_extract(recovery_event.payload_json, '$.candidateId') = ?2
+                 ORDER BY recovery.created_at DESC, recovery.id DESC LIMIT 1",
                 [task_id.as_str(), operation.id.as_str()],
                 |row| row.get(0),
             )
@@ -233,10 +242,14 @@ impl SqliteStore {
         let connection = self.connection().map_err(open_error_to_port)?;
         let mut statement = connection
             .prepare(
-                "SELECT id, task_id, operation_kind, idempotency_class, idempotency_key,
-                        canonical_request_artifact_id, operation_digest, status,
-                        executor_fencing_token, attempt_count, created_at, updated_at
+                "SELECT oi.id, oi.task_id, oi.operation_kind, oi.idempotency_class,
+                        oi.idempotency_key, oi.canonical_request_artifact_id,
+                        oi.operation_digest, oi.status, attempt.fencing_token,
+                        oi.current_attempt_no, oi.created_at, oi.updated_at
                  FROM operation_intents oi
+                 LEFT JOIN operation_attempts attempt
+                   ON attempt.operation_intent_id = oi.id
+                  AND attempt.attempt_no = oi.current_attempt_no
                  WHERE oi.task_id = ?1 AND (
                     (
                         oi.operation_kind LIKE 'workspace.recovery.%'
@@ -249,10 +262,16 @@ impl SqliteStore {
                             SELECT 1 FROM operation_intents recovery
                             WHERE recovery.task_id = oi.task_id
                               AND recovery.operation_kind LIKE 'workspace.recovery.%'
-                              AND json_extract(
-                                    recovery.external_receipt_json,
-                                    '$.candidateId'
-                                  ) = oi.id
+                              AND EXISTS (
+                                  SELECT 1 FROM events recovery_event
+                                  WHERE recovery_event.stream_id = recovery.task_id
+                                    AND recovery_event.event_type = 'workspace.recovery.requested'
+                                    AND recovery_event.correlation_id = recovery.idempotency_key
+                                    AND json_extract(
+                                          recovery_event.payload_json,
+                                          '$.candidateId'
+                                        ) = oi.id
+                              )
                               AND recovery.status NOT IN ('failed', 'cancelled')
                         )
                     )
@@ -271,10 +290,15 @@ impl SqliteStore {
             .collect::<Result<Vec<_>, PortError>>()?;
         let discardable = connection
             .query_row(
-                "SELECT id, task_id, operation_kind, idempotency_class, idempotency_key,
-                        canonical_request_artifact_id, operation_digest, status,
-                        executor_fencing_token, attempt_count, created_at, updated_at
+                "SELECT created.id, created.task_id, created.operation_kind,
+                        created.idempotency_class, created.idempotency_key,
+                        created.canonical_request_artifact_id, created.operation_digest,
+                        created.status, attempt.fencing_token,
+                        created.current_attempt_no, created.created_at, created.updated_at
                  FROM operation_intents created
+                 LEFT JOIN operation_attempts attempt
+                   ON attempt.operation_intent_id = created.id
+                  AND attempt.attempt_no = created.current_attempt_no
                  WHERE created.task_id = ?1
                    AND created.operation_kind = 'worktree.create'
                    AND created.status = 'succeeded'
@@ -282,10 +306,16 @@ impl SqliteStore {
                         SELECT 1 FROM operation_intents recovery
                         WHERE recovery.task_id = created.task_id
                           AND recovery.operation_kind = 'workspace.recovery.discard'
-                          AND json_extract(
-                                recovery.external_receipt_json,
-                                '$.candidateId'
-                              ) = created.id
+                          AND EXISTS (
+                              SELECT 1 FROM events recovery_event
+                              WHERE recovery_event.stream_id = recovery.task_id
+                                AND recovery_event.event_type = 'workspace.recovery.requested'
+                                AND recovery_event.correlation_id = recovery.idempotency_key
+                                AND json_extract(
+                                      recovery_event.payload_json,
+                                      '$.candidateId'
+                                    ) = created.id
+                          )
                           AND recovery.status NOT IN ('failed', 'cancelled')
                    )
                  ORDER BY created.created_at DESC, created.id DESC LIMIT 1",

@@ -76,7 +76,7 @@ fn locate_canonical(
     let object_format = object_format(repository.object_format())?;
     let stable_identity = identity(&common_dir, object_format);
     let repository_id =
-        RepositoryId::new(format!("repo-{stable_identity}")).map_err(|_| integrity())?;
+        RepositoryId::new(format!("repo-{}", &stable_identity[7..])).map_err(|_| integrity())?;
     if is_excluded(gateway, &workdir) {
         return Err(conflict());
     }
@@ -111,7 +111,7 @@ pub(crate) fn open_for_locator(
     if format != locator.object_format || identity(&common_dir, format) != locator.stable_identity {
         return Err(conflict());
     }
-    let expected_id = format!("repo-{}", locator.stable_identity);
+    let expected_id = format!("repo-{}", &locator.stable_identity[7..]);
     if locator.repository_id.as_str() != expected_id {
         return Err(conflict());
     }
@@ -420,7 +420,7 @@ pub(crate) fn identity(common_dir: &Path, format: ObjectFormat) -> String {
     hasher.update(common_dir.as_os_str().to_string_lossy().as_bytes());
     hasher.update([0]);
     hasher.update(format.as_str().as_bytes());
-    hex_digest(hasher.finalize().as_slice())
+    format!("sha256:{}", hex_digest(hasher.finalize().as_slice()))
 }
 
 pub(crate) fn digest_id(value: &str) -> String {

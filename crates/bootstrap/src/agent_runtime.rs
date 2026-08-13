@@ -1314,9 +1314,14 @@ mod tests {
                 "INSERT INTO projects (
                     id, name, repository_path, repository_identity, created_at, updated_at,
                     policy_profile_id, artifact_root_mode, artifact_root_path
-                 ) VALUES (?1, 'Audit project', 'D:/repo', 'repo-1', ?2, ?2,
+                 ) VALUES (?1, 'Audit project', 'D:/repo', ?4, ?2, ?2,
                     'default', 'application_data', ?3)",
-                params!["project-1", "2026-07-23T13:30:00Z", artifact_root,],
+                params![
+                    "project-1",
+                    "2026-07-23T13:30:00Z",
+                    artifact_root,
+                    digest_bytes(b"audit repository identity").as_str(),
+                ],
             )
             .expect("project row");
         connection
@@ -1386,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_specialist_audit_commits_deliberation_record_and_task_budget() {
+    fn specialist_request_fails_closed_without_trusted_budget_authority() {
         let temporary = TempDir::new().expect("temporary state directory");
         let database_path = temporary.path().join("state.sqlite3");
         let artifact_path = temporary.path().join("artifacts");
@@ -1400,9 +1405,13 @@ mod tests {
                 "INSERT INTO projects (
                     id, name, repository_path, repository_identity, created_at, updated_at,
                     policy_profile_id, artifact_root_mode, artifact_root_path
-                 ) VALUES ('project-1', 'Specialist project', 'D:/repo', 'repo-1', ?1, ?1,
+                 ) VALUES ('project-1', 'Specialist project', 'D:/repo', ?3, ?1, ?1,
                     'default', 'application_data', ?2)",
-                params!["2026-08-11T00:00:00Z", artifact_root],
+                params![
+                    "2026-08-11T00:00:00Z",
+                    artifact_root,
+                    digest_bytes(b"specialist repository identity").as_str(),
+                ],
             )
             .expect("project row");
         connection
@@ -1536,16 +1545,6 @@ mod tests {
         database
             .mark_running(&run_request.run_id, "2026-08-11T00:00:02Z")
             .expect("running run");
-        connection
-            .execute(
-                "INSERT INTO deliberation_task_budgets (
-                    task_id, max_threads, max_tokens, max_cost_microunits,
-                    deadline_unix_seconds, reserved_threads, reserved_tokens,
-                    reserved_cost_microunits
-                 ) VALUES ('task-1', 4, 1000, 1000, 2000000000, 0, 0, 0)",
-                [],
-            )
-            .expect("task budget");
         let workspace_root = temporary.path().join("workspaces");
         std::fs::create_dir_all(&workspace_root).expect("workspace root");
         let repositories = local_agent_terminal_repository_git::GitRepositoryGateway::open(
@@ -1609,10 +1608,9 @@ mod tests {
         };
         let mut response = handler
             .request_specialist(request)
-            .expect("specialist decision");
+            .expect("bounded specialist decision");
         assert!(response.accepted);
-        let repeated_commit = response.prepared_commit.clone();
-        handler
+        let error = handler
             .persist_audit(AgentRequestAudit {
                 run_id: run_request.run_id,
                 task_id: run_request.task_id,
@@ -1628,77 +1626,20 @@ mod tests {
                 context_commit: None,
                 specialist_commit: response.prepared_commit.take(),
             })
-            .expect("specialist audit commit");
-        handler
-            .persist_audit(AgentRequestAudit {
-                run_id: RunId::new("run-parent").expect("run id"),
-                task_id: TaskId::new("task-1").expect("task id"),
-                connection_id: "connection-parent".to_owned(),
-                connection_binding_digest: connection_digest(&connection_binding)
-                    .expect("connection digest"),
-                request_id: "specialist-accepted".to_owned(),
-                kind: AgentRequestKind::SpecialistRequest,
-                request_digest: digest_bytes(b"specialist request"),
-                decision: AgentRequestAuditDecision::Accepted,
-                reason_code: None,
-                deadline: Timestamp::from_unix_seconds(2_000_000_000),
-                fence: AgentRequestAuditFence::new(),
-                context_commit: None,
-                specialist_commit: repeated_commit,
-            })
-            .expect("idempotent specialist audit commit");
-
-        let snapshot = database
-            .load(&TaskId::new("task-1").expect("task id"))
-            .expect("deliberation snapshot");
-        assert_eq!(snapshot.specialist_requests().len(), 1);
-        let reserved: (i64, i64, i64) = connection
-            .query_row(
-                "SELECT reserved_threads, reserved_tokens, reserved_cost_microunits
-                 FROM deliberation_task_budgets WHERE task_id = 'task-1'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("budget reservation");
-        assert_eq!(reserved, (1, 100, 100));
-        let dispatch: (String, String, String, String, String) = connection
-            .query_row(
-                "SELECT specialist_run_id, specialist_agent_id, family_key, thread_id,
-                        context_package_artifact_id
-                 FROM deliberation_specialist_dispatches
-                 WHERE request_id = 'specialist-accepted'",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .expect("durable specialist dispatch");
-        assert!(dispatch.0.starts_with("specialist-"));
-        assert_eq!(dispatch.1, "agent-specialist");
+            .expect_err("missing trusted budget authority must fail closed");
         assert_eq!(
-            dispatch.2,
-            AgentFamilyKey::from_provider_model("provider-specialist", "model-specialist")
-                .expect("family")
-                .as_str()
+            error.safe_classification(),
+            SafeErrorClassification::IntegrityFailure
         );
-        assert!(dispatch.3.starts_with("thread-specialist-"));
-        assert!(dispatch.4.starts_with("specialist-context-"));
-        let thread_count: i64 = connection
+        let dispatch_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM deliberation_specialist_threads
-                 WHERE thread_id = ?1 AND task_id = 'task-1'
-                   AND specialist_run_id = ?2 AND context_package_artifact_id = ?3",
-                params![dispatch.3, dispatch.0, dispatch.4],
+                "SELECT COUNT(*) FROM deliberation_specialist_dispatches
+                 WHERE task_id = 'task-1' AND request_id = 'specialist-accepted'",
+                [],
                 |row| row.get(0),
             )
-            .expect("durable direct thread");
-        assert_eq!(thread_count, 1);
+            .expect("dispatch count");
+        assert_eq!(dispatch_count, 0);
     }
 
     #[test]

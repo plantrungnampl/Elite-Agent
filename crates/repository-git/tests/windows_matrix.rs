@@ -180,6 +180,9 @@ fn inspect_reports_clean_repository_without_exposing_handles() {
     fs::create_dir(&managed_root).expect("managed");
     let gateway = GitRepositoryGateway::open(&managed_root, &[]).expect("gateway");
     let repository = locator(&gateway, &source);
+    assert!(
+        local_agent_terminal_domain::Sha256Digest::new(repository.stable_identity.clone()).is_ok()
+    );
 
     let snapshot = gateway
         .inspect(InspectRepository {
