@@ -8,6 +8,7 @@ mod deliberation_runtime;
 mod logging;
 #[cfg(windows)]
 mod production_tools;
+mod protocol_response_artifacts;
 mod startup;
 mod tool_runtime;
 mod workspace_monitor;

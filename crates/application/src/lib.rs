@@ -40,6 +40,7 @@ mod orchestration;
 mod plan_approval;
 mod policy;
 mod ports;
+mod protocol_request;
 mod repository;
 mod resume;
 mod run_configuration;
@@ -165,6 +166,12 @@ pub use ports::{
     ArtifactRootReader, ArtifactStore, ArtifactUnavailableState, ArtifactWriteReservation, Clock,
     EventStore, IdGenerator, NewArtifact, NewEvent, ProjectionChange, ReservedArtifact, TaskQuery,
     WorkspaceEvidenceStore, WorkspaceMutationStore,
+};
+pub use protocol_request::{
+    ProtocolRequestBegin, ProtocolRequestBeginResult, ProtocolRequestIdentity,
+    ProtocolRequestRecord, ProtocolRequestState, ProtocolRequestStore, ProtocolRequestTerminal,
+    ProtocolRequestTerminalStatus, ProtocolResponseArtifact, ProtocolResponseArtifactPublisher,
+    ProtocolStreamAdvance, ProtocolStreamIdentity,
 };
 pub use repository::{
     CreateWorktree, DiscardWorktree, ExpectedPresence, InspectRepository, InspectWorktree,

@@ -20,13 +20,16 @@ use local_agent_terminal_application::{
     AgentFamilyKey, AgentMessageArtifact, AgentRequestAudit, AgentRequestAuditDecision,
     AgentRequestHandler, AgentRequestKind, AgentRunStore, AgentRuntime, AgentSpecialistCommit,
     AgentSpecialistRequest, AgentSpecialistResponse, Clock, DeliberationRunAssignment, PortError,
-    Retryability, SafeErrorClassification,
+    ProtocolRequestBegin, ProtocolRequestBeginResult, ProtocolRequestIdentity,
+    ProtocolRequestRecord, ProtocolRequestStore, ProtocolRequestTerminal,
+    ProtocolResponseArtifact, ProtocolResponseArtifactPublisher, ProtocolStreamAdvance,
+    ProtocolStreamIdentity, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     AgentDescriptor, AgentRunLimits, AgentRunSnapshot, AgentRunStatus, AgentRunTerminal,
     ArtifactId, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
     BoundGenerationParameters, BoundRunConfig, CancelAgentRun, RunId, Sha256Digest,
-    SpecialistBudget, SpecialistRequest, TaskId, Timestamp, TrustTier,
+    Sequence, SpecialistBudget, SpecialistRequest, TaskId, Timestamp, TrustTier,
 };
 
 const EMPTY_JSON_DIGEST: &str =
@@ -74,13 +77,19 @@ fn start_returns_after_durable_acceptance_and_scripted_output_is_deterministic()
     assert_eq!(peer.terminal_acknowledgements(), 1);
     assert_eq!(
         peer.outputs(),
-        vec!["proposer:core:2:context-1".to_owned()]
+        vec!["proposer:core:run-start:run-1:context-1".to_owned()]
     );
     assert_eq!(
         log.lock().unwrap().as_slice(),
         [
+            "protocol.response.published",
+            "protocol.response.completed",
+            "protocol.response.published",
+            "protocol.response.completed",
             "artifact.message.published",
             "store.terminal.committed",
+            "protocol.response.published",
+            "protocol.response.completed",
             "peer.terminal.acknowledged"
         ]
     );
@@ -263,7 +272,7 @@ fn proposer_critic_and_verifier_outputs_are_stable_for_the_same_bound_input() {
 
         assert_eq!(
             peer.outputs(),
-            vec![format!("{role}:core:2:context-1")]
+            vec![format!("{role}:core:run-start:run-1:context-1")]
         );
     }
 }
@@ -277,7 +286,7 @@ fn disabled_descriptor_is_listed_but_never_dispatched() {
     let protocol_peer: Arc<dyn ProtocolPeer> = peer.clone();
     let mut descriptor = agent_descriptor();
     descriptor.enabled = false;
-    let runtime = ProtocolAgentRuntime::new(
+    let runtime = runtime_with_ports(
         store,
         artifacts,
         clock,
@@ -313,7 +322,7 @@ fn duplicate_peer_connection_ids_are_rejected_at_construction() {
     let second: Arc<dyn ProtocolPeer> =
         Arc::new(ScriptedPeer::new(Script::Slow, second_peer_descriptor));
 
-    let result = ProtocolAgentRuntime::new(
+    let result = runtime_with_ports(
         store,
         artifacts,
         clock,
@@ -345,7 +354,7 @@ fn startup_recovery_deduplicates_authoritative_connection_digests() {
     let second: Arc<dyn ProtocolPeer> =
         Arc::new(ScriptedPeer::new(Script::Slow, second_peer_descriptor));
 
-    ProtocolAgentRuntime::new(
+    runtime_with_ports(
         store.clone(),
         Arc::new(RecordingArtifacts::default()),
         Arc::new(ManualClock::new(1_800_000_000)),
@@ -368,7 +377,7 @@ fn startup_clock_failure_is_returned_before_runtime_is_available() {
     let protocol_peer: Arc<dyn ProtocolPeer> =
         Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
 
-    let result = ProtocolAgentRuntime::new(
+    let result = runtime_with_ports(
         store.clone(),
         artifacts,
         clock,
@@ -393,7 +402,7 @@ fn startup_store_recovery_failure_is_returned_before_runtime_is_available() {
     let protocol_peer: Arc<dyn ProtocolPeer> =
         Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
 
-    let result = ProtocolAgentRuntime::new(
+    let result = runtime_with_ports(
         store.clone(),
         Arc::new(RecordingArtifacts::default()),
         Arc::new(ManualClock::new(1_800_000_000)),
@@ -418,7 +427,7 @@ fn capacity_one_reserves_an_in_flight_start_before_durable_create() {
     let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
     let protocol_peer: Arc<dyn ProtocolPeer> = peer.clone();
     let runtime = Arc::new(
-        ProtocolAgentRuntime::new(
+        runtime_with_ports(
             store.clone(),
             Arc::new(RecordingArtifacts::default()),
             Arc::new(ManualClock::new(1_800_000_000)),
@@ -468,7 +477,7 @@ fn compensation_shutdown_interrupts_and_removes_sibling_connection_runs() {
     descriptor.capabilities.max_concurrent_runs = 2;
     let peer = Arc::new(MultiRunPeer::new(descriptor));
     let protocol_peer: Arc<dyn ProtocolPeer> = peer.clone();
-    let runtime = ProtocolAgentRuntime::new(
+    let runtime = runtime_with_ports(
         store.clone(),
         Arc::new(RecordingArtifacts::default()),
         Arc::new(AdvancingClock::new(1_800_000_000)),
@@ -770,7 +779,7 @@ fn compensation_uses_a_fresh_monotonic_timestamp_after_running_store_failure() {
     let clock = Arc::new(AdvancingClock::new(1_800_000_000));
     let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
     let protocol_peer: Arc<dyn ProtocolPeer> = peer.clone();
-    let runtime = ProtocolAgentRuntime::new(
+    let runtime = runtime_with_ports(
         store.clone(),
         Arc::new(RecordingArtifacts::default()),
         clock,
@@ -1108,7 +1117,7 @@ fn accepted_handler_result_is_not_disclosed_when_durable_audit_fails() {
 }
 
 #[test]
-fn initial_request_clock_failure_returns_one_typed_error_and_poisoned_state_recovers() {
+fn initial_request_clock_failure_returns_no_unpersisted_response_and_poisoned_state_recovers() {
     let store = Arc::new(RecordingStore::default());
     let artifacts = Arc::new(RecordingArtifacts::default());
     let clock = Arc::new(ManualClock::new(1_800_000_000));
@@ -1128,20 +1137,13 @@ fn initial_request_clock_failure_returns_one_typed_error_and_poisoned_state_reco
     runtime.start_run(request).unwrap();
     clock.fail();
 
-    let response = peer
-        .request(
+    assert!(matches!(
+        peer.request(
             0,
             context_query_frame("agent:clock-initial", "run-1", "query-clock-initial", 1),
-        )
-        .unwrap();
-
-    assert_eq!(
-        serde_json::to_value(response)
-            .unwrap()
-            .pointer("/error/data/category")
-            .unwrap(),
-        "internal_error"
-    );
+        ),
+        Err(ProtocolError::InternalAgentFailure)
+    ));
     assert_eq!(store.status("run-1"), Some(AgentRunStatus::Running));
     clock.recover();
     assert_eq!(runtime.check_timeouts().unwrap(), vec![run_id("run-1")]);

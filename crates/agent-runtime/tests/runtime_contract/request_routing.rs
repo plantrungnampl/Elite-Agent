@@ -69,8 +69,168 @@ fn request_routing_replays_exact_rpc_ids_and_rejects_conflicts_wrong_origins_and
         assert_eq!(value.pointer("/error/data/category").unwrap(), category);
     }
     assert_eq!(handler.context_requests().len(), 1);
-    assert_eq!(handler.audits().len(), 4);
+    assert_eq!(handler.audits().len(), 3);
     assert_eq!(store.status("run-1"), Some(AgentRunStatus::Succeeded));
+}
+
+#[test]
+fn reconstructed_runtime_replays_terminal_responses_before_routing_and_rejects_tuple_drift() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let first_peer = Arc::new(MultiRunPeer::new(descriptor.clone()));
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let first_runtime = runtime_with_protocol_peer_and_handler(
+        Arc::clone(&store),
+        Arc::clone(&artifacts),
+        Arc::clone(&clock),
+        first_peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut first_run = run_request("run-first", None);
+    first_run.run_config.limits.max_context_queries = 2;
+    first_runtime.start_run(first_run).unwrap();
+
+    let request = context_query_frame("agent:restart-replay", "run-first", "query-1", 1);
+    let first = first_peer.request(0, request.clone()).unwrap();
+    let rejected = first_peer
+        .request(0, tool_request_frame("agent:restart-rejected", "run-first"))
+        .unwrap();
+    assert_eq!(handler.context_requests().len(), 1);
+    let audit_count = handler.audits().len();
+    drop(first_runtime);
+
+    let second_peer = Arc::new(MultiRunPeer::new(descriptor));
+    let second_runtime = runtime_with_protocol_peer_and_handler(
+        Arc::clone(&store),
+        Arc::clone(&artifacts),
+        clock,
+        second_peer.clone(),
+        Arc::clone(&handler),
+    );
+    let mut current_run = run_request("run-current", None);
+    current_run.run_config.limits.max_context_queries = 2;
+    second_runtime.start_run(current_run).unwrap();
+
+    let replay = second_peer.request(0, request).unwrap();
+    let rejected_replay = second_peer
+        .request(0, tool_request_frame("agent:restart-rejected", "run-first"))
+        .unwrap();
+    let conflict = second_peer
+        .request(
+            0,
+            context_query_frame("agent:restart-replay", "run-first", "changed-query", 1),
+        )
+        .unwrap();
+
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&replay).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_vec(&rejected).unwrap(),
+        serde_json::to_vec(&rejected_replay).unwrap()
+    );
+    assert_eq!(handler.context_requests().len(), 1);
+    assert_eq!(handler.audits().len(), audit_count);
+    assert_eq!(
+        serde_json::to_value(conflict)
+            .unwrap()
+            .pointer("/error/data/category")
+            .unwrap(),
+        "protocol_conflict"
+    );
+}
+
+#[test]
+fn terminal_response_is_not_returned_until_artifact_and_terminal_row_are_durable() {
+    let log = script_log();
+    let store = Arc::new(RecordingStore::new(Arc::clone(&log)));
+    let artifacts = Arc::new(RecordingArtifacts::new(Arc::clone(&log)));
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.context_query = true;
+    let peer = Arc::new(MultiRunPeer::new(descriptor));
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let runtime = runtime_with_protocol_peer_and_handler(
+        Arc::clone(&store),
+        Arc::clone(&artifacts),
+        clock,
+        peer.clone(),
+        handler,
+    );
+    let mut run = run_request("run-1", None);
+    run.run_config.limits.max_context_queries = 1;
+    runtime.start_run(run).unwrap();
+    log.lock().unwrap().clear();
+    store.fail_protocol_complete();
+
+    let request = context_query_frame("agent:commit-order", "run-1", "query-1", 1);
+    assert!(matches!(
+        peer.request(0, request.clone()),
+        Err(ProtocolError::InternalAgentFailure)
+    ));
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        ["protocol.response.published"]
+    );
+
+    store.allow_protocol_complete();
+    let replay = peer.request(0, request).unwrap();
+    assert_eq!(
+        serde_json::to_value(replay)
+            .unwrap()
+            .pointer("/result/queryId")
+            .unwrap(),
+        "query-1"
+    );
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        ["protocol.response.published", "protocol.response.completed"]
+    );
+}
+
+#[test]
+fn reconstructed_runtime_restores_stream_head_and_accepts_the_next_sequence() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let mut descriptor = peer_descriptor();
+    descriptor.capabilities.max_concurrent_runs = 2;
+    let first_peer = Arc::new(MultiRunPeer::new(descriptor.clone()));
+    let first_clock: Arc<dyn Clock> = clock.clone();
+    let first_runtime = runtime_with_protocol_peer(
+        Arc::clone(&store),
+        first_clock,
+        first_peer.clone(),
+    );
+    first_runtime.start_run(run_request("run-1", None)).unwrap();
+    assert!(matches!(
+        first_peer.receive(0, stream_delta_frame("run-1", 1, "content", "first")),
+        Ok(InboundDisposition::Notification(_))
+    ));
+    drop(first_runtime);
+    store.mark_protocol_request_pending("connection-1", "core:run-start:run-1");
+
+    let second_peer = Arc::new(MultiRunPeer::new(descriptor));
+    let second_clock: Arc<dyn Clock> = clock;
+    let second_runtime = runtime_with_ports(
+        Arc::clone(&store),
+        artifacts,
+        second_clock,
+        vec![agent_registration(second_peer.clone())],
+    )
+    .unwrap();
+    second_runtime.start_run(run_request("run-1", None)).unwrap();
+    assert_eq!(second_peer.start_count(), 1);
+
+    assert!(matches!(
+        second_peer.receive(0, stream_delta_frame("run-1", 2, "content", "second")),
+        Ok(InboundDisposition::Notification(_))
+    ));
 }
 
 #[test]
@@ -934,7 +1094,7 @@ impl StaleCleanupRace {
         let peer = Arc::new(MultiRunPeer::new(descriptor));
         let protocol_peer: Arc<dyn ProtocolPeer> = peer.clone();
         let runtime = Arc::new(
-            ProtocolAgentRuntime::new(
+            runtime_with_ports(
                 store.clone(),
                 artifacts.clone(),
                 clock.clone(),
@@ -1042,7 +1202,7 @@ fn runtime_recreation_recovers_memory_lost_stale_cleanup() {
     descriptor.capabilities.max_concurrent_runs = 2;
     let second_peer = Arc::new(MultiRunPeer::new(descriptor));
     let second_protocol_peer: Arc<dyn ProtocolPeer> = second_peer.clone();
-    let second_runtime = ProtocolAgentRuntime::new(
+    let second_runtime = runtime_with_ports(
         store.clone(),
         artifacts.clone(),
         clock,
@@ -1256,7 +1416,7 @@ impl ThreadedRaceFixture {
         let (peer, attempted, completed) = ThreadedRacePeer::new(emission, Arc::clone(&gate));
         let protocol_peer: Arc<dyn ProtocolPeer> = peer.clone();
         let runtime = Arc::new(
-            ProtocolAgentRuntime::new(
+            runtime_with_ports(
                 store.clone(),
                 Arc::new(RecordingArtifacts::default()),
                 Arc::new(ManualClock::new(1_800_000_000)),

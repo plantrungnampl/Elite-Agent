@@ -380,6 +380,47 @@ fn stable_id(prefix: &str, value: &str) -> String {
     format!("{prefix}-{:x}", Sha256::digest(value.as_bytes()))
 }
 
+fn protocol_response_artifact_id(
+    identity: &ProtocolRequestIdentity,
+) -> Result<ArtifactId, ProtocolError> {
+    ArtifactId::new(stable_id(
+        "protocol-response",
+        &format!(
+            "{}:{}:{}:{}",
+            identity.connection_id(),
+            identity.request_id(),
+            identity.method(),
+            identity.request_digest().as_str(),
+        ),
+    ))
+    .map_err(|_| ProtocolError::InternalAgentFailure)
+}
+
+fn response_terminal_status(
+    response: &ProtocolFrame,
+) -> Result<ProtocolRequestTerminalStatus, ProtocolError> {
+    if frame_value(response)?.get("error").is_some() {
+        Ok(ProtocolRequestTerminalStatus::Failed)
+    } else {
+        Ok(ProtocolRequestTerminalStatus::Completed)
+    }
+}
+
+fn stream_advance_from_frame(
+    frame: &ProtocolFrame,
+    connection_id: &str,
+) -> Result<ProtocolStreamAdvance, ProtocolError> {
+    let value = frame_value(frame)?;
+    ProtocolStreamAdvance::new(
+        connection_id,
+        RunId::new(required_string(&value, "/params/runId")?)
+            .map_err(|_| ProtocolError::InvalidRequest)?,
+        required_string(&value, "/params/channel")?,
+        Sequence::new(required_u64(&value, "/params/sequence")?),
+    )
+    .map_err(|_| ProtocolError::InvalidRequest)
+}
+
 fn digest_bytes(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(bytes)))
         .expect("SHA-256 formatting is valid")

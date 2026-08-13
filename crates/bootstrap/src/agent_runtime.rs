@@ -21,8 +21,9 @@ use local_agent_terminal_application::{
     ContextQuery, ContextRunReconstructibility, ContextVersionSet, DeliberationArtifactRef,
     DeliberationBudget, DeliberationCommandContext, DeliberationCommands,
     DeliberationRunAssignment, DeliberationStore, EventId, PolicyActor, PortError,
-    ReservedArtifact, ResourceClass, RiskLevel, RunId, Sha256Digest, SpecialistBudget,
-    SpecialistRequest, TaskId, TaskQuery, TaskRisk, TrustTier, WorkspaceEvidenceStore,
+    ProtocolRequestStore, ProtocolResponseArtifactPublisher, ReservedArtifact, ResourceClass,
+    RiskLevel, RunId, Sha256Digest, SpecialistBudget, SpecialistRequest, TaskId, TaskQuery,
+    TaskRisk, TrustTier, WorkspaceEvidenceStore,
 };
 use local_agent_terminal_orchestration::{
     authorize_specialist, AgentEligibility, SpecialistDenial,
@@ -52,7 +53,7 @@ const OPENAI_AGENT_ID: &str = "core_adapter";
 const OPENAI_CONNECTION_ID: &str = "openai_core_adapter";
 const ANTHROPIC_AGENT_ID: &str = "anthropic_core_adapter";
 const ANTHROPIC_CONNECTION_ID: &str = "anthropic_core_adapter";
-const PROTOCOL_VERSION: &str = "1.0";
+const PROTOCOL_VERSION: &str = "2.0";
 const OPENAI_MANIFEST: &[u8] = br#"{"adapter":"openai-responses","agentId":"core_adapter","providerId":"openai","schema":"trusted-openai-core-adapter-manifest.v1"}"#;
 const ANTHROPIC_MANIFEST: &[u8] = br#"{"adapter":"anthropic-messages","agentId":"anthropic_core_adapter","providerId":"anthropic","schema":"trusted-anthropic-core-adapter-manifest.v1"}"#;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -307,6 +308,8 @@ fn compose_runtime(
     let runtime = Arc::new(ProtocolAgentRuntime::new_with_request_handler(
         Arc::new(database.clone()) as Arc<dyn AgentRunStore>,
         durable_artifacts.clone() as Arc<dyn AgentArtifactStore>,
+        Arc::new(database.clone()) as Arc<dyn ProtocolRequestStore>,
+        durable_artifacts.clone() as Arc<dyn ProtocolResponseArtifactPublisher>,
         Arc::new(database.clone()) as Arc<dyn Clock>,
         runtime_peers,
         request_handler as Arc<dyn AgentRequestHandler>,
@@ -505,9 +508,9 @@ impl AgentRuntime for ComposedAgentRuntime {
     }
 }
 
-struct DurableAgentArtifacts {
-    database: SqliteStore,
-    artifacts: Arc<ContentAddressedArtifactStore>,
+pub(crate) struct DurableAgentArtifacts {
+    pub(crate) database: SqliteStore,
+    pub(crate) artifacts: Arc<ContentAddressedArtifactStore>,
 }
 
 #[derive(Clone)]
@@ -974,7 +977,7 @@ impl DurableAgentRequestHandler {
             request,
             assignment,
         } = prepared;
-        let snapshot = self.database.load(request.task_id())?;
+        let snapshot = DeliberationStore::load(&self.database, request.task_id())?;
         let artifact = DeliberationArtifactRef::new(
             artifact.artifact_id,
             Sha256Digest::new(artifact.content_hash).map_err(|_| integrity_failure())?,
@@ -1822,6 +1825,8 @@ mod tests {
             ProtocolAgentRuntime::new(
                 Arc::new(database.clone()) as Arc<dyn AgentRunStore>,
                 durable_artifacts.clone() as Arc<dyn AgentArtifactStore>,
+                Arc::new(database.clone()) as Arc<dyn ProtocolRequestStore>,
+                durable_artifacts.clone() as Arc<dyn ProtocolResponseArtifactPublisher>,
                 clock as Arc<dyn Clock>,
                 vec![(descriptor.clone(), connection.binding_digest.clone(), peer)],
             )

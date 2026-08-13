@@ -134,6 +134,92 @@ fn validates_responses_against_the_durable_pending_method() {
 }
 
 #[test]
+fn restores_pending_run_start_for_method_specific_response() {
+    let mut session = ready_session();
+    session
+        .restore_pending_request(run_start("run-restore", "core:restore-start"), at(0))
+        .expect("the durable run-start request is restored without dispatch");
+
+    session
+        .receive_response(
+            response(
+                "core:restore-start",
+                json!({ "runId": "run-restore", "accepted": true }),
+            ),
+            at(0),
+        )
+        .expect("the restored run-start accepts its method-specific response");
+}
+
+#[test]
+fn restored_run_start_rejects_context_query_response_for_same_id() {
+    let mut session = ready_session();
+    session
+        .restore_pending_request(run_start("run-restore", "core:restore-start"), at(0))
+        .expect("the durable run-start request is restored");
+
+    assert!(matches!(
+        session.receive_response(
+            response(
+                "core:restore-start",
+                json!({
+                    "queryId": "query-1",
+                    "items": [{
+                        "itemId": "item-1",
+                        "contentRef": "artifact-context-1",
+                        "contentDigest": CONTEXT_DIGEST,
+                        "sourceRefs": ["artifact-context-1"],
+                        "observationClass": "core_observed"
+                    }],
+                    "truncated": false,
+                    "effectivePayloadDigest": CONTEXT_DIGEST,
+                    "redactionReportDigest": BINDING_DIGEST
+                }),
+            ),
+            at(0),
+        ),
+        Err(ProtocolError::InvalidFrame)
+    ));
+}
+
+#[test]
+fn restoring_exact_pending_run_start_is_idempotent() {
+    let mut session = ready_session();
+    let request = run_start("run-restore", "core:restore-start");
+    session
+        .restore_pending_request(request.clone(), at(0))
+        .expect("the first durable run-start restore succeeds");
+    session
+        .restore_pending_request(request, at(1))
+        .expect("restoring the exact pending tuple is idempotent");
+
+    session
+        .receive_response(
+            response(
+                "core:restore-start",
+                json!({ "runId": "run-restore", "accepted": true }),
+            ),
+            at(1),
+        )
+        .expect("the idempotent restore leaves one usable pending response");
+}
+
+#[test]
+fn restoring_changed_pending_run_start_digest_conflicts() {
+    let mut session = ready_session();
+    session
+        .restore_pending_request(run_start("run-restore", "core:restore-start"), at(0))
+        .expect("the original durable run-start request is restored");
+
+    let mut changed = start_value("run-restore", "core:restore-start");
+    changed["params"]["taskId"] = json!("task-2");
+    assert!(matches!(
+        session.restore_pending_request(decode(changed), at(0)),
+        Err(ProtocolError::ProtocolConflict)
+    ));
+}
+
+#[test]
 fn enforces_core_and_agent_prefixes_and_keeps_notifications_response_free() {
     let mut session = ready_session();
     let mut wrong_start_origin = start_value("run-1", "core:start-1");
@@ -306,6 +392,31 @@ fn rejects_stream_sequence_gaps_and_terminalizes_that_run() {
     ));
     assert!(matches!(
         session.receive(stream_delta("run-1", 2, "late"), at(0)),
+        Err(ProtocolError::InvalidRequest)
+    ));
+}
+
+#[test]
+fn restores_durable_per_channel_stream_heads_before_receiving_the_next_delta() {
+    let mut session = ready_session();
+    start_run(&mut session, "run-1");
+    session
+        .restore_stream_head("run-1", "content", 2)
+        .expect("the persisted content head is restored after run acceptance");
+
+    assert!(matches!(
+        session.receive(stream_delta("run-1", 3, "third"), at(0)),
+        Ok(InboundDisposition::Notification(_))
+    ));
+    assert!(matches!(
+        session.receive(
+            stream_delta_with_channel("run-1", 1, "status", "running"),
+            at(0)
+        ),
+        Ok(InboundDisposition::Notification(_))
+    ));
+    assert!(matches!(
+        session.receive(stream_delta("run-1", 2, "unknown prior delta"), at(0)),
         Err(ProtocolError::InvalidRequest)
     ));
 }
@@ -511,10 +622,23 @@ fn stream_delta(run_id: &str, sequence: u64, delta: &str) -> ProtocolFrame {
 }
 
 fn stream_value(run_id: &str, sequence: u64, delta: &str) -> Value {
+    stream_value_with_channel(run_id, sequence, "content", delta)
+}
+
+fn stream_delta_with_channel(
+    run_id: &str,
+    sequence: u64,
+    channel: &str,
+    delta: &str,
+) -> ProtocolFrame {
+    decode(stream_value_with_channel(run_id, sequence, channel, delta))
+}
+
+fn stream_value_with_channel(run_id: &str, sequence: u64, channel: &str, delta: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
         "method": "agent.stream.delta",
-        "params": { "runId": run_id, "sequence": sequence, "channel": "content", "delta": delta }
+        "params": { "runId": run_id, "sequence": sequence, "channel": channel, "delta": delta }
     })
 }
 

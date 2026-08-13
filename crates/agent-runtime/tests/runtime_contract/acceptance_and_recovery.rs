@@ -1,3 +1,150 @@
+#[test]
+fn reconstructed_runtime_replays_core_start_and_cancel_without_peer_side_effects() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+    let runtime = runtime_with_artifacts(
+        Arc::clone(&store),
+        Arc::clone(&artifacts),
+        Arc::clone(&clock),
+        Arc::clone(&peer),
+    );
+    runtime
+        .start_run(run_request("run-durable-replay", None))
+        .unwrap();
+    runtime
+        .cancel(CancelAgentRun {
+            run_id: run_id("run-durable-replay"),
+            reason: "replay-cancel".to_owned(),
+            deadline_ms: 1_000,
+        })
+        .unwrap();
+    assert_eq!(peer.start_requests().len(), 1);
+    assert_eq!(peer.cancel_count(), 1);
+
+    let reconstructed = runtime_with_artifacts(store, artifacts, clock, Arc::clone(&peer));
+    reconstructed
+        .start_run(run_request("run-durable-replay", None))
+        .unwrap();
+    reconstructed
+        .cancel(CancelAgentRun {
+            run_id: run_id("run-durable-replay"),
+            reason: "replay-cancel".to_owned(),
+            deadline_ms: 1_000,
+        })
+        .unwrap();
+
+    assert_eq!(peer.start_requests().len(), 1);
+    assert_eq!(peer.cancel_count(), 1);
+}
+
+#[test]
+fn reconstructed_runtime_rejects_changed_core_request_digest_before_peer_start() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let clock = Arc::new(ManualClock::new(1_800_000_000));
+    let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+    let runtime = runtime_with_artifacts(
+        Arc::clone(&store),
+        Arc::clone(&artifacts),
+        Arc::clone(&clock),
+        Arc::clone(&peer),
+    );
+    runtime
+        .start_run(run_request("run-digest-conflict", None))
+        .unwrap();
+
+    let reconstructed = runtime_with_artifacts(store, artifacts, clock, Arc::clone(&peer));
+    let mut changed = run_request("run-digest-conflict", None);
+    changed.idempotency_key = "task-1:reviewer:changed".to_owned();
+    let error = reconstructed.start_run(changed).unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Conflict
+    );
+    assert_eq!(peer.start_requests().len(), 1);
+}
+
+#[test]
+fn core_response_completion_failure_returns_no_start_receipt_or_peer_dispatch() {
+    let store = Arc::new(RecordingStore::default());
+    store.fail_protocol_complete();
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+    let runtime = runtime_with_artifacts(
+        Arc::clone(&store),
+        artifacts,
+        Arc::new(ManualClock::new(1_800_000_000)),
+        Arc::clone(&peer),
+    );
+
+    let error = runtime
+        .start_run(run_request("run-complete-failure", None))
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::StorageFull
+    );
+    assert!(peer.start_requests().is_empty());
+}
+
+#[test]
+fn core_response_artifact_failure_returns_no_start_receipt_or_peer_dispatch() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    artifacts.fail_protocol_response_publish();
+    let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+    let runtime = runtime_with_artifacts(
+        Arc::clone(&store),
+        artifacts,
+        Arc::new(ManualClock::new(1_800_000_000)),
+        Arc::clone(&peer),
+    );
+
+    let error = runtime
+        .start_run(run_request("run-artifact-failure", None))
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::Internal
+    );
+    assert!(peer.start_requests().is_empty());
+}
+
+#[test]
+fn cancel_response_completion_failure_returns_no_receipt() {
+    let store = Arc::new(RecordingStore::default());
+    let artifacts = Arc::new(RecordingArtifacts::default());
+    let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
+    let runtime = runtime_with_artifacts(
+        Arc::clone(&store),
+        artifacts,
+        Arc::new(ManualClock::new(1_800_000_000)),
+        Arc::clone(&peer),
+    );
+    runtime
+        .start_run(run_request("run-cancel-complete-failure", None))
+        .unwrap();
+    store.fail_protocol_complete();
+
+    let error = runtime
+        .cancel(CancelAgentRun {
+            run_id: run_id("run-cancel-complete-failure"),
+            reason: "durable-cancel".to_owned(),
+            deadline_ms: 1_000,
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        error.safe_classification(),
+        SafeErrorClassification::StorageFull
+    );
+    assert_eq!(peer.cancel_count(), 1);
+}
 
 #[derive(Default)]
 struct AcceptanceGateState {
@@ -353,6 +500,15 @@ impl MultiRunPeer {
         let sink = Arc::clone(&self.sinks.lock().unwrap()[index]);
         sink.request(frame)
     }
+
+    fn receive(
+        &self,
+        index: usize,
+        frame: ProtocolFrame,
+    ) -> Result<InboundDisposition, ProtocolError> {
+        let sink = Arc::clone(&self.sinks.lock().unwrap()[index]);
+        sink.receive(frame)
+    }
 }
 
 impl ProtocolPeer for MultiRunPeer {
@@ -386,14 +542,18 @@ impl ProtocolPeer for MultiRunPeer {
 }
 
 fn threaded_delta(run_id: &str) -> ProtocolFrame {
+    stream_delta_frame(run_id, 1, "content", "threaded")
+}
+
+fn stream_delta_frame(run_id: &str, sequence: u64, channel: &str, delta: &str) -> ProtocolFrame {
     decode_protocol_frame(serde_json::json!({
         "jsonrpc": "2.0",
         "method": "agent.stream.delta",
         "params": {
             "runId": run_id,
-            "sequence": 1,
-            "channel": "content",
-            "delta": "threaded"
+            "sequence": sequence,
+            "channel": channel,
+            "delta": delta
         }
     }))
 }
@@ -438,6 +598,22 @@ fn context_query_frame(
             "scopes": ["repository"],
             "maxItems": 1,
             "maxTokens": max_tokens
+        }
+    }))
+}
+
+fn tool_request_frame(request_id: &str, run_id: &str) -> ProtocolFrame {
+    decode_protocol_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "tool.request",
+        "params": {
+            "runId": run_id,
+            "requestId": "tool-request-1",
+            "tool": "tool-1",
+            "arguments": {},
+            "argumentsDigest": EMPTY_JSON_DIGEST,
+            "reason": "test policy rejection"
         }
     }))
 }
@@ -487,12 +663,30 @@ fn runtime_with_artifacts(
 ) -> ProtocolAgentRuntime {
     let protocol_peer: Arc<dyn ProtocolPeer> = peer;
     ProtocolAgentRuntime::new(
+        store.clone(),
+        artifacts.clone(),
         store,
         artifacts,
         clock,
         vec![agent_registration(protocol_peer)],
     )
     .unwrap()
+}
+
+fn runtime_with_ports(
+    store: Arc<RecordingStore>,
+    artifacts: Arc<RecordingArtifacts>,
+    clock: Arc<dyn Clock>,
+    agents: Vec<(AgentDescriptor, Sha256Digest, Arc<dyn ProtocolPeer>)>,
+) -> Result<ProtocolAgentRuntime, PortError> {
+    ProtocolAgentRuntime::new(
+        store.clone(),
+        artifacts.clone(),
+        store,
+        artifacts,
+        clock,
+        agents,
+    )
 }
 
 fn runtime_with_request_handler(
@@ -505,6 +699,8 @@ fn runtime_with_request_handler(
     let protocol_peer: Arc<dyn ProtocolPeer> = peer;
     let request_handler: Arc<dyn AgentRequestHandler> = handler;
     ProtocolAgentRuntime::new_with_request_handler(
+        store.clone(),
+        artifacts.clone(),
         store,
         artifacts,
         clock,
@@ -524,6 +720,8 @@ fn runtime_with_protocol_peer_and_handler(
     let protocol_peer: Arc<dyn ProtocolPeer> = peer;
     let request_handler: Arc<dyn AgentRequestHandler> = handler;
     ProtocolAgentRuntime::new_with_request_handler(
+        store.clone(),
+        artifacts.clone(),
         store,
         artifacts,
         clock,
@@ -538,9 +736,12 @@ fn runtime_with_protocol_peer(
     clock: Arc<dyn Clock>,
     peer: Arc<dyn ProtocolPeer>,
 ) -> ProtocolAgentRuntime {
+    let artifacts = Arc::new(RecordingArtifacts::default());
     ProtocolAgentRuntime::new(
+        store.clone(),
+        artifacts.clone(),
         store,
-        Arc::new(RecordingArtifacts::default()),
+        artifacts,
         clock,
         vec![agent_registration(peer)],
     )
@@ -968,6 +1169,9 @@ impl AgentRequestHandler for RecordingRequestHandler {
 #[derive(Default)]
 struct RecordingStore {
     runs: Mutex<BTreeMap<String, AgentRunSnapshot>>,
+    protocol_requests: Mutex<BTreeMap<(String, String), RecordedProtocolRequest>>,
+    protocol_stream_heads: Mutex<BTreeMap<(String, String, String), Sequence>>,
+    fail_protocol_complete: Mutex<bool>,
     terminals: Mutex<Vec<AgentRunTerminal>>,
     fail_terminal: Mutex<bool>,
     fail_start: Mutex<Option<StartStoreFailure>>,
@@ -980,6 +1184,12 @@ struct RecordingStore {
     log: ScriptLog,
 }
 
+#[derive(Clone)]
+struct RecordedProtocolRequest {
+    begin: ProtocolRequestBegin,
+    terminal: Option<ProtocolRequestTerminal>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartStoreFailure {
     Acceptance,
@@ -989,7 +1199,9 @@ enum StartStoreFailure {
 #[derive(Default)]
 struct RecordingArtifacts {
     published: Mutex<Vec<AgentMessageArtifact>>,
-    fail_publish: Mutex<bool>,
+    protocol_responses: Mutex<Vec<ProtocolResponseArtifact>>,
+    fail_agent_message_publish: Mutex<bool>,
+    fail_protocol_response_publish: Mutex<bool>,
     log: ScriptLog,
 }
 
@@ -1011,11 +1223,15 @@ impl RecordingArtifacts {
     }
 
     fn fail_publish(&self) {
-        *self.fail_publish.lock().unwrap() = true;
+        *self.fail_agent_message_publish.lock().unwrap() = true;
     }
 
     fn allow_publish(&self) {
-        *self.fail_publish.lock().unwrap() = false;
+        *self.fail_agent_message_publish.lock().unwrap() = false;
+    }
+
+    fn fail_protocol_response_publish(&self) {
+        *self.fail_protocol_response_publish.lock().unwrap() = true;
     }
 }
 
@@ -1036,12 +1252,34 @@ impl AgentArtifactStore for RecordingArtifacts {
         &self,
         artifact: &AgentMessageArtifact,
     ) -> Result<ArtifactId, PortError> {
-        if *self.fail_publish.lock().unwrap() {
+        if *self.fail_agent_message_publish.lock().unwrap() {
             return Err(internal_failure());
         }
         self.published.lock().unwrap().push(artifact.clone());
         self.log.lock().unwrap().push("artifact.message.published");
         ArtifactId::new(format!("artifact-{}", artifact.message_id)).map_err(|_| invalid_input())
+    }
+}
+
+impl ProtocolResponseArtifactPublisher for RecordingArtifacts {
+    fn publish_protocol_response(
+        &self,
+        _begin: &ProtocolRequestBegin,
+        response: &ProtocolResponseArtifact,
+    ) -> Result<ProtocolResponseArtifact, PortError> {
+        if *self.fail_protocol_response_publish.lock().unwrap() {
+            return Err(internal_failure());
+        }
+        let mut responses = self.protocol_responses.lock().unwrap();
+        if let Some(existing) = responses
+            .iter()
+            .find(|existing| existing.artifact_id() == response.artifact_id())
+        {
+            return Ok(existing.clone());
+        }
+        responses.push(response.clone());
+        self.log.lock().unwrap().push("protocol.response.published");
+        Ok(response.clone())
     }
 }
 
@@ -1065,12 +1303,29 @@ impl RecordingStore {
         self.terminals.lock().unwrap().len()
     }
 
+    fn mark_protocol_request_pending(&self, connection_id: &str, request_id: &str) {
+        self.protocol_requests
+            .lock()
+            .unwrap()
+            .get_mut(&(connection_id.to_owned(), request_id.to_owned()))
+            .expect("recorded protocol request")
+            .terminal = None;
+    }
+
     fn fail_terminal(&self) {
         *self.fail_terminal.lock().unwrap() = true;
     }
 
     fn allow_terminal(&self) {
         *self.fail_terminal.lock().unwrap() = false;
+    }
+
+    fn fail_protocol_complete(&self) {
+        *self.fail_protocol_complete.lock().unwrap() = true;
+    }
+
+    fn allow_protocol_complete(&self) {
+        *self.fail_protocol_complete.lock().unwrap() = false;
     }
 
     fn terminal_time(&self, run_id: &str) -> Option<Timestamp> {
@@ -1224,6 +1479,127 @@ impl AgentRunStore for RecordingStore {
     }
 }
 
+impl ProtocolRequestStore for RecordingStore {
+    fn begin(&self, begin: &ProtocolRequestBegin) -> Result<ProtocolRequestBeginResult, PortError> {
+        begin.validate()?;
+        let key = (
+            begin.identity().connection_id().to_owned(),
+            begin.identity().request_id().to_owned(),
+        );
+        let mut requests = self.protocol_requests.lock().unwrap();
+        let Some(existing) = requests.get(&key) else {
+            requests.insert(
+                key,
+                RecordedProtocolRequest {
+                    begin: begin.clone(),
+                    terminal: None,
+                },
+            );
+            return Ok(ProtocolRequestBeginResult::Begun);
+        };
+        if existing.begin.identity() != begin.identity() {
+            return Err(protocol_conflict());
+        }
+        Ok(match &existing.terminal {
+            Some(terminal) => ProtocolRequestBeginResult::Replayed(terminal.clone()),
+            None => ProtocolRequestBeginResult::Pending,
+        })
+    }
+
+    fn load(
+        &self,
+        identity: &ProtocolRequestIdentity,
+    ) -> Result<Option<ProtocolRequestRecord>, PortError> {
+        identity.validate()?;
+        let key = (
+            identity.connection_id().to_owned(),
+            identity.request_id().to_owned(),
+        );
+        let requests = self.protocol_requests.lock().unwrap();
+        let Some(existing) = requests.get(&key) else {
+            return Ok(None);
+        };
+        if existing.begin.identity() != identity {
+            return Err(protocol_conflict());
+        }
+        match &existing.terminal {
+            Some(terminal) => {
+                ProtocolRequestRecord::terminal(existing.begin.clone(), terminal.clone()).map(Some)
+            }
+            None => Ok(Some(ProtocolRequestRecord::pending(existing.begin.clone()))),
+        }
+    }
+
+    fn complete(
+        &self,
+        terminal: &ProtocolRequestTerminal,
+    ) -> Result<ProtocolRequestTerminal, PortError> {
+        terminal.validate()?;
+        if *self.fail_protocol_complete.lock().unwrap() {
+            return Err(storage_full());
+        }
+        let key = (
+            terminal.identity().connection_id().to_owned(),
+            terminal.identity().request_id().to_owned(),
+        );
+        let mut requests = self.protocol_requests.lock().unwrap();
+        let existing = requests.get_mut(&key).ok_or_else(invalid_input)?;
+        if existing.begin.identity() != terminal.identity() {
+            return Err(protocol_conflict());
+        }
+        match &existing.terminal {
+            Some(existing_terminal) if existing_terminal == terminal => {
+                Ok(existing_terminal.clone())
+            }
+            Some(_) => Err(protocol_conflict()),
+            None => {
+                existing.terminal = Some(terminal.clone());
+                self.log.lock().unwrap().push("protocol.response.completed");
+                Ok(terminal.clone())
+            }
+        }
+    }
+
+    fn load_stream_head(
+        &self,
+        stream: &ProtocolStreamIdentity,
+    ) -> Result<Option<Sequence>, PortError> {
+        stream.validate()?;
+        Ok(self
+            .protocol_stream_heads
+            .lock()
+            .unwrap()
+            .get(&(
+                stream.connection_id().to_owned(),
+                stream.run_id().as_str().to_owned(),
+                stream.channel().to_owned(),
+            ))
+            .copied())
+    }
+
+    fn advance_stream(&self, advance: &ProtocolStreamAdvance) -> Result<(), PortError> {
+        advance.validate()?;
+        let key = (
+            advance.connection_id().to_owned(),
+            advance.run_id().as_str().to_owned(),
+            advance.channel().to_owned(),
+        );
+        let mut heads = self.protocol_stream_heads.lock().unwrap();
+        match heads.get(&key).copied() {
+            None if advance.sequence().get() == 1 => {
+                heads.insert(key, advance.sequence());
+                Ok(())
+            }
+            Some(current) if current == advance.sequence() => Ok(()),
+            Some(current) if current.get().checked_add(1) == Some(advance.sequence().get()) => {
+                heads.insert(key, advance.sequence());
+                Ok(())
+            }
+            _ => Err(protocol_conflict()),
+        }
+    }
+}
+
 struct ManualClock {
     seconds: Mutex<i64>,
     fail: Mutex<bool>,
@@ -1345,6 +1721,13 @@ fn storage_full() -> PortError {
     PortError::failure(
         SafeErrorClassification::StorageFull,
         Retryability::Retryable,
+    )
+}
+
+fn protocol_conflict() -> PortError {
+    PortError::failure(
+        SafeErrorClassification::Conflict,
+        Retryability::NonRetryable,
     )
 }
 

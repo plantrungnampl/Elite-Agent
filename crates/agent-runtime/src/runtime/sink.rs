@@ -2,6 +2,8 @@
 struct RuntimeSink {
     store: Arc<dyn AgentRunStore>,
     artifacts: Arc<dyn AgentArtifactStore>,
+    protocol_requests: Arc<dyn ProtocolRequestStore>,
+    response_artifacts: Arc<dyn ProtocolResponseArtifactPublisher>,
     clock: Arc<dyn Clock>,
     request_handler: Arc<dyn AgentRequestHandler>,
     request_routing_enabled: bool,
@@ -53,6 +55,18 @@ impl RuntimeSink {
                 return Err(error);
             }
         };
+        if let InboundDisposition::Notification(ProtocolFrame::StreamDeltaNotification(_)) =
+            &disposition
+        {
+            let advance = stream_advance_from_frame(&frame, &self.request.connection.connection_id)?;
+            if let Err(error) = self.protocol_requests.advance_stream(&advance) {
+                self.handle_protocol_error(ProtocolError::InternalAgentFailure, now)?;
+                return Err(match error.safe_classification() {
+                    SafeErrorClassification::Conflict => ProtocolError::ProtocolConflict,
+                    _ => ProtocolError::InternalAgentFailure,
+                });
+            }
+        }
         Ok(disposition)
     }
 
@@ -65,9 +79,8 @@ impl RuntimeSink {
         let value = frame_value(&frame)?;
         let id = required_string(&value, "/id")?;
         let method = required_string(&value, "/method")?;
-        let request_bytes =
-            serde_json::to_vec(&frame).map_err(|_| ProtocolError::InternalAgentFailure)?;
-        let request_digest = digest_bytes(&request_bytes);
+        let request_digest = Sha256Digest::new(canonical_request_digest(&frame)?)
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
         let now = match runtime_time(self.clock.as_ref()) {
             Ok(now) => now,
             Err(_) => {
@@ -76,30 +89,60 @@ impl RuntimeSink {
                 self.slots
                     .poison_connection(self.request.connection.binding_digest.as_str())
                     .map_err(|_| ProtocolError::InternalAgentFailure)?;
-                return error_response(&id, "internal_error", false)
-                    .map_err(|_| ProtocolError::InternalAgentFailure);
+                return Err(ProtocolError::InternalAgentFailure);
             }
         };
-        match self.replay_response(&id, &method, request_digest.as_str()) {
-            Ok(Some(response)) => return Ok(response),
-            Ok(None) => {}
-            Err(error) => {
-                drop(request_guard);
-                return self.request_error(
-                    &frame,
-                    &id,
-                    request_digest,
-                    protocol_request_error_category(error),
-                );
+        let begin = ProtocolRequestBegin::new(
+            ProtocolRequestIdentity::new(
+                self.request.connection.connection_id.clone(),
+                id.clone(),
+                method.clone(),
+                request_digest.clone(),
+            )
+            .map_err(|_| ProtocolError::InternalAgentFailure)?,
+            Some(self.request.task_id.clone()),
+            Some(self.request.run_id.clone()),
+            now.text.clone(),
+        )
+        .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        match self.protocol_requests.begin(&begin) {
+            Ok(ProtocolRequestBeginResult::Replayed(terminal)) => {
+                return self.replay_terminal_response(&terminal);
             }
+            Ok(ProtocolRequestBeginResult::Pending) => {
+                let response = error_response(&id, "internal_error", false)
+                    .map_err(|_| ProtocolError::InternalAgentFailure)?;
+                let response = self.finalize_terminal_response(
+                    &begin,
+                    response,
+                    &now.text,
+                )?;
+                drop(request_guard);
+                return Ok(response);
+            }
+            Ok(ProtocolRequestBeginResult::Begun) => {}
+            Err(error) if error.safe_classification() == SafeErrorClassification::Conflict => {
+                drop(request_guard);
+                return error_response(&id, "protocol_conflict", false)
+                    .map_err(|_| ProtocolError::InternalAgentFailure);
+            }
+            Err(_) => return Err(ProtocolError::InternalAgentFailure),
         }
         if let Some(reason) = self.preflight_request(&frame, &id)? {
             let response = self.request_error(&frame, &id, request_digest, reason);
             return match response {
-                Ok(response) => Ok(response),
+                Ok(response) => {
+                    let response = self.finalize_terminal_response(
+                        &begin,
+                        response,
+                        &now.text,
+                    )?;
+                    drop(request_guard);
+                    Ok(response)
+                }
                 Err(error) => {
                     drop(request_guard);
-                    self.fail_request(&id, error, now)
+                    self.fail_request(&begin, &id, error, now)
                 }
             };
         }
@@ -108,30 +151,39 @@ impl RuntimeSink {
             Ok(mut session) => session.receive(frame.clone(), now.date_time),
             Err(_) => {
                 drop(request_guard);
-                return self.fail_request(&id, ProtocolError::InternalAgentFailure, now);
+                return self.fail_request(&begin, &id, ProtocolError::InternalAgentFailure, now);
             }
         };
         let disposition = match received {
             Ok(InboundDisposition::Request(frame)) => frame,
             Ok(InboundDisposition::ReplayRequest(_)) => {
                 drop(request_guard);
-                return self
-                    .replay_response(&id, &method, request_digest.as_str())?
-                    .ok_or(ProtocolError::InvalidRequest);
+                return self.fail_request(&begin, &id, ProtocolError::InternalAgentFailure, now);
             }
             Ok(_) => return Err(ProtocolError::InvalidRequest),
             Err(error) => {
                 let reason = protocol_request_error_category(error);
                 let response = self.request_error(&frame, &id, request_digest, reason);
                 if error == ProtocolError::OutputLimitExceeded {
-                    let _ = self.handle_protocol_error(error, now);
+                    let _ = self.handle_protocol_error(error, now.clone());
                     drop(request_guard);
-                    return response;
+                    return match response {
+                        Ok(response) => self.finalize_terminal_response(
+                            &begin,
+                            response,
+                            &now.text,
+                        ),
+                        Err(audit_error) => self.fail_request(&begin, &id, audit_error, now),
+                    };
                 }
                 drop(request_guard);
                 return match response {
-                    Ok(response) => Ok(response),
-                    Err(audit_error) => self.fail_request(&id, audit_error, now),
+                    Ok(response) => self.finalize_terminal_response(
+                        &begin,
+                        response,
+                        &now.text,
+                    ),
+                    Err(audit_error) => self.fail_request(&begin, &id, audit_error, now),
                 };
             }
         };
@@ -183,28 +235,34 @@ impl RuntimeSink {
             Ok(response) => response,
             Err(error) => {
                 drop(request_guard);
-                return self.fail_request(&id, error, now);
+                return self.fail_request(&begin, &id, error, now);
             }
         };
         let response_time = match runtime_time(self.clock.as_ref()) {
             Ok(response_time) => response_time,
             Err(_) => {
                 drop(request_guard);
-                return self.fail_request(&id, ProtocolError::InternalAgentFailure, now);
+                return self.fail_request(&begin, &id, ProtocolError::InternalAgentFailure, now);
             }
         };
         let outbound = match self.session.lock() {
             Ok(mut session) => session.outbound(response.clone(), response_time.date_time),
             Err(_) => {
                 drop(request_guard);
-                return self.fail_request(&id, ProtocolError::InternalAgentFailure, response_time);
+                return self.fail_request(
+                    &begin,
+                    &id,
+                    ProtocolError::InternalAgentFailure,
+                    response_time,
+                );
             }
         };
         if let Err(error) = outbound {
             drop(request_guard);
-            return self.fail_request(&id, error, response_time);
+            return self.fail_request(&begin, &id, error, response_time);
         }
-        self.remember_replay_response(&id, &method, request_digest.as_str(), &response)?;
+        let response = self.finalize_terminal_response(&begin, response, &response_time.text)?;
+        drop(request_guard);
         Ok(response)
     }
 
@@ -251,47 +309,52 @@ impl RuntimeSink {
         Ok(None)
     }
 
-    fn replay_response(
+    fn replay_terminal_response(
         &self,
-        request_id: &str,
-        method: &str,
-        request_digest: &str,
-    ) -> Result<Option<ProtocolFrame>, ProtocolError> {
-        let state = self
-            .request_state
-            .lock()
-            .map_err(|_| ProtocolError::InternalAgentFailure)?;
-        match state.replayed_responses.get(request_id) {
-            Some(replay)
-                if replay.method == method && replay.request_digest == request_digest =>
-            {
-                Ok(Some(replay.response.clone()))
-            }
-            Some(_) => Err(ProtocolError::ProtocolConflict),
-            None => Ok(None),
-        }
+        terminal: &ProtocolRequestTerminal,
+    ) -> Result<ProtocolFrame, ProtocolError> {
+        self.replay_response_artifact(terminal.response())
     }
 
-    fn remember_replay_response(
+    fn replay_response_artifact(
         &self,
-        request_id: &str,
-        method: &str,
-        request_digest: &str,
-        response: &ProtocolFrame,
-    ) -> Result<(), ProtocolError> {
-        self.request_state
-            .lock()
-            .map_err(|_| ProtocolError::InternalAgentFailure)?
-            .replayed_responses
-            .insert(
-                request_id.to_owned(),
-                ReplayResponse {
-                    method: method.to_owned(),
-                    request_digest: request_digest.to_owned(),
-                    response: response.clone(),
-                },
-            );
-        Ok(())
+        response: &ProtocolResponseArtifact,
+    ) -> Result<ProtocolFrame, ProtocolError> {
+        self.codec.decode(response.bytes())
+    }
+
+    fn finalize_terminal_response(
+        &self,
+        begin: &ProtocolRequestBegin,
+        response: ProtocolFrame,
+        completed_at: &str,
+    ) -> Result<ProtocolFrame, ProtocolError> {
+        let bytes = serde_json::to_vec(&response).map_err(|_| ProtocolError::InternalAgentFailure)?;
+        let artifact = ProtocolResponseArtifact::new(
+            protocol_response_artifact_id(begin.identity())?,
+            bytes,
+        )
+        .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        let artifact = self
+            .response_artifacts
+            .publish_protocol_response(begin, &artifact)
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        let durable_response = self.replay_response_artifact(&artifact)?;
+        let terminal = ProtocolRequestTerminal::new(
+            begin.identity().clone(),
+            response_terminal_status(&durable_response)?,
+            artifact,
+            completed_at.to_owned(),
+        )
+        .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        let stored = self
+            .protocol_requests
+            .complete(&terminal)
+            .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        if stored != terminal {
+            return Err(ProtocolError::ProtocolConflict);
+        }
+        self.replay_terminal_response(&stored)
     }
 
     fn request_error(
@@ -324,12 +387,18 @@ impl RuntimeSink {
 
     fn fail_request(
         &self,
+        begin: &ProtocolRequestBegin,
         request_id: &str,
         error: ProtocolError,
         now: RuntimeTime,
     ) -> Result<ProtocolFrame, ProtocolError> {
         let response = error_response(request_id, "internal_error", false)
             .map_err(|_| ProtocolError::InternalAgentFailure)?;
+        let response = self.finalize_terminal_response(
+            begin,
+            response,
+            &now.text,
+        )?;
         let _ = self.handle_protocol_error(error, now);
         Ok(response)
     }

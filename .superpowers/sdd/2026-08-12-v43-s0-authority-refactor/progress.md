@@ -44,4 +44,7 @@ Task 6: full workspace runtime gate failed only in legacy v6 fixture paths assig
 Task 6: complete (no owned file over 2,000 lines; design package kept read-only)
 Task 7: dispatched (base effa850; MACP v2 protocol/runtime/provider cutover)
 Task 7: ruling - canonical agent-protocol.v2 runStartRequest and approved plan govern over prose in design section 39.3; do not add runConfigurationRef because the closed v2 schema permits only runId/taskId/contextPackageRef/idempotencyKey and optional role
-Task 7: complete (MACP v2 local package gates 28/76/28/32 green; code-only commit requires the preserved docs/schema companion package for clean-checkout builds)
+Task 7: implementation committed (9ddd9b1; MACP v2 local package gates 28/76/28/32 green; review pending; code-only commit requires the preserved docs/schema companion package for clean-checkout builds)
+Task 7: review round 0 (1 Critical, 1 Important open - protocol request/response authority is volatile across restart; rejected and failed responses are not terminal replay records)
+Task 7: fix round 1/5 dispatched (durable v7 protocol_requests/response-artifact authority, runtime hydration, exact replay/conflict, and failed/rejected terminal coverage)
+Task 7: fix round 1/5 implementation verified (durable core and agent request correlation; artifact-before-terminal-before-response ordering; exact reopen replay/conflict; per-channel stream recovery; protocol/application/runtime/provider/SQLite gates green; bootstrap agent-runtime focused 5 green; full bootstrap legacy Task 8 fixture gate tracked separately)

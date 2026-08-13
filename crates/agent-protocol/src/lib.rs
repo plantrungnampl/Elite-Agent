@@ -15,6 +15,6 @@ pub use peer::{
     RunExecutionBinding, RunStart,
 };
 pub use session::{
-    ConnectionBinding, InboundDisposition, ProtocolCapabilities, ProtocolOffer, ProtocolSession,
-    ProtocolTrustTier, SessionLimits,
+    canonical_request_digest, ConnectionBinding, InboundDisposition, ProtocolCapabilities,
+    ProtocolOffer, ProtocolSession, ProtocolTrustTier, SessionLimits,
 };

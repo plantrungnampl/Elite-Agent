@@ -16,6 +16,7 @@ mod migrations;
 mod plan_approval_store;
 mod policy_store;
 mod project_store;
+mod protocol_request_store;
 mod run_configuration_store;
 mod task_query;
 mod tool_activity;

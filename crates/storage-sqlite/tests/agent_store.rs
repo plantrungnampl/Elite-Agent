@@ -12,13 +12,16 @@ use local_agent_terminal_agent_runtime::{
 };
 use local_agent_terminal_application::{
     AgentArtifactStore, AgentMessageArtifact, AgentRunStore, AgentRuntime, ArtifactRef,
-    ArtifactStore, Clock, NewArtifact, PortError, Retryability, SafeErrorClassification,
+    ArtifactStore, Clock, NewArtifact, PortError, ProtocolRequestBegin, ProtocolRequestBeginResult,
+    ProtocolRequestIdentity, ProtocolRequestStore, ProtocolRequestTerminal,
+    ProtocolRequestTerminalStatus, ProtocolResponseArtifact, ProtocolResponseArtifactPublisher,
+    ProtocolStreamAdvance, ProtocolStreamIdentity, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     AgentDescriptor, AgentRunLimits, AgentRunMessage, AgentRunStatus, AgentRunTerminal, AgentUsage,
     ArtifactId, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
-    BoundGenerationParameters, BoundRunConfig, Phase, RunId, Sha256Digest, TaskId, Timestamp,
-    TrustTier,
+    BoundGenerationParameters, BoundRunConfig, Phase, RunId, Sequence, Sha256Digest, TaskId,
+    Timestamp, TrustTier,
 };
 use local_agent_terminal_storage_files::{
     ContentAddressedArtifactReader, ContentAddressedArtifactStore,
@@ -31,12 +34,12 @@ use sha2::{Digest, Sha256};
 const EMPTY_JSON_DIGEST: &str =
     "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 const CONNECTION_BINDING_DIGEST: &str =
-    "sha256:6e171d4e7a1d7b7db1c14807e8a2a5cc9093eac495d66a2ca76439264d09b7d5";
+    "sha256:b26578733a878b45c3f6526cb937d53f11d13e35c7428d914cc06babb43ad729";
 const CONTEXT_BYTES: &[u8] = br#"{"context":"bound"}"#;
 const RFC8785_GENERATION_DIGEST: &str =
     "sha256:0ac6c8907856746804e71de596b1ddceed49d53b3c52035da285c42271851863";
 const RFC8785_RUN_CONFIG_DIGEST: &str =
-    "sha256:e730df0d28bc2827af7d559c318357a1e79107661d5f6ace658d8117e4a057f0";
+    "sha256:d16eba369db3033a8aed5b34d9a1bef7464095fc832c31a1442b5c8bde4352ba";
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -266,6 +269,10 @@ fn rfc8785_canonical_bytes_and_digests_survive_run_reconstruction() {
         canonical_json: canonical,
         digest: digest_from_str(RFC8785_GENERATION_DIGEST),
     };
+    assert_eq!(
+        request.connection.binding_digest,
+        connection_digest(&request.connection)
+    );
     request.validate().unwrap();
     let run_config = canonical_agent_run_config_artifact(&request).unwrap();
     assert_eq!(
@@ -558,6 +565,119 @@ fn duplicate_idempotency_key_conflicts_but_exact_replay_is_idempotent() {
             .unwrap_err()
             .safe_classification(),
         SafeErrorClassification::Conflict,
+    );
+}
+
+#[test]
+fn protocol_terminal_response_replays_exact_bytes_after_reopen_and_conflicts_on_tuple_drift() {
+    let database = TestDatabase::new();
+    let store = database.store();
+    let descriptor = descriptor();
+    store.register_descriptor(&descriptor).unwrap();
+    let request = bound_run("protocol-replay", "protocol-replay-key");
+    let connection_id = request.connection.connection_id.clone();
+    let run_id = request.run_id.clone();
+    seed_default_artifacts(&database, &request, &descriptor);
+    store.create_bound_run(&request).unwrap();
+
+    let identity = ProtocolRequestIdentity::new(
+        request.connection.connection_id.clone(),
+        "agent:protocol-replay",
+        "context.query",
+        digest('a'),
+    )
+    .unwrap();
+    let begin = ProtocolRequestBegin::new(
+        identity.clone(),
+        Some(request.task_id.clone()),
+        Some(request.run_id.clone()),
+        timestamp(5),
+    )
+    .unwrap();
+    assert_eq!(
+        store.begin(&begin).unwrap(),
+        ProtocolRequestBeginResult::Begun
+    );
+
+    let response = ProtocolResponseArtifact::new(
+        artifact_id("protocol-response-replay"),
+        br#"{"jsonrpc":"2.0","id":"agent:protocol-replay","error":{"code":-32000,"message":"denied","data":{"category":"policy_denied","retryable":false}}}"#.to_vec(),
+    )
+    .unwrap();
+    database.put_artifact(
+        response.artifact_id(),
+        request.task_id.as_str(),
+        "protocol-response",
+        response.bytes(),
+    );
+    let terminal = ProtocolRequestTerminal::new(
+        identity.clone(),
+        ProtocolRequestTerminalStatus::Failed,
+        response.clone(),
+        timestamp(9),
+    )
+    .unwrap();
+    assert_eq!(store.complete(&terminal).unwrap(), terminal);
+    store
+        .advance_stream(
+            &ProtocolStreamAdvance::new(
+                request.connection.connection_id.clone(),
+                request.run_id.clone(),
+                "content",
+                Sequence::new(1),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    drop(store);
+
+    let reopened = database.store();
+    assert_eq!(
+        reopened.begin(&begin).unwrap(),
+        ProtocolRequestBeginResult::Replayed(terminal.clone()),
+    );
+    assert_eq!(
+        reopened.load(&identity).unwrap().unwrap().state(),
+        &local_agent_terminal_application::ProtocolRequestState::Terminal(terminal),
+    );
+    reopened
+        .advance_stream(
+            &ProtocolStreamAdvance::new(
+                request.connection.connection_id.clone(),
+                request.run_id.clone(),
+                "content",
+                Sequence::new(2),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let changed = ProtocolRequestBegin::new(
+        ProtocolRequestIdentity::new(
+            request.connection.connection_id,
+            "agent:protocol-replay",
+            "context.query",
+            digest('b'),
+        )
+        .unwrap(),
+        Some(request.task_id),
+        Some(request.run_id),
+        timestamp(5),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.begin(&changed).unwrap_err().safe_classification(),
+        SafeErrorClassification::Conflict,
+    );
+    assert_eq!(
+        reopened
+            .load_stream_head(
+                &ProtocolStreamIdentity::new(connection_id, run_id, "content").unwrap(),
+            )
+            .unwrap()
+            .unwrap()
+            .get(),
+        2,
     );
 }
 
@@ -948,6 +1068,8 @@ fn runtime_terminal_publishes_exact_bytes_through_sqlite_and_content_addressed_s
     let runtime = ProtocolAgentRuntime::new(
         store.clone(),
         artifacts.clone(),
+        store.clone(),
+        artifacts.clone(),
         clock,
         vec![(
             descriptor,
@@ -956,6 +1078,20 @@ fn runtime_terminal_publishes_exact_bytes_through_sqlite_and_content_addressed_s
         )],
     )
     .unwrap();
+
+    assert_eq!(
+        store
+            .load_stream_head(
+                &ProtocolStreamIdentity::new(
+                    request.connection.connection_id.clone(),
+                    request.run_id.clone(),
+                    "content",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        None,
+    );
 
     runtime.start_run(request.clone()).unwrap();
     peer.drive().unwrap();
@@ -1004,6 +1140,8 @@ fn hostile_crashed_and_timed_out_runtime_runs_do_not_mutate_real_task_workflow_s
         let clock = Arc::new(ManualClock::new(1_800_000_000));
         let peer = Arc::new(ScriptedPeer::new(script, peer_descriptor()));
         let runtime = ProtocolAgentRuntime::new(
+            store.clone(),
+            artifacts.clone(),
             store.clone(),
             artifacts,
             clock.clone(),
@@ -1057,6 +1195,8 @@ fn artifact_and_terminal_store_failures_do_not_mutate_real_task_workflow_state()
         }
         let peer = Arc::new(ScriptedPeer::new(Script::Proposer, peer_descriptor()));
         let runtime = ProtocolAgentRuntime::new(
+            store.clone(),
+            artifacts.clone(),
             store,
             artifacts,
             Arc::new(ManualClock::new(1_800_000_000)),
@@ -1089,6 +1229,8 @@ fn post_start_store_failures_do_not_mutate_real_task_workflow_state() {
         fail_agent_run_status(&database, failed_status);
         let peer = Arc::new(ScriptedPeer::new(Script::Slow, peer_descriptor()));
         let runtime = ProtocolAgentRuntime::new(
+            store.clone(),
+            Arc::new(RuntimeArtifacts::new(&database)),
             store,
             Arc::new(RuntimeArtifacts::new(&database)),
             Arc::new(ManualClock::new(1_800_000_000)),
@@ -1177,6 +1319,44 @@ impl AgentArtifactStore for RuntimeArtifacts {
             )
             .map_err(|_| internal_failure())?;
         Ok(artifact_id)
+    }
+}
+
+impl ProtocolResponseArtifactPublisher for RuntimeArtifacts {
+    fn publish_protocol_response(
+        &self,
+        begin: &ProtocolRequestBegin,
+        response: &ProtocolResponseArtifact,
+    ) -> Result<ProtocolResponseArtifact, PortError> {
+        let task_id = begin.task_id().ok_or_else(internal_failure)?;
+        let content_hash = response.content_digest();
+        let reference = self.content.put(NewArtifact {
+            expected_hash: content_hash.as_str().to_owned(),
+            expected_size: response.size_bytes(),
+            content: response.bytes().to_vec(),
+        })?;
+        Connection::open(&self.database_path)
+            .map_err(|_| internal_failure())?
+            .execute(
+                "INSERT INTO artifacts (
+                    id, task_id, project_id, artifact_type, logical_path, content_hash,
+                    storage_key, size_bytes, mime_type, availability, created_by_type,
+                    created_by_id, created_at, supersedes, verification_state
+                 ) VALUES (?1, ?2, 'project-1', 'protocol-response', ?3, ?4, ?5, ?6,
+                    'application/json', 'available', 'core', 'agent-runtime',
+                    '2027-01-15T08:00:00Z', NULL, 'hash_verified')
+                 ON CONFLICT(id) DO NOTHING",
+                params![
+                    response.artifact_id().as_str(),
+                    task_id.as_str(),
+                    format!("protocol/{}.json", response.artifact_id().as_str()),
+                    reference.content_hash,
+                    reference.storage_key,
+                    i64::try_from(reference.size_bytes).map_err(|_| internal_failure())?,
+                ],
+            )
+            .map_err(|_| internal_failure())?;
+        Ok(response.clone())
     }
 }
 
@@ -1385,7 +1565,7 @@ fn peer_descriptor() -> PeerDescriptor {
             executable_digest: digest('b').as_str().to_owned(),
             trust_tier: ProtocolTrustTier::CoreAdapter,
         },
-        protocol_version: "1.0".to_owned(),
+        protocol_version: "2.0".to_owned(),
         capabilities: ProtocolCapabilities {
             roles: ["reviewer".to_owned()].into_iter().collect(),
             skills: ["testing".to_owned()].into_iter().collect(),
@@ -1438,7 +1618,7 @@ fn bound_run(suffix: &str, idempotency_key: &str) -> BoundAgentRunRequest {
             trust_tier: TrustTier::CoreAdapter,
             manifest_digest: manifest_digest.clone(),
             executable_digest: executable_digest.clone(),
-            contract_version: "1.0".to_owned(),
+            contract_version: "2.0".to_owned(),
             adapter_version: "adapter-1".to_owned(),
             provider_id: "provider-1".to_owned(),
             model_id: "model-1".to_owned(),
@@ -1463,7 +1643,7 @@ fn bound_run(suffix: &str, idempotency_key: &str) -> BoundAgentRunRequest {
             trust_tier: TrustTier::CoreAdapter,
             manifest_digest,
             executable_digest,
-            contract_version: "1.0".to_owned(),
+            contract_version: "2.0".to_owned(),
             adapter_version: "adapter-1".to_owned(),
             binding_digest: digest_from_str(CONNECTION_BINDING_DIGEST),
         },

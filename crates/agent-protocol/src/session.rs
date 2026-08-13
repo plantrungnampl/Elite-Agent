@@ -135,13 +135,17 @@ enum RequestOrigin {
 
 struct RunRecord {
     accepted: bool,
-    last_sequence: Option<u64>,
-    last_delta: Vec<u8>,
+    stream_heads: HashMap<String, StreamHead>,
     output_bytes: usize,
     terminal: bool,
     cancellation_deadline: Option<DateTime<Utc>>,
     buffered_stream_frames: usize,
     stream_backpressured: bool,
+}
+
+struct StreamHead {
+    last_sequence: u64,
+    last_delta: Option<Vec<u8>>,
 }
 
 impl ProtocolSession {
@@ -208,32 +212,58 @@ impl ProtocolSession {
         }
     }
 
+    /// Restores one durable core request that is still awaiting a response.
+    ///
+    /// Restoration only updates session correlation state; it does not dispatch the frame. An
+    /// exact pending replay is idempotent, while a request ID with different durable identity is
+    /// rejected as a protocol conflict.
+    pub fn restore_pending_request(
+        &mut self,
+        frame: ProtocolFrame,
+        at: DateTime<Utc>,
+    ) -> Result<(), ProtocolError> {
+        self.ensure_connected()?;
+        let value = frame_value(&frame)?;
+        let method = match &frame {
+            ProtocolFrame::InitializeRequest(_) => "initialize",
+            ProtocolFrame::RunStartRequest(_) => "agent.run.start",
+            ProtocolFrame::RunCancelRequest(_) => "agent.run.cancel",
+            ProtocolFrame::ShutdownRequest(_) => "shutdown",
+            ProtocolFrame::InitializedNotification(_)
+            | ProtocolFrame::ExitNotification(_)
+            | ProtocolFrame::RunCompleteRequest(_)
+            | ProtocolFrame::StreamDeltaNotification(_)
+            | ProtocolFrame::ContextQueryRequest(_)
+            | ProtocolFrame::ToolRequest(_)
+            | ProtocolFrame::SpecialistRequest(_)
+            | ProtocolFrame::HeartbeatNotification(_) => return Err(ProtocolError::InvalidRequest),
+            _ => return Err(ProtocolError::InvalidRequest),
+        };
+        let id = request_id(&value)?;
+        if !is_core_id(id) {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        let digest = request_digest(&value)?;
+        if self.request_replays(id, method, &digest, RequestOrigin::Core)? {
+            return self
+                .pending_responses
+                .contains_key(id)
+                .then_some(())
+                .ok_or(ProtocolError::ProtocolConflict);
+        }
+
+        self.outbound(frame, at)
+    }
+
     pub fn receive_response(
         &mut self,
         frame: ProtocolFrame,
         _at: DateTime<Utc>,
     ) -> Result<(), ProtocolError> {
-        self.ensure_connected()?;
+        self.validate_response(&frame)?;
         let value = frame_value(&frame)?;
-        if !is_response(&value) {
-            return Err(ProtocolError::InvalidRequest);
-        }
-
         let id = request_id(&value)?;
-        if !is_core_id(id) {
-            return Err(ProtocolError::InvalidRequest);
-        }
-        let pending = self
-            .pending_responses
-            .get(id)
-            .cloned()
-            .ok_or(ProtocolError::InvalidRequest)?;
-        if pending.origin != RequestOrigin::Core
-            || pending.connection_id != self.binding.connection_id
-        {
-            return Err(ProtocolError::InvalidRequest);
-        }
-        validate_response_for_method(&value, &pending.method)?;
+        let pending = self.pending_core_response(&value)?;
 
         if pending.method == "initialize" && value.get("result").is_some() {
             self.selected_capabilities = Some(self.validate_initialize_response(&value)?);
@@ -249,6 +279,28 @@ impl ProtocolSession {
             )?;
         }
         self.complete_request(id, pending);
+        Ok(())
+    }
+
+    /// Validates a core response without completing correlation or changing negotiated/run state.
+    pub fn validate_response(&self, frame: &ProtocolFrame) -> Result<(), ProtocolError> {
+        self.ensure_connected()?;
+        let value = frame_value(frame)?;
+        let pending = self.pending_core_response(&value)?;
+        validate_response_for_method(&value, &pending.method)?;
+
+        if pending.method == "initialize" && value.get("result").is_some() {
+            self.validate_initialize_response(&value)?;
+        }
+        if pending.method == "agent.run.start" && value.get("result").is_some() {
+            self.validate_run_start_response(
+                &value,
+                pending
+                    .run_id
+                    .as_deref()
+                    .ok_or(ProtocolError::InvalidRequest)?,
+            )?;
+        }
         Ok(())
     }
 
@@ -382,6 +434,33 @@ impl ProtocolSession {
             .ok_or(ProtocolError::InvalidRequest)
     }
 
+    /// Restores a durable stream position before the next delta arrives.
+    ///
+    /// The durable protocol store records sequence heads but not delta bytes. A repeated restored
+    /// sequence is therefore rejected rather than accepted as an unverifiable duplicate.
+    pub fn restore_stream_head(
+        &mut self,
+        run_id: &str,
+        channel: &str,
+        sequence: u64,
+    ) -> Result<(), ProtocolError> {
+        if !matches!(channel, "content" | "status" | "telemetry") || sequence == 0 {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        let run = self.active_run_mut(run_id)?;
+        if run.stream_heads.contains_key(channel) {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        run.stream_heads.insert(
+            channel.to_owned(),
+            StreamHead {
+                last_sequence: sequence,
+                last_delta: None,
+            },
+        );
+        Ok(())
+    }
+
     fn outbound_response(&mut self, value: &Value) -> Result<(), ProtocolError> {
         let id = request_id(value)?;
         if !is_agent_id(id) {
@@ -446,8 +525,7 @@ impl ProtocolSession {
             run_id,
             RunRecord {
                 accepted: false,
-                last_sequence: None,
-                last_delta: Vec::new(),
+                stream_heads: HashMap::new(),
                 output_bytes: 0,
                 terminal: false,
                 cancellation_deadline: None,
@@ -524,24 +602,57 @@ impl ProtocolSession {
         Ok(selected)
     }
 
-    fn accept_run_start(
-        &mut self,
+    fn pending_core_response(&self, value: &Value) -> Result<PendingRequest, ProtocolError> {
+        if !is_response(value) {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        let id = request_id(value)?;
+        if !is_core_id(id) {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        let pending = self
+            .pending_responses
+            .get(id)
+            .cloned()
+            .ok_or(ProtocolError::InvalidRequest)?;
+        if pending.origin != RequestOrigin::Core
+            || pending.connection_id != self.binding.connection_id
+        {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        Ok(pending)
+    }
+
+    fn validate_run_start_response(
+        &self,
         value: &Value,
-        expected_run_id: String,
+        expected_run_id: &str,
     ) -> Result<(), ProtocolError> {
         let result = object_field(
             value.as_object().ok_or(ProtocolError::InvalidRequest)?,
             "result",
         )?;
-        if required_bool(result, "accepted")? && required_str(result, "runId")? == expected_run_id {
-            self.runs
-                .get_mut(&expected_run_id)
-                .ok_or(ProtocolError::InvalidRequest)?
-                .accepted = true;
+        if required_bool(result, "accepted")?
+            && required_str(result, "runId")? == expected_run_id
+            && self.runs.contains_key(expected_run_id)
+        {
             Ok(())
         } else {
             Err(ProtocolError::InvalidRequest)
         }
+    }
+
+    fn accept_run_start(
+        &mut self,
+        value: &Value,
+        expected_run_id: String,
+    ) -> Result<(), ProtocolError> {
+        self.validate_run_start_response(value, &expected_run_id)?;
+        self.runs
+            .get_mut(&expected_run_id)
+            .ok_or(ProtocolError::InvalidRequest)?
+            .accepted = true;
+        Ok(())
     }
 
     fn receive_agent_request_for_active_run(
@@ -564,21 +675,28 @@ impl ProtocolSession {
     fn receive_stream_delta(&mut self, value: &Value) -> Result<bool, ProtocolError> {
         let params = params(value)?;
         let run_id = required_str(params, "runId")?.to_owned();
+        let channel = required_str(params, "channel")?;
         let sequence = required_u64(params, "sequence")?;
         let delta = required_str(params, "delta")?.as_bytes();
         let max_output_bytes = self.limits.max_output_bytes;
         let high_watermark = STREAM_HIGH_WATERMARK;
         let run = self.active_run_mut(&run_id)?;
 
-        let invalid_sequence = match run.last_sequence {
+        let invalid_sequence = match run.stream_heads.get(channel) {
             None => sequence != 1,
-            Some(last_sequence) if sequence == last_sequence => {
-                if run.last_delta == delta {
+            Some(StreamHead {
+                last_sequence,
+                last_delta: Some(last_delta),
+            }) if sequence == *last_sequence => {
+                if last_delta == delta {
                     return Ok(true);
                 }
                 true
             }
-            Some(last_sequence) => last_sequence.checked_add(1) != Some(sequence),
+            Some(StreamHead { last_sequence, .. }) if sequence == *last_sequence => true,
+            Some(StreamHead { last_sequence, .. }) => {
+                last_sequence.checked_add(1) != Some(sequence)
+            }
         };
         if invalid_sequence {
             run.terminal = true;
@@ -593,8 +711,13 @@ impl ProtocolSession {
             run.terminal = true;
             return Err(ProtocolError::OutputLimitExceeded);
         }
-        run.last_sequence = Some(sequence);
-        run.last_delta = delta.to_vec();
+        run.stream_heads.insert(
+            channel.to_owned(),
+            StreamHead {
+                last_sequence: sequence,
+                last_delta: Some(delta.to_vec()),
+            },
+        );
         run.output_bytes = output_bytes;
         run.buffered_stream_frames = run
             .buffered_stream_frames
@@ -823,6 +946,11 @@ fn request_digest(value: &Value) -> Result<String, ProtocolError> {
     let canonical =
         serde_json_canonicalizer::to_vec(value).map_err(|_| ProtocolError::InvalidRequest)?;
     Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
+}
+
+/// Returns the RFC 8785 digest used for durable request correlation.
+pub fn canonical_request_digest(frame: &ProtocolFrame) -> Result<String, ProtocolError> {
+    request_digest(&frame_value(frame)?)
 }
 
 pub(crate) fn binding_digest(binding: &ConnectionBinding) -> String {

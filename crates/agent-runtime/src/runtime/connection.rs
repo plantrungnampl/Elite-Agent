@@ -11,20 +11,25 @@ use std::{
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use local_agent_terminal_agent_protocol::{
-    InboundDisposition, NdjsonCodec, PeerDescriptor, PeerEventSink, ProtocolError, ProtocolFrame,
-    ProtocolOffer, ProtocolPeer, ProtocolSession, ProtocolTrustTier,
+    canonical_request_digest, InboundDisposition, NdjsonCodec, PeerDescriptor, PeerEventSink,
+    ProtocolError, ProtocolFrame, ProtocolOffer, ProtocolPeer, ProtocolSession, ProtocolTrustTier,
     RunCancel, RunExecutionBinding, RunStart, SessionLimits, DEFAULT_MAX_FRAME_BYTES,
 };
 use local_agent_terminal_application::{
     AgentArtifactStore, AgentContextQueryRequest, AgentContextQueryResponse, AgentMessageArtifact,
     AgentRequestAudit, AgentRequestAuditDecision, AgentRequestAuditFence, AgentRequestCancellation,
     AgentRequestHandler, AgentRequestKind, AgentRunStore, AgentRuntime, AgentSpecialistRequest,
-    AgentSpecialistResponse, Clock, PortError, Retryability, SafeErrorClassification,
+    AgentSpecialistResponse, Clock, PortError, ProtocolRequestStore,
+    ProtocolRequestBegin, ProtocolRequestBeginResult, ProtocolRequestIdentity,
+    ProtocolRequestTerminal, ProtocolRequestTerminalStatus, ProtocolResponseArtifact,
+    ProtocolResponseArtifactPublisher, ProtocolStreamAdvance, ProtocolStreamIdentity,
+    Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     AgentCancellationReceipt, AgentClaim, AgentDescriptor, AgentRunMessage,
     AgentRunReceipt, AgentRunStatus, AgentRunTerminal, AgentUsage, ArtifactId,
     BoundAgentRunRequest, CancelAgentRun, RunId, Sha256Digest, Timestamp, TrustTier,
+    Sequence,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -36,6 +41,8 @@ pub(crate) const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 pub struct ProtocolAgentRuntime {
     store: Arc<dyn AgentRunStore>,
     artifacts: Arc<dyn AgentArtifactStore>,
+    protocol_requests: Arc<dyn ProtocolRequestStore>,
+    response_artifacts: Arc<dyn ProtocolResponseArtifactPublisher>,
     clock: Arc<dyn Clock>,
     request_handler: Arc<dyn AgentRequestHandler>,
     request_routing_enabled: bool,
@@ -71,14 +78,6 @@ struct RunRequestState {
     context_queries: u64,
     specialist_requests: u64,
     context_query_ids: BTreeSet<String>,
-    replayed_responses: BTreeMap<String, ReplayResponse>,
-}
-
-#[derive(Clone)]
-struct ReplayResponse {
-    method: String,
-    request_digest: String,
-    response: ProtocolFrame,
 }
 
 struct DenyAgentRequestHandler;
