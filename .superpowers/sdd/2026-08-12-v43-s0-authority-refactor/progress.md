@@ -35,3 +35,10 @@ Task 5: fix round 1/5 (3 addressed, 0 open - typed fact accessor; separate publi
 Task 5: compatibility repair (d8c0e77 - repository identity and operation-attempt readers aligned with v7; stale specialist regression proves missing-budget fail-closed)
 Task 5: full workspace runtime gate inconclusive after 15-minute timeout; known v6 bootstrap fixture cutover remains assigned to Task 8; workspace check, Clippy, doc tests and all Task 5 package gates green
 Task 5: complete (commits ea53dd2..d8c0e77, independent Task 5 review clean; fresh exact gates 1+8+7+23; no owned file over 2,000 lines)
+Task 6: RED confirmed (missing application assurance authority and SQLite persistence surfaces)
+Task 6: review round 0 (4 Important open - late exact replay; arbitrary acceptance artifact; understated HighAssurance requirements; incomplete schema-v7 repair model)
+Task 6: fix round 1/5 (4 addressed, 0 open - monotonic replay; exact canonical acceptance proof; normative requirement floors; both repair states covered)
+Task 6: independent re-review ship; minor hostile parse-boundary regression added
+Task 6: scoped gates green (domain 1, application 5, assurance store 7, schema v7 13, schema health 8; domain/application/storage-sqlite all-features green; fmt/check/Clippy/doc green)
+Task 6: full workspace runtime gate failed only in legacy v6 fixture paths assigned to Task 8 (bootstrap authority seeding and storage-files repository identity)
+Task 6: complete (no owned file over 2,000 lines; design package kept read-only)

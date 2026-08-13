@@ -9,6 +9,22 @@ use rusqlite::{params, Connection};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
+const PRIOR_RUN_CONFIGURATION_REPAIR: &str = r#"
+DROP TRIGGER run_configuration_binding_scope;
+CREATE TRIGGER run_configuration_binding_scope BEFORE INSERT ON run_configuration_bindings FOR EACH ROW BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM agent_runs r
+        JOIN tasks t ON t.id=r.task_id
+        JOIN artifacts a ON a.id=NEW.config_artifact_id
+        WHERE r.id=NEW.run_id
+          AND r.run_config_artifact_id=NEW.config_artifact_id
+          AND a.project_id=t.project_id
+          AND (a.task_id IS NULL OR a.task_id=r.task_id)
+    ) THEN RAISE(ABORT,'run configuration binding must match the exact run artifact') END;
+END;
+"#;
+
 struct TempDirectory(PathBuf);
 
 impl TempDirectory {
@@ -122,6 +138,45 @@ fn v7_run_configuration_scope_repair_installs_and_reopens_exactly() {
             )
             .unwrap();
         assert!(!trigger.contains("a.content_hash=NEW.config_digest"));
+        drop(connection);
+        SqliteStore::open(&path).unwrap();
+    }
+}
+
+#[test]
+fn v7_assurance_scope_repair_separates_physical_and_semantic_digests() {
+    let directory = TempDirectory::new();
+    let raw_path = directory.0.join("raw-v7-assurance.sqlite3");
+    let prior_path = directory.0.join("prior-complete-v7-assurance.sqlite3");
+    let intermediate_path = directory.0.join("run-repaired-v7-assurance.sqlite3");
+    let v7 = include_str!("../../../docs/multi-agent-terminal-design/schemas/sqlite-v7.sql");
+    let app = include_str!("../src/app_projection_schema.sql");
+
+    Connection::open(&raw_path)
+        .unwrap()
+        .execute_batch(v7)
+        .unwrap();
+    Connection::open(&prior_path)
+        .unwrap()
+        .execute_batch(&format!("{v7}\n{app}"))
+        .unwrap();
+    Connection::open(&intermediate_path)
+        .unwrap()
+        .execute_batch(&format!("{v7}\n{app}\n{PRIOR_RUN_CONFIGURATION_REPAIR}"))
+        .unwrap();
+
+    for path in [raw_path, prior_path, intermediate_path] {
+        SqliteStore::open(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let trigger: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type='trigger' AND name='assurance_degradation_scope'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!trigger.contains("a.content_hash=NEW.receipt_digest"));
         drop(connection);
         SqliteStore::open(&path).unwrap();
     }

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod agent;
+mod assurance;
 mod context;
 mod deliberation;
 mod event;
@@ -17,6 +18,11 @@ pub use agent::{
     AgentRunTerminal, AgentUsage, BoundAgentConnection, BoundAgentRunRequest,
     BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, CancelAgentRun,
     MAX_GENERATION_PARAMETERS_BYTES,
+};
+pub use assurance::{
+    AssuranceAssessment, AssuranceDecision, AssuranceDegradationInput, AssuranceDegradationReceipt,
+    AssuranceError, AssuranceObserved, AssuranceReasonCode, AssuranceRequirements,
+    AssuranceRunEvidence,
 };
 pub use context::{
     ContextBudget, ContextError, ContextPackageArtifact, ContextPackageBinding,

@@ -31,10 +31,28 @@ CREATE TRIGGER run_configuration_binding_scope BEFORE INSERT ON run_configuratio
 END;
 COMMIT;
 "#;
+const ASSURANCE_DEGRADATION_SCOPE_REPAIR: &str = r#"
+BEGIN IMMEDIATE;
+DROP TRIGGER assurance_degradation_scope;
+CREATE TRIGGER assurance_degradation_scope BEFORE INSERT ON assurance_degradation_receipts FOR EACH ROW BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM tasks t
+        JOIN artifacts a ON a.id=NEW.receipt_artifact_id
+        WHERE t.id=NEW.task_id
+          AND a.project_id=t.project_id
+          AND (a.task_id IS NULL OR a.task_id=NEW.task_id)
+    ) THEN RAISE(ABORT,'assurance degradation receipt must be exact and task-scoped') END;
+    SELECT CASE WHEN NEW.decision='continue_degraded' AND NEW.actor_binding_id IS NULL THEN RAISE(ABORT,'continuing with degraded assurance requires explicit actor proof') END;
+END;
+COMMIT;
+"#;
 
 static EXPECTED_V6_OBJECTS: OnceLock<SchemaObjects> = OnceLock::new();
 static EXPECTED_V7_OBJECTS: OnceLock<SchemaObjects> = OnceLock::new();
 static EXPECTED_PRIOR_COMPLETE_OBJECTS: OnceLock<SchemaObjects> = OnceLock::new();
+static EXPECTED_RUN_CONFIGURATION_REPAIRED_COMPLETE_OBJECTS: OnceLock<SchemaObjects> =
+    OnceLock::new();
 static EXPECTED_REPAIRED_COMPLETE_OBJECTS: OnceLock<SchemaObjects> = OnceLock::new();
 static EXPECTED_WORKFLOW_RULE_AUTHORITY: OnceLock<WorkflowRuleAuthority> = OnceLock::new();
 
@@ -176,6 +194,7 @@ fn recognize_schema(connection: &Connection) -> Result<SchemaKind, OpenError> {
     }
     if actual == *expected_v7_objects()?
         || actual == *expected_prior_complete_objects()?
+        || actual == *expected_run_configuration_repaired_complete_objects()?
         || actual == *expected_repaired_complete_objects()?
     {
         verify_workflow_rule_authority(connection)?;
@@ -202,8 +221,12 @@ fn install_or_verify_app_projections(connection: &Connection) -> Result<(), Open
     if actual == *expected_v7_objects()? {
         connection.execute_batch(APP_PROJECTION_SCHEMA)?;
         connection.execute_batch(RUN_CONFIGURATION_BINDING_REPAIR)?;
+        connection.execute_batch(ASSURANCE_DEGRADATION_SCOPE_REPAIR)?;
     } else if actual == *expected_prior_complete_objects()? {
         connection.execute_batch(RUN_CONFIGURATION_BINDING_REPAIR)?;
+        connection.execute_batch(ASSURANCE_DEGRADATION_SCOPE_REPAIR)?;
+    } else if actual == *expected_run_configuration_repaired_complete_objects()? {
+        connection.execute_batch(ASSURANCE_DEGRADATION_SCOPE_REPAIR)?;
     } else {
         return Err(unsupported_schema());
     }
@@ -239,6 +262,19 @@ fn expected_prior_complete_objects() -> Result<&'static SchemaObjects, OpenError
 fn expected_repaired_complete_objects() -> Result<&'static SchemaObjects, OpenError> {
     cached_schema(
         &EXPECTED_REPAIRED_COMPLETE_OBJECTS,
+        &[
+            SQLITE_V7,
+            APP_PROJECTION_SCHEMA,
+            RUN_CONFIGURATION_BINDING_REPAIR,
+            ASSURANCE_DEGRADATION_SCOPE_REPAIR,
+        ],
+    )
+}
+
+fn expected_run_configuration_repaired_complete_objects(
+) -> Result<&'static SchemaObjects, OpenError> {
+    cached_schema(
+        &EXPECTED_RUN_CONFIGURATION_REPAIRED_COMPLETE_OBJECTS,
         &[
             SQLITE_V7,
             APP_PROJECTION_SCHEMA,

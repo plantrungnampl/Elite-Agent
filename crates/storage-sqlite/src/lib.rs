@@ -3,6 +3,7 @@
 mod agent_store;
 mod approval_store;
 mod artifact_journal;
+mod assurance_store;
 mod context_store;
 mod deliberation_boundary_store;
 mod deliberation_budget_store;

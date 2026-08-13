@@ -622,26 +622,26 @@ pub trait AssuranceStore: Send + Sync {
 }
 ```
 
-- [ ] **Step 1: Write RED escalation and degradation tests**
+- [x] **Step 1: Write RED escalation and degradation tests**
 
 Cover Quick to Standard, Quick to HighAssurance, Standard to HighAssurance, all downgrades, ReadOnlyResearch changes, version replay, insufficient groups, same executor/reviewer, and all three decisions. Assert `ContinueDegraded` without both actor binding and acceptance artifact is invalid.
 
-- [ ] **Step 2: Run focused tests and confirm RED**
+- [x] **Step 2: Run focused tests and confirm RED**
 
 ```powershell
 cargo test -p local-agent-terminal-application --test assurance -- --nocapture
 cargo test -p local-agent-terminal-storage-sqlite --test assurance_store -- --nocapture
 ```
 
-- [ ] **Step 3: Implement pure policy and canonical receipts**
+- [x] **Step 3: Implement pure policy and canonical receipts**
 
 Count distinct `independence.group_id` values and compare exact executor/reviewer run IDs. Preserve the requested profile on degraded continuation. Compute `receiptDigest` from canonical bytes with the digest omitted, then serialize the final closed schema.
 
-- [ ] **Step 4: Implement v7 profile/degradation persistence**
+- [x] **Step 4: Implement v7 profile/degradation persistence**
 
 Profile escalation uses one immediate transaction, inserts the immutable revision, increments stream/profile revisions once, updates `last_profile_revision_id`, and leaves phase unchanged. Degradation rows are append-only and task/run-set scoped.
 
-- [ ] **Step 5: Verify and commit assurance authority**
+- [x] **Step 5: Verify and commit assurance authority**
 
 ```powershell
 cargo fmt --all -- --check

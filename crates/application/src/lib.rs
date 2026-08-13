@@ -5,24 +5,28 @@ pub use local_agent_terminal_domain::{
     AgentCancellationReceipt, AgentClaim, AgentDescriptor, AgentError, AgentEvidenceRef,
     AgentFamilyKey, AgentProfileConfiguration, AgentRole, AgentRunLimits, AgentRunMessage,
     AgentRunReceipt, AgentRunSnapshot, AgentRunStatus, AgentRunTerminal, AgentUsage,
-    AllowedDataClass, ArtifactId, BoundAgentConnection, BoundAgentRunRequest,
-    BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, CancelAgentRun,
-    CapabilitySnapshot, ClaimVerification, ContextBudget, ContextError, ContextPackageArtifact,
-    ContextPackageBinding, ContextPackageDescriptor, ContextPackageIdentity, ContextPackageMember,
-    ContextVersionSet, DataPolicySnapshot, DeliberationBudget, DeliberationError, EndpointClass,
-    EventId, EvidenceFreshness, FallbackCandidate, FallbackMode, FallbackPolicy, FencingToken,
-    GenerationParameters, GitObjectId, IndependenceConfiguration, IndependenceDimensions,
-    LeaseClaim, LineRange, ModelEndpointConfiguration, NetworkScope, Phase, PolicyAction,
-    PolicyActor, PolicyDecisionSet, PolicyResource, ProjectId, ProviderTrainingUse, RepositoryId,
-    ResourceClass, RetentionClass, RunBudgetReservation, RunConfiguration, RunConfigurationError,
-    RunId, Sequence, Sha256Digest, SourceIdentity, SpecialistBudget, SpecialistRequest, TaskBranch,
-    TaskId, TaskRisk, Timestamp, TrustTier, UnsignedRunConfiguration, WorkspaceFingerprint,
-    WorkspaceVersion, WorktreeId, MAX_GENERATION_PARAMETERS_BYTES,
+    AllowedDataClass, ArtifactId, AssuranceAssessment, AssuranceDecision,
+    AssuranceDegradationInput, AssuranceDegradationReceipt, AssuranceError, AssuranceObserved,
+    AssuranceReasonCode, AssuranceRequirements, AssuranceRunEvidence, BoundAgentConnection,
+    BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig,
+    CancelAgentRun, CapabilitySnapshot, ClaimVerification, ContextBudget, ContextError,
+    ContextPackageArtifact, ContextPackageBinding, ContextPackageDescriptor,
+    ContextPackageIdentity, ContextPackageMember, ContextVersionSet, DataPolicySnapshot,
+    DeliberationBudget, DeliberationError, EndpointClass, EventId, EvidenceFreshness,
+    FallbackCandidate, FallbackMode, FallbackPolicy, FencingToken, GenerationParameters,
+    GitObjectId, IndependenceConfiguration, IndependenceDimensions, LeaseClaim, LineRange,
+    ModelEndpointConfiguration, NetworkScope, Phase, PolicyAction, PolicyActor, PolicyDecisionSet,
+    PolicyResource, ProjectId, ProviderTrainingUse, RepositoryId, ResourceClass, RetentionClass,
+    RunBudgetReservation, RunConfiguration, RunConfigurationError, RunId, Sequence, Sha256Digest,
+    SourceIdentity, SpecialistBudget, SpecialistRequest, TaskBranch, TaskId, TaskRisk, Timestamp,
+    TrustTier, UnsignedRunConfiguration, WorkspaceFingerprint, WorkspaceVersion, WorktreeId,
+    MAX_GENERATION_PARAMETERS_BYTES,
 };
 
 mod agent;
 mod append_events;
 mod approval;
+mod assurance;
 mod authority;
 mod canonical_json;
 mod context;
@@ -60,6 +64,9 @@ pub use approval::{
     PlanApprovalPlanRefV1, PolicyExceptionApprovalOperationV1, PolicyExceptionApprovalPayloadV1,
     ToolApprovalOperationV1, ToolApprovalPayloadV1, ToolApprovalPublication, ToolApprovalRequest,
     ToolApprovalRequestPublisher,
+};
+pub use assurance::{
+    prepare_assurance_acceptance_artifact, AssuranceStore, ProfileEscalationCommand,
 };
 pub use authority::{
     validate_authoritative_tool_request, ToolAuthorityResolver, ToolAuthoritySnapshot,

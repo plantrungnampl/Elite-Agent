@@ -26,6 +26,19 @@ CREATE TRIGGER run_configuration_binding_scope BEFORE INSERT ON run_configuratio
     ) THEN RAISE(ABORT,'run configuration binding must match the exact run artifact') END;
 END;
 "#;
+const REPAIRED_ASSURANCE_DEGRADATION_SCOPE: &str = r#"
+CREATE TRIGGER assurance_degradation_scope BEFORE INSERT ON assurance_degradation_receipts FOR EACH ROW BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM tasks t
+        JOIN artifacts a ON a.id=NEW.receipt_artifact_id
+        WHERE t.id=NEW.task_id
+          AND a.project_id=t.project_id
+          AND (a.task_id IS NULL OR a.task_id=NEW.task_id)
+    ) THEN RAISE(ABORT,'assurance degradation receipt must be exact and task-scoped') END;
+    SELECT CASE WHEN NEW.decision='continue_degraded' AND NEW.actor_binding_id IS NULL THEN RAISE(ABORT,'continuing with degraded assurance requires explicit actor proof') END;
+END;
+"#;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -80,7 +93,7 @@ fn clean_v7_and_migrated_v7_have_identical_authority_objects() {
 }
 
 #[test]
-fn exact_normative_v7_reopens_with_only_the_approved_trigger_repair() {
+fn exact_normative_v7_reopens_with_only_the_approved_trigger_repairs() {
     let expected = runtime_v7_objects();
     let directory = TempDirectory::new();
     let path = directory.database_path();
@@ -418,6 +431,16 @@ fn runtime_v7_objects() -> SchemaObjects {
         ))
         .expect("normative v7 run configuration trigger exists")
         .sql = normalize_sql(repaired_scope);
+    let repaired_assurance = REPAIRED_ASSURANCE_DEGRADATION_SCOPE
+        .trim()
+        .trim_end_matches(';');
+    objects
+        .get_mut(&(
+            "trigger".to_owned(),
+            "assurance_degradation_scope".to_owned(),
+        ))
+        .expect("normative v7 assurance degradation trigger exists")
+        .sql = normalize_sql(repaired_assurance);
     objects
 }
 

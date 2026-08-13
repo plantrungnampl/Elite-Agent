@@ -523,7 +523,7 @@ fn serialize_timestamp<S: Serializer>(value: &Timestamp, serializer: S) -> Resul
         .serialize(serializer)
 }
 
-fn format_timestamp(value: Timestamp) -> Result<String, RunConfigurationError> {
+pub(crate) fn format_timestamp(value: Timestamp) -> Result<String, RunConfigurationError> {
     let seconds = value.unix_seconds();
     if seconds < 0 {
         return Err(RunConfigurationError::Invalid);
@@ -561,7 +561,7 @@ fn deserialize_timestamp<'de, D: Deserializer<'de>>(
         .ok_or_else(|| serde::de::Error::custom("invalid canonical RFC3339 timestamp"))
 }
 
-fn parse_timestamp(value: &str) -> Option<i64> {
+pub(crate) fn parse_timestamp(value: &str) -> Option<i64> {
     if value.len() != 20
         || value.as_bytes().get(4) != Some(&b'-')
         || value.as_bytes().get(7) != Some(&b'-')
