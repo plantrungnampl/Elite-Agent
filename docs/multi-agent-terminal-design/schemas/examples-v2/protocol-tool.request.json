@@ -1,0 +1,17 @@
+{
+  "jsonrpc": "2.0",
+  "id": "agent:77",
+  "method": "tool.request",
+  "params": {
+    "runId": "run-238",
+    "requestId": "tool-77",
+    "planStepId": "step-4",
+    "executorFencingToken": null,
+    "tool": "git.diff",
+    "arguments": {
+      "path": "src/auth"
+    },
+    "argumentsDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "reason": "Verify whether the proposed change matches the approved scope"
+  }
+}

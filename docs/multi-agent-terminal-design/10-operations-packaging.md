@@ -207,3 +207,23 @@ A user-generated diagnostic bundle may include:
 - active trust-tier summary without executable arguments containing secrets;
 - unresolved or indeterminate operation counts;
 - artifact and database integrity status.
+
+## 13. v3 startup and update gates
+
+Startup remains closed to dispatch until it has verified runtime database pragmas, schema/update journal, immutable evidence reachability, leases, operation attempts, protocol traces, approval receipts, Git/worktree state, and containment attestation validity.
+
+An update may not begin while a non-resumable or indeterminate effect is unresolved. Acceptance requires upgrade from every supported schema generation, crash injection around every migration/health switch, and either a compatible current generation or a verified whole-state restore. Database, artifacts, policy/config, update journal, and credential references form one backup generation; mixed generations are not success.
+
+## v4 cognitive operations
+
+The application exposes maintenance operations for:
+
+- inspect and rebuild an index generation;
+- verify memory evidence freshness;
+- export memory, retrieval, context, and evaluation receipts without secret payloads;
+- quarantine a retrieval adapter;
+- migrate from legacy memory entries to versioned memory records;
+- compare benchmark configurations;
+- delete disposable index generations while preserving authority data.
+
+Backup includes SQLite authority, content-addressed artifacts, policies, and migration receipts. Embedded vector/graph indexes may be excluded when a verified rebuild is possible. Sidecar or remote engine state is never the sole backup of memory.

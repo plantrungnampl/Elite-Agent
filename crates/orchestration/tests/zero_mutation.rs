@@ -1,16 +1,16 @@
 use std::sync::{Arc, Mutex};
 
 use local_agent_terminal_application::{
-    AcquireLease, AgentRuntime, AppendOperation, AppendResult, AuthoritativeProcessBinding,
-    AuthorizedFileRead, AuthorizedFileWrite, AuthorizedToolRequest, CancellationReceipt,
-    CapabilityFilesystem, CreateWorktree, DeliberationArtifactRef, DeliberationBoundaryCheck,
-    DeliberationBoundaryRecord, DeliberationBoundaryStore, DeliberationDispatchBinding,
-    DeliberationDispatchStore, DeliberationPhaseDispatchSet, DeliberationProposalDispatchPlan,
+    AcquireLease, AgentRuntime, AuthoritativeProcessBinding, AuthorizedFileRead,
+    AuthorizedFileWrite, AuthorizedToolRequest, CancellationReceipt, CapabilityFilesystem,
+    CreateWorktree, DeliberationArtifactRef, DeliberationBoundaryCheck, DeliberationBoundaryRecord,
+    DeliberationBoundaryStore, DeliberationDispatchBinding, DeliberationDispatchStore,
+    DeliberationPhaseDispatchSet, DeliberationPhaseTransition, DeliberationProposalDispatchPlan,
     DeliberationRepositoryAuthority, DeliberationRunAssignment, DeliberationToolCatalog,
-    DeliberationToolSchema, DiscardWorktree, DisclosureOutcome, EventStore, ExecutorLeaseStore,
-    FileReadRequest, FileWriteRequest, GitDiffRequest, GitDiffResult, GitStatusRequest,
-    GitStatusResult, InspectRepository, LeaseSnapshot, PolicyBoundBytes, PortError,
-    RepositoryGateway, RepositoryLocator, RepositorySnapshot, Retryability, RevokeLease,
+    DeliberationToolSchema, DeliberationWorkflowAuthority, DiscardWorktree, DisclosureOutcome,
+    ExecutorLeaseStore, FileReadRequest, FileWriteRequest, GitDiffRequest, GitDiffResult,
+    GitStatusRequest, GitStatusResult, InspectRepository, LeaseSnapshot, PolicyBoundBytes,
+    PortError, RepositoryGateway, RepositoryLocator, RepositorySnapshot, Retryability, RevokeLease,
     SafeErrorClassification, StructuredToolExecutor, ToolExecutionId, ToolExecutionResult,
     VerifiedBytes, VerifiedWrite, WorktreeSnapshot,
 };
@@ -262,12 +262,13 @@ impl DeliberationToolCatalog for WriteSpyAdapter {
     }
 }
 
-impl EventStore for WriteSpyAdapter {
-    fn append(&self, operation: AppendOperation) -> Result<AppendResult, PortError> {
+impl DeliberationWorkflowAuthority for WriteSpyAdapter {
+    fn transition(&self, operation: DeliberationPhaseTransition) -> Result<(), PortError> {
+        assert!(!operation.rule_id().is_empty());
+        assert_eq!(operation.guards().len(), 1);
+        assert!(!operation.effects().is_empty());
         *self.event_writes.lock().unwrap() += 1;
-        Ok(AppendResult {
-            new_version: Sequence::new(operation.expected_version.get() + 1),
-        })
+        Ok(())
     }
 }
 
@@ -294,6 +295,10 @@ impl DeliberationDispatchStore for WriteSpyAdapter {
 impl AgentRuntime for WriteSpyAdapter {
     fn list_agents(&self) -> Result<Vec<AgentDescriptor>, PortError> {
         unreachable!()
+    }
+
+    fn prepare_run(&self, _: &BoundAgentRunRequest) -> Result<(), PortError> {
+        Err(forbidden_mutation())
     }
 
     fn start_run(&self, request: BoundAgentRunRequest) -> Result<AgentRunReceipt, PortError> {

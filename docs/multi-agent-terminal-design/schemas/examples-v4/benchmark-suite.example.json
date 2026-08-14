@@ -1,0 +1,41 @@
+{
+  "suiteId": "engineering-v1",
+  "version": 1,
+  "name": "Engineering Agent Quality Baseline",
+  "createdAt": "2026-08-04T06:00:00Z",
+  "description": "Locked local engineering cases",
+  "cases": [
+    {
+      "caseId": "qrqc-warning-close",
+      "taskClass": "bug-diagnosis",
+      "objective": "Identify why a QRQC warning cannot be closed",
+      "repositoryRevision": "commit:abc123",
+      "fixtureArtifactIds": [
+        "fixture-1"
+      ],
+      "budgetProfile": {
+        "maxTokens": 32000,
+        "maxToolCalls": 20,
+        "maxDurationMs": 600000
+      },
+      "requiredFacts": [
+        "SQL filters by NUM",
+        "The form assigned ID instead of NUM"
+      ],
+      "requiredEvidence": [
+        "Source mapping",
+        "SQL predicate"
+      ],
+      "forbiddenMistakes": [
+        "Claim the Vue source caused the defect without evidence"
+      ],
+      "requiredChecks": [
+        "Regression test closes warning"
+      ],
+      "acceptanceRules": [
+        "All required facts and evidence are present",
+        "No forbidden mistake occurs"
+      ]
+    }
+  ]
+}

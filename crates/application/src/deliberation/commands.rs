@@ -1,6 +1,7 @@
 
 pub struct DeliberationCommands<'a> {
     store: &'a dyn DeliberationStore,
+    workflow_authority: Option<&'a dyn DeliberationWorkflowAuthority>,
     plan_approval_authority: Option<&'a dyn PlanApprovalAuthorityProvider>,
 }
 
@@ -8,6 +9,18 @@ impl<'a> DeliberationCommands<'a> {
     pub const fn new(store: &'a dyn DeliberationStore) -> Self {
         Self {
             store,
+            workflow_authority: None,
+            plan_approval_authority: None,
+        }
+    }
+
+    pub const fn with_workflow_authority(
+        store: &'a dyn DeliberationStore,
+        workflow_authority: &'a dyn DeliberationWorkflowAuthority,
+    ) -> Self {
+        Self {
+            store,
+            workflow_authority: Some(workflow_authority),
             plan_approval_authority: None,
         }
     }
@@ -18,6 +31,19 @@ impl<'a> DeliberationCommands<'a> {
     ) -> Self {
         Self {
             store,
+            workflow_authority: None,
+            plan_approval_authority: Some(plan_approval_authority),
+        }
+    }
+
+    pub const fn with_authorities(
+        store: &'a dyn DeliberationStore,
+        workflow_authority: &'a dyn DeliberationWorkflowAuthority,
+        plan_approval_authority: &'a dyn PlanApprovalAuthorityProvider,
+    ) -> Self {
+        Self {
+            store,
+            workflow_authority: Some(workflow_authority),
             plan_approval_authority: Some(plan_approval_authority),
         }
     }
@@ -55,8 +81,13 @@ impl<'a> DeliberationCommands<'a> {
         review_plan: ReviewPlan,
         review_artifact: DeliberationArtifactRef,
     ) -> Result<(), PortError> {
-        let snapshot = self.authorize(&context, Phase::ParallelAnalysis)?;
+        eprintln!("publish proposals entered");
+        let snapshot = self.authorize(&context, Phase::ParallelAnalysis).map_err(|error| {
+            eprintln!("publish proposals authorization failed: {error:?}");
+            error
+        })?;
         if snapshot.quorum.is_some() || snapshot.quorum_publication.is_some() {
+            eprintln!("publish proposals conflict: quorum already present");
             return Err(conflict());
         }
         let review_targets: BTreeSet<_> = review_plan
@@ -78,11 +109,26 @@ impl<'a> DeliberationCommands<'a> {
                     .any(|assignment| assignment.agent_id() == edge.reviewer_id())
             })
         {
+            eprintln!(
+                "publish proposals conflict: selected={} targets={} assignments={} reviewers={:?}",
+                selected.len(),
+                review_targets.len(),
+                snapshot.run_assignments.len(),
+                review_plan
+                    .edges()
+                    .iter()
+                    .map(|edge| edge.reviewer_id())
+                    .collect::<Vec<_>>()
+            );
             return Err(conflict());
         }
         let proposals = IndependentQuorum::new(selected)
-            .map_err(|_| conflict())?
+            .map_err(|error| {
+                eprintln!("publish proposals quorum conflict: {error:?}");
+                conflict()
+            })?
             .reveal();
+        eprintln!("publish proposals quorum built");
         self.persist_authorized(
             context.clone(),
             snapshot,
@@ -170,7 +216,10 @@ impl<'a> DeliberationCommands<'a> {
         context: DeliberationCommandContext,
         request: SpecialistRequest,
     ) -> Result<DeliberationPersistenceCommand, PortError> {
-        let snapshot = self.authorize(&context, Phase::ParallelAnalysis)?;
+        let snapshot = self.authorize(&context, Phase::ParallelAnalysis).map_err(|error| {
+            eprintln!("publish proposals authorization failed: {error:?}");
+            error
+        })?;
         if snapshot.quorum.is_some()
             || snapshot.quorum_publication.is_some()
             || snapshot
@@ -244,7 +293,7 @@ impl<'a> DeliberationCommands<'a> {
         plan_version: u64,
     ) -> Result<(), PortError> {
         let command = self.prepare_synthesis(context, decision, plan_artifact, plan_version)?;
-        self.store.persist(command)
+        self.persist_command(command)
     }
 
     fn prepare_synthesis(
@@ -374,6 +423,14 @@ impl<'a> DeliberationCommands<'a> {
                 &["create_plan_approval_request"],
             ),
         )
+        .map_err(|error| {
+            eprintln!("publish proposals persistence preparation failed: {error:?}");
+            error
+        })
+        .map_err(|error| {
+            eprintln!("publish proposals command construction failed: {error:?}");
+            error
+        })
             .map_err(|_| conflict())?
             .state()
             .clone();
@@ -442,8 +499,33 @@ impl<'a> DeliberationCommands<'a> {
         snapshot: DeliberationSnapshot,
         record: DeliberationRecord,
     ) -> Result<(), PortError> {
-        let command = self.build_authorized(context, snapshot, record)?;
-        self.store.persist(command)
+        let command = self.build_authorized(context, snapshot, record).map_err(|error| {
+            eprintln!("deliberation command build failed: {error:?}");
+            error
+        })?;
+        self.persist_command(command)
+    }
+
+    fn persist_command(&self, command: DeliberationPersistenceCommand) -> Result<(), PortError> {
+        let transition = phase_transition_for_command(&command).map_err(|error| {
+            eprintln!("deliberation transition construction failed: {error:?}");
+            error
+        })?;
+        let workflow_authority = match transition {
+            Some(_) => Some(self.workflow_authority.ok_or_else(conflict)?),
+            None => None,
+        };
+        self.store.persist(command).map_err(|error| {
+            eprintln!("deliberation evidence persistence failed: {error:?}");
+            error
+        })?;
+        if let (Some(authority), Some(transition)) = (workflow_authority, transition) {
+            authority.transition(transition).map_err(|error| {
+                eprintln!("deliberation workflow transition failed: {error:?}");
+                error
+            })?;
+        }
+        Ok(())
     }
 
     fn build_authorized(
@@ -506,11 +588,25 @@ impl<'a> DeliberationCommands<'a> {
 
 pub struct PersistDeliberationSynthesis<'a> {
     store: &'a dyn DeliberationSynthesisStore,
+    workflow_authority: Option<&'a dyn DeliberationWorkflowAuthority>,
 }
 
 impl<'a> PersistDeliberationSynthesis<'a> {
     pub const fn new(store: &'a dyn DeliberationSynthesisStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            workflow_authority: None,
+        }
+    }
+
+    pub const fn with_workflow_authority(
+        store: &'a dyn DeliberationSynthesisStore,
+        workflow_authority: &'a dyn DeliberationWorkflowAuthority,
+    ) -> Self {
+        Self {
+            store,
+            workflow_authority: Some(workflow_authority),
+        }
     }
 
     pub fn execute(
@@ -522,7 +618,11 @@ impl<'a> PersistDeliberationSynthesis<'a> {
         plan_version: u64,
     ) -> Result<(), PortError> {
         let command = self.prepare(context, decision, plan, plan_artifact, plan_version)?;
-        self.store.persist_synthesis(command)
+        let transition = phase_transition_for_command(command.persistence())?
+            .ok_or_else(conflict)?;
+        let authority = self.workflow_authority.ok_or_else(conflict)?;
+        self.store.persist_synthesis(command)?;
+        authority.transition(transition)
     }
 
     pub fn prepare(
@@ -603,20 +703,10 @@ fn build_append(
         authority.actor_id.clone(),
         record.clone(),
     )?;
-    let projection_changes = if record.changes_phase() {
+    if record.changes_phase() {
         let request = transition_request_for_record(record, expected_task_state, event_type.clone())?;
-        let state = reduce(expected_task_state, &request)
-            .map_err(|_| conflict())?
-            .state()
-            .clone();
-        vec![ProjectionChange::TaskState {
-            task_id: task_id.clone(),
-            state,
-            updated_at: authority.occurred_at.clone(),
-        }]
-    } else {
-        Vec::new()
-    };
+        reduce(expected_task_state, &request).map_err(|_| conflict())?;
+    }
     Ok(AppendOperation {
         stream_id: StreamId::new(task_id.as_str()).map_err(|_| conflict())?,
         expected_version: local_agent_terminal_domain::Sequence::new(expected_task_version),
@@ -638,8 +728,102 @@ fn build_append(
             correlation_id: authority.correlation_id.clone(),
             created_at: authority.occurred_at.clone(),
         }],
-        projection_changes,
+        projection_changes: Vec::new(),
     })
+}
+
+fn phase_transition_for_command(
+    command: &DeliberationPersistenceCommand,
+) -> Result<Option<DeliberationPhaseTransition>, PortError> {
+    if !command.record.changes_phase() {
+        return Ok(None);
+    }
+    let event = WorkflowEvent::new(command.record.event_type()).map_err(|_| conflict())?;
+    let request = transition_request_for_record(
+        &command.record,
+        &command.expected_task_state,
+        event.clone(),
+    )?;
+    let guards = request
+        .guard_evidence_kinds
+        .iter()
+        .map(|kind| {
+            let artifact = transition_artifact(&command.record, kind)?;
+            Ok(crate::WorkflowGuardEvidence {
+                kind: kind.clone(),
+                reference: artifact.artifact_id().as_str().to_owned(),
+                subject_digest: None,
+                evidence_digest: artifact.content_digest().clone(),
+                artifact_id: Some(artifact.artifact_id().clone()),
+                approval_receipt_id: None,
+            })
+        })
+        .collect::<Result<Vec<_>, PortError>>()?;
+    let effects = request
+        .effect_kinds
+        .iter()
+        .map(|kind| {
+            let artifact = transition_artifact(&command.record, kind)?;
+            Ok(crate::WorkflowEffectBinding {
+                kind: kind.clone(),
+                reference: artifact.artifact_id().as_str().to_owned(),
+                effect_digest: artifact.content_digest().clone(),
+                artifact_id: Some(artifact.artifact_id().clone()),
+            })
+        })
+        .collect::<Result<Vec<_>, PortError>>()?;
+    Ok(Some(DeliberationPhaseTransition::new(
+        command.task_id.clone(),
+        command.event_authority.event_id.as_str().to_owned(),
+        request.rule_id,
+        command.expected_task_state.stream_version(),
+        event,
+        guards,
+        effects,
+        parse_policy_timestamp(&command.event_authority.occurred_at)?,
+    )))
+}
+
+fn transition_artifact(
+    record: &DeliberationRecord,
+    binding_kind: &str,
+) -> Result<DeliberationArtifactRef, PortError> {
+    match (record, binding_kind) {
+        (
+            DeliberationRecord::QuorumPublication {
+                proposal_artifact, ..
+            },
+            "analysis_quorum_receipt" | "publish_selected_proposals",
+        ) => Ok(proposal_artifact.clone()),
+        (
+            DeliberationRecord::QuorumPublication {
+                review_artifact, ..
+            },
+            "assign_review_edges",
+        ) => Ok(review_artifact.clone()),
+        (
+            DeliberationRecord::ObjectionSevereAccepted {
+                objection_artifact, ..
+            },
+            "accepted_severe_objection",
+        ) => Ok(objection_artifact.clone()),
+        (
+            DeliberationRecord::ObjectionSevereAccepted {
+                review_artifact, ..
+            },
+            "increment_review_round",
+        ) => Ok(review_artifact.clone()),
+        (
+            DeliberationRecord::ObjectionRoundClosed { plan_approval, .. },
+            "create_plan_approval_request",
+        ) => DeliberationArtifactRef::new(
+            plan_approval.request_artifact().artifact_id.clone(),
+            plan_approval.request_artifact().content_digest.clone(),
+            plan_approval.request_artifact().size_bytes,
+        ),
+        _ if record.changes_phase() => Ok(record.primary_artifact().clone()),
+        _ => Err(conflict()),
+    }
 }
 
 fn transition_request_for_record(

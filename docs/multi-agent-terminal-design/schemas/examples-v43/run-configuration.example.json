@@ -1,0 +1,93 @@
+{
+  "schemaVersion": "1.0",
+  "runConfigurationId": "run-config-standard-reviewer-1",
+  "taskId": "task-1",
+  "providerConnectionRef": "provider-connection/openai-enterprise-1",
+  "adapter": {
+    "adapterId": "mat-openai-adapter",
+    "adapterVersion": "1.0.0",
+    "transport": "stdio",
+    "protocol": "mat-agent-control-v2",
+    "implementationDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "modelEndpoint": {
+    "providerId": "provider-a",
+    "resolvedModelId": "model-a-2026-08",
+    "modelFamily": "model-a",
+    "endpointClass": "enterprise_gateway",
+    "endpointRef": "endpoint/eu-primary",
+    "region": "eu",
+    "contextWindowTokens": 200000,
+    "maxOutputTokens": 32000
+  },
+  "agentProfile": {
+    "profileId": "standard-reviewer-v1",
+    "role": "reviewer",
+    "promptTemplateVersion": "reviewer-1.0.0",
+    "toolPolicyRef": "policy/reviewer-read-only-v1",
+    "responseSchemaRef": "schema/review-result-v1"
+  },
+  "generationParameters": {
+    "temperature": 0.2,
+    "topP": 0.95,
+    "maxOutputTokens": 12000,
+    "seed": 7,
+    "stopSequences": []
+  },
+  "capabilitySnapshot": {
+    "toolCalling": true,
+    "structuredOutput": true,
+    "streaming": true,
+    "cancellation": true,
+    "contextQuery": true,
+    "vision": false,
+    "maxParallelToolCalls": 4,
+    "capabilityDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "dataPolicySnapshot": {
+    "policyDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "retentionClass": "enterprise_controlled",
+    "providerTrainingUse": "contractually_disabled",
+    "allowedDataClasses": [
+      "internal",
+      "source_code"
+    ],
+    "networkScope": "provider_only",
+    "regionConstraint": "eu"
+  },
+  "budgetReservation": {
+    "inputTokens": 80000,
+    "outputTokens": 12000,
+    "toolCalls": 40,
+    "wallTimeMs": 900000,
+    "costMicrounits": 2500000,
+    "currency": "USD"
+  },
+  "fallbackPolicy": {
+    "mode": "explicit_only",
+    "userApprovalRequired": true,
+    "candidates": [
+      {
+        "providerConnectionRef": "provider-connection/local-1",
+        "resolvedModelId": "local-model-b",
+        "independenceGroup": "local-model-b-group"
+      }
+    ]
+  },
+  "independence": {
+    "groupId": "provider-a/model-a/reviewer-v1",
+    "fingerprint": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "dimensions": {
+      "provider": "provider-a",
+      "modelFamily": "model-a",
+      "promptFamily": "reviewer-v1",
+      "contextCorpus": "context-package-501",
+      "retrievalPipeline": "retrieval-v3",
+      "toolPolicy": "reviewer-read-only-v1",
+      "adapterImplementation": "mat-openai-adapter-1.0.0"
+    }
+  },
+  "credentialsExcluded": true,
+  "createdAt": "2026-08-07T09:00:00Z",
+  "configDigest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+}

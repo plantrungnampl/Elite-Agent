@@ -1,0 +1,19 @@
+{
+  "comparisonId": "comparison-1",
+  "baselineRunId": "run-control-1",
+  "candidateRunId": "run-benchmark-1",
+  "controlledConfigurationDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "declaredTreatmentDimensions": [
+    "retrievalPipeline",
+    "contextCompiler",
+    "memoryPolicy"
+  ],
+  "controlEqualityReceiptDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "perCaseRegressions": [],
+  "metricDeltas": {
+    "verifierAcceptance": 0.2
+  },
+  "result": "improved",
+  "comparisonDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "createdAt": "2026-08-06T08:10:00Z"
+}

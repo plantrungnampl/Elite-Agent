@@ -3,20 +3,21 @@ use std::sync::{Arc, Mutex};
 use local_agent_terminal_application::{
     recover_deliberation, ApprovalId, CanonicalDeliberationFact, DeliberationArtifactRef,
     DeliberationCommandContext, DeliberationCommands, DeliberationPersistenceCommand,
-    DeliberationRecord, DeliberationRecoveryInput, DeliberationRunAssignment, DeliberationSnapshot,
-    DeliberationStore, PlanApprovalAuthorityBinding, PlanApprovalAuthorityProvider,
+    DeliberationPhaseTransition, DeliberationRecord, DeliberationRecoveryInput,
+    DeliberationRunAssignment, DeliberationSnapshot, DeliberationStore,
+    DeliberationWorkflowAuthority, PlanApprovalAuthorityBinding, PlanApprovalAuthorityProvider,
     PlanApprovalBindingInput, PlanApprovalPathScopeV1, PortError, PreparePlanApprovalRequestInput,
-    ProjectionChange, Retryability, SafeErrorClassification,
+    Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, ClaimVerification, Condition, DecisionApproach, DecisionPackage,
     DeliberationLimits, DeliberationTaskBudget, Dissent, EventId, EvidenceCitation,
-    EvidenceFreshness, FencingToken,
+    EvidenceFreshness,
     FinalObjection, FinalObjectionSet, IndependentProposal, IndependentQuorum, MaterialClaim,
     ObjectionSeverity, OperationState, Phase, ProjectId, RejectedApproach, ReviewEdge, ReviewPlan,
     RunId, Sequence, Sha256Digest, SourceIdentity, SpecialistBudget, SpecialistRequest, TaskId,
     TaskOutcomeMode, Timestamp, VerificationMethod, WorkflowProfile, WorkflowState,
-    WorkflowStateSnapshot, WorkspaceVersion,
+    WorkflowStateSnapshot,
 };
 
 #[derive(Default)]
@@ -36,6 +37,23 @@ struct Store {
 
 struct FixedPlanApprovalAuthority {
     binding: PlanApprovalAuthorityBinding,
+}
+
+struct RecordingWorkflowAuthority {
+    writes: Arc<Mutex<Writes>>,
+    transitions: Mutex<Vec<DeliberationPhaseTransition>>,
+}
+
+impl DeliberationWorkflowAuthority for RecordingWorkflowAuthority {
+    fn transition(&self, request: DeliberationPhaseTransition) -> Result<(), PortError> {
+        assert_eq!(
+            self.writes.lock().unwrap().commands.len(),
+            1,
+            "deliberation evidence must be durable before the workflow transition"
+        );
+        self.transitions.lock().unwrap().push(request);
+        Ok(())
+    }
 }
 
 impl PlanApprovalAuthorityProvider for FixedPlanApprovalAuthority {
@@ -71,8 +89,9 @@ impl DeliberationStore for Store {
 #[test]
 fn persistence_command_carries_exact_event_projection_and_artifact_authority() {
     let (store, writes) = make_store(unpublished_snapshot());
+    let workflow = workflow_authority(&writes);
 
-    DeliberationCommands::new(&store)
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .publish_proposals(
             command("task-1", 7, "core"),
             review_plan(),
@@ -97,11 +116,74 @@ fn persistence_command_carries_exact_event_projection_and_artifact_authority() {
     );
     assert_eq!(persisted.append().events[0].correlation_id, "correlation-1");
     assert!(
-        matches!(persisted.append().projection_changes.as_slice(), [ProjectionChange::TaskState { task_id, state, .. }] if task_id.as_str() == "task-1" && state.phase() == Phase::CrossReview && state.condition() == Condition::Active && state.operation() == OperationState::None && state.workspace_version() == WorkspaceVersion::new(1) && state.fencing_token() == FencingToken::new(1).unwrap())
+        persisted.append().projection_changes.is_empty(),
+        "deliberation evidence must not update the workflow projection directly"
     );
     assert!(
         matches!(persisted.record(), DeliberationRecord::QuorumPublication { proposals, proposal_artifact, review_plan, review_artifact } if proposals == &IndependentQuorum::new(vec![proposal(1), proposal(2)]).unwrap().reveal() && proposal_artifact.artifact_id().as_str() == "artifact-record-1" && proposal_artifact.content_digest() == &digest('9') && !review_plan.edges().is_empty() && review_artifact.artifact_id().as_str() == "artifact-review-1")
     );
+}
+
+#[test]
+fn deliberation_phase_change_persists_evidence_then_requests_v3_authority() {
+    let mut snapshot = unpublished_snapshot();
+    snapshot.task_state = authoritative_state(Phase::ParallelAnalysis, 3);
+    let (store, writes) = make_store(snapshot);
+    let authority = RecordingWorkflowAuthority {
+        writes: Arc::clone(&writes),
+        transitions: Mutex::new(Vec::new()),
+    };
+
+    DeliberationCommands::with_workflow_authority(&store, &authority)
+        .publish_proposals(
+            DeliberationCommandContext::new(
+                TaskId::new("task-1").unwrap(),
+                7,
+                authoritative_state(Phase::ParallelAnalysis, 3),
+                task_budget(),
+                ActorId::new("core").unwrap(),
+                artifact("artifact-record-1", '9'),
+                EventId::new("event-1").unwrap(),
+                "correlation-1",
+                "2026-08-09T00:00:00Z",
+            )
+            .unwrap(),
+            review_plan(),
+            artifact("artifact-review-1", '8'),
+        )
+        .unwrap();
+
+    let transitions = authority.transitions.lock().unwrap();
+    let transition = &transitions[0];
+    assert_eq!(transitions.len(), 1);
+    assert_eq!(transition.rule_id(), "WF-P004");
+    assert_eq!(transition.expected_stream_version(), 3);
+    assert_eq!(transition.event().as_str(), "analysis.quorum.reached");
+    assert_eq!(transition.guard_kinds(), vec!["analysis_quorum_receipt"]);
+    assert_eq!(
+        transition.effect_kinds(),
+        vec!["assign_review_edges", "publish_selected_proposals"]
+    );
+    assert!(writes.lock().unwrap().commands[0]
+        .append()
+        .projection_changes
+        .is_empty());
+}
+
+#[test]
+fn deliberation_phase_change_without_workflow_authority_is_rejected_before_evidence() {
+    let (store, writes) = make_store(unpublished_snapshot());
+
+    let error = DeliberationCommands::new(&store)
+        .publish_proposals(
+            command("task-1", 7, "core"),
+            review_plan(),
+            artifact("artifact-review-1", '8'),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.safe_classification(), SafeErrorClassification::Conflict);
+    assert!(writes.lock().unwrap().commands.is_empty());
 }
 
 #[test]
@@ -214,7 +296,8 @@ fn objection_close_requires_a_trusted_exact_plan_authority_provider() {
     let authority = FixedPlanApprovalAuthority {
         binding: PlanApprovalAuthorityBinding::issue(plan_approval_binding()).unwrap(),
     };
-    DeliberationCommands::with_plan_approval_authority(&store, &authority)
+    let workflow = workflow_authority(&writes);
+    DeliberationCommands::with_authorities(&store, &workflow, &authority)
         .close_objection_round(
             command_for_phase("task-1", 7, "core", Phase::FinalObjection),
             plan_approval_request(),
@@ -416,7 +499,8 @@ fn emitted_events_use_exact_actor_and_observation_schema() {
     assert_event_authority(&writes, "agent", "agent-1", "agent_claimed");
 
     let (store, writes) = make_store(unpublished_snapshot());
-    DeliberationCommands::new(&store)
+    let workflow = workflow_authority(&writes);
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .publish_proposals(
             command("task-1", 7, "core"),
             review_plan(),
@@ -427,8 +511,8 @@ fn emitted_events_use_exact_actor_and_observation_schema() {
 }
 
 #[test]
-fn command_context_binds_the_complete_authoritative_state_without_accepting_an_append() {
-    let state = authoritative_state(Phase::ParallelAnalysis, 7);
+fn command_context_keeps_evidence_and_workflow_versions_independent() {
+    let state = authoritative_state(Phase::ParallelAnalysis, 3);
     let context = DeliberationCommandContext::new(
         TaskId::new("task-1").unwrap(),
         7,
@@ -447,7 +531,8 @@ fn command_context_binds_the_complete_authoritative_state_without_accepting_an_a
     )
     .unwrap();
 
-    assert_eq!(context.expected_task_state().sequence(), Sequence::new(7));
+    assert_eq!(context.expected_task_version(), 7);
+    assert_eq!(context.expected_task_state().sequence(), Sequence::new(3));
 }
 
 #[test]
@@ -476,31 +561,27 @@ fn malformed_correlation_and_timestamp_are_invalid_input_not_stale_conflicts() {
 }
 
 #[test]
-fn caller_structural_version_mismatch_is_invalid_but_loaded_staleness_is_conflict() {
-    let structural = DeliberationCommandContext::new(
+fn loaded_evidence_staleness_is_conflict_with_an_independent_workflow_version() {
+    let context = DeliberationCommandContext::new(
         TaskId::new("task-1").unwrap(),
         8,
-        authoritative_state(Phase::ParallelAnalysis, 7),
+        authoritative_state(Phase::ParallelAnalysis, 3),
         task_budget(),
-        ActorId::new("actor-1").unwrap(),
+        ActorId::new("agent-1").unwrap(),
         artifact("artifact-record-1", '9'),
         EventId::new("event-1").unwrap(),
         "correlation-1",
         "2026-08-09T00:00:00Z",
     )
-    .unwrap_err();
-    assert_eq!(
-        structural.safe_classification(),
-        SafeErrorClassification::InvalidInput
-    );
+    .unwrap();
 
     let mut loaded = snapshot(Phase::ParallelAnalysis);
-    loaded.task_version = 8;
-    loaded.task_state = authoritative_state(Phase::ParallelAnalysis, 8);
+    loaded.task_version = 9;
+    loaded.task_state = authoritative_state(Phase::ParallelAnalysis, 3);
     let (store, writes) = make_store(loaded);
     let stale = DeliberationCommands::new(&store)
         .record_private_proposal(
-            command("task-1", 7, "agent-1"),
+            context,
             proposal(1),
             artifact("proposal-1", '7'),
         )
@@ -554,7 +635,8 @@ fn proposal_publication_requires_independent_quorum() {
     assert_eq!(writes.lock().unwrap().published, 0);
 
     *store.snapshot.lock().unwrap() = unpublished_snapshot();
-    DeliberationCommands::new(&store)
+    let workflow = workflow_authority(&writes);
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .publish_proposals(
             command("task-1", 7, "core"),
             review_plan(),
@@ -862,8 +944,9 @@ fn publication_accepts_multiple_reviewers_when_target_set_is_exact() {
         .unwrap(),
     );
     let (store, writes) = make_store(state);
+    let workflow = workflow_authority(&writes);
 
-    DeliberationCommands::new(&store)
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .publish_proposals(
             command("task-1", 7, "core"),
             multi_reviewer_plan(),
@@ -1106,7 +1189,8 @@ fn synthesis_requires_exact_authoritative_claim_records() {
 
     let state = snapshot_with_verified_claims(vec![claim("claim-b", true), claim("claim-a", true)]);
     let (store, writes) = make_store(state);
-    DeliberationCommands::new(&store)
+    let workflow = workflow_authority(&writes);
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .synthesize(
             command_for_phase("task-1", 7, "core", Phase::Synthesis),
             decision_with_claims(vec![claim("claim-a", true), claim("claim-b", true)]),
@@ -1122,8 +1206,9 @@ fn synthesis_binds_exact_plan_reference_and_json_safe_version() {
     let state = snapshot(Phase::Synthesis);
     let (store, writes) = make_store(state);
     let plan_artifact = artifact("plan-1", '4');
+    let workflow = workflow_authority(&writes);
 
-    DeliberationCommands::new(&store)
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .synthesize(
             command_for_phase("task-1", 7, "core", Phase::Synthesis),
             decision(claim("claim-a", true)),
@@ -1178,8 +1263,9 @@ fn synthesis_rejects_mismatched_plan_and_unsafe_version_without_writes() {
 fn accepted_severe_objection_transitions_to_cross_review_and_close_then_rejects() {
     let state = snapshot_with_objection_set(ObjectionSeverity::Severe);
     let (store, writes) = make_store(state);
+    let workflow = workflow_authority(&writes);
 
-    DeliberationCommands::new(&store)
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .accept_severe_objection(
             command_for_phase("task-1", 7, "core", Phase::FinalObjection),
             review_plan_for_round(2),
@@ -1199,22 +1285,14 @@ fn accepted_severe_objection_transitions_to_cross_review_and_close_then_rejects(
             && review_plan == &review_plan_for_round(2)
             && review_artifact == &artifact("artifact-record-1", '9')
     ));
-    let next_state = match &writes
-        .lock()
-        .unwrap()
-        .commands
-        .last()
-        .unwrap()
-        .append()
-        .projection_changes[0]
-    {
-        ProjectionChange::TaskState { state, .. } => state.clone(),
-    };
-    assert_eq!(next_state.phase(), Phase::CrossReview);
+    let transitions = workflow.transitions.lock().unwrap();
+    assert_eq!(transitions.len(), 1);
+    assert_eq!(transitions[0].rule_id(), "WF-P008");
+    drop(transitions);
 
     let mut reopened = snapshot(Phase::CrossReview);
     reopened.task_version = 8;
-    reopened.task_state = next_state;
+    reopened.task_state = authoritative_state(Phase::CrossReview, 8);
     let (store, close_writes) = make_store(reopened);
     assert!(DeliberationCommands::new(&store)
         .close_objection_round(
@@ -1259,7 +1337,8 @@ fn reopened_round_writers_require_exact_active_history_and_supersession() {
     ));
     let reopened = recover_history_snapshot_at(Phase::CrossReview, 9, reopened_facts.clone());
     let (store, writes) = make_store(reopened);
-    DeliberationCommands::new(&store)
+    let workflow = workflow_authority(&writes);
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .record_claim_set(
             command_for_phase("task-1", 9, "core", Phase::CrossReview),
             vec![claim("claim-a", false)],
@@ -1279,7 +1358,8 @@ fn reopened_round_writers_require_exact_active_history_and_supersession() {
     let verifying =
         recover_history_snapshot_at(Phase::PrePlanVerification, 10, reopened_facts.clone());
     let (store, writes) = make_store(verifying);
-    DeliberationCommands::new(&store)
+    let workflow = workflow_authority(&writes);
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .record_verification_set(
             command_for_phase("task-1", 10, "core", Phase::PrePlanVerification),
             vec![claim("claim-a", true)],
@@ -1358,7 +1438,8 @@ fn reopened_round_writers_require_exact_active_history_and_supersession() {
     ));
     let synthesis = recover_history_snapshot_at(Phase::Synthesis, 12, reopened_facts);
     let (store, writes) = make_store(synthesis);
-    DeliberationCommands::new(&store)
+    let workflow = workflow_authority(&writes);
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .synthesize(
             command_for_phase_with_artifact(
                 "task-1",

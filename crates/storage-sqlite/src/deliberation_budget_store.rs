@@ -1,8 +1,5 @@
-use local_agent_terminal_application::{
-    DeliberationBudgetReservation, PortError, Retryability, SafeErrorClassification,
-};
+use local_agent_terminal_application::{PortError, Retryability, SafeErrorClassification};
 use local_agent_terminal_domain::{DeliberationTaskBudget, TaskId};
-use rusqlite::Transaction;
 
 use crate::SqliteStore;
 
@@ -13,15 +10,6 @@ impl SqliteStore {
     ) -> Result<Option<DeliberationTaskBudget>, PortError> {
         Err(missing_trusted_budget_authority())
     }
-}
-
-pub(crate) fn reserve_task_budget(
-    _transaction: &Transaction<'_>,
-    _task_id: &TaskId,
-    _budget: DeliberationTaskBudget,
-    _reservation: DeliberationBudgetReservation,
-) -> Result<(), PortError> {
-    Err(missing_trusted_budget_authority())
 }
 
 // The normative v7 workflow requires a trusted budget receipt, but the receipt and

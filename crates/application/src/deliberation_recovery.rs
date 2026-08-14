@@ -192,9 +192,7 @@ pub struct DeliberationRecoveryInput {
 pub fn recover_deliberation(
     input: DeliberationRecoveryInput,
 ) -> Result<DeliberationSnapshot, PortError> {
-    if input.task_version != input.task_state.sequence().get()
-        || !valid_assignments(&input.run_assignments)
-    {
+    if !valid_assignments(&input.run_assignments) {
         return Err(conflict());
     }
     let mut previous_sequence = 0;

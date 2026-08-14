@@ -1,0 +1,28 @@
+{
+  "decisionId": "budget-1",
+  "projectId": "p1",
+  "taskId": "t1",
+  "runId": "r1",
+  "contextPackageId": "cp1",
+  "taskClass": "bug-diagnosis",
+  "riskLevel": "medium",
+  "allocations": {
+    "objective": 1200,
+    "authoritativeState": 800,
+    "repositoryEvidence": 4200,
+    "experienceMemory": 1000,
+    "contradictions": 800
+  },
+  "totalAllocatedTokens": 8000,
+  "strategyVersion": "adaptive-budget.v1",
+  "coverageMillionths": 850000,
+  "marginalUtilityThresholdMillionths": 100000,
+  "stoppingReason": "sufficient_coverage",
+  "evidence": {
+    "sourceId": "artifact-budget-receipt",
+    "sourceRevision": "artifact:v1",
+    "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sourceKind": "budget-decision"
+  },
+  "createdAt": "2026-08-06T01:15:00Z"
+}

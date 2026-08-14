@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://multi-agent-terminal.local/schemas/benchmark-run-receipt.v1.schema.json",
+  "title": "Immutable Benchmark Run Receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "runId",
+    "suiteId",
+    "suiteVersion",
+    "logicalCaseId",
+    "caseVersion",
+    "taskId",
+    "arm",
+    "controlledConfigurationDigest",
+    "treatmentConfiguration",
+    "treatmentConfigurationDigest",
+    "actualRepositoryRevision",
+    "fixtureManifestDigest",
+    "objectiveDigest",
+    "budgetProfileDigest",
+    "actualUsageDigest",
+    "policyDigest",
+    "toolPermissionsDigest",
+    "modelDigest",
+    "promptDigest",
+    "evaluatorDigest",
+    "acceptanceRulesDigest",
+    "resultArtifactId",
+    "status",
+    "startedAt",
+    "completedAt"
+  ],
+  "properties": {
+    "runId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "suiteId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "suiteVersion": {
+      "type": "integer",
+      "minimum": 3
+    },
+    "logicalCaseId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "caseVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "arm": {
+      "enum": [
+        "control_no_memory",
+        "compaction_only",
+        "evidence_retrieval",
+        "evidence_plus_experience"
+      ]
+    },
+    "controlledConfigurationDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "treatmentConfiguration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "retrievalPipeline",
+        "contextCompiler",
+        "memoryPolicy"
+      ],
+      "properties": {
+        "retrievalPipeline": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contextCompiler": {
+          "type": "string",
+          "minLength": 1
+        },
+        "memoryPolicy": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "treatmentConfigurationDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "actualRepositoryRevision": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "fixtureManifestDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "objectiveDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "budgetProfileDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "actualUsageDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "policyDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "toolPermissionsDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "modelDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "promptDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "evaluatorDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "acceptanceRulesDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "resultArtifactId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "failed",
+        "indeterminate"
+      ]
+    },
+    "startedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "completedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

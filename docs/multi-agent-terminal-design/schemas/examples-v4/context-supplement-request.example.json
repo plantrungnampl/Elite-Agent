@@ -1,0 +1,10 @@
+{
+  "requestId": "supp-req-1",
+  "runId": "r1",
+  "parentPackageId": "cp-v4-1",
+  "kind": "previous-failures",
+  "reason": "Check whether the proposed mapping repeats a known defect",
+  "query": "QRQC NUM ID warning close",
+  "maxItems": 8,
+  "maxTokens": 2000
+}

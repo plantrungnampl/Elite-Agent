@@ -166,10 +166,34 @@ pub trait ArtifactStore: Send + Sync {
 }
 
 #[async_trait]
-pub trait VectorStore: Send + Sync {
-    async fn upsert(&self, chunks: Vec<EmbeddedChunk>) -> Result<()>;
-    async fn search(&self, query: VectorQuery) -> Result<Vec<VectorHit>>;
-    async fn delete_source(&self, source: SourceId) -> Result<()>;
+pub trait RetrievalEngine: Send + Sync {
+    async fn index(&self, request: IndexRequest) -> Result<IndexReceipt>;
+    async fn retrieve(&self, request: RetrievalRequest) -> Result<RetrievalResult>;
+    async fn invalidate(&self, request: InvalidationRequest) -> Result<InvalidationReceipt>;
+    async fn health(&self) -> Result<RetrievalHealth>;
+}
+
+#[async_trait]
+pub trait MemoryRepository: Send + Sync {
+    async fn propose(&self, proposal: MemoryProposal) -> Result<MemoryProposalId>;
+    async fn transition(&self, command: MemoryTransition) -> Result<MemoryReceipt>;
+    async fn query_active(&self, query: ActiveMemoryQuery) -> Result<Vec<MemoryRecord>>;
+}
+
+#[async_trait]
+pub trait ContextCompiler: Send + Sync {
+    async fn compile(&self, request: ContextCompileRequest) -> Result<ContextPackage>;
+    async fn supplement(&self, request: ContextSupplementRequest) -> Result<ContextSupplement>;
+}
+
+#[async_trait]
+pub trait RunEvaluator: Send + Sync {
+    async fn evaluate(&self, input: EvaluationInput) -> Result<RunEvaluation>;
+}
+
+#[async_trait]
+pub trait LearningEngine: Send + Sync {
+    async fn extract(&self, input: LearningInput) -> Result<Vec<MemoryProposal>>;
 }
 
 #[async_trait]
@@ -300,3 +324,89 @@ Each failure is isolated and classified:
   Git tree ID is the commit input.
 - No application or infrastructure type is constructed inside `domain`,
   `application`, or `orchestration`; `bootstrap` is the only composition root.
+
+## 10.1 Cognitive subsystem
+
+The v4 cognitive subsystem is an application capability, not a provider-owned agent feature.
+
+```mermaid
+flowchart TB
+    ORCH[Orchestration] --> RP[Retrieval Planner]
+    RP --> RE[RetrievalEngine port]
+    RE --> EMB[Embedded hybrid adapter]
+    RE --> SIDE[Optional sidecar adapter]
+    RP --> CC[Context Compiler]
+    CC --> POL[Policy Evaluator]
+    CC --> ART[Artifact Store]
+    ORCH --> WM[Working Memory Manager]
+    ORCH --> QE[Run Evaluator]
+    QE --> LE[Learning Engine]
+    LE --> MR[MemoryRepository port]
+    MR --> SQL[SQLite authority adapter]
+```
+
+Dependency rules:
+
+- orchestration depends on application-owned cognitive ports;
+- retrieval adapters cannot call workflow mutation APIs;
+- the embedded adapter is a reviewed `core_adapter`; an external retrieval sidecar defaults to `brokered_process` and receives no repository path, SQLite handle, or Artifact Store capability;
+- the Context Compiler re-reads authoritative bytes instead of trusting returned engine content;
+- the Memory Repository owns lifecycle transitions, while the Learning Engine may only propose;
+- evaluation and reflection remain separate so an agent cannot grade its own result into active memory;
+- all concrete construction remains in `bootstrap`.
+
+Recommended Rust modules:
+
+```text
+src/
+├── domain/cognition/
+│   ├── memory.rs
+│   ├── working_memory.rs
+│   ├── evaluation.rs
+│   └── invariants.rs
+├── application/cognition/
+│   ├── retrieval_plan.rs
+│   ├── compile_context.rs
+│   ├── record_observation.rs
+│   ├── evaluate_run.rs
+│   └── propose_lessons.rs
+├── ports/
+│   ├── retrieval_engine.rs
+│   ├── memory_repository.rs
+│   ├── context_compiler.rs
+│   ├── run_evaluator.rs
+│   └── learning_engine.rs
+└── adapters/
+    ├── retrieval_embedded/
+    ├── retrieval_sidecar/
+    └── sqlite_memory/
+```
+
+Vector and graph primitives are private dependencies of a `RetrievalEngine` adapter and are never consumed directly by orchestration.
+
+## 10.2 Cognitive failure domains
+
+| Failure | Required behavior |
+|---|---|
+| Vector index unavailable | Continue exact/keyword retrieval and mark degraded branch |
+| Graph stale | Exclude stale graph evidence and schedule rebuild |
+| Reranker unavailable | Use deterministic rank fusion |
+| Sidecar crashes | Terminate request, preserve trace, retry only if idempotent |
+| Learning extraction fails | Complete task without creating memory proposals |
+| Evaluation unavailable | Do not pass quality gate that requires it |
+| Memory evidence becomes stale | Remove from active retrieval; create and verify a new memory version before reuse |
+| Context supplement exceeds budget | Return typed budget denial without truncating unknown suffix |
+
+## 11. v3 authority topology and commit barrier
+
+Module boundaries do not by themselves prove authority boundaries. Runtime composition MUST enforce this topology:
+
+1. only the storage adapter owns the authoritative SQLite connection;
+2. only the capability broker owns authoritative repository, Git-ref, and promoted-filesystem handles;
+3. workers receive private per-attempt staging/worktrees and opaque capability identifiers, never an ambient writable shared-worktree handle;
+4. lease grant/transfer and external promotion share the same bounded per-task barrier;
+5. inside the barrier the broker rechecks `(taskId, holderRunId, active lease, fencingToken, operationIntentId)` immediately before the external commit point;
+6. typed effect evidence is persisted against the exact operation attempt using compare-and-set semantics;
+7. crashes between effect and evidence are reconciled by querying the resource, never by blind retry.
+
+The bootstrap module is therefore both the dependency composition root and the runtime capability root. A compile-time dependency DAG is necessary but not sufficient; denied-capability integration tests must prove that UI, adapters, and workers cannot construct authoritative handles.

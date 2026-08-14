@@ -1,0 +1,44 @@
+{
+  "commandId": "transition-command-15",
+  "taskId": "task-1",
+  "ruleId": "WF-P015",
+  "expectedStreamVersion": 7,
+  "event": "plan.approved",
+  "fromState": {
+    "phase": "AwaitingPlanApproval",
+    "workflowProfile": "Standard",
+    "outcomeMode": "WorkspaceChange"
+  },
+  "toState": {
+    "phase": "Implementation",
+    "workflowProfile": "Standard",
+    "outcomeMode": "WorkspaceChange"
+  },
+  "guardEvidence": [
+    {
+      "kind": "plan_approval_receipt",
+      "reference": "approval-receipt-plan-1",
+      "subjectDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "evidenceDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  ],
+  "effects": [
+    {
+      "kind": "persist_approved_plan_version",
+      "reference": "plan-1:v3",
+      "effectDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "kind": "allocate_executor_lease",
+      "reference": "lease-1",
+      "effectDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "actor": {
+    "kind": "trusted_core",
+    "bindingDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "reducerVersion": "workflow-reducer-1.0.0",
+  "preparedAt": "2026-08-07T08:00:00Z",
+  "commandDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+}

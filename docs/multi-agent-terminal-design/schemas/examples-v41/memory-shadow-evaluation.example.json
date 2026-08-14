@@ -1,0 +1,21 @@
+{
+  "evaluationId": "shadow-1",
+  "memoryId": "memory-1",
+  "projectId": "p1",
+  "taskId": "t1",
+  "controlArm": "control_no_memory",
+  "candidateArm": "evidence_plus_experience",
+  "controlRunId": "benchmark-run-control",
+  "candidateRunId": "benchmark-run-candidate",
+  "result": "passed",
+  "qualityDeltaMillionths": 120000,
+  "newForbiddenMistakes": 0,
+  "newUnsupportedClaims": 0,
+  "evidence": {
+    "sourceId": "artifact-shadow-result",
+    "sourceRevision": "artifact:v1",
+    "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sourceKind": "shadow-evaluation"
+  },
+  "evaluatedAt": "2026-08-06T01:30:00Z"
+}

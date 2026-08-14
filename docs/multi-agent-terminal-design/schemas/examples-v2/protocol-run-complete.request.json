@@ -1,0 +1,30 @@
+{
+  "jsonrpc": "2.0",
+  "id": "agent:100",
+  "method": "agent.run.complete",
+  "params": {
+    "runId": "run-238",
+    "status": "succeeded",
+    "message": {
+      "messageId": "msg-900",
+      "type": "critique",
+      "replyTo": "msg-877",
+      "threadId": "thread-auth-security",
+      "content": "The proposal does not revoke the token family after reuse detection.",
+      "claims": [
+        {
+          "statement": "Current code has no token-family invalidation path.",
+          "observationClass": "agent_claimed",
+          "evidenceRefs": [
+            "source:src/auth/token_service.rs@worktree-task-1-abc123:88-140"
+          ]
+        }
+      ]
+    },
+    "usage": {
+      "inputTokens": 12000,
+      "outputTokens": 1800,
+      "providerReportedCostMicrounits": 80000
+    }
+  }
+}

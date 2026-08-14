@@ -9,8 +9,8 @@ use local_agent_terminal_application::{
     DeliberationCardKindDto, DeliberationDispatchStore, DeliberationEvidenceDto,
     DeliberationRepositoryAuthority, DeliberationResumeActionDto, DeliberationStore,
     DeliberationSynthesisStore, DeliberationThreadDto, DeliberationToolCatalog,
-    DeliberationToolSchema, DeliberationWorkspaceDto, EventStore, EvidenceStateDto,
-    InspectRepository, PlanAgentAgreementDto, PlanAgreementPositionDto,
+    DeliberationToolSchema, DeliberationWorkflowAuthority, DeliberationWorkspaceDto,
+    EvidenceStateDto, InspectRepository, PlanAgentAgreementDto, PlanAgreementPositionDto,
     PlanApprovalAuthorityProvider, PlanApprovalCurrentAuthority,
     PlanApprovalCurrentAuthoritySource, PlanApprovalResolutionDto, PlanApprovalResolutionStatusDto,
     PlanApprovalStatusDto, PlanApprovalStore, PlanApprovalViewDto, PlanRejectedAlternativeDto,
@@ -31,6 +31,7 @@ use local_agent_terminal_storage_sqlite::SqliteStore;
 use sha2::{Digest, Sha256};
 
 use crate::agent_runtime::ComposedAgentRuntime;
+use crate::workflow_authority::{trusted_workflow_core_digest, ProductionWorkflowAuthority};
 
 pub(crate) fn compose_deliberation_runtime(
     database: SqliteStore,
@@ -46,20 +47,25 @@ pub(crate) fn compose_deliberation_runtime(
     });
     let store = Arc::new(
         database
+            .with_workflow_core_actor_digest(trusted_workflow_core_digest())
             .with_artifact_reader(Arc::new(ContentAddressedArtifactReader))
             .with_plan_approval_authority_source(
                 Arc::clone(&authority) as Arc<dyn PlanApprovalCurrentAuthoritySource>
             ),
     );
+    let workflow_authority = Arc::new(ProductionWorkflowAuthority::new(
+        store.as_ref().clone(),
+        Arc::clone(&artifacts),
+    ));
     let preapproval_runtime = agent_runtime.map(|runtime| runtime as Arc<dyn AgentRuntime>);
     Arc::new(DeliberationRuntime {
         authority: Some(authority),
         boundaries: Some(Arc::clone(&store) as Arc<dyn DeliberationBoundaryStore>),
         store: Some(Arc::clone(&store) as Arc<dyn DeliberationSynthesisStore>),
-        events: Some(Arc::clone(&store) as Arc<dyn EventStore>),
         dispatches: Some(Arc::clone(&store) as Arc<dyn DeliberationDispatchStore>),
         agent_runtime: preapproval_runtime,
         tools: Arc::new(PreApprovalToolCatalog),
+        workflow_authority: Some(workflow_authority),
         plan_approval_authority: None,
         query_store: Some(store),
         artifacts: Some(artifacts),
@@ -74,10 +80,10 @@ pub struct DeliberationRuntime {
     authority: Option<Arc<dyn DeliberationRepositoryAuthority>>,
     boundaries: Option<Arc<dyn DeliberationBoundaryStore>>,
     store: Option<Arc<dyn DeliberationSynthesisStore>>,
-    events: Option<Arc<dyn EventStore>>,
     dispatches: Option<Arc<dyn DeliberationDispatchStore>>,
     agent_runtime: Option<Arc<dyn AgentRuntime>>,
     tools: Arc<dyn DeliberationToolCatalog>,
+    workflow_authority: Option<Arc<dyn DeliberationWorkflowAuthority>>,
     plan_approval_authority: Option<Arc<dyn PlanApprovalAuthorityProvider>>,
     query_store: Option<Arc<SqliteStore>>,
     artifacts: Option<Arc<ContentAddressedArtifactStore>>,
@@ -93,10 +99,10 @@ impl DeliberationRuntime {
             authority: Some(authority),
             boundaries: Some(boundaries),
             store: Some(store),
-            events: None,
             dispatches: None,
             agent_runtime: None,
             tools: Arc::new(PreApprovalToolCatalog),
+            workflow_authority: None,
             plan_approval_authority: None,
             query_store: None,
             artifacts: None,
@@ -113,10 +119,10 @@ impl DeliberationRuntime {
             authority: Some(authority),
             boundaries: Some(boundaries),
             store: Some(store),
-            events: None,
             dispatches: None,
             agent_runtime: None,
             tools: Arc::new(PreApprovalToolCatalog),
+            workflow_authority: None,
             plan_approval_authority: Some(plan_approval_authority),
             query_store: None,
             artifacts: None,
@@ -127,22 +133,33 @@ impl DeliberationRuntime {
         let authority = self.authority.as_deref()?;
         let boundaries = self.boundaries.as_deref()?;
         let store = self.store.as_deref()?;
+        let workflow_authority = self.workflow_authority.as_deref()?;
         Some(match self.plan_approval_authority.as_deref() {
-            Some(plan_approval_authority) => DeliberationCoordinator::with_plan_approval_authority(
+            Some(plan_approval_authority) => DeliberationCoordinator::with_authorities(
                 authority,
                 boundaries,
                 store,
+                workflow_authority,
                 plan_approval_authority,
             ),
-            None => DeliberationCoordinator::new(authority, boundaries, store),
+            None => DeliberationCoordinator::with_workflow_authority(
+                authority,
+                boundaries,
+                store,
+                workflow_authority,
+            ),
         })
+    }
+
+    pub fn workflow_authority(&self) -> Option<&dyn DeliberationWorkflowAuthority> {
+        self.workflow_authority.as_deref()
     }
 
     pub fn preapproval_coordinator(&self) -> Option<PreApprovalCoordinator<'_>> {
         Some(PreApprovalCoordinator::new(
             self.authority.as_deref()?,
             self.boundaries.as_deref()?,
-            self.events.as_deref()?,
+            self.workflow_authority.as_deref()?,
             self.tools.as_ref(),
             self.dispatches.as_deref()?,
             self.agent_runtime.as_deref()?,

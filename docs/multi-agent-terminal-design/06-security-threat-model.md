@@ -433,3 +433,49 @@ key.
   operation;
 - no agent can transition workflow state, change trust tier, or grant itself a
   permission.
+
+## 11. v3 proof-bearing security claims
+
+Security claims are capability-specific. A Boolean such as `containment_verified` is not evidence. External enablement requires an immutable exact-tuple attestation covering executable digest, manifest digest, launcher digest, isolation profile digest, Windows build, architecture, suite version, and evidence artifact. Any tuple change or revocation disables execution fail-closed.
+
+Containment and fencing form one control. A worker with a direct writable authoritative handle is outside the supported model because a database lease revocation cannot revoke an already-open handle. Private per-attempt staging plus broker-only promotion is mandatory for the write-capable profile.
+
+The hostile installed-product suite must test repository/profile/app-data/credential/registry access, reparse/UNC/device/ADS escape, loopback/LAN/internet, named-pipe and privileged IPC access, detached/breakaway descendants, resource exhaustion, and stale-token writes. Denied-access success, surviving descendants, and stale authoritative mutations must each equal zero.
+
+## v4 cognitive-memory threats and controls
+
+### Memory poisoning
+
+**Threat:** untrusted repository text, model output, retrieved web content, or agent reflection becomes durable guidance.
+
+**Controls:** candidate-only ingestion, authoritative evidence links, lifecycle gates, conflict detection, quarantine, scoped approval, append-only versions, and no activation by model agreement.
+
+### Cross-project memory leakage
+
+**Threat:** retrieval or relation edges expose another project's code, preference, episode, or memory.
+
+**Controls:** project-scoped authority keys, database triggers, adapter conformance tests, opaque references, policy pre-filtering, and final serialized-payload canaries.
+
+### Stale or superseded memory
+
+**Threat:** an agent follows a previously correct rule after its source or applicability conditions changed.
+
+**Controls:** source hashes, applicability predicates, index generation, stale lifecycle state, mandatory freshness check before package inclusion, and revalidation after repository revision changes.
+
+### Retrieval manipulation
+
+**Threat:** attacker-controlled content repeats keywords or embedding bait to dominate context.
+
+**Controls:** source trust labels, diversity limits, deterministic rank fusion, bounded contribution per source, evidence-strength scoring, contradiction retrieval, and inspection of why each item was selected.
+
+### Reflection self-approval
+
+**Threat:** an agent claims success and promotes its own lesson.
+
+**Controls:** separate verifier, evaluator, learning, and memory-authority components; deterministic receipts; immutable evaluation; and explicit promotion policy.
+
+### Sensitive embedding and reranking disclosure
+
+**Threat:** denied content reaches a remote embedding or reranking provider.
+
+**Controls:** classification before indexing, local default, external-disclosure policy, exact outbound receipt, provider allowlist, and route-complete canary tests.

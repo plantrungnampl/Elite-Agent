@@ -1,0 +1,32 @@
+{
+  "decisionId": "context-budget-1",
+  "projectId": "p1",
+  "taskId": "t1",
+  "runId": "run-1",
+  "contextPackageId": "context-package-1",
+  "taskClass": "bug-diagnosis",
+  "riskLevel": "medium",
+  "allocations": {
+    "objective": 800,
+    "authoritativeState": 700,
+    "repositoryEvidence": 3500,
+    "experienceMemory": 700,
+    "contradictions": 500
+  },
+  "totalAllocatedTokens": 6200,
+  "maxBudgetTokens": 8000,
+  "reservedOutputTokens": 1200,
+  "reservedVerificationTokens": 600,
+  "strategyVersion": "adaptive-budget.v2",
+  "coverageMillionths": 870000,
+  "marginalUtilityThresholdMillionths": 100000,
+  "stoppingReason": "sufficient_coverage",
+  "policySnapshotDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "evidence": {
+    "sourceId": "artifact-context-budget-1",
+    "sourceRevision": "artifact:v1",
+    "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sourceKind": "budget-decision"
+  },
+  "createdAt": "2026-08-06T02:30:00Z"
+}

@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use local_agent_terminal_application::{
     DeliberationArtifactRef, DeliberationClaimSource, DeliberationCommandContext,
     DeliberationPlanDto, DeliberationSnapshot, DeliberationSynthesisStore,
-    PersistDeliberationSynthesis, PortError,
+    DeliberationWorkflowAuthority, PersistDeliberationSynthesis, PortError,
 };
 use local_agent_terminal_domain::{
     ClaimVerification, DecisionPackage, DeliberationError, MaterialClaim, VerificationMethod,
@@ -67,9 +67,10 @@ pub struct SynthesisRequest {
 
 pub(crate) fn persist_synthesis(
     store: &dyn DeliberationSynthesisStore,
+    workflow_authority: &dyn DeliberationWorkflowAuthority,
     request: SynthesisRequest,
 ) -> Result<(), PortError> {
-    PersistDeliberationSynthesis::new(store).execute(
+    PersistDeliberationSynthesis::with_workflow_authority(store, workflow_authority).execute(
         request.context,
         request.decision,
         request.plan,

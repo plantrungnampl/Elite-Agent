@@ -221,7 +221,7 @@ The user can at any time:
 - cloud context preview is available before first disclosure under a policy profile;
 - hidden or redacted content is visibly marked, not silently omitted.
 - final commit approval is rendered from an immutable core DTO and confirms the
-  candidate tree ID; React never supplies a replacement operation payload.
+  candidate commit OID and tree ID; React never supplies a replacement operation payload.
 - raw shell approval shows the executable shell, exact script bytes, cwd,
   environment profile, network mode, expected writes, and reason.
 
@@ -241,3 +241,65 @@ The UI never converts uncertainty into success. It distinguishes:
 Retry is disabled for an indeterminate non-repeatable operation. The user can
 inspect evidence, mark an externally verified outcome, preserve the task, or
 cancel it.
+
+## 10. v3 authority and uncertainty presentation
+
+The UI displays workflow phase, stop condition, and external operation state as separate axes. It must not collapse `indeterminate` into failure or safe retry.
+
+Approval screens render the canonical request constructed by the core: actor, repository identity, task, logical intent, expected ref and old OID, candidate commit OID, diff/scope, verification, policy exceptions, nonce, expiry, and digest fingerprint. The UI sends only the decision reference and credential evidence; it does not reconstruct the operation payload.
+
+Recovery screens show immutable attempt history and typed resource receipts. A generic Retry button is forbidden for `non_repeatable` or unresolved effects. Trust badges are derived from the current attestation tuple and revocation state, not from manifest declarations or a cached Boolean.
+
+## 11. Cognitive memory and quality workspace
+
+### 11.1 Context debugger
+
+The Context Inspector becomes a debugger with:
+
+- package and supplement timeline;
+- token budget by segment;
+- retrieval branches used, degraded, or denied;
+- per-item source, revision, hash, score components, and inclusion reason;
+- supportive and contradictory evidence shown separately;
+- stale, redacted, restricted, and superseded states;
+- “used in conclusion” and verifier feedback markers;
+- exact package digest and exportable reconstruction receipt.
+
+### 11.2 Memory explorer
+
+The Memory Explorer filters by type, project, task, status, applicability, source, confidence, and age. Each record displays:
+
+- content and narrow applicability statement;
+- evidence and verification method;
+- lifecycle and version history;
+- relations such as contradicts or supersedes;
+- tasks where it was retrieved and whether it was useful;
+- expiration or invalidation conditions;
+- actions to approve, reject, supersede, retract, or request reverification.
+
+No UI action edits an active memory record in place.
+
+### 11.3 Working-memory view
+
+For an active run, the user can inspect facts, inferences, unknowns, hypotheses, next action, and required checks. Visual treatment must clearly distinguish verified evidence from agent assertion.
+
+### 11.4 Learning review queue
+
+Memory proposals show the originating run, verified outcome, quality score, proposed type, applicability, evidence, conflicts, and expected benefit. Bulk approval is disabled for security-sensitive, preference, or negative-memory proposals.
+
+### 11.5 Agent quality dashboard
+
+The dashboard shows per-role and per-configuration:
+
+- first-pass acceptance;
+- repair loops;
+- repeated-error and unsupported-claim rates;
+- context usefulness and contradiction recall;
+- latency, token, tool-call, and cost distributions;
+- benchmark regressions with direct links to evidence.
+
+Aggregate scores never hide a failed security, privacy, or correctness gate.
+
+### 11.6 Degraded-state UX
+
+If a retrieval branch is unavailable, the task workspace states what is missing, expected quality impact, whether work may continue, and available recovery action such as rebuild index or restart sidecar.

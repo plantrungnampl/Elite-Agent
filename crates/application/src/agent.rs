@@ -135,6 +135,8 @@ impl Eq for AgentRequestAuditFence {}
 
 pub trait AgentRuntime: Send + Sync {
     fn list_agents(&self) -> Result<Vec<AgentDescriptor>, PortError>;
+    /// Persists exact context and run-configuration bindings without invoking a provider.
+    fn prepare_run(&self, request: &BoundAgentRunRequest) -> Result<(), PortError>;
     fn start_run(&self, request: BoundAgentRunRequest) -> Result<AgentRunReceipt, PortError>;
     fn cancel(&self, request: CancelAgentRun) -> Result<AgentCancellationReceipt, PortError>;
 }

@@ -917,8 +917,7 @@ impl DeliberationSnapshot {
     }
 
     pub fn validate(&self) -> Result<(), PortError> {
-        if self.task_version != self.task_state.sequence().get()
-            || self
+        if self
                 .run_assignments
                 .iter()
                 .map(|assignment| &assignment.run_id)

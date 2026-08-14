@@ -996,6 +996,10 @@ impl AgentRuntime for ProtocolAgentRuntime {
         Ok(self.descriptors.values().cloned().collect())
     }
 
+    fn prepare_run(&self, request: &BoundAgentRunRequest) -> Result<(), PortError> {
+        self.store.create_bound_run(request).map(|_| ())
+    }
+
     fn start_run(&self, request: BoundAgentRunRequest) -> Result<AgentRunReceipt, PortError> {
         self.start(request)
     }

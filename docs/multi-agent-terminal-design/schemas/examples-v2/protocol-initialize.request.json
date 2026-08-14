@@ -1,0 +1,17 @@
+{
+  "jsonrpc": "2.0",
+  "id": "core:1",
+  "method": "initialize",
+  "params": {
+    "protocolVersions": [
+      "2.0"
+    ],
+    "capabilities": [
+      "agent.stream.delta",
+      "context.query",
+      "tool.request",
+      "specialist.request"
+    ],
+    "connectionBindingDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}

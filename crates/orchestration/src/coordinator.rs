@@ -4,9 +4,9 @@ use local_agent_terminal_application::{
     DeliberationCommands, DeliberationDispatchBinding, DeliberationDispatchStore,
     DeliberationPhaseDispatchSet, DeliberationProposalDispatchPlan,
     DeliberationRepositoryAuthority, DeliberationSynthesisStore, DeliberationToolAccess,
-    DeliberationToolCatalog, DeliberationToolSchema, EventStore, InitialDeliberationPhaseRequest,
-    PlanApprovalAuthorityProvider, PortError, PreparePlanApprovalRequestInput, Retryability,
-    SafeErrorClassification,
+    DeliberationToolCatalog, DeliberationToolSchema, DeliberationWorkflowAuthority,
+    InitialDeliberationPhaseRequest, PlanApprovalAuthorityProvider, PortError,
+    PreparePlanApprovalRequestInput, Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     AgentRunReceipt, MaterialClaim, Phase, ReviewPlan, TaskId, WorkflowState,
@@ -156,7 +156,7 @@ impl<'a> PrePlanReadView<'a> {
 pub struct PreApprovalCoordinator<'a> {
     authority: &'a dyn DeliberationRepositoryAuthority,
     boundaries: &'a dyn DeliberationBoundaryStore,
-    events: &'a dyn EventStore,
+    workflow_authority: &'a dyn DeliberationWorkflowAuthority,
     tools: &'a dyn DeliberationToolCatalog,
     dispatches: &'a dyn DeliberationDispatchStore,
     runtime: &'a dyn AgentRuntime,
@@ -166,7 +166,7 @@ impl<'a> PreApprovalCoordinator<'a> {
     pub const fn new(
         authority: &'a dyn DeliberationRepositoryAuthority,
         boundaries: &'a dyn DeliberationBoundaryStore,
-        events: &'a dyn EventStore,
+        workflow_authority: &'a dyn DeliberationWorkflowAuthority,
         tools: &'a dyn DeliberationToolCatalog,
         dispatches: &'a dyn DeliberationDispatchStore,
         runtime: &'a dyn AgentRuntime,
@@ -174,7 +174,7 @@ impl<'a> PreApprovalCoordinator<'a> {
         Self::from_read_view(
             PrePlanReadView::new(authority, tools),
             boundaries,
-            events,
+            workflow_authority,
             dispatches,
             runtime,
         )
@@ -183,14 +183,14 @@ impl<'a> PreApprovalCoordinator<'a> {
     pub const fn from_read_view(
         read_view: PrePlanReadView<'a>,
         boundaries: &'a dyn DeliberationBoundaryStore,
-        events: &'a dyn EventStore,
+        workflow_authority: &'a dyn DeliberationWorkflowAuthority,
         dispatches: &'a dyn DeliberationDispatchStore,
         runtime: &'a dyn AgentRuntime,
     ) -> Self {
         Self {
             authority: read_view.authority,
             boundaries,
-            events,
+            workflow_authority,
             tools: read_view.tools,
             dispatches,
             runtime,
@@ -219,12 +219,19 @@ impl<'a> PreApprovalCoordinator<'a> {
                 ..
             } => (task_id, expected_state.phase()),
         };
-        if verify_repository_boundary(self.authority, self.boundaries, task_id, boundary_phase)?
+        if verify_repository_boundary(self.authority, self.boundaries, task_id, boundary_phase)
+            .map_err(|error| {
+                eprintln!("preapproval boundary failed: {error:?}");
+                error
+            })?
             == BoundaryOutcome::Blocked
         {
             return Err(integrity_failure());
         }
-        PreApprovalSurface::new(self.tools.dispatch_schemas(task_id)?)?;
+        PreApprovalSurface::new(self.tools.dispatch_schemas(task_id).map_err(|error| {
+            eprintln!("preapproval tool catalog failed: {error:?}");
+            error
+        })?)?;
 
         match &operation {
             PrePlanOperation::AdvanceOnly { transition, .. } => {
@@ -293,7 +300,21 @@ impl<'a> PreApprovalCoordinator<'a> {
                 receipts: Vec::new(),
             });
         };
-        dispatch.persist(self.dispatches)?;
+        for binding in dispatch.bindings() {
+            self.runtime
+                .prepare_run(binding.request())
+                .map_err(|error| {
+                    eprintln!(
+                        "preapproval run preparation failed for {}: {error:?}",
+                        binding.request().run_id.as_str()
+                    );
+                    error
+                })?;
+        }
+        dispatch.persist(self.dispatches).map_err(|error| {
+            eprintln!("preapproval dispatch persistence failed: {error:?}");
+            error
+        })?;
         let mut receipts = Vec::with_capacity(dispatch.bindings().len());
         for binding in dispatch.bindings() {
             receipts.push(self.runtime.start_run(binding.request().clone())?);
@@ -312,10 +333,7 @@ impl<'a> PreApprovalCoordinator<'a> {
         let guard = transition.guard.ok_or_else(invalid_input)?;
         let prepared =
             prepare_initial_deliberation_phase(request, transition.event, guard, transition.to)?;
-        let append = self.events.append(prepared.append)?;
-        if append.new_version != prepared.next_state.sequence() {
-            return Err(integrity_failure());
-        }
+        self.workflow_authority.transition(prepared.transition)?;
         Ok(prepared.next_state)
     }
 }
@@ -342,6 +360,7 @@ pub struct DeliberationCoordinator<'a> {
     authority: &'a dyn DeliberationRepositoryAuthority,
     boundaries: &'a dyn DeliberationBoundaryStore,
     store: &'a dyn DeliberationSynthesisStore,
+    workflow_authority: Option<&'a dyn DeliberationWorkflowAuthority>,
     plan_approval_authority: Option<&'a dyn PlanApprovalAuthorityProvider>,
 }
 
@@ -355,6 +374,22 @@ impl<'a> DeliberationCoordinator<'a> {
             authority,
             boundaries,
             store,
+            workflow_authority: None,
+            plan_approval_authority: None,
+        }
+    }
+
+    pub const fn with_workflow_authority(
+        authority: &'a dyn DeliberationRepositoryAuthority,
+        boundaries: &'a dyn DeliberationBoundaryStore,
+        store: &'a dyn DeliberationSynthesisStore,
+        workflow_authority: &'a dyn DeliberationWorkflowAuthority,
+    ) -> Self {
+        Self {
+            authority,
+            boundaries,
+            store,
+            workflow_authority: Some(workflow_authority),
             plan_approval_authority: None,
         }
     }
@@ -369,6 +404,23 @@ impl<'a> DeliberationCoordinator<'a> {
             authority,
             boundaries,
             store,
+            workflow_authority: None,
+            plan_approval_authority: Some(plan_approval_authority),
+        }
+    }
+
+    pub const fn with_authorities(
+        authority: &'a dyn DeliberationRepositoryAuthority,
+        boundaries: &'a dyn DeliberationBoundaryStore,
+        store: &'a dyn DeliberationSynthesisStore,
+        workflow_authority: &'a dyn DeliberationWorkflowAuthority,
+        plan_approval_authority: &'a dyn PlanApprovalAuthorityProvider,
+    ) -> Self {
+        Self {
+            authority,
+            boundaries,
+            store,
+            workflow_authority: Some(workflow_authority),
             plan_approval_authority: Some(plan_approval_authority),
         }
     }
@@ -380,11 +432,8 @@ impl<'a> DeliberationCoordinator<'a> {
         review_artifact: DeliberationArtifactRef,
     ) -> Result<(), PortError> {
         self.verify_current(&context)?;
-        DeliberationCommands::new(self.store).publish_proposals(
-            context,
-            review_plan,
-            review_artifact,
-        )
+        self.commands()
+            .publish_proposals(context, review_plan, review_artifact)
     }
 
     pub fn accept_severe_objection(
@@ -393,7 +442,8 @@ impl<'a> DeliberationCoordinator<'a> {
         review_plan: ReviewPlan,
     ) -> Result<(), PortError> {
         self.verify_current(&context)?;
-        DeliberationCommands::new(self.store).accept_severe_objection(context, review_plan)
+        self.commands()
+            .accept_severe_objection(context, review_plan)
     }
 
     pub fn record_claim_set(
@@ -402,7 +452,7 @@ impl<'a> DeliberationCoordinator<'a> {
         claims: Vec<MaterialClaim>,
     ) -> Result<(), PortError> {
         self.verify_current(&context)?;
-        DeliberationCommands::new(self.store).record_claim_set(context, claims)
+        self.commands().record_claim_set(context, claims)
     }
 
     pub fn record_verification_set(
@@ -411,12 +461,16 @@ impl<'a> DeliberationCoordinator<'a> {
         claims: Vec<MaterialClaim>,
     ) -> Result<(), PortError> {
         self.verify_current(&context)?;
-        DeliberationCommands::new(self.store).record_verification_set(context, claims)
+        self.commands().record_verification_set(context, claims)
     }
 
     pub fn synthesize(&self, request: SynthesisRequest) -> Result<(), PortError> {
         self.verify_current(&request.context)?;
-        persist_synthesis(self.store, request)
+        persist_synthesis(
+            self.store,
+            self.workflow_authority.ok_or_else(integrity_failure)?,
+            request,
+        )
     }
 
     pub fn close_objection_round(
@@ -425,14 +479,22 @@ impl<'a> DeliberationCoordinator<'a> {
         approval_input: PreparePlanApprovalRequestInput,
     ) -> Result<(), PortError> {
         self.verify_current(&context)?;
-        match self.plan_approval_authority {
-            Some(authority) => {
-                DeliberationCommands::with_plan_approval_authority(self.store, authority)
-                    .close_objection_round(context, approval_input)
+        self.commands()
+            .close_objection_round(context, approval_input)
+    }
+
+    fn commands(&self) -> DeliberationCommands<'_> {
+        match (self.workflow_authority, self.plan_approval_authority) {
+            (Some(workflow), Some(plan)) => {
+                DeliberationCommands::with_authorities(self.store, workflow, plan)
             }
-            None => {
-                DeliberationCommands::new(self.store).close_objection_round(context, approval_input)
+            (Some(workflow), None) => {
+                DeliberationCommands::with_workflow_authority(self.store, workflow)
             }
+            (None, Some(plan)) => {
+                DeliberationCommands::with_plan_approval_authority(self.store, plan)
+            }
+            (None, None) => DeliberationCommands::new(self.store),
         }
     }
 

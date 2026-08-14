@@ -1,0 +1,25 @@
+{
+  "eventId": "memory-usage-1",
+  "memoryId": "memory-negative-1",
+  "projectId": "p1",
+  "taskId": "t1",
+  "runId": "run-1",
+  "eventType": "helpful",
+  "retrieved": true,
+  "included": true,
+  "cited": true,
+  "usedInConclusion": true,
+  "helpfulnessMillionths": 800000,
+  "tokenCost": 180,
+  "position": 3,
+  "outcomeDeltaMillionths": 150000,
+  "retrievalCandidateId": "retrieval-candidate-memory-1",
+  "contextPackageItemId": "context-item-memory-1",
+  "evidence": {
+    "sourceId": "artifact-memory-usage-1",
+    "sourceRevision": "artifact:v1",
+    "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sourceKind": "artifact"
+  },
+  "createdAt": "2026-08-06T02:25:00Z"
+}

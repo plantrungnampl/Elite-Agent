@@ -1,0 +1,22 @@
+{
+  "stateId": "state-output-language-v1",
+  "projectId": "p1",
+  "taskId": "t1",
+  "key": "user.output.language",
+  "value": {"language": "vi"},
+  "scope": {"kind": "task", "id": "t1"},
+  "authorityKind": "current_instruction",
+  "precedenceRank": 600,
+  "status": "active",
+  "sources": [
+    {
+      "sourceId": "artifact-user-request",
+      "sourceRevision": "artifact:v1",
+      "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sourceKind": "artifact"
+    }
+  ],
+  "validFrom": "2026-08-06T01:00:00Z",
+  "createdAt": "2026-08-06T01:00:00Z",
+  "statusChangedAt": "2026-08-06T01:00:00Z"
+}

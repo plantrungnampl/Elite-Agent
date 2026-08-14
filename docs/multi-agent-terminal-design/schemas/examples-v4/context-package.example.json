@@ -1,0 +1,92 @@
+{
+  "packageId": "cp-v4-1",
+  "schemaVersion": "cognitive-context.v1",
+  "projectId": "p1",
+  "taskId": "t1",
+  "runId": "r1",
+  "agentId": "debug-agent",
+  "role": "debugger",
+  "objective": "Find the cause of a warning-close regression",
+  "successCriteria": [
+    "Identify the mapped property mismatch and cite authoritative evidence"
+  ],
+  "createdAt": "2026-08-04T06:20:00Z",
+  "budget": {
+    "maxTokens": 32000,
+    "reservedResponseTokens": 8000,
+    "progressiveSupplementTokens": 6000
+  },
+  "taskState": {
+    "phase": "Implementation",
+    "condition": "Active",
+    "operationState": "None",
+    "currentPlanArtifactId": "a-plan-1",
+    "currentDiffArtifactId": null,
+    "completedWork": [],
+    "outstandingChecks": [
+      "Confirm warning-close regression cause"
+    ]
+  },
+  "workingMemory": {
+    "facts": [
+      "wm-fact-1"
+    ],
+    "inferences": [],
+    "unknowns": [
+      "wm-unknown-1"
+    ],
+    "hypotheses": [],
+    "nextAction": "Inspect the close SQL and DTO mapping",
+    "stopCondition": "Cause is evidenced and regression test is defined"
+  },
+  "retrievalSessionId": "ret-1",
+  "items": [
+    {
+      "itemId": "ci1",
+      "category": "negative-memory",
+      "source": {
+        "sourceId": "mr1",
+        "sourceRevision": "v1",
+        "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sourceKind": "memory",
+        "locator": {}
+      },
+      "inclusionReason": "Exact subsystem and failure-mode match",
+      "authorityState": "verified-memory",
+      "tokenCount": 96,
+      "redacted": false
+    }
+  ],
+  "requiredChecks": [
+    "Verify SQL parameter binding against the NUM filter"
+  ],
+  "permissions": {
+    "allowedTools": [
+      "repository.read",
+      "test.run"
+    ],
+    "deniedTools": [
+      "network.unrestricted"
+    ],
+    "writeCapability": "private-staging",
+    "networkPolicy": "denied"
+  },
+  "provenance": [
+    {
+      "sourceId": "a1",
+      "sourceRevision": "artifact:v1",
+      "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sourceKind": "artifact",
+      "locator": {}
+    }
+  ],
+  "redactions": [],
+  "policyDecisionIds": [
+    "pd1"
+  ],
+  "policySnapshotDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "promptTemplateVersion": "debugger.v4",
+  "retrievalPipelineVersion": "hybrid-retrieval.v1",
+  "contextCompilerVersion": "context-compiler.v1",
+  "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

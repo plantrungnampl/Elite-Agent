@@ -1,0 +1,14 @@
+{
+  "receiptId": "state-resolution-output-language-1",
+  "projectId": "p1",
+  "taskId": "t1",
+  "key": "user.output.language",
+  "candidateStateIds": ["state-output-language-vi", "state-output-language-en"],
+  "winningStateId": "state-output-language-vi",
+  "resolutionRuleVersion": "state-resolution.v3",
+  "resultArtifactId": "artifact-state-resolution-result",
+  "resultDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "policySnapshotDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "conflictId": "state-conflict-output-language-1",
+  "createdAt": "2026-08-06T02:05:00Z"
+}

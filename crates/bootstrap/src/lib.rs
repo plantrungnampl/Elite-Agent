@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod agent_run_configuration;
 mod agent_runtime;
 mod agent_runtime_support;
 mod agent_specialist_context;
@@ -11,6 +12,7 @@ mod production_tools;
 mod protocol_response_artifacts;
 mod startup;
 mod tool_runtime;
+mod workflow_authority;
 mod workspace_monitor;
 mod workspace_runtime;
 

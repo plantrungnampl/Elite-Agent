@@ -1,0 +1,32 @@
+{
+  "schemaVersion": "1.0",
+  "comparisonId": "comparison-bootstrap-001",
+  "suiteId": "orchestration-product-proof-bootstrap",
+  "suiteVersion": 1,
+  "baselineArm": "single_with_retrieval_and_verification",
+  "candidateArms": [
+    "standard_cross_review",
+    "high_assurance"
+  ],
+  "includedRunReceiptDigests": [
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  ],
+  "budgetCompliance": {
+    "validRunCount": 1,
+    "invalidOverflowCount": 0,
+    "maximumObservedVariancePercent": 0.0
+  },
+  "pairedResults": [],
+  "perCategoryResults": [],
+  "decision": {
+    "status": "inconclusive",
+    "qualityClaimAllowed": false,
+    "rationale": "The bootstrap fixture demonstrates the contract only; representative paired repetitions have not been executed."
+  },
+  "limitations": [
+    "No live provider runs are included.",
+    "A single fixture cannot support a product-quality claim."
+  ],
+  "createdAt": "2026-08-07T09:00:00Z",
+  "reportDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+}

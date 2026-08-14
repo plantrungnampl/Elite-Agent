@@ -5,17 +5,17 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use local_agent_terminal_application::{
-    AcquireLease, ArtifactJournal, ArtifactJournalStatus, ArtifactJournalTransition,
-    ArtifactRootMode, ArtifactWriteReservation, CanonicalEvidenceRef, ExecutorLeaseStore,
-    ExpectedPresence, IdempotencyClass, LeaseState, NewProject, NewTask, OperationIntent,
-    OperationIntentStatus, ProjectSettings, RepositoryHealth, RepositoryInspectionRecord,
-    RepositorySnapshot, RevokeLease, RiskLevel, SafeErrorClassification, TaskQuery,
-    WorkspaceMutationRequest, WorkspaceMutationStore, WorkspaceRecoveryStore, WorkspaceStateStore,
-    WorktreeIntent,
+    select_initial_workflow, AcquireLease, ArtifactJournal, ArtifactJournalStatus,
+    ArtifactJournalTransition, ArtifactRootMode, ArtifactWriteReservation, CanonicalEvidenceRef,
+    ExecutorLeaseStore, ExpectedPresence, IdempotencyClass, LeaseState, NewProject, NewTask,
+    OperationIntent, OperationIntentStatus, ProjectSettings, RepositoryHealth,
+    RepositoryInspectionRecord, RepositorySnapshot, RevokeLease, RiskLevel,
+    SafeErrorClassification, TaskQuery, WorkflowAuthorityStore, WorkspaceMutationRequest,
+    WorkspaceMutationStore, WorkspaceRecoveryStore, WorkspaceStateStore, WorktreeIntent,
 };
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, FencingToken, GitObjectId, LeaseClaim, ProjectId, RepositoryId, RunId,
-    TaskBranch, TaskId, WorkspaceFingerprint, WorktreeId,
+    TaskBranch, TaskId, TaskOutcomeMode, WorkflowProfile, WorkspaceFingerprint, WorktreeId,
 };
 use local_agent_terminal_storage_sqlite::{CoreSystemRunRequest, SqliteStore};
 use rusqlite::{params, Connection};
@@ -103,6 +103,12 @@ fn new_task() -> NewTask {
         risk_level: RiskLevel::High,
         base_branch: TaskBranch::new("main").unwrap(),
         base_commit: GitObjectId::new(SHA1).unwrap(),
+        initial_workflow: select_initial_workflow(
+            RiskLevel::High,
+            TaskOutcomeMode::WorkspaceChange,
+            "default",
+        )
+        .unwrap(),
         created_at: "2026-07-26T00:00:01Z".to_owned(),
     }
 }
@@ -204,6 +210,25 @@ fn seed_project(store: &SqliteStore) {
 fn seed_task(store: &SqliteStore) {
     seed_project(store);
     store.create_task(new_task()).unwrap();
+}
+
+#[test]
+fn task_creation_persists_initial_workflow_authority_for_restart() {
+    let database = TempDatabase::new();
+    let store = SqliteStore::open(&database.path).unwrap();
+    seed_task(&store);
+    drop(store);
+
+    let reopened = SqliteStore::open(&database.path).unwrap();
+    let workflow = reopened
+        .load_workflow(&TaskId::new("task-1").unwrap())
+        .expect("workflow authority survives restart");
+
+    assert_eq!(workflow.phase(), local_agent_terminal_domain::Phase::Intake);
+    assert_eq!(workflow.workflow_profile(), WorkflowProfile::HighAssurance);
+    assert_eq!(workflow.outcome_mode(), TaskOutcomeMode::WorkspaceChange);
+    assert_eq!(workflow.stream_version(), 0);
+    assert_eq!(workflow.profile_revision(), 1);
 }
 
 fn operation_intent() -> OperationIntent {
@@ -1011,7 +1036,7 @@ fn workspace_mutation_is_atomic_and_invalidates_candidate_approvals() {
         local_agent_terminal_domain::Phase::WorkspaceDirty
     );
     assert_eq!(result.task_state.workspace_version().get(), 0);
-    assert_eq!(result.task_state.fencing_token().get(), 2);
+    assert_eq!(result.task_state.fencing_epoch(), 2);
     assert_eq!(
         result.invalidated_approval_ids,
         vec!["approval-plan".to_owned(), "approval-tool".to_owned()]

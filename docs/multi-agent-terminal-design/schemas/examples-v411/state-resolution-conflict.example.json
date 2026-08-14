@@ -1,0 +1,16 @@
+{
+  "conflictId": "state-conflict-output-language-1",
+  "projectId": "p1",
+  "taskId": "t1",
+  "key": "user.output.language",
+  "candidateStateIds": ["state-output-language-vi", "state-output-language-en"],
+  "precedenceRank": 600,
+  "evidence": {
+    "sourceId": "artifact-conflict-receipt",
+    "sourceRevision": "artifact:v1",
+    "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sourceKind": "state-resolution"
+  },
+  "status": "open",
+  "createdAt": "2026-08-06T02:00:00Z"
+}

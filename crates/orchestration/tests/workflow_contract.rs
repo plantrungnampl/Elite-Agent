@@ -1,16 +1,16 @@
 use std::collections::BTreeSet;
 
 use local_agent_terminal_application::{
-    recover_deliberation, AgentRuntime, AppendOperation, AppendResult, ApprovalId,
-    CanonicalDeliberationFact, Clock, CompareAndExpirePlanApproval,
-    CompareAndInvalidatePlanApproval, CompareAndResolvePlanApproval, DeliberationArtifactRef,
-    DeliberationBoundaryRecord, DeliberationBoundaryStore, DeliberationCommandContext,
-    DeliberationDispatchBinding, DeliberationDispatchStore, DeliberationPersistenceCommand,
-    DeliberationPhaseDispatchAuthority, DeliberationPhaseDispatchSet,
-    DeliberationProposalDispatchPlan, DeliberationRecord, DeliberationRecoveryInput,
-    DeliberationRepositoryAuthority, DeliberationRunAssignment, DeliberationSnapshot,
-    DeliberationStore, DeliberationSynthesisCommand, DeliberationSynthesisStore,
-    DeliberationToolAccess, DeliberationToolCatalog, DeliberationToolSchema, EventStore,
+    recover_deliberation, AgentRuntime, ApprovalId, CanonicalDeliberationFact, Clock,
+    CompareAndExpirePlanApproval, CompareAndInvalidatePlanApproval, CompareAndResolvePlanApproval,
+    DeliberationArtifactRef, DeliberationBoundaryRecord, DeliberationBoundaryStore,
+    DeliberationCommandContext, DeliberationDispatchBinding, DeliberationDispatchStore,
+    DeliberationPersistenceCommand, DeliberationPhaseDispatchAuthority,
+    DeliberationPhaseDispatchSet, DeliberationPhaseTransition, DeliberationProposalDispatchPlan,
+    DeliberationRecord, DeliberationRecoveryInput, DeliberationRepositoryAuthority,
+    DeliberationRunAssignment, DeliberationSnapshot, DeliberationStore,
+    DeliberationSynthesisCommand, DeliberationSynthesisStore, DeliberationToolAccess,
+    DeliberationToolCatalog, DeliberationToolSchema, DeliberationWorkflowAuthority,
     PlanApprovalAction, PlanApprovalAuthorityBinding, PlanApprovalAuthorityProvider,
     PlanApprovalBindingInput, PlanApprovalCurrentState, PlanApprovalPathScopeV1, PlanApprovalState,
     PlanApprovalStore, PortError, PreparePlanApprovalRequestInput, ResolvePlanApproval,
@@ -144,6 +144,8 @@ fn coordinator_checks_boundary_commits_effect_and_accepts_run_before_external_di
             "boundary-compare-and-persist",
             "tool-catalog",
             "phase",
+            "prepare",
+            "prepare",
             "binding-set",
             "runtime",
             "runtime",
@@ -359,8 +361,9 @@ fn one_coordinator_path_guards_every_dispatching_preplan_phase() {
             "repository-scan",
             "boundary-compare-and-persist",
             "tool-catalog",
-            "binding-set",
         ];
+        expected_log.extend(std::iter::repeat_n("prepare", expected_runs));
+        expected_log.push("binding-set");
         expected_log.extend(std::iter::repeat_n("runtime", expected_runs));
         assert_eq!(*log.lock().unwrap(), expected_log);
     }
@@ -519,6 +522,7 @@ fn repository_checked_quorum_publication_reveals_only_after_two_private_proposal
     let authority = RecordingAuthority { log: &log };
     let boundaries = RecordingBoundaryStore { log: &log };
     let store = WorkflowStore::new(unpublished_snapshot());
+    let workflow = RecordingWorkflowAuthority::default();
     assert!(store
         .snapshot
         .lock()
@@ -528,7 +532,7 @@ fn repository_checked_quorum_publication_reveals_only_after_two_private_proposal
         .all(|entry| !entry.proposal().is_revealed()));
     assert!(IndependentQuorum::new(vec![proposal(1)]).is_err());
 
-    DeliberationCoordinator::new(&authority, &boundaries, &store)
+    DeliberationCoordinator::with_workflow_authority(&authority, &boundaries, &store, &workflow)
         .publish_proposals(
             deliberation_context(
                 Phase::ParallelAnalysis,
@@ -585,28 +589,31 @@ fn repository_checked_claim_and_verification_commands_persist_each_phase_boundar
         3,
         published_facts.clone(),
     ));
+    let workflow = RecordingWorkflowAuthority::default();
 
-    DeliberationCoordinator::new(&authority, &boundaries, &cross_review)
-        .record_claim_set(
-            deliberation_context(
-                Phase::CrossReview,
-                3,
-                deliberation_artifact("claim-set", '3'),
-                "event-claims",
-            ),
-            vec![material_claim(false)],
-        )
-        .unwrap();
+    DeliberationCoordinator::with_workflow_authority(
+        &authority,
+        &boundaries,
+        &cross_review,
+        &workflow,
+    )
+    .record_claim_set(
+        deliberation_context(
+            Phase::CrossReview,
+            3,
+            deliberation_artifact("claim-set", '3'),
+            "event-claims",
+        ),
+        vec![material_claim(false)],
+    )
+    .unwrap();
     let claim_command = cross_review.writes.lock().unwrap()[0].clone();
     assert_eq!(
         claim_command.append().events[0].event_type.as_str(),
         "review.complete"
     );
-    assert!(matches!(
-        claim_command.append().projection_changes.as_slice(),
-        [local_agent_terminal_application::ProjectionChange::TaskState { state, .. }]
-            if state.phase() == Phase::PrePlanVerification
-    ));
+    assert!(claim_command.append().projection_changes.is_empty());
+    assert_eq!(workflow.transitions.lock().unwrap()[0].rule_id(), "WF-P005");
 
     let mut claim_facts = published_facts;
     claim_facts.push(
@@ -621,31 +628,34 @@ fn repository_checked_claim_and_verification_commands_persist_each_phase_boundar
     );
     let verification =
         WorkflowStore::new(recover_snapshot(Phase::PrePlanVerification, 4, claim_facts));
-    DeliberationCoordinator::new(&authority, &boundaries, &verification)
-        .record_verification_set(
-            deliberation_context(
-                Phase::PrePlanVerification,
-                4,
-                deliberation_artifact("verification-set", '4'),
-                "event-verification",
-            ),
-            vec![material_claim(true)],
-        )
-        .unwrap();
+    let verification_workflow = RecordingWorkflowAuthority::default();
+    DeliberationCoordinator::with_workflow_authority(
+        &authority,
+        &boundaries,
+        &verification,
+        &verification_workflow,
+    )
+    .record_verification_set(
+        deliberation_context(
+            Phase::PrePlanVerification,
+            4,
+            deliberation_artifact("verification-set", '4'),
+            "event-verification",
+        ),
+        vec![material_claim(true)],
+    )
+    .unwrap();
 
     let verification_command = verification.writes.lock().unwrap()[0].clone();
     assert_eq!(
         verification_command.append().events[0].event_type.as_str(),
         "claims.checked"
     );
-    assert!(matches!(
-        verification_command
-            .append()
-            .projection_changes
-            .as_slice(),
-        [local_agent_terminal_application::ProjectionChange::TaskState { state, .. }]
-            if state.phase() == Phase::Synthesis
-    ));
+    assert!(verification_command.append().projection_changes.is_empty());
+    assert_eq!(
+        verification_workflow.transitions.lock().unwrap()[0].rule_id(),
+        "WF-P006"
+    );
 }
 
 #[test]
@@ -655,8 +665,9 @@ fn severe_objection_reopens_one_bounded_round_and_recovery_preserves_history() {
     let boundaries = RecordingBoundaryStore { log: &log };
     let facts = objection_facts(ObjectionSeverity::Severe);
     let store = WorkflowStore::new(recover_snapshot(Phase::FinalObjection, 7, facts.clone()));
+    let workflow = RecordingWorkflowAuthority::default();
 
-    DeliberationCoordinator::new(&authority, &boundaries, &store)
+    DeliberationCoordinator::with_workflow_authority(&authority, &boundaries, &store, &workflow)
         .accept_severe_objection(
             deliberation_context(
                 Phase::FinalObjection,
@@ -725,11 +736,13 @@ fn approval_close_reloads_canonical_authority_before_persisting_transition() {
         calls: std::sync::Mutex::new(0),
         binding: PlanApprovalAuthorityBinding::issue(plan_approval_binding()).unwrap(),
     };
+    let workflow = RecordingWorkflowAuthority::default();
 
-    DeliberationCoordinator::with_plan_approval_authority(
+    DeliberationCoordinator::with_authorities(
         &authority,
         &boundaries,
         &store,
+        &workflow,
         &approvals,
     )
     .close_objection_round(
@@ -749,11 +762,8 @@ fn approval_close_reloads_canonical_authority_before_persisting_transition() {
         writes[0].record(),
         DeliberationRecord::ObjectionRoundClosed { .. }
     ));
-    assert!(matches!(
-        writes[0].append().projection_changes.as_slice(),
-        [local_agent_terminal_application::ProjectionChange::TaskState { state, .. }]
-            if state.phase() == Phase::AwaitingPlanApproval
-    ));
+    assert!(writes[0].append().projection_changes.is_empty());
+    assert_eq!(workflow.transitions.lock().unwrap()[0].rule_id(), "WF-P013");
 }
 
 #[test]
@@ -770,10 +780,12 @@ fn canonical_resolution_reloads_and_appends_exact_plan_approved_event() {
         calls: std::sync::Mutex::new(0),
         binding: PlanApprovalAuthorityBinding::issue(plan_approval_binding()).unwrap(),
     };
-    DeliberationCoordinator::with_plan_approval_authority(
+    let workflow = RecordingWorkflowAuthority::default();
+    DeliberationCoordinator::with_authorities(
         &authority,
         &boundaries,
         &deliberation,
+        &workflow,
         &approvals,
     )
     .close_objection_round(
@@ -1174,21 +1186,13 @@ impl DeliberationDispatchStore for RecordingDispatchStore<'_> {
     }
 }
 
-impl EventStore for RecordingEventStore<'_> {
-    fn append(&self, operation: AppendOperation) -> Result<AppendResult, PortError> {
-        assert_eq!(operation.events.len(), 1);
-        assert_eq!(operation.projection_changes.len(), 1);
-        assert_eq!(
-            operation.events[0].payload["effectArtifacts"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
+impl DeliberationWorkflowAuthority for RecordingEventStore<'_> {
+    fn transition(&self, transition: DeliberationPhaseTransition) -> Result<(), PortError> {
+        assert!(!transition.rule_id().is_empty());
+        assert_eq!(transition.guards().len(), 1);
+        assert!(!transition.effects().is_empty());
         self.log.lock().unwrap().push("phase");
-        Ok(AppendResult {
-            new_version: Sequence::new(operation.expected_version.get() + 1),
-        })
+        Ok(())
     }
 }
 
@@ -1199,6 +1203,11 @@ struct RecordingRuntime<'a> {
 impl AgentRuntime for RecordingRuntime<'_> {
     fn list_agents(&self) -> Result<Vec<AgentDescriptor>, PortError> {
         unreachable!()
+    }
+
+    fn prepare_run(&self, _: &BoundAgentRunRequest) -> Result<(), PortError> {
+        self.log.lock().unwrap().push("prepare");
+        Ok(())
     }
 
     fn start_run(&self, request: BoundAgentRunRequest) -> Result<AgentRunReceipt, PortError> {
@@ -1217,6 +1226,18 @@ impl AgentRuntime for RecordingRuntime<'_> {
 struct WorkflowStore {
     snapshot: std::sync::Mutex<DeliberationSnapshot>,
     writes: std::sync::Mutex<Vec<DeliberationPersistenceCommand>>,
+}
+
+#[derive(Default)]
+struct RecordingWorkflowAuthority {
+    transitions: std::sync::Mutex<Vec<DeliberationPhaseTransition>>,
+}
+
+impl DeliberationWorkflowAuthority for RecordingWorkflowAuthority {
+    fn transition(&self, request: DeliberationPhaseTransition) -> Result<(), PortError> {
+        self.transitions.lock().unwrap().push(request);
+        Ok(())
+    }
 }
 
 impl WorkflowStore {

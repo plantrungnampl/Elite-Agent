@@ -4,7 +4,6 @@ use local_agent_terminal_application::{
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
-use crate::deliberation_budget_store::reserve_task_budget;
 use crate::event_store::{open_error_to_port, sqlite_error_to_port};
 use crate::SqliteStore;
 
@@ -14,14 +13,7 @@ impl DeliberationDispatchStore for SqliteStore {
         plan: &DeliberationProposalDispatchPlan,
     ) -> Result<(), PortError> {
         plan.validate()?;
-        self.persist_dispatch_set(
-            plan.task_id(),
-            "ParallelAnalysis",
-            0,
-            plan.task_budget(),
-            plan.budget_reservation()?,
-            plan.bindings(),
-        )
+        self.persist_dispatch_set(plan.task_id(), "ParallelAnalysis", 0, plan.bindings())
     }
 
     fn compare_and_persist_phase_binding_set(
@@ -33,8 +25,6 @@ impl DeliberationDispatchStore for SqliteStore {
             dispatch_set.task_id(),
             phase_name(dispatch_set.phase()),
             dispatch_set.authority().round(),
-            dispatch_set.task_budget(),
-            dispatch_set.budget_reservation()?,
             dispatch_set.bindings(),
         )
     }
@@ -46,20 +36,15 @@ impl SqliteStore {
         task_id: &local_agent_terminal_domain::TaskId,
         phase: &str,
         round: u32,
-        budget: local_agent_terminal_domain::DeliberationTaskBudget,
-        reservation: local_agent_terminal_application::DeliberationBudgetReservation,
         bindings: &[DeliberationDispatchBinding],
     ) -> Result<(), PortError> {
         let mut connection = self.connection().map_err(open_error_to_port)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
-        reserve_task_budget(
-            &transaction,
-            task_id,
-            budget,
-            local_agent_terminal_application::DeliberationBudgetReservation::default(),
-        )?;
+        for binding in bindings {
+            require_exact_run_bindings(&transaction, task_id, binding)?;
+        }
         let existing = bindings
             .iter()
             .map(|binding| {
@@ -76,11 +61,54 @@ impl SqliteStore {
             return Err(conflict());
         }
 
-        reserve_task_budget(&transaction, task_id, budget, reservation)?;
         for binding in bindings {
             insert_dispatch_reservation(&transaction, task_id, phase, round, binding)?;
         }
         transaction.commit().map_err(sqlite_error_to_port)
+    }
+}
+
+fn require_exact_run_bindings(
+    transaction: &Transaction<'_>,
+    task_id: &local_agent_terminal_domain::TaskId,
+    binding: &DeliberationDispatchBinding,
+) -> Result<(), PortError> {
+    let request = binding.request();
+    let exact: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM agent_runs r
+                JOIN context_packages c ON c.id = r.context_package_id
+                JOIN run_configuration_bindings rc ON rc.run_id = r.id
+                WHERE r.id = ?1 AND r.task_id = ?2 AND r.agent_id = ?3
+                  AND r.role = ?4 AND r.context_package_id = ?5
+                  AND r.connection_binding_digest = ?6
+                  AND r.run_config_artifact_id = ?7
+                  AND rc.config_artifact_id = r.run_config_artifact_id
+                  AND c.task_id = r.task_id AND c.agent_id = r.agent_id
+                  AND c.role = r.role AND c.effective_content_artifact_id = ?8
+                  AND c.content_hash = ?9 AND c.policy_snapshot_digest = ?10
+            )",
+            params![
+                request.run_id.as_str(),
+                task_id.as_str(),
+                request.agent_id,
+                request.role,
+                request.context.context_package_id,
+                request.connection.binding_digest.as_str(),
+                request.run_config.run_config_artifact_id.as_str(),
+                request.context.effective_context_artifact_id.as_str(),
+                request.context.content_digest.as_str(),
+                request.context.policy_snapshot_digest.as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error_to_port)?;
+    if exact {
+        Ok(())
+    } else {
+        Err(conflict())
     }
 }
 

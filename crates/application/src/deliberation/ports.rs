@@ -7,6 +7,89 @@ pub trait DeliberationStore: Send + Sync {
     fn persist(&self, command: DeliberationPersistenceCommand) -> Result<(), PortError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliberationPhaseTransition {
+    task_id: TaskId,
+    transition_event_id: String,
+    rule_id: String,
+    expected_stream_version: u64,
+    event: WorkflowEvent,
+    guards: Vec<crate::WorkflowGuardEvidence>,
+    effects: Vec<crate::WorkflowEffectBinding>,
+    prepared_at: local_agent_terminal_domain::Timestamp,
+}
+
+impl DeliberationPhaseTransition {
+    pub(crate) fn new(
+        task_id: TaskId,
+        transition_event_id: String,
+        rule_id: String,
+        expected_stream_version: u64,
+        event: WorkflowEvent,
+        guards: Vec<crate::WorkflowGuardEvidence>,
+        effects: Vec<crate::WorkflowEffectBinding>,
+        prepared_at: local_agent_terminal_domain::Timestamp,
+    ) -> Self {
+        Self {
+            task_id,
+            transition_event_id,
+            rule_id,
+            expected_stream_version,
+            event,
+            guards,
+            effects,
+            prepared_at,
+        }
+    }
+
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    pub fn transition_event_id(&self) -> &str {
+        &self.transition_event_id
+    }
+
+    pub fn rule_id(&self) -> &str {
+        &self.rule_id
+    }
+
+    pub const fn expected_stream_version(&self) -> u64 {
+        self.expected_stream_version
+    }
+
+    pub fn event(&self) -> &WorkflowEvent {
+        &self.event
+    }
+
+    pub fn guards(&self) -> &[crate::WorkflowGuardEvidence] {
+        &self.guards
+    }
+
+    pub fn effects(&self) -> &[crate::WorkflowEffectBinding] {
+        &self.effects
+    }
+
+    pub fn guard_kinds(&self) -> Vec<&str> {
+        self.guards.iter().map(|guard| guard.kind.as_str()).collect()
+    }
+
+    pub fn effect_kinds(&self) -> Vec<&str> {
+        self.effects
+            .iter()
+            .map(|effect| effect.kind.as_str())
+            .collect()
+    }
+
+    pub const fn prepared_at(&self) -> local_agent_terminal_domain::Timestamp {
+        self.prepared_at
+    }
+}
+
+pub trait DeliberationWorkflowAuthority: Send + Sync {
+    fn transition(&self, request: DeliberationPhaseTransition) -> Result<(), PortError>;
+}
+
 /// Atomically persists the validated decision record/event/projections and the complete synthesis
 /// execution DTO. Implementations must reject a command whose `validate` method fails and must not
 /// expose either half independently.
@@ -26,7 +109,7 @@ pub struct InitialDeliberationPhaseRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedInitialDeliberationPhase {
-    pub append: AppendOperation,
+    pub transition: DeliberationPhaseTransition,
     pub next_state: WorkflowState,
 }
 
@@ -58,43 +141,47 @@ pub fn prepare_initial_deliberation_phase(
     if next_state.phase() != expected_phase {
         return Err(conflict());
     }
-    let effect_artifacts = request
+    let artifact = request
         .effect_artifacts
+        .first()
+        .cloned()
+        .ok_or_else(invalid_input)?;
+    let guards = transition
+        .guard_evidence_kinds
         .iter()
-        .map(|artifact| {
-            serde_json::json!({
-                "artifactId": artifact.artifact_id().as_str(),
-                "contentDigest": artifact.content_digest().as_str(),
-                "sizeBytes": artifact.size_bytes(),
-            })
+        .map(|kind| crate::WorkflowGuardEvidence {
+            kind: kind.clone(),
+            reference: artifact.artifact_id().as_str().to_owned(),
+            subject_digest: None,
+            evidence_digest: artifact.content_digest().clone(),
+            artifact_id: Some(artifact.artifact_id().clone()),
+            approval_receipt_id: None,
         })
-        .collect::<Vec<_>>();
-    let append = AppendOperation {
-        stream_id: StreamId::new(request.task_id.as_str()).map_err(|_| invalid_input())?,
-        expected_version: request.expected_state.sequence(),
-        events: vec![NewEvent {
-            event_id: request.event_id,
-            event_type: event,
-            schema_version: 1,
-            actor_type: "core".to_owned(),
-            actor_id: ActorId::new("core").map_err(|_| conflict())?,
-            observation_class: "core_observed".to_owned(),
-            payload: serde_json::json!({
-                "taskId": request.task_id.as_str(),
-                "effectArtifacts": effect_artifacts,
-            }),
-            metadata: serde_json::json!({}),
-            causation_id: None,
-            correlation_id: request.correlation_id,
-            created_at: request.occurred_at.clone(),
-        }],
-        projection_changes: vec![ProjectionChange::TaskState {
-            task_id: request.task_id,
-            state: next_state.clone(),
-            updated_at: request.occurred_at,
-        }],
-    };
-    Ok(PreparedInitialDeliberationPhase { append, next_state })
+        .collect();
+    let effects = transition
+        .effect_kinds
+        .iter()
+        .map(|kind| crate::WorkflowEffectBinding {
+            kind: kind.clone(),
+            reference: artifact.artifact_id().as_str().to_owned(),
+            effect_digest: artifact.content_digest().clone(),
+            artifact_id: Some(artifact.artifact_id().clone()),
+        })
+        .collect();
+    let authority = DeliberationPhaseTransition::new(
+        request.task_id,
+        request.event_id.as_str().to_owned(),
+        transition.rule_id,
+        request.expected_state.stream_version(),
+        event,
+        guards,
+        effects,
+        parse_policy_timestamp(&request.occurred_at)?,
+    );
+    Ok(PreparedInitialDeliberationPhase {
+        transition: authority,
+        next_state,
+    })
 }
 
 fn initial_phase_transition_request(

@@ -1,0 +1,20 @@
+{
+  "eventId": "wm-7",
+  "runId": "r1",
+  "sequence": 7,
+  "eventType": "fact.recorded",
+  "statement": "The close SQL filters by NUM.",
+  "evidence": [
+    {
+      "sourceId": "chunk-sql-1",
+      "sourceRevision": "commit:abc123",
+      "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sourceKind": "source-chunk",
+      "locator": {
+        "path": "UpdateWarningStatus.aspx.cs"
+      }
+    }
+  ],
+  "supportingFactIds": [],
+  "confidenceMillionths": 1000000
+}

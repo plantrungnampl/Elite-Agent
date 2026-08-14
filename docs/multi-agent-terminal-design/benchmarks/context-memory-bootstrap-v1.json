@@ -1,0 +1,367 @@
+{
+  "suiteId": "context-memory-bootstrap-v1",
+  "version": 2,
+  "name": "Context and Memory Controlled Bootstrap Corpus",
+  "createdAt": "2026-08-06T01:00:00Z",
+  "description": "Contract-level controlled corpus for implementation and regression work. Passing it is not evidence of production agent quality.",
+  "experimentArms": [
+    "control_no_memory",
+    "compaction_only",
+    "evidence_retrieval",
+    "evidence_plus_experience"
+  ],
+  "comparisonRules": {
+    "equalModelConfiguration": true,
+    "equalEvaluatorConfiguration": true,
+    "equalRepositoryRevision": true,
+    "equalBudgetProfile": true,
+    "reportPerCaseRegressions": true
+  },
+  "primaryMetrics": [
+    "first_pass_verifier_acceptance",
+    "repeated_known_error_rate",
+    "unsupported_claim_rate",
+    "stale_memory_use_rate",
+    "cross_scope_leakage",
+    "token_cost",
+    "latency_ms",
+    "memory_contribution"
+  ],
+  "cases": [
+    {
+      "caseId": "precedence-current-instruction",
+      "taskClass": "architecture-design",
+      "objective": "Resolve output language when a current instruction conflicts with an older project preference.",
+      "repositoryRevision": "design-v4.1",
+      "fixturePaths": [
+        "benchmarks/fixtures/state-records.json"
+      ],
+      "applicableMemoryFixtureIds": [
+        "memory-old-output-language"
+      ],
+      "budgetProfile": {
+        "maxTokens": 12000,
+        "maxToolCalls": 16,
+        "maxDurationMs": 90000
+      },
+      "expectedInformationNeeds": [
+        "Current explicit instruction",
+        "Older project preference",
+        "State precedence rule"
+      ],
+      "requiredFacts": [
+        "Current explicit instruction has precedence rank 600",
+        "Explicit user preference has precedence rank 200"
+      ],
+      "requiredEvidence": [
+        "benchmarks/fixtures/state-records.json"
+      ],
+      "forbiddenMistakes": [
+        "Apply the older preference over the current instruction"
+      ],
+      "acceptanceRules": [
+        "Select Vietnamese",
+        "Identify state-current-output-language as the winner"
+      ]
+    },
+    {
+      "caseId": "precedence-task-override",
+      "taskClass": "migration-planning",
+      "objective": "Resolve database write policy for task t2 when a task override conflicts with the project default.",
+      "repositoryRevision": "design-v4.1",
+      "fixturePaths": [
+        "benchmarks/fixtures/state-records.json"
+      ],
+      "applicableMemoryFixtureIds": [],
+      "budgetProfile": {
+        "maxTokens": 12000,
+        "maxToolCalls": 16,
+        "maxDurationMs": 90000
+      },
+      "expectedInformationNeeds": [
+        "Task override",
+        "Project setting",
+        "Scope match"
+      ],
+      "requiredFacts": [
+        "Task override outranks project setting",
+        "The task is read-only"
+      ],
+      "requiredEvidence": [
+        "benchmarks/fixtures/state-records.json"
+      ],
+      "forbiddenMistakes": [
+        "Recommend mediated writes for t2"
+      ],
+      "acceptanceRules": [
+        "Select read_only for task t2",
+        "Explain the precedence decision"
+      ]
+    },
+    {
+      "caseId": "stale-memory-exclusion",
+      "taskClass": "repository-onboarding",
+      "objective": "Identify the current normative clean-install schema without using stale memory.",
+      "repositoryRevision": "design-v4.1",
+      "fixturePaths": [
+        "00-README.md",
+        "schemas/README.md",
+        "benchmarks/fixtures/memory-records.json"
+      ],
+      "applicableMemoryFixtureIds": [
+        "memory-old-sqlite-v3"
+      ],
+      "budgetProfile": {
+        "maxTokens": 12000,
+        "maxToolCalls": 16,
+        "maxDurationMs": 90000
+      },
+      "expectedInformationNeeds": [
+        "Current README normative contract",
+        "Schema files",
+        "Stale memory status"
+      ],
+      "requiredFacts": [
+        "sqlite-v4.sql is normative in v4.1",
+        "memory-old-sqlite-v3 is stale"
+      ],
+      "requiredEvidence": [
+        "00-README.md",
+        "schemas/README.md",
+        "benchmarks/fixtures/memory-records.json"
+      ],
+      "forbiddenMistakes": [
+        "Claim sqlite-v3.sql is current",
+        "Cite stale memory as authority"
+      ],
+      "acceptanceRules": [
+        "Select sqlite-v4.sql",
+        "Cite an authoritative document"
+      ]
+    },
+    {
+      "caseId": "negative-memory-guard",
+      "taskClass": "security-review",
+      "objective": "Review a proposal that activates a candidate memory directly.",
+      "repositoryRevision": "design-v4.1",
+      "fixturePaths": [
+        "04-context-memory.md",
+        "benchmarks/fixtures/memory-records.json"
+      ],
+      "applicableMemoryFixtureIds": [
+        "memory-direct-activation-trap"
+      ],
+      "budgetProfile": {
+        "maxTokens": 12000,
+        "maxToolCalls": 16,
+        "maxDurationMs": 90000
+      },
+      "expectedInformationNeeds": [
+        "Memory lifecycle",
+        "Known negative memory",
+        "Promotion evidence"
+      ],
+      "requiredFacts": [
+        "Direct candidate-to-active activation is forbidden"
+      ],
+      "requiredEvidence": [
+        "04-context-memory.md",
+        "benchmarks/fixtures/memory-records.json"
+      ],
+      "forbiddenMistakes": [
+        "Approve direct activation",
+        "Treat model agreement as promotion evidence"
+      ],
+      "acceptanceRules": [
+        "Reject direct activation",
+        "Require evidence, review, and activation gate"
+      ]
+    },
+    {
+      "caseId": "typed-invalidation-before-retrieval",
+      "taskClass": "regression-investigation",
+      "objective": "Decide whether a durable procedure may be retrieved after its source hash changed.",
+      "repositoryRevision": "design-v4.1",
+      "fixturePaths": [
+        "04-context-memory.md",
+        "schemas/cognitive-memory.v2.schema.json",
+        "benchmarks/fixtures/memory-records.json"
+      ],
+      "applicableMemoryFixtureIds": [
+        "memory-typed-invalidation"
+      ],
+      "budgetProfile": {
+        "maxTokens": 12000,
+        "maxToolCalls": 16,
+        "maxDurationMs": 90000
+      },
+      "expectedInformationNeeds": [
+        "Declared invalidation rules",
+        "Latest evaluation result",
+        "Current source hash"
+      ],
+      "requiredFacts": [
+        "Every rule requires a current passing evaluation"
+      ],
+      "requiredEvidence": [
+        "04-context-memory.md",
+        "schemas/cognitive-memory.v2.schema.json",
+        "benchmarks/fixtures/memory-records.json"
+      ],
+      "forbiddenMistakes": [
+        "Retrieve the procedure without revalidation"
+      ],
+      "acceptanceRules": [
+        "Mark the memory ineligible until revalidated",
+        "Identify the failed source_hash_changed condition"
+      ]
+    },
+    {
+      "caseId": "evidence-outranks-summary",
+      "taskClass": "bug-diagnosis",
+      "objective": "Resolve a conflict between a memory summary and current repository source.",
+      "repositoryRevision": "design-v4.1",
+      "fixturePaths": [
+        "04-context-memory.md"
+      ],
+      "applicableMemoryFixtureIds": [],
+      "budgetProfile": {
+        "maxTokens": 12000,
+        "maxToolCalls": 16,
+        "maxDurationMs": 90000
+      },
+      "expectedInformationNeeds": [
+        "Current source bytes",
+        "Memory provenance",
+        "Contradiction"
+      ],
+      "requiredFacts": [
+        "Repository source at the bound revision is authoritative",
+        "Memory is only eligible experience"
+      ],
+      "requiredEvidence": [
+        "04-context-memory.md"
+      ],
+      "forbiddenMistakes": [
+        "Prefer a semantically similar memory summary over current source"
+      ],
+      "acceptanceRules": [
+        "Reread and cite current source",
+        "Record the contradiction"
+      ]
+    },
+    {
+      "caseId": "utility-token-tradeoff",
+      "taskClass": "research",
+      "objective": "Select context items when a long episodic memory has negative measured utility and high token cost.",
+      "repositoryRevision": "design-v4.1",
+      "fixturePaths": [
+        "benchmarks/fixtures/memory-records.json",
+        "04-context-memory.md"
+      ],
+      "applicableMemoryFixtureIds": [
+        "memory-verbose-low-utility"
+      ],
+      "budgetProfile": {
+        "maxTokens": 12000,
+        "maxToolCalls": 16,
+        "maxDurationMs": 90000
+      },
+      "expectedInformationNeeds": [
+        "Token budget",
+        "Utility snapshot",
+        "Unique evidence coverage"
+      ],
+      "requiredFacts": [
+        "Low-utility memory is advisory for exclusion or review",
+        "Utility cannot mutate authority"
+      ],
+      "requiredEvidence": [
+        "benchmarks/fixtures/memory-records.json",
+        "04-context-memory.md"
+      ],
+      "forbiddenMistakes": [
+        "Include the entire low-utility memory only because it is available",
+        "Delete the memory automatically"
+      ],
+      "acceptanceRules": [
+        "Exclude it from the initial package unless it covers a unique need",
+        "Retain authority history"
+      ]
+    },
+    {
+      "caseId": "shadow-promotion-regression",
+      "taskClass": "architecture-design",
+      "objective": "Decide whether policy may approve a model-generated procedure whose shadow run introduced regressions.",
+      "repositoryRevision": "design-v4.1",
+      "fixturePaths": [
+        "04-context-memory.md",
+        "benchmarks/fixtures/memory-records.json"
+      ],
+      "applicableMemoryFixtureIds": [
+        "memory-shadow-regression"
+      ],
+      "budgetProfile": {
+        "maxTokens": 12000,
+        "maxToolCalls": 16,
+        "maxDurationMs": 90000
+      },
+      "expectedInformationNeeds": [
+        "Memory origin",
+        "Shadow comparison",
+        "Forbidden mistakes",
+        "Unsupported claims"
+      ],
+      "requiredFacts": [
+        "Policy approval requires a passing shadow evaluation for model-generated procedural memory"
+      ],
+      "requiredEvidence": [
+        "04-context-memory.md",
+        "benchmarks/fixtures/memory-records.json"
+      ],
+      "forbiddenMistakes": [
+        "Approve a failed shadow candidate",
+        "Hide per-case regression behind aggregate improvement"
+      ],
+      "acceptanceRules": [
+        "Reject policy promotion",
+        "Report the regression explicitly"
+      ]
+    },
+    {
+      "caseId": "adaptive-budget-stopping",
+      "taskClass": "bug-diagnosis",
+      "objective": "Stop retrieval after all required information needs are covered and marginal utility falls below cost.",
+      "repositoryRevision": "design-v4.1",
+      "fixturePaths": [
+        "04-context-memory.md"
+      ],
+      "applicableMemoryFixtureIds": [],
+      "budgetProfile": {
+        "maxTokens": 12000,
+        "maxToolCalls": 16,
+        "maxDurationMs": 90000
+      },
+      "expectedInformationNeeds": [
+        "Coverage status",
+        "Remaining questions",
+        "Marginal utility threshold",
+        "Token and latency cost"
+      ],
+      "requiredFacts": [
+        "Static percentages are fallback profiles",
+        "Budget decisions are immutable receipts"
+      ],
+      "requiredEvidence": [
+        "04-context-memory.md"
+      ],
+      "forbiddenMistakes": [
+        "Continue retrieving until the context window is full"
+      ],
+      "acceptanceRules": [
+        "Stop at sufficient coverage or low marginal utility",
+        "Persist the stopping reason"
+      ]
+    }
+  ]
+}

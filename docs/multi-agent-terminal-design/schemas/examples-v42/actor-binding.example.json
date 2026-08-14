@@ -1,0 +1,12 @@
+{
+  "bindingId": "actor-binding-1",
+  "actorKind": "user",
+  "actorId": "user-1",
+  "sessionId": "session-1",
+  "proofType": "local_authenticated_session",
+  "bindingDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "issuedAt": "2026-08-06T08:00:00Z",
+  "expiresAt": "2026-08-06T08:10:00Z",
+  "sessionEpoch": 1,
+  "status": "active"
+}

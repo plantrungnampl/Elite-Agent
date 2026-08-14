@@ -1,0 +1,17 @@
+{
+  "jsonrpc": "2.0",
+  "id": "agent:12",
+  "method": "context.query",
+  "params": {
+    "runId": "run-238",
+    "queryId": "cq-12",
+    "query": "Previous verified decisions about authentication persistence",
+    "scopes": [
+      "project-memory",
+      "decisions",
+      "repository"
+    ],
+    "maxItems": 12,
+    "maxTokens": 8000
+  }
+}

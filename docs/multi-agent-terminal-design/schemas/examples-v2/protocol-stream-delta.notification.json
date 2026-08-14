@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "method": "agent.stream.delta",
+  "params": {
+    "runId": "run-238",
+    "sequence": 17,
+    "channel": "content",
+    "delta": "The main risk is"
+  }
+}

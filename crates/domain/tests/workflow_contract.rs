@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use local_agent_terminal_domain::{
-    reduce, reduce_condition, Condition, FencingToken, GuardEvaluations, GuardName, OperationState,
-    Phase, TaskOutcomeMode, TransitionRequest, WorkflowEvent, WorkflowProfile, WorkflowState,
+    reduce, reduce_condition, Condition, GuardEvaluations, GuardName, OperationState, Phase,
+    TaskOutcomeMode, TransitionRequest, WorkflowEvent, WorkflowProfile, WorkflowState,
     WorkflowStateSnapshot,
 };
 use serde_json::Value;
@@ -130,7 +130,7 @@ fn v3_state_retains_profile_outcome_and_authority_versions() {
     assert_eq!(state.stream_version(), 7);
     assert_eq!(state.profile_revision(), 2);
     assert_eq!(state.workspace_version().get(), 3);
-    assert_eq!(state.fencing_token(), FencingToken::new(4).unwrap());
+    assert_eq!(state.fencing_epoch(), 4);
     assert_eq!(state.last_transition_event_id(), Some("transition-7"));
     assert_eq!(state.last_profile_revision_id(), Some("profile-revision-2"));
 }
@@ -375,7 +375,7 @@ fn condition_rules_are_idless_and_change_only_condition_and_stream_version() {
             transition.state().workspace_version(),
             source.workspace_version()
         );
-        assert_eq!(transition.state().fencing_token(), source.fencing_token());
+        assert_eq!(transition.state().fencing_epoch(), source.fencing_epoch());
         assert_eq!(
             transition.state().stream_version(),
             source.stream_version() + 1

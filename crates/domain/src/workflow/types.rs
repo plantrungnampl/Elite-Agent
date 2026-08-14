@@ -212,7 +212,7 @@ pub struct WorkflowState {
     sequence: Sequence,
     profile_revision: u64,
     workspace_version: WorkspaceVersion,
-    fencing_token: FencingToken,
+    fencing_epoch: u64,
     last_transition_event_id: Option<String>,
     last_profile_revision_id: Option<String>,
 }
@@ -251,8 +251,7 @@ impl WorkflowState {
             sequence: Sequence::new(snapshot.stream_version),
             profile_revision: snapshot.profile_revision,
             workspace_version: WorkspaceVersion::new(snapshot.workspace_version),
-            fencing_token: FencingToken::new(snapshot.fencing_epoch)
-                .map_err(|error| WorkflowError::InvalidState(error.to_string()))?,
+            fencing_epoch: snapshot.fencing_epoch,
             last_transition_event_id: snapshot.last_transition_event_id,
             last_profile_revision_id: snapshot.last_profile_revision_id,
         };
@@ -270,7 +269,7 @@ impl WorkflowState {
             stream_version: self.sequence.get(),
             profile_revision: self.profile_revision,
             workspace_version: self.workspace_version.get(),
-            fencing_epoch: self.fencing_token.get(),
+            fencing_epoch: self.fencing_epoch,
             last_transition_event_id: self.last_transition_event_id.clone(),
             last_profile_revision_id: self.last_profile_revision_id.clone(),
         }
@@ -312,8 +311,8 @@ impl WorkflowState {
         self.workspace_version
     }
 
-    pub const fn fencing_token(&self) -> FencingToken {
-        self.fencing_token
+    pub const fn fencing_epoch(&self) -> u64 {
+        self.fencing_epoch
     }
 
     pub fn last_transition_event_id(&self) -> Option<&str> {
@@ -390,9 +389,9 @@ impl WorkflowState {
                     | "allocate_new_executor_token"
             )
         }) {
-            self.fencing_token =
-                self.fencing_token
-                    .checked_increment()
+            self.fencing_epoch =
+                self.fencing_epoch
+                    .checked_add(1)
                     .ok_or(WorkflowError::VersionOverflow {
                         field: "fencing epoch",
                     })?;

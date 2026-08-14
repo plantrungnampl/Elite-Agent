@@ -1,0 +1,15 @@
+{
+  "jsonrpc": "2.0",
+  "id": "agent:91",
+  "method": "specialist.request",
+  "params": {
+    "runId": "run-238",
+    "requestId": "specialist-91",
+    "capability": "database-migration-review",
+    "reason": "The proposal introduces a new token-family table.",
+    "requiredContext": [
+      "artifact:proposal-3",
+      "source:schema.sql"
+    ]
+  }
+}

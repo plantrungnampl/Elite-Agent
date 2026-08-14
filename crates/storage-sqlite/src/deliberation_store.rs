@@ -1,11 +1,12 @@
 use std::str::FromStr;
 
 use local_agent_terminal_application::{
-    recover_deliberation, AgentSpecialistDispatchCommand, AgentSpecialistDispatchStore,
-    ArtifactRootReader, CanonicalDeliberationFact, DeliberationArtifactRef,
-    DeliberationPersistenceCommand, DeliberationRecord, DeliberationRecoveryInput,
-    DeliberationSnapshot, DeliberationStore, DeliberationSynthesisCommand,
-    DeliberationSynthesisStore, PortError, Retryability, SafeErrorClassification,
+    plan_approval_payload, recover_deliberation, AgentSpecialistDispatchCommand,
+    AgentSpecialistDispatchStore, ArtifactRootReader, CanonicalDeliberationFact,
+    DeliberationArtifactRef, DeliberationPersistenceCommand, DeliberationRecord,
+    DeliberationRecoveryInput, DeliberationSnapshot, DeliberationStore,
+    DeliberationSynthesisCommand, DeliberationSynthesisStore, PortError, Retryability,
+    SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
     ArtifactId, Condition, OperationState, Phase, Sha256Digest, TaskId, TaskOutcomeMode,
@@ -17,7 +18,6 @@ use sha2::{Digest, Sha256};
 use crate::agent_store::{
     load_deliberation_run_assignments, read_available_artifact, validate_available_artifact,
 };
-use crate::deliberation_budget_store::reserve_task_budget;
 use crate::event_store::{append_in_transaction, open_error_to_port, sqlite_error_to_port};
 use crate::SqliteStore;
 
@@ -44,12 +44,13 @@ impl DeliberationStore for SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(sqlite_error_to_port)?;
         let task_state = load_workflow_state(&transaction, task_id)?;
+        let task_version = load_task_version(&transaction, task_id)?;
         let run_assignments =
             load_deliberation_run_assignments(&transaction, artifact_reader, task_id)?;
         let facts = load_facts(&transaction, artifact_reader, task_id)?;
         let snapshot = recover_deliberation(DeliberationRecoveryInput {
             task_id: task_id.clone(),
-            task_version: task_state.sequence().get(),
+            task_version,
             task_state,
             run_assignments,
             facts,
@@ -324,12 +325,6 @@ fn persist_command_in_transaction(
     if event_exists(transaction, event.event_id.as_str())? {
         return Err(conflict());
     }
-    reserve_task_budget(
-        transaction,
-        command.task_id(),
-        command.task_budget(),
-        command.budget_reservation(),
-    )?;
     append_in_transaction(transaction, command.append())?;
     transaction
         .execute(
@@ -534,18 +529,78 @@ fn persist_plan_approval_request(
     approval: &local_agent_terminal_application::NewPlanApproval,
 ) -> Result<(), PortError> {
     approval.validate()?;
+    let payload = plan_approval_payload(approval.binding())?;
+    let operation_intent_id = format!(
+        "plan-approval-intent:{}:{}",
+        approval.task_id().as_str(),
+        approval.operation_digest().as_str(),
+    );
+    let idempotency_key = format!(
+        "plan-approval:{}:{}",
+        approval.task_id().as_str(),
+        approval.operation_digest().as_str(),
+    );
+    let actor_binding_digest = approval.authority_binding().content_digest().as_str();
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO operation_intents (
+                id, task_id, run_id, operation_kind, idempotency_class, idempotency_key,
+                canonical_request_artifact_id, operation_digest, actor_binding_digest,
+                status, current_attempt_no, created_at, updated_at
+             ) VALUES (?1, ?2, NULL, 'plan.approve', 'non_repeatable', ?3, ?4, ?5,
+                ?6, 'pending', 0, ?7, ?7)",
+            params![
+                operation_intent_id,
+                approval.task_id().as_str(),
+                idempotency_key,
+                approval.request_artifact().artifact_id.as_str(),
+                approval.operation_digest().as_str(),
+                actor_binding_digest,
+                approval.binding().requested_at,
+            ],
+        )
+        .map_err(sqlite_error_to_port)?;
+    let exact_intent: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM operation_intents
+                WHERE id = ?1 AND task_id = ?2 AND run_id IS NULL
+                  AND operation_kind = 'plan.approve'
+                  AND idempotency_class = 'non_repeatable' AND idempotency_key = ?3
+                  AND canonical_request_artifact_id = ?4 AND operation_digest = ?5
+                  AND actor_binding_digest = ?6 AND status = 'pending'
+                  AND current_attempt_no = 0 AND created_at = ?7 AND updated_at = ?7
+             )",
+            params![
+                operation_intent_id,
+                approval.task_id().as_str(),
+                idempotency_key,
+                approval.request_artifact().artifact_id.as_str(),
+                approval.operation_digest().as_str(),
+                actor_binding_digest,
+                approval.binding().requested_at,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error_to_port)?;
+    if !exact_intent {
+        return Err(conflict());
+    }
     transaction
         .execute(
             "INSERT OR IGNORE INTO approvals (
-                id, task_id, approval_type, schema_version, operation_digest, status,
-                requested_at, resolved_at, resolved_by, expires_at, request_artifact_id,
-                invalidation_reason
-             ) VALUES (?1, ?2, 'plan', 'approval-digest.v1', ?3, 'pending', ?4,
-                NULL, NULL, ?5, ?6, NULL)",
+                id, task_id, operation_intent_id, approval_type, schema_version,
+                operation_digest, actor_binding_digest, nonce, status, requested_at,
+                resolved_at, expires_at, request_artifact_id, invalidation_reason
+             ) VALUES (?1, ?2, ?3, 'plan', 'approval-digest.v1', ?4, ?5, ?6,
+                'pending', ?7, NULL, ?8, ?9, NULL)",
             params![
                 approval.approval_id().as_str(),
                 approval.task_id().as_str(),
+                operation_intent_id,
                 approval.operation_digest().as_str(),
+                actor_binding_digest,
+                payload.nonce,
                 approval.binding().requested_at,
                 approval.binding().expires_at,
                 approval.request_artifact().artifact_id.as_str(),
@@ -557,15 +612,19 @@ fn persist_plan_approval_request(
             "SELECT EXISTS(
                 SELECT 1 FROM approvals
                 WHERE id = ?1 AND task_id = ?2 AND approval_type = 'plan'
-                  AND schema_version = 'approval-digest.v1' AND operation_digest = ?3
-                  AND status = 'pending' AND requested_at = ?4 AND resolved_at IS NULL
-                  AND resolved_by IS NULL AND expires_at = ?5 AND request_artifact_id = ?6
+                  AND operation_intent_id = ?3 AND schema_version = 'approval-digest.v1'
+                  AND operation_digest = ?4 AND actor_binding_digest = ?5 AND nonce = ?6
+                  AND status = 'pending' AND requested_at = ?7 AND resolved_at IS NULL
+                  AND expires_at = ?8 AND request_artifact_id = ?9
                   AND invalidation_reason IS NULL
              )",
             params![
                 approval.approval_id().as_str(),
                 approval.task_id().as_str(),
+                operation_intent_id,
                 approval.operation_digest().as_str(),
+                actor_binding_digest,
+                payload.nonce,
                 approval.binding().requested_at,
                 approval.binding().expires_at,
                 approval.request_artifact().artifact_id.as_str(),
@@ -665,6 +724,17 @@ fn load_facts(
         facts.push(fact);
     }
     Ok(facts)
+}
+
+fn load_task_version(connection: &Connection, task_id: &TaskId) -> Result<u64, PortError> {
+    let version: i64 = connection
+        .query_row(
+            "SELECT current_sequence FROM tasks WHERE id = ?1",
+            [task_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error_to_port)?;
+    u64::try_from(version).map_err(|_| integrity_failure())
 }
 
 pub(crate) fn load_workflow_state(

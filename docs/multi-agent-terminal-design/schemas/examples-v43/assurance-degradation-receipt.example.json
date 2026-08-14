@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "1.0",
+  "receiptId": "assurance-degradation-1",
+  "taskId": "task-1",
+  "requestedProfile": "HighAssurance",
+  "requirements": {
+    "minimumDistinctIndependenceGroups": 2,
+    "executorReviewerSeparationRequired": true
+  },
+  "observed": {
+    "distinctIndependenceGroups": 1,
+    "runRefs": [
+      "run-reviewer-a"
+    ],
+    "roleSeparationSatisfied": true,
+    "runSetDigest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+  },
+  "reasonCode": "provider_unavailable",
+  "decision": "continue_degraded",
+  "actorBindingId": "actor-binding-1",
+  "acceptanceArtifactRef": "artifact/assurance-acceptance-1",
+  "createdAt": "2026-08-07T09:00:00Z",
+  "receiptDigest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+}

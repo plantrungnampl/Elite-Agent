@@ -1,0 +1,49 @@
+{
+  "records": [
+    {
+      "memoryId": "memory-old-output-language",
+      "memoryType": "preference",
+      "status": "active",
+      "content": "Use English for project reports",
+      "scope": {"kind": "project", "id": "p1"}
+    },
+    {
+      "memoryId": "memory-direct-activation-trap",
+      "memoryType": "negative",
+      "status": "active",
+      "content": "Direct candidate-to-active memory activation bypasses verification and review",
+      "scope": {"kind": "project", "id": "p1"}
+    },
+    {
+      "memoryId": "memory-old-sqlite-v3",
+      "memoryType": "semantic",
+      "status": "stale",
+      "content": "sqlite-v3.sql is the current normative clean-install schema",
+      "scope": {"kind": "project", "id": "p1"}
+    },
+    {
+      "memoryId": "memory-typed-invalidation",
+      "memoryType": "procedural",
+      "status": "active",
+      "content": "Evaluate every typed invalidation rule before retrieving durable experience",
+      "scope": {"kind": "project", "id": "p1"}
+    },
+    {
+      "memoryId": "memory-verbose-low-utility",
+      "memoryType": "episodic",
+      "status": "active",
+      "content": "A long prior task transcript with no unique evidence",
+      "scope": {"kind": "project", "id": "p1"},
+      "tokenCost": 5000,
+      "utilityMillionths": -250000
+    },
+    {
+      "memoryId": "memory-shadow-regression",
+      "memoryType": "procedural",
+      "status": "verified",
+      "content": "Always prefer memory summaries over repository source",
+      "scope": {"kind": "project", "id": "p1"},
+      "shadowResult": "failed"
+    }
+  ]
+}

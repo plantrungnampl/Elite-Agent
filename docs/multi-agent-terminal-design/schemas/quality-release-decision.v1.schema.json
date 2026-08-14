@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://multi-agent-terminal.local/schemas/quality-release-decision.v1.schema.json",
+  "title": "Quality Release Decision v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decisionId",
+    "comparisonId",
+    "comparisonDigest",
+    "requiredGateIds",
+    "decision",
+    "residualRisks",
+    "decidedByActorBindingDigest",
+    "decidedAt",
+    "decisionDigest"
+  ],
+  "properties": {
+    "decisionId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "comparisonId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "comparisonDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "requiredGateIds": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^G[0-9]+$"
+      }
+    },
+    "decision": {
+      "enum": [
+        "allow_internal_experiment",
+        "allow_feature_enablement",
+        "allow_quality_claim",
+        "deny"
+      ]
+    },
+    "residualRisks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "decidedByActorBindingDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "decidedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "decisionDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

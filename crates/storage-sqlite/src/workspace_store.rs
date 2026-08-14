@@ -42,15 +42,24 @@ impl WorkspaceStateStore for SqliteStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error_to_port)?;
-        let project_exists: bool = transaction
+        let policy_profile_id: Option<String> = transaction
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                "SELECT policy_profile_id FROM projects WHERE id = ?1",
                 [task.project_id.as_str()],
                 |row| row.get(0),
             )
+            .optional()
             .map_err(sqlite_error_to_port)?;
-        if !project_exists {
+        let Some(policy_profile_id) = policy_profile_id else {
             return Err(not_found());
+        };
+        let expected_selection = local_agent_terminal_application::select_initial_workflow(
+            task.risk_level,
+            task.initial_workflow.outcome_mode(),
+            &policy_profile_id,
+        )?;
+        if task.initial_workflow != expected_selection {
+            return Err(invalid_input());
         }
         transaction
             .execute(
@@ -71,6 +80,25 @@ impl WorkspaceStateStore for SqliteStore {
                     task.risk_level.as_str(),
                     task.base_branch.as_str(),
                     task.base_commit.as_str(),
+                    task.created_at,
+                ],
+            )
+            .map_err(sqlite_error_to_port)?;
+        transaction
+            .execute(
+                "INSERT INTO task_workflow_authority (
+                    task_id, workflow_profile, outcome_mode, phase, selected_by_kind,
+                    selected_by_actor_binding_id, selection_policy_digest, created_at,
+                    updated_at, completed_at, stream_version, last_transition_event_id,
+                    profile_revision, last_profile_revision_id
+                 ) VALUES (
+                    ?1, ?2, ?3, 'Intake', 'core', NULL, ?4, ?5, ?5, NULL, 0, NULL, 1, NULL
+                 )",
+                params![
+                    task.task_id.as_str(),
+                    task.initial_workflow.workflow_profile().as_str(),
+                    task.initial_workflow.outcome_mode().as_str(),
+                    task.initial_workflow.selection_policy_digest().as_str(),
                     task.created_at,
                 ],
             )
@@ -860,6 +888,7 @@ fn verify_operation_evidence(
 fn validate_new_task(task: &NewTask) -> Result<(), PortError> {
     if task.title.trim().is_empty()
         || task.objective.trim().is_empty()
+        || task.initial_workflow.risk_level() != task.risk_level
         || task.created_at.trim().is_empty()
     {
         return Err(invalid_input());
@@ -1020,8 +1049,9 @@ fn record_workspace_mutation_with_authority(
             Sequence::try_from(current_sequence).map_err(|_| integrity_failure())?,
         ));
     }
-    let current_token = state.fencing_token();
-    let fencing_epoch = i64::try_from(current_token.get()).map_err(|_| integrity_failure())?;
+    let current_token =
+        FencingToken::new(state.fencing_epoch()).map_err(|_| integrity_failure())?;
+    let fencing_epoch = i64::try_from(state.fencing_epoch()).map_err(|_| integrity_failure())?;
     let lease: Option<(String, i64, String)> = transaction
         .query_row(
             "SELECT holder_run_id, fencing_token, status
@@ -1103,7 +1133,7 @@ fn record_workspace_mutation_with_authority(
         "preEvidenceArtifactId": request.pre_evidence.artifact_id.as_str(),
         "postEvidenceArtifactId": request.post_evidence.artifact_id.as_str(),
         "resumeTarget": state.phase().as_str(),
-        "newFencingToken": next_state.fencing_token().get(),
+        "newFencingToken": next_state.fencing_epoch(),
     });
     let event_id = format!(
         "workspace.mutated:{}:{next_sequence}",
@@ -1144,7 +1174,7 @@ fn record_workspace_mutation_with_authority(
                 next_state.condition().as_str(),
                 next_state.operation().as_str(),
                 i64::try_from(next_state.workspace_version().get()).map_err(|_| invalid_input())?,
-                i64::try_from(next_state.fencing_token().get()).map_err(|_| invalid_input())?,
+                i64::try_from(next_state.fencing_epoch()).map_err(|_| invalid_input())?,
                 next_sequence,
                 now,
                 request.task_id.as_str(),

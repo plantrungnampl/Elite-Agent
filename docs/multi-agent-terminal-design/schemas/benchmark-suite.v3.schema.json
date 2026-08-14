@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://multi-agent-terminal.local/schemas/benchmark-suite.v3.schema.json",
+  "title": "Controlled Agent Quality Benchmark Suite v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "suiteId",
+    "version",
+    "name",
+    "createdAt",
+    "controlledDimensions",
+    "treatmentDimensions",
+    "experimentArms",
+    "cases"
+  ],
+  "properties": {
+    "suiteId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 3
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "controlledDimensions": {
+      "type": "array",
+      "minItems": 10,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "repositoryRevision",
+          "fixtureManifest",
+          "objective",
+          "budgetProfile",
+          "policy",
+          "toolPermissions",
+          "model",
+          "prompt",
+          "evaluator",
+          "acceptanceRules"
+        ]
+      }
+    },
+    "treatmentDimensions": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "retrievalPipeline",
+          "contextCompiler",
+          "memoryPolicy"
+        ]
+      }
+    },
+    "experimentArms": {
+      "type": "array",
+      "minItems": 2,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "control_no_memory",
+          "compaction_only",
+          "evidence_retrieval",
+          "evidence_plus_experience"
+        ]
+      }
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "logicalCaseId",
+          "caseVersion",
+          "objective",
+          "repositoryRevision",
+          "fixtureManifestDigest",
+          "objectiveDigest",
+          "budgetProfileDigest",
+          "policyDigest",
+          "toolPermissionsDigest",
+          "acceptanceRulesDigest"
+        ],
+        "properties": {
+          "logicalCaseId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "caseVersion": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "objective": {
+            "type": "string",
+            "minLength": 1
+          },
+          "repositoryRevision": {
+            "type": "string",
+            "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "fixtureManifestDigest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "objectiveDigest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "budgetProfileDigest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "policyDigest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "toolPermissionsDigest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "acceptanceRulesDigest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          }
+        }
+      }
+    }
+  }
+}

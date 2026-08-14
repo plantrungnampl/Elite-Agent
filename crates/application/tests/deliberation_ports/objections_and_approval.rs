@@ -94,8 +94,9 @@ fn severe_objection_acceptance_allows_selective_reviewers_when_history_has_extra
     let mut state = snapshot_with_objection_set(ObjectionSeverity::Severe);
     state.run_assignments.push(run_assignment(3));
     let (store, writes) = make_store(state);
+    let workflow = workflow_authority(&writes);
 
-    DeliberationCommands::new(&store)
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .accept_severe_objection(
             command_for_phase("task-1", 7, "core", Phase::FinalObjection),
             review_plan_for_round(2),
@@ -118,7 +119,8 @@ fn every_deliberation_record_category_has_a_checked_exact_event_path() {
     assert_record_event(&writes, "agent.message.created", false);
 
     let (store, writes) = make_store(snapshot(Phase::CrossReview));
-    DeliberationCommands::new(&store)
+    let workflow = workflow_authority(&writes);
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .record_review_edges(
             command_for_phase("task-1", 7, "core", Phase::CrossReview),
             review_plan(),
@@ -127,7 +129,8 @@ fn every_deliberation_record_category_has_a_checked_exact_event_path() {
     assert_record_event(&writes, "review.edges.assigned", false);
 
     let (store, writes) = make_store(snapshot(Phase::CrossReview));
-    DeliberationCommands::new(&store)
+    let workflow = workflow_authority(&writes);
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .record_thread_summary(
             command_for_phase("task-1", 7, "core", Phase::CrossReview),
             "thread-1",
@@ -142,7 +145,8 @@ fn every_deliberation_record_category_has_a_checked_exact_event_path() {
     assert_record_event(&writes, "specialist.requested", false);
 
     let (store, writes) = make_store(snapshot(Phase::CrossReview));
-    DeliberationCommands::new(&store)
+    let workflow = workflow_authority(&writes);
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .record_claim_set(
             command_for_phase("task-1", 7, "core", Phase::CrossReview),
             vec![claim("claim-a", false)],
@@ -152,7 +156,8 @@ fn every_deliberation_record_category_has_a_checked_exact_event_path() {
 
     let state = snapshot(Phase::PrePlanVerification);
     let (store, writes) = make_store(state);
-    DeliberationCommands::new(&store)
+    let workflow = workflow_authority(&writes);
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .record_verification_set(
             command_for_phase("task-1", 7, "core", Phase::PrePlanVerification),
             vec![claim("claim-a", true)],
@@ -162,7 +167,8 @@ fn every_deliberation_record_category_has_a_checked_exact_event_path() {
 
     let state = snapshot(Phase::Synthesis);
     let (store, writes) = make_store(state);
-    DeliberationCommands::new(&store)
+    let workflow = workflow_authority(&writes);
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .synthesize(
             command_for_phase("task-1", 7, "core", Phase::Synthesis),
             decision(claim("claim-a", true)),
@@ -183,7 +189,8 @@ fn every_deliberation_record_category_has_a_checked_exact_event_path() {
 
     let state = snapshot_with_objection_set(ObjectionSeverity::Severe);
     let (store, writes) = make_store(state);
-    DeliberationCommands::new(&store)
+    let workflow = workflow_authority(&writes);
+    DeliberationCommands::with_workflow_authority(&store, &workflow)
         .accept_severe_objection(
             command_for_phase("task-1", 7, "core", Phase::FinalObjection),
             review_plan_for_round(2),
@@ -195,7 +202,8 @@ fn every_deliberation_record_category_has_a_checked_exact_event_path() {
     let authority = FixedPlanApprovalAuthority {
         binding: PlanApprovalAuthorityBinding::issue(plan_approval_binding()).unwrap(),
     };
-    DeliberationCommands::with_plan_approval_authority(&store, &authority)
+    let workflow = workflow_authority(&writes);
+    DeliberationCommands::with_authorities(&store, &workflow, &authority)
         .close_objection_round(
             command_for_phase("task-1", 7, "core", Phase::FinalObjection),
             plan_approval_request(),
@@ -819,6 +827,13 @@ fn authoritative_state(phase: Phase, sequence: u64) -> WorkflowState {
     .unwrap()
 }
 
+fn workflow_authority(writes: &Arc<Mutex<Writes>>) -> RecordingWorkflowAuthority {
+    RecordingWorkflowAuthority {
+        writes: Arc::clone(writes),
+        transitions: Mutex::new(Vec::new()),
+    }
+}
+
 fn command_with_budget(
     phase: Phase,
     actor: &str,
@@ -990,9 +1005,21 @@ fn assert_record_event(writes: &Arc<Mutex<Writes>>, event_type: &str, changes_ph
     assert_eq!(event.actor_id.as_str(), actor_id);
     assert_eq!(event.observation_class, observation_class);
     assert_ne!(event.observation_class, "agent_asserted");
+    assert!(
+        command.append().projection_changes.is_empty(),
+        "deliberation events never update workflow projections directly"
+    );
     assert_eq!(
-        command.append().projection_changes.len(),
-        usize::from(changes_phase)
+        changes_phase,
+        matches!(
+            event_type,
+            "analysis.quorum.reached"
+                | "review.complete"
+                | "claims.checked"
+                | "decision.draft.created"
+                | "objection.severe.accepted"
+                | "objection.round.closed"
+        )
     );
     command.validate().unwrap();
 }

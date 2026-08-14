@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "id": "core:8",
+  "result": {
+    "runId": "run-238",
+    "accepted": true
+  }
+}

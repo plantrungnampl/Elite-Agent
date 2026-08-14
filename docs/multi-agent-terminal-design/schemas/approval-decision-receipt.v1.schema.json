@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-terminal.local/schemas/approval-decision-receipt.v1.schema.json",
+  "title": "Approval Decision Receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "approvalRequestDigest",
+    "taskId",
+    "operationIntentId",
+    "actorBindingDigest",
+    "nonce",
+    "decision",
+    "credentialEvidenceDigest",
+    "decidedAt",
+    "receiptDigest"
+  ],
+  "properties": {
+    "schema": {
+      "const": "approval-decision-receipt.v1"
+    },
+    "approvalRequestDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "operationIntentId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "actorBindingDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "nonce": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "decision": {
+      "enum": [
+        "granted",
+        "denied"
+      ]
+    },
+    "credentialEvidenceDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "decidedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "receiptDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "extensions": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9-]*(?:\\.[a-z][a-z0-9-]*)+$"
+      },
+      "additionalProperties": true
+    }
+  }
+}

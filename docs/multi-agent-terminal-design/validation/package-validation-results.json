@@ -1,0 +1,914 @@
+{
+  "checks": [
+    {
+      "name": "suite.core_regression",
+      "passed": true,
+      "detail": "39/39 checks passed"
+    },
+    {
+      "name": "suite.v32_hardening",
+      "passed": true,
+      "detail": "68/68 v3.2 hardening checks passed"
+    },
+    {
+      "name": "suite.v4_cognitive",
+      "passed": true,
+      "detail": "79/79 v4 cognitive checks passed"
+    },
+    {
+      "name": "suite.v4_traceability",
+      "passed": true,
+      "detail": "30/30 v4 traceability checks passed"
+    },
+    {
+      "name": "suite.v41_memory_utility",
+      "passed": true,
+      "detail": "30/30 v4.1 memory utility checks passed"
+    },
+    {
+      "name": "suite.v41_traceability",
+      "passed": true,
+      "detail": "19/19 v4.1 traceability checks passed"
+    },
+    {
+      "name": "suite.v411_loop_review",
+      "passed": true,
+      "detail": "60/60 v4.1.1 loop-review checks passed"
+    },
+    {
+      "name": "suite.v42_end_to_end",
+      "passed": true,
+      "detail": "96/96 v4.2 end-to-end checks passed"
+    },
+    {
+      "name": "suite.v43_implementation_product_proof",
+      "passed": true,
+      "detail": "81/81 v4.3 implementation/product-proof checks passed"
+    },
+    {
+      "name": "json.parse.benchmarks/context-memory-bootstrap-v1.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.benchmarks/fixtures/memory-records.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.benchmarks/fixtures/state-records.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.benchmarks/orchestration-product-proof-bootstrap-v1.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/actor-binding.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/agent-protocol.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/agent-protocol.v2.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/agent-quality-benchmark.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/agent-quality-benchmark.v2.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/approval-decision-receipt.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/approval-digest.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/approval-digest.v2.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/assurance-degradation-receipt.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/benchmark-case-result.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/benchmark-comparison-report.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/benchmark-run-receipt.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/benchmark-suite.v3.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/cognitive-memory.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/cognitive-memory.v2.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/cognitive-memory.v3.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/cognitive-memory.v4.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/credential-challenge.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples/approval-final-commit.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples/protocol-context-query.request.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples/protocol-initialize.request.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples/protocol-run-complete.request.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/approval-final-commit.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/protocol-context-query.request.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/protocol-context-query.response.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/protocol-error.response.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/protocol-initialize.request.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/protocol-initialize.response.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/protocol-initialized.notification.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/protocol-run-cancel.request.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/protocol-run-complete.request.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/protocol-run-start.request.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/protocol-run-start.response.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/protocol-specialist.request.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/protocol-stream-delta.notification.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/protocol-tool.request.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v2/protocol-tool.response.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v4/benchmark-suite.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v4/context-package.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v4/context-supplement-request.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v4/memory-proposal.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v4/retrieval-request.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v4/run-evaluation.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v4/run-reflection.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v4/working-memory-event.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v41/benchmark-suite.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v41/context-budget-decision.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v41/memory-proposal.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v41/memory-shadow-evaluation.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v41/state-record.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v411/benchmark-run-arm.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v411/benchmark-run-memory-binding.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v411/context-budget-decision.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v411/invalidation-evaluation.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v411/memory-origin-record.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v411/memory-shadow-evaluation.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v411/memory-usage-event.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v411/state-resolution-conflict.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v411/state-resolution-receipt.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v42/actor-binding.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v42/benchmark-case-result.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v42/benchmark-comparison-report.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v42/benchmark-run-receipt.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v42/benchmark-suite.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v42/credential-challenge.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v42/preference-memory-proposal.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v42/quality-release-decision.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v42/retrieval-indeterminate.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v43/assurance-degradation-receipt.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v43/orchestration-benchmark-case-result.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v43/orchestration-benchmark-comparison-report.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v43/orchestration-benchmark-run-receipt.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v43/orchestration-benchmark-suite.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v43/product-traceability.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v43/run-configuration.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/examples-v43/workflow-transition-command.example.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/orchestration-benchmark-case-result.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/orchestration-benchmark-comparison-report.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/orchestration-benchmark-run-receipt.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/orchestration-benchmark-suite.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/product-traceability.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/product-traceability.v43.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/quality-release-decision.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/run-configuration.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/workflow-transition-command.v1.schema.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/workflow-transitions.v1.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/workflow-transitions.v2.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.schemas/workflow-transitions.v3.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.validation/package-validation-results.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.validation/v43-implementation-product-proof-results.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "json.parse.validation/validation-results.json",
+      "passed": true,
+      "detail": "valid JSON"
+    },
+    {
+      "name": "schema.compile.actor-binding.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.agent-protocol.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.agent-protocol.v2.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.agent-quality-benchmark.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.agent-quality-benchmark.v2.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.approval-decision-receipt.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.approval-digest.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.approval-digest.v2.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.assurance-degradation-receipt.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.benchmark-case-result.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.benchmark-comparison-report.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.benchmark-run-receipt.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.benchmark-suite.v3.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.cognitive-memory.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.cognitive-memory.v2.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.cognitive-memory.v3.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.cognitive-memory.v4.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.credential-challenge.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.orchestration-benchmark-case-result.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.orchestration-benchmark-comparison-report.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.orchestration-benchmark-run-receipt.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.orchestration-benchmark-suite.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.product-traceability.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.quality-release-decision.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.run-configuration.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.compile.workflow-transition-command.v1.schema.json",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "example.examples/protocol-context-query.request.json",
+      "passed": true,
+      "detail": "valid against agent-protocol.v1.schema.json"
+    },
+    {
+      "name": "example.examples/protocol-initialize.request.json",
+      "passed": true,
+      "detail": "valid against agent-protocol.v1.schema.json"
+    },
+    {
+      "name": "example.examples/protocol-run-complete.request.json",
+      "passed": true,
+      "detail": "valid against agent-protocol.v1.schema.json"
+    },
+    {
+      "name": "example.examples/approval-final-commit.example.json",
+      "passed": true,
+      "detail": "valid against approval-digest.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v2/protocol-initialize.request.json",
+      "passed": true,
+      "detail": "valid against agent-protocol.v2.schema.json"
+    },
+    {
+      "name": "example.examples-v2/protocol-initialize.response.json",
+      "passed": true,
+      "detail": "valid against agent-protocol.v2.schema.json"
+    },
+    {
+      "name": "example.examples-v2/protocol-tool.response.json",
+      "passed": true,
+      "detail": "valid against agent-protocol.v2.schema.json"
+    },
+    {
+      "name": "example.examples-v2/approval-final-commit.example.json",
+      "passed": true,
+      "detail": "valid against approval-digest.v2.schema.json"
+    },
+    {
+      "name": "example.examples-v4/retrieval-request.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v4/memory-proposal.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v4/context-package.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v4/run-evaluation.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v4/context-supplement-request.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v4/working-memory-event.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v4/run-reflection.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v4/benchmark-suite.example.json",
+      "passed": true,
+      "detail": "valid against agent-quality-benchmark.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v41/state-record.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v2.schema.json"
+    },
+    {
+      "name": "example.examples-v41/memory-proposal.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v2.schema.json"
+    },
+    {
+      "name": "example.examples-v41/memory-shadow-evaluation.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v2.schema.json"
+    },
+    {
+      "name": "example.examples-v41/context-budget-decision.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v2.schema.json"
+    },
+    {
+      "name": "example.examples-v41/benchmark-suite.example.json",
+      "passed": true,
+      "detail": "valid against agent-quality-benchmark.v2.schema.json"
+    },
+    {
+      "name": "example.examples-v411/state-resolution-conflict.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v3.schema.json"
+    },
+    {
+      "name": "example.examples-v411/state-resolution-receipt.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v3.schema.json"
+    },
+    {
+      "name": "example.examples-v411/memory-origin-record.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v3.schema.json"
+    },
+    {
+      "name": "example.examples-v411/memory-shadow-evaluation.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v3.schema.json"
+    },
+    {
+      "name": "example.examples-v411/memory-usage-event.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v3.schema.json"
+    },
+    {
+      "name": "example.examples-v411/context-budget-decision.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v3.schema.json"
+    },
+    {
+      "name": "example.examples-v411/benchmark-run-arm.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v3.schema.json"
+    },
+    {
+      "name": "example.examples-v411/benchmark-run-memory-binding.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v3.schema.json"
+    },
+    {
+      "name": "example.examples-v411/invalidation-evaluation.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v3.schema.json"
+    },
+    {
+      "name": "example.examples-v42/retrieval-indeterminate.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v4.schema.json"
+    },
+    {
+      "name": "example.examples-v42/preference-memory-proposal.example.json",
+      "passed": true,
+      "detail": "valid against cognitive-memory.v4.schema.json"
+    },
+    {
+      "name": "example.examples-v42/benchmark-suite.example.json",
+      "passed": true,
+      "detail": "valid against benchmark-suite.v3.schema.json"
+    },
+    {
+      "name": "example.examples-v42/benchmark-run-receipt.example.json",
+      "passed": true,
+      "detail": "valid against benchmark-run-receipt.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v42/benchmark-case-result.example.json",
+      "passed": true,
+      "detail": "valid against benchmark-case-result.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v42/benchmark-comparison-report.example.json",
+      "passed": true,
+      "detail": "valid against benchmark-comparison-report.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v42/quality-release-decision.example.json",
+      "passed": true,
+      "detail": "valid against quality-release-decision.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v42/actor-binding.example.json",
+      "passed": true,
+      "detail": "valid against actor-binding.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v42/credential-challenge.example.json",
+      "passed": true,
+      "detail": "valid against credential-challenge.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v43/workflow-transition-command.example.json",
+      "passed": true,
+      "detail": "valid against workflow-transition-command.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v43/run-configuration.example.json",
+      "passed": true,
+      "detail": "valid against run-configuration.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v43/assurance-degradation-receipt.example.json",
+      "passed": true,
+      "detail": "valid against assurance-degradation-receipt.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v43/orchestration-benchmark-suite.example.json",
+      "passed": true,
+      "detail": "valid against orchestration-benchmark-suite.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v43/orchestration-benchmark-run-receipt.example.json",
+      "passed": true,
+      "detail": "valid against orchestration-benchmark-run-receipt.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v43/orchestration-benchmark-case-result.example.json",
+      "passed": true,
+      "detail": "valid against orchestration-benchmark-case-result.v1.schema.json"
+    },
+    {
+      "name": "example.examples-v43/orchestration-benchmark-comparison-report.example.json",
+      "passed": true,
+      "detail": "valid against orchestration-benchmark-comparison-report.v1.schema.json"
+    },
+    {
+      "name": "example.product-traceability.v43.json",
+      "passed": true,
+      "detail": "valid against product-traceability.v1.schema.json"
+    },
+    {
+      "name": "example.benchmarks/context-memory-bootstrap-v1.json",
+      "passed": true,
+      "detail": "valid against agent-quality-benchmark.v2.schema.json"
+    },
+    {
+      "name": "example.benchmarks/orchestration-product-proof-bootstrap-v1.json",
+      "passed": true,
+      "detail": "valid against orchestration-benchmark-suite.v1.schema.json"
+    },
+    {
+      "name": "package.markdown_links",
+      "passed": true,
+      "detail": "all relative Markdown links resolve"
+    },
+    {
+      "name": "package.workflow_sql_alignment",
+      "passed": true,
+      "detail": "v4.3 workflow enums and transition endpoints align with SQLite v7"
+    },
+    {
+      "name": "package.no_placeholders",
+      "passed": true,
+      "detail": "no active placeholder markers"
+    }
+  ]
+}

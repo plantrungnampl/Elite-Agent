@@ -1,0 +1,16 @@
+{
+  "evaluationId": "invalidation-evaluation-1",
+  "memoryId": "memory-negative-1",
+  "projectId": "p1",
+  "taskId": "t1",
+  "ruleId": "rule-source-hash-1",
+  "result": "passed",
+  "evidence": {
+    "sourceId": "artifact-invalidation-evidence-1",
+    "sourceRevision": "artifact:v1",
+    "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sourceKind": "invalidation-evaluation"
+  },
+  "evaluatedAt": "2026-08-06T02:12:00Z",
+  "validUntil": "2026-08-07T02:12:00Z"
+}

@@ -1,271 +1,149 @@
-# Finalization and Approval Integrity
+# Finalization and Approval Integrity v3
 
 ## 1. Goal
 
-The final commit must contain exactly the Git tree that the reviewer and user
-saw. An approval of a mutable worktree, a diff without its base, or a command
-string without its environment is insufficient.
+Finalization must update the task ref to the exact Git commit object reviewed and approved by the bound human actor. Tree equality alone is insufficient because a commit OID also depends on parent ordering, author/committer identities, timestamps/timezones, message, headers, and optional signature.
 
-This specification closes three gaps:
-
-- time-of-check/time-of-use between review and commit;
-- stale executor writes after review;
-- ambiguous or noncanonical approval payloads.
-
-The normative payload schema is
-[`schemas/approval-digest.v1.schema.json`](schemas/approval-digest.v1.schema.json).
-A schema-valid final-commit fixture is in
-[`schemas/examples/approval-final-commit.example.json`](schemas/examples/approval-final-commit.example.json).
+The normative request schema is [`schemas/approval-digest.v2.schema.json`](schemas/approval-digest.v2.schema.json). The decision receipt schema is [`schemas/approval-decision-receipt.v1.schema.json`](schemas/approval-decision-receipt.v1.schema.json).
 
 ## 2. Approval classes
 
-### Plan approval
+- **Plan:** approved plan version, base, paths, tools, verification profile, policy, and risk.
+- **Tool:** exact executable/typed request, arguments digest, cwd/environment/network profiles, expected writes, run/step, and fencing token.
+- **Policy exception:** actor, purpose, resource/destination, exact effective payload and redaction report.
+- **Final commit:** repository, task, logical intent, ref transition, exact candidate commit OID, plan/review/verification, metadata, actor, policy, nonce, expiry, workspace version, and fencing epoch.
 
-Binds:
+## 3. Finalization preparation
 
-- task and risk class;
-- plan ID, version, and content digest;
-- base commit;
-- allowed path scopes;
-- planned structured tools and commands;
-- policy snapshot;
-- expected verification profile;
-- expiry.
-
-It authorizes implementation within scope. It does not authorize arbitrary
-shell, policy exceptions, destructive actions, or commit.
-
-### Tool approval
-
-Binds the exact structured request:
-
-- executable identity and argv or typed tool arguments;
-- cwd capability;
-- environment and network profiles;
-- expected reads/writes;
-- task, run, plan step, phase, fencing token;
-- policy snapshot and expiry.
-
-### Policy-exception approval
-
-Binds the actor, purpose, exact resource digest, disclosure destination,
-redaction result, duration, and policy version.
-
-### Final commit approval
-
-Binds the immutable candidate tree and commit operation described below.
-
-## 3. Canonical digest
-
-All approval payloads contain:
-
-```json
-{
-  "schema": "approval-digest.v1",
-  "approvalType": "final_commit",
-  "taskId": "task-1",
-  "operation": {},
-  "policySnapshotDigest": "sha256:...",
-  "workspaceVersion": 42,
-  "requestedAt": "2026-07-23T13:20:00Z",
-  "expiresAt": "2026-07-23T13:35:00Z",
-  "nonce": "..."
-}
-```
-
-Digest algorithm:
-
-1. validate against the exact schema version;
-2. reject unknown fields for authorization-bearing objects;
-3. canonicalize with RFC 8785 JSON Canonicalization Scheme;
-4. hash the UTF-8 bytes using SHA-256;
-5. store `sha256:<lowercase-hex>`;
-6. display a short fingerprint while retaining the complete digest.
-
-The core, not React or an agent, constructs and canonicalizes the payload.
-Execution reconstructs it from authoritative records and recomputes the digest.
-
-Canonicalization test vectors cover object ordering, Unicode, escaping, integer
-boundaries, negative zero, floating-point rejection, duplicate keys, and
-timestamp normalization. Authorization payloads prefer integers and
-fixed-format decimal strings over binary floating point.
-
-## 4. Candidate tree creation
-
-Finalization starts only after implementation and repair stop:
+Finalization starts only after implementation/repair has stopped:
 
 1. stop accepting new write requests;
-2. revoke the executor lease and persist a new fencing epoch;
+2. revoke/terminalize the active executor lease and commit a newer fencing epoch;
 3. terminate or await every write-capable process;
-4. reconcile operation intents and filesystem events;
-5. record Git HEAD, index, worktree, submodule, and untracked-file state;
-6. reject unresolved merges, conflicts, unsupported nested repositories, or
-   indeterminate writes;
-7. create a private temporary Git index;
-8. populate it from the approved base and intended worktree changes;
-9. apply path-scope and plan validation;
-10. create a candidate Git tree with `git write-tree`;
-11. persist the tree ID, base commit, diff artifact, file manifest, and
-    workspace version.
+4. reconcile all operation attempts and filesystem/Git observations;
+5. reject unresolved merge/conflict, nested repository, submodule/LFS, or indeterminate-write conditions not covered by policy;
+6. create a private Git index from the approved base;
+7. apply only intended in-scope bytes, including explicitly selected untracked files;
+8. write the candidate tree;
+9. construct the complete commit object with exact ordered parents, identities, timestamps/timezones, message, headers, hook policy, and optional signature;
+10. persist immutable `final_commit_candidates` evidence containing both tree and commit OIDs.
 
-The application does not use or modify the user's original repository index.
-Untracked intended files must be explicitly included. Ignored/generated files
-are listed separately and cannot silently enter the candidate.
+The user's original index is not used or modified.
 
-Submodules are represented by their gitlink commit IDs. Git LFS pointer bytes
-and required object availability are recorded. Filters and attributes that can
-change staged bytes are part of the candidate-tree evidence.
+## 4. Exact-object verification
 
-## 5. Verification of the exact tree
+Materialize the pre-created candidate commit object in a disposable worktree. Verification records candidate OID/tree, profile, command/tool digests, environment/network, toolchain, stdout/stderr/results, timing, exit status, and unexpected writes.
 
-Verification runs against a clean disposable worktree materialized from the
-candidate tree, not against an earlier mutable approximation.
+A formatter, generator, hook, or test that changes intended source invalidates the candidate. The workflow returns to repair and creates a new tree, commit object, verification set, review, and approval request.
 
-For each check the system records:
-
-- candidate tree ID;
-- verification profile and command digest;
-- toolchain paths and versions;
-- environment and network profiles;
-- stdout/stderr/result artifacts;
-- start/end core timestamps;
-- exit status;
-- files created or changed by the check.
-
-Test-generated changes do not alter the candidate tree. If a required formatter
-or generator produces intended source changes, finalization stops, returns to
-repair, and creates a new candidate tree after the changes are approved.
-
-Flaky or quarantined checks remain visible and cannot be converted into
-`verified` solely by an agent assertion.
-
-## 6. Final review
+## 5. Review package
 
 The reviewer receives:
 
-- task objective and approved plan version;
-- base commit and candidate tree ID;
-- canonical diff between them;
-- added, deleted, renamed, binary, submodule, LFS, mode, and symlink changes;
+- objective and approved plan;
+- base/parent OIDs and candidate commit/tree OIDs;
+- canonical diff and complete file manifest;
+- modes, symlinks, binaries, submodules, LFS pointers, generated/ignored files;
 - scope-to-plan mapping;
-- exact verification results;
-- policy exceptions and unresolved objections;
-- known generated or ignored files;
-- proposed commit metadata and hook policy.
+- exact verification evidence;
+- policy exceptions, objections, and recovery status;
+- complete proposed commit metadata and digest fingerprint.
 
-Reviewer output cites the candidate tree ID. A review of any other revision is
-stale.
+A review citing any other OID is stale.
 
-## 7. Final approval payload
+## 6. Canonical approval request
 
-The `operation` for `final_commit` contains at minimum:
+The core constructs and canonicalizes the request; UI and agents cannot supply a replacement body. Required final-commit operation fields include:
 
 ```json
 {
-  "baseCommit": "0123456789abcdef...",
+  "repositoryIdentityDigest": "sha256:...",
+  "baseCommit": "012345...",
   "expectedRef": "refs/heads/agent/task-1",
-  "expectedOldRefValue": "0123456789abcdef...",
-  "candidateTree": "fedcba9876543210...",
-  "plan": {
-    "id": "plan-7",
-    "version": 3,
-    "contentDigest": "sha256:..."
-  },
+  "expectedOldRefValue": "012345...",
+  "candidateTree": "fedcba...",
+  "candidateCommitOid": "89abcd...",
+  "plan": {"id": "plan-7", "version": 3, "contentDigest": "sha256:..."},
   "verificationSetDigest": "sha256:...",
   "reviewArtifactDigest": "sha256:...",
   "commit": {
     "messageDigest": "sha256:...",
-    "authorIdentityRef": "user:configured-git-author",
-    "hookPolicy": "disabled_exact_tree"
+    "authorIdentityRef": "user:git-author",
+    "authorTimestamp": "2026-08-04T08:00:00Z",
+    "committerIdentityRef": "core:finalizer",
+    "committerTimestamp": "2026-08-04T08:00:00Z",
+    "hookPolicy": "disabled_exact_object"
   },
   "executorFencingEpoch": 20
 }
 ```
 
-The approval UI displays human-readable details generated from this immutable
-object. It cannot submit a new operation body with the approval click.
+The top-level request additionally binds `taskId`, `operationIntentId`, `actorBindingDigest`, policy snapshot, workspace version, requested/expiry times, and nonce. Canonicalization follows RFC 8785 and SHA-256 after exact schema validation.
 
-## 8. Commit creation
+## 7. Actor-bound decision receipt
 
-Default hook policy is `disabled_exact_tree`:
+Approval produces an immutable receipt binding:
 
-1. construct the commit object from the approved tree, parent, author,
-   committer, and exact message;
-2. use a plumbing-level exact-tree operation rather than restaging mutable
-   files;
-3. atomically update the task branch only if the ref still equals
-   `expectedOldRefValue`;
-4. read the resulting commit and verify its tree equals `candidateTree`;
-5. synchronize the isolated task worktree index to the approved tree without
-   changing worktree files, then verify expected clean/ignored state;
-6. persist the commit object ID and verification event;
-7. mark the task completed only after the event append succeeds.
+- canonical approval request digest;
+- task and logical operation intent;
+- actor/session binding digest;
+- nonce and decision;
+- credential evidence digest;
+- core decision time and receipt digest.
 
-An implementation may use `git commit-tree` plus expected-old-value
-`git update-ref` semantics. Concrete command selection belongs to the Git
-adapter and must pass compatibility tests. Failure to synchronize the isolated
-worktree index does not invalidate an already verified exact-tree commit, but
-the task remains in a cleanup-required recovery state rather than claiming a
-clean worktree.
+`resolved_by` text is not authorization evidence. A Windows Hello or equivalent signature may prove the actor gesture, but the application still defines and verifies the canonical challenge and replay scope.
 
-## 9. Git hooks
+## 8. Commit/ref operation
 
-Hooks are repository-controlled code and are not allowed to run implicitly
-during the exact-tree commit.
+After approval, the broker does not reconstruct or restage the commit. Under the per-task barrier it:
 
-Policies:
+1. verifies the exact granted receipt, current fencing epoch, repository identity, ref, expected old OID, and candidate commit OID;
+2. verifies the candidate object still exists and its tree/headers match immutable evidence;
+3. performs expected-old-value ref compare-and-swap to the approved candidate OID;
+4. rereads the ref/object and persists a typed receipt against the exact operation attempt;
+5. updates the isolated worktree/index as cleanup without changing the authoritative commit result.
 
-- `disabled_exact_tree`: default; no commit hook executes;
-- `preverified_hooks`: selected hooks run earlier as isolated verification
-  tools against the candidate tree;
-- `legacy_commit_hooks`: outside MVP because hooks may alter state between
-  approval and commit.
+Hooks do not run implicitly. `preverified_hooks` run earlier as isolated verification tools; any state change creates a new candidate.
 
-If a preverified hook changes intended source, the candidate is discarded and
-the workflow returns to repair. Hook executable, bytes, arguments, environment,
-network, result, and resulting writes are recorded.
+## 9. Replay and recovery
 
-## 10. Approval invalidation
+Approval authorizes one logical effect, not one process call and not an unlimited bearer capability. Multiple dispatch attempts may reconcile the same exact tuple.
 
-An open approval becomes invalid when any bound field changes, including:
+Recovery is three-way:
 
-- candidate tree or base commit;
-- branch ref value;
-- workspace version;
-- plan or verification set;
-- review artifact;
-- policy snapshot;
-- commit message or identity;
-- hook/environment/network policy;
-- executor fencing epoch;
-- actor, task, expiry, or nonce.
+- ref still equals expected old OID: retry the same CAS to the same candidate OID;
+- ref equals candidate OID: recover success without another update;
+- ref equals anything else: invalidate/block and never overwrite automatically.
 
-Filesystem monitoring provides fast notification, but correctness does not
-depend on it. The core recomputes authoritative Git and digest state immediately
-before commit.
+Different actor/session, repository, task, intent, ref, old OID, candidate OID, digest, nonce, or expiry fails.
 
-## 11. Crash recovery
+## 10. Acceptance invariants
 
-| Crash point | Recovery |
-|---|---|
-| Before candidate tree persisted | Discard temporary index; restart finalization |
-| After tree persisted, before verification | Reuse tree after hash/ref validation |
-| During verification | Mark check interrupted; rerun only if its contract permits |
-| After approval, before commit object | Revalidate approval and refs; user need not reapprove if all inputs still match and approval is unexpired |
-| After commit object, before ref update | Reuse commit object after verifying tree and metadata |
-| After ref update, before index synchronization | Detect exact commit, synchronize isolated index, or mark cleanup required |
-| After index synchronization, before completion event | Detect expected commit at ref and append recovered completion |
-| Ref changed unexpectedly | Do not overwrite; invalidate approval and enter `WorkspaceDirty` or blocked recovery |
+- changing any commit metadata changes the candidate OID and invalidates approval;
+- final ref new value always equals the approved candidate OID;
+- wrong actor/session and cross-effect replay are rejected;
+- workspace mutation after candidate creation cannot enter the approved object;
+- crash after ref update but before database receipt recovers by ref query without duplicate effect;
+- no terminal success is emitted before the ref/object receipt is persisted.
+## v4.2 exact finalization correction
 
-No force push, reset hard, clean, or ref overwrite is used for recovery.
+The only valid local-commit sequence is:
 
-## 12. Acceptance invariants
+1. build the candidate tree;
+2. construct the complete immutable commit object, including parents, author,
+   committer, timestamps, message, headers, signatures, and tree;
+3. persist `candidate_tree_oid` and `candidate_commit_oid`;
+4. verify the exact tuple and create `final_commit_verification_receipts`;
+5. perform final review citing both OIDs;
+6. issue a credential-bound approval for the exact candidate commit OID,
+   expected ref, and expected old OID;
+7. enter `RefPromotion` and perform only expected-old-value ref CAS;
+8. prove the resulting ref equals the approved candidate commit OID.
 
-- no write-capable lease exists during final review or commit approval;
-- every verification result names the candidate tree;
-- the approved digest is recomputed immediately before effect;
-- the branch ref update is conditional on the approved old value;
-- the resulting commit tree equals the approved tree;
-- any external mutation invalidates the candidate;
-- hooks cannot execute implicitly;
-- recovery never overwrites an unexpected ref.
+No step after approval may construct, amend, sign, retimestamp, or otherwise
+change the commit. Repair discards or invalidates both candidate OIDs,
+verification evidence, and dependent approval. `LocalCommit` is a historical v1
+phase name and must not be implemented as commit construction.
+
+Read-only deliverables and workspace-only outcomes use their own acceptance and
+completion packages. They never overload final-commit approval.

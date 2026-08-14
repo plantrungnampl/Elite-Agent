@@ -1,0 +1,49 @@
+{
+  "schemaVersion": "1.0",
+  "runId": "bench-run-standard-001-r1",
+  "suiteId": "orchestration-product-proof-bootstrap",
+  "suiteVersion": 1,
+  "caseId": "bugfix-null-guard-001",
+  "arm": "standard_cross_review",
+  "repeatIndex": 1,
+  "runConfigurationRefs": [
+    "run-config-primary-1",
+    "run-config-reviewer-1"
+  ],
+  "independenceGroups": [
+    "provider-a/model-a/analyst",
+    "provider-b/model-b/reviewer"
+  ],
+  "controlledInputDigests": {
+    "repositoryRevision": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "objective": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "acceptanceRules": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+    "toolPolicy": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "evaluatorConfiguration": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+  },
+  "reservedBudget": {
+    "inputTokens": 100000,
+    "outputTokens": 20000,
+    "toolCalls": 60,
+    "wallTimeMs": 1200000,
+    "costMicrounits": 4000000,
+    "currency": "USD"
+  },
+  "actualUsage": {
+    "inputTokens": 93000,
+    "outputTokens": 18000,
+    "toolCalls": 52,
+    "wallTimeMs": 950000,
+    "costMicrounits": 3700000,
+    "currency": "USD"
+  },
+  "status": "completed",
+  "startedAt": "2026-08-07T09:00:00Z",
+  "endedAt": "2026-08-07T09:15:50Z",
+  "outputArtifactRef": "artifacts/bench-run-standard-001-output",
+  "evidenceArtifactRefs": [
+    "artifacts/bench-run-standard-001-tests",
+    "artifacts/bench-run-standard-001-review"
+  ],
+  "receiptDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

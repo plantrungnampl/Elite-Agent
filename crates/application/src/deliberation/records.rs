@@ -11,7 +11,7 @@ use local_agent_terminal_domain::{
 use crate::{
     parse_policy_timestamp, AppendOperation, CanonicalDeliberationFact, DeliberationPlanDto,
     NewEvent, NewPlanApproval, PlanApprovalAuthorityBinding, PlanApprovalCurrentState, PortError,
-    PreparePlanApprovalRequest, PreparePlanApprovalRequestInput, ProjectionChange, Retryability,
+    PreparePlanApprovalRequest, PreparePlanApprovalRequestInput, Retryability,
     SafeErrorClassification,
 };
 
@@ -75,9 +75,6 @@ impl DeliberationCommandContext {
     }
 
     fn validate(&self) -> Result<(), PortError> {
-        if self.expected_task_version != self.expected_task_state.sequence().get() {
-            return Err(invalid_input());
-        }
         validate_label(&self.correlation_id)?;
         parse_policy_timestamp(&self.occurred_at).map_err(|_| invalid_input())?;
         self.record_artifact.validate()
@@ -660,8 +657,7 @@ impl DeliberationPersistenceCommand {
 
     pub fn validate(&self) -> Result<(), PortError> {
         self.record.validate(&self.task_id)?;
-        if self.expected_task_version != self.expected_task_state.sequence().get()
-            || self.expected_task_state.phase() != self.record.expected_phase()
+        if self.expected_task_state.phase() != self.record.expected_phase()
             || self.actor_id != self.event_authority.actor_id
             || self.budget_reservation != self.record.budget_reservation()
         {

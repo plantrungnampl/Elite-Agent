@@ -467,8 +467,7 @@ fn current_state_for_binding(
     binding.task_version = task_state.sequence().get();
     binding.workspace_version = task_state.workspace_version().get();
     binding.fencing_epoch = task_state
-        .fencing_token()
-        .get()
+        .fencing_epoch()
         .checked_add(1)
         .ok_or_else(integrity_failure)?;
     let manifest_digest: Option<String> = connection

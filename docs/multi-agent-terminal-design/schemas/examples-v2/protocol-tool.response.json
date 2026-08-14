@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "id": "agent:tool-1",
+  "result": {
+    "requestId": "tool-1",
+    "decision": "approval_required",
+    "operationIntentId": "intent-1",
+    "status": "pending"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "jsonrpc": "2.0",
+  "id": "core:8",
+  "error": {
+    "code": -32031,
+    "message": "Context window exceeded",
+    "data": {
+      "category": "context_too_large",
+      "retryable": true,
+      "suggestedMaxTokens": 24000
+    }
+  }
+}

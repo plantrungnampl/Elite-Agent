@@ -192,8 +192,7 @@ fn validate_current_authority(
             != i64::try_from(command.from_state.workspace_version().get())
                 .map_err(|_| invalid_input())?
         || current.task_fencing_epoch
-            != i64::try_from(command.from_state.fencing_token().get())
-                .map_err(|_| invalid_input())?
+            != i64::try_from(command.from_state.fencing_epoch()).map_err(|_| invalid_input())?
         || current.workflow_profile != command.from_state.workflow_profile().as_str()
         || current.outcome_mode != command.from_state.outcome_mode().as_str()
         || current.stream_version
@@ -557,15 +556,13 @@ fn update_task_projection(
                 command.to_state.operation().as_str(),
                 i64::try_from(command.to_state.workspace_version().get())
                     .map_err(|_| invalid_input())?,
-                i64::try_from(command.to_state.fencing_token().get())
-                    .map_err(|_| invalid_input())?,
+                i64::try_from(command.to_state.fencing_epoch()).map_err(|_| invalid_input())?,
                 updated_at,
                 command.task_id.as_str(),
                 command.from_state.phase().as_str(),
                 i64::try_from(command.from_state.workspace_version().get())
                     .map_err(|_| invalid_input())?,
-                i64::try_from(command.from_state.fencing_token().get())
-                    .map_err(|_| invalid_input())?,
+                i64::try_from(command.from_state.fencing_epoch()).map_err(|_| invalid_input())?,
             ],
         )
         .map_err(authority_sql_error)?;

@@ -3,9 +3,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, Condition, EventId, FencingToken, GitObjectId, LeaseClaim, OperationState,
-    Phase, ProjectId, RepositoryId, Sequence, TaskBranch, TaskId, WorkflowState,
-    WorkspaceFingerprint, WorkspaceVersion, WorktreeId,
+    Phase, ProjectId, RepositoryId, Sequence, Sha256Digest, TaskBranch, TaskId, TaskOutcomeMode,
+    WorkflowProfile, WorkflowState, WorkspaceFingerprint, WorkspaceVersion, WorktreeId,
 };
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::{
     AcquireLease, CanonicalEvidenceRef, CreateWorktree, DiscardWorktree, ExecutorLeaseStore,
@@ -105,7 +107,70 @@ pub struct NewTask {
     pub risk_level: RiskLevel,
     pub base_branch: TaskBranch,
     pub base_commit: GitObjectId,
+    pub initial_workflow: InitialWorkflowSelection,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitialWorkflowSelection {
+    risk_level: RiskLevel,
+    workflow_profile: WorkflowProfile,
+    outcome_mode: TaskOutcomeMode,
+    selection_policy_digest: Sha256Digest,
+}
+
+impl InitialWorkflowSelection {
+    pub const fn risk_level(&self) -> RiskLevel {
+        self.risk_level
+    }
+
+    pub const fn workflow_profile(&self) -> WorkflowProfile {
+        self.workflow_profile
+    }
+
+    pub const fn outcome_mode(&self) -> TaskOutcomeMode {
+        self.outcome_mode
+    }
+
+    pub const fn selection_policy_digest(&self) -> &Sha256Digest {
+        &self.selection_policy_digest
+    }
+}
+
+pub fn select_initial_workflow(
+    risk_level: RiskLevel,
+    outcome_mode: TaskOutcomeMode,
+    policy_profile_id: &str,
+) -> Result<InitialWorkflowSelection, PortError> {
+    if policy_profile_id.trim().is_empty() {
+        return Err(invalid_input());
+    }
+    let workflow_profile = match outcome_mode {
+        TaskOutcomeMode::ReadOnlyDeliverable => WorkflowProfile::ReadOnlyResearch,
+        TaskOutcomeMode::WorkspaceChange | TaskOutcomeMode::LocalCommit => match risk_level {
+            RiskLevel::Low => WorkflowProfile::Quick,
+            RiskLevel::Medium => WorkflowProfile::Standard,
+            RiskLevel::High | RiskLevel::Critical => WorkflowProfile::HighAssurance,
+        },
+    };
+    let canonical = serde_json_canonicalizer::to_vec(&json!({
+        "outcomeMode": outcome_mode.as_str(),
+        "policyProfileId": policy_profile_id,
+        "riskLevel": risk_level.as_str(),
+        "schema": "initial-workflow-selection.v1",
+        "workflowProfile": workflow_profile.as_str(),
+    }))
+    .map_err(|_| invalid_input())?;
+    let selection_policy_digest =
+        Sha256Digest::new(format!("sha256:{:x}", Sha256::digest(canonical)))
+            .map_err(|_| invalid_input())?;
+
+    Ok(InitialWorkflowSelection {
+        risk_level,
+        workflow_profile,
+        outcome_mode,
+        selection_policy_digest,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

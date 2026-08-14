@@ -1,0 +1,568 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://multi-agent-terminal.local/schemas/run-configuration.v1.schema.json",
+  "title": "Run Configuration v1",
+  "description": "Immutable, reconstructible provider/model/runtime configuration. Credential material is forbidden.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "runConfigurationId",
+    "taskId",
+    "providerConnectionRef",
+    "adapter",
+    "modelEndpoint",
+    "agentProfile",
+    "generationParameters",
+    "capabilitySnapshot",
+    "dataPolicySnapshot",
+    "budgetReservation",
+    "fallbackPolicy",
+    "independence",
+    "credentialsExcluded",
+    "createdAt",
+    "configDigest"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "1.0"
+    },
+    "runConfigurationId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "providerConnectionRef": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "Opaque reference to a trusted-core connection record; never a secret or token."
+    },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "adapterId",
+        "adapterVersion",
+        "transport",
+        "protocol"
+      ],
+      "properties": {
+        "adapterId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "adapterVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "transport": {
+          "enum": [
+            "inproc",
+            "stdio",
+            "http",
+            "websocket",
+            "acp_bridge",
+            "mcp_bridge"
+          ]
+        },
+        "protocol": {
+          "enum": [
+            "mat-agent-control-v2",
+            "acp",
+            "mcp"
+          ]
+        },
+        "implementationDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "modelEndpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "providerId",
+        "resolvedModelId",
+        "modelFamily",
+        "endpointClass",
+        "contextWindowTokens",
+        "maxOutputTokens"
+      ],
+      "properties": {
+        "providerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "resolvedModelId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "modelFamily": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "endpointClass": {
+          "enum": [
+            "hosted_api",
+            "local_runtime",
+            "managed_cli",
+            "enterprise_gateway"
+          ]
+        },
+        "endpointRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "region": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "contextWindowTokens": {
+          "type": "integer",
+          "minimum": 1024
+        },
+        "maxOutputTokens": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "agentProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profileId",
+        "role",
+        "promptTemplateVersion",
+        "toolPolicyRef",
+        "responseSchemaRef"
+      ],
+      "properties": {
+        "profileId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "role": {
+          "enum": [
+            "lead",
+            "analyst",
+            "reviewer",
+            "implementer",
+            "verifier",
+            "specialist",
+            "researcher"
+          ]
+        },
+        "promptTemplateVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "toolPolicyRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "responseSchemaRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    },
+    "generationParameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "temperature",
+        "topP",
+        "maxOutputTokens"
+      ],
+      "properties": {
+        "temperature": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "topP": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "maxOutputTokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "stopSequences": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "maxLength": 256
+          }
+        }
+      }
+    },
+    "capabilitySnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "toolCalling",
+        "structuredOutput",
+        "streaming",
+        "cancellation",
+        "contextQuery",
+        "vision",
+        "maxParallelToolCalls",
+        "capabilityDigest"
+      ],
+      "properties": {
+        "toolCalling": {
+          "type": "boolean"
+        },
+        "structuredOutput": {
+          "type": "boolean"
+        },
+        "streaming": {
+          "type": "boolean"
+        },
+        "cancellation": {
+          "type": "boolean"
+        },
+        "contextQuery": {
+          "type": "boolean"
+        },
+        "vision": {
+          "type": "boolean"
+        },
+        "maxParallelToolCalls": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 128
+        },
+        "capabilityDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "dataPolicySnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policyDigest",
+        "retentionClass",
+        "providerTrainingUse",
+        "allowedDataClasses",
+        "networkScope"
+      ],
+      "properties": {
+        "policyDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "retentionClass": {
+          "enum": [
+            "none",
+            "ephemeral",
+            "provider_standard",
+            "enterprise_controlled"
+          ]
+        },
+        "providerTrainingUse": {
+          "enum": [
+            "forbidden",
+            "contractually_disabled",
+            "unknown"
+          ]
+        },
+        "allowedDataClasses": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "source_code",
+              "personal_data"
+            ]
+          }
+        },
+        "networkScope": {
+          "enum": [
+            "offline",
+            "allowlisted",
+            "provider_only",
+            "policy_brokered"
+          ]
+        },
+        "regionConstraint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "budgetReservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inputTokens",
+        "outputTokens",
+        "toolCalls",
+        "wallTimeMs",
+        "costMicrounits",
+        "currency"
+      ],
+      "properties": {
+        "inputTokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "outputTokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "toolCalls": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "wallTimeMs": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "costMicrounits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        }
+      }
+    },
+    "fallbackPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "userApprovalRequired",
+        "candidates"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "none",
+            "explicit_only"
+          ]
+        },
+        "userApprovalRequired": {
+          "type": "boolean"
+        },
+        "candidates": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "providerConnectionRef",
+              "resolvedModelId",
+              "independenceGroup"
+            ],
+            "properties": {
+              "providerConnectionRef": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              "resolvedModelId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "independenceGroup": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "none"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "candidates": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "explicit_only"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "userApprovalRequired": {
+                "const": true
+              },
+              "candidates": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "independence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "groupId",
+        "fingerprint",
+        "dimensions"
+      ],
+      "properties": {
+        "groupId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "fingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "dimensions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "provider",
+            "modelFamily",
+            "promptFamily",
+            "contextCorpus",
+            "retrievalPipeline",
+            "toolPolicy",
+            "adapterImplementation"
+          ],
+          "properties": {
+            "provider": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "modelFamily": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "promptFamily": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "contextCorpus": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "retrievalPipeline": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "toolPolicy": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "adapterImplementation": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          }
+        }
+      }
+    },
+    "credentialsExcluded": {
+      "const": true
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "configDigest": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  },
+  "not": {
+    "anyOf": [
+      {
+        "required": [
+          "apiKey"
+        ]
+      },
+      {
+        "required": [
+          "accessToken"
+        ]
+      },
+      {
+        "required": [
+          "refreshToken"
+        ]
+      },
+      {
+        "required": [
+          "password"
+        ]
+      },
+      {
+        "required": [
+          "credential"
+        ]
+      },
+      {
+        "required": [
+          "secret"
+        ]
+      }
+    ]
+  }
+}

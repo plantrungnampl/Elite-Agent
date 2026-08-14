@@ -183,3 +183,77 @@ sources.
 **Reason:** Correlated agents can confidently agree on the same false claim.  
 **Consequence:** Memory promotion stores evidence hashes, verification method,
 approval, supersession, and retraction state.
+
+## ADR-023 — Logical intent is separate from dispatch attempt
+
+**Decision:** A logical effect has a stable operation intent. Every actual send or execution creates an immutable numbered attempt with its own owner, fencing token, policy/approval binding, boundary evidence, receipt, result, and terminal state.
+
+**Reason:** Mutable single-row retry state destroys forensic evidence and allows stale completion to overwrite the current effect.
+
+## ADR-024 — External mutation uses broker-only promotion
+
+**Decision:** Workers prepare output in private per-attempt staging. Only the trusted broker can promote files or update Git refs after an in-barrier fencing recheck.
+
+## ADR-025 — Final approval binds a pre-created Git commit OID
+
+**Decision:** Create and verify the exact commit object before approval. Approval binds the candidate commit OID, not only the tree and a partial metadata recipe.
+
+## ADR-026 — Approval decision is an immutable actor-bound receipt
+
+**Decision:** Approval status is a projection over an immutable decision receipt binding request digest, logical intent, actor/session evidence, nonce, decision, and time.
+
+## ADR-027 — External enablement requires exact-tuple attestation
+
+**Decision:** No external executable is enabled from a Boolean trust flag. Enablement references an immutable, unrevoked attestation for the exact installed tuple.
+
+## ADR-028 — Release claims require invariant-to-evidence traceability
+
+**Decision:** Every high-impact claim maps to a normative primitive, negative test, evidence artifact, owner, and capability gate in the invariant registry.
+
+## ADR-029 — Cognitive lifecycle instead of static context retrieval
+
+**Decision:** adopt observe → retrieve → compile → act → verify → evaluate → learn as the agent-quality lifecycle.
+
+**Reason:** retrieval alone cannot prevent repeated mistakes or prove quality improvement.
+
+## ADR-030 — Typed memory with verified promotion
+
+**Decision:** separate working, episodic, semantic, procedural, negative, and scoped preference memory. Long-term activation requires authoritative verification.
+
+**Reason:** different memory classes have different risks, retention, and applicability.
+
+## ADR-031 — Retrieval engines are non-authoritative adapters
+
+**Decision:** keyword, vector, graph, sidecar, and remote engines return candidate references only. The core re-reads authoritative bytes and compiles final context.
+
+**Reason:** engine replacement, rebuild, privacy, and audit must not change authority semantics.
+
+## ADR-032 — Role-specific Context Compiler
+
+**Decision:** compile immutable context packages and supplements from task state, evidence, memory, contradictions, role, policy, and budget.
+
+**Reason:** sending the same retrieval dump to every role wastes context and weakens quality.
+
+## ADR-033 — Evaluation precedes learning
+
+**Decision:** verify and evaluate a run before lesson extraction; the Learning Engine may only propose memory.
+
+**Reason:** self-reported success and reflection cannot safely validate durable knowledge.
+
+## ADR-034 — Negative memory is first-class
+
+**Decision:** preserve verified failed approaches, invalid assumptions, and regression patterns with applicability and invalidation conditions.
+
+**Reason:** preventing known repeated errors is a direct, measurable quality improvement.
+
+## ADR-035 — Quality claims require locked comparative benchmarks
+
+**Decision:** no release claim about better memory or agent quality is accepted without equal-input baseline comparison and per-case regression reporting.
+
+**Reason:** subjective demos and aggregate judge scores are insufficient evidence.
+
+## ADR-036 — Preserve SQLite authority storage
+
+**Decision:** extend SQLite for cognitive authority records while keeping large artifacts in files and indexes replaceable.
+
+**Reason:** the product remains single-user, local-first, and single-writer; changing databases does not solve retrieval or learning quality.

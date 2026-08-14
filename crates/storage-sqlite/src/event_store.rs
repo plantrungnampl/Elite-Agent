@@ -118,7 +118,7 @@ pub(crate) fn append_in_transaction(
             )
             .map_err(sqlite_error_to_port)?;
         let next_fencing_epoch =
-            i64::try_from(state.fencing_token().get()).map_err(|_| invalid_input())?;
+            i64::try_from(state.fencing_epoch()).map_err(|_| invalid_input())?;
         let changed = if current_fencing_epoch == next_fencing_epoch {
             transaction.execute(
                 "UPDATE tasks SET

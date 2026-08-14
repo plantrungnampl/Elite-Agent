@@ -1,0 +1,34 @@
+{
+  "proposalId": "mp-v41-1",
+  "projectId": "p1",
+  "originTaskId": "t1",
+  "originRunId": "r1",
+  "originKind": "model_generated",
+  "memoryType": "negative",
+  "contentArtifactId": "artifact-memory-1",
+  "applicability": {
+    "summary": "Do not activate durable memory without verified evidence and review",
+    "scope": {"kind": "project", "id": "p1"},
+    "taskClasses": ["architecture-design"]
+  },
+  "evidence": [
+    {
+      "sourceId": "artifact-validation-1",
+      "sourceRevision": "artifact:v1",
+      "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sourceKind": "artifact"
+    }
+  ],
+  "confidenceMillionths": 900000,
+  "invalidationRules": [
+    {
+      "ruleId": "rule-source-hash-1",
+      "kind": "source_hash_changed",
+      "target": {"sourceId": "artifact-validation-1"},
+      "expected": {"contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      "cadence": "before_retrieval",
+      "explanation": "The lesson must be revalidated when its evidence changes"
+    }
+  ],
+  "sensitivity": "internal"
+}

@@ -1,0 +1,49 @@
+{
+  "proposalId": "memory-proposal-preference-1",
+  "projectId": "project-1",
+  "originTaskId": "task-1",
+  "originRunId": "run-1",
+  "memoryType": "preference",
+  "logicalKey": "preference.output.language",
+  "contentArtifactId": "artifact-memory-content-1",
+  "applicability": {
+    "summary": "Use Vietnamese for user-facing explanations.",
+    "scope": {
+      "kind": "user",
+      "id": "user-1"
+    },
+    "taskClasses": [
+      "architecture-design",
+      "code-modification"
+    ]
+  },
+  "evidence": [
+    {
+      "sourceId": "artifact-user-instruction-1",
+      "sourceRevision": "1",
+      "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sourceKind": "artifact"
+    }
+  ],
+  "confidenceMillionths": 1000000,
+  "sensitivity": "normal",
+  "subject": {
+    "kind": "user",
+    "id": "user-1"
+  },
+  "originKind": "user_explicit",
+  "invalidationRules": [
+    {
+      "ruleId": "rule-pref-1",
+      "kind": "manual_revoke",
+      "target": {
+        "revokeKey": "preference.output.language"
+      },
+      "expected": {
+        "requiredState": "not_revoked"
+      },
+      "cadence": "before_retrieval",
+      "explanation": "The preference remains valid until the user revokes or supersedes it."
+    }
+  ]
+}

@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://multi-agent-terminal.local/schemas/assurance-degradation-receipt.v1.schema.json",
+  "title": "Assurance Degradation Receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "receiptId",
+    "taskId",
+    "requestedProfile",
+    "requirements",
+    "observed",
+    "reasonCode",
+    "decision",
+    "createdAt",
+    "receiptDigest"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "1.0"
+    },
+    "receiptId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "requestedProfile": {
+      "enum": [
+        "Standard",
+        "HighAssurance"
+      ]
+    },
+    "requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimumDistinctIndependenceGroups",
+        "executorReviewerSeparationRequired"
+      ],
+      "properties": {
+        "minimumDistinctIndependenceGroups": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "executorReviewerSeparationRequired": {
+          "type": "boolean"
+        }
+      }
+    },
+    "observed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "distinctIndependenceGroups",
+        "runRefs",
+        "roleSeparationSatisfied",
+        "runSetDigest"
+      ],
+      "properties": {
+        "distinctIndependenceGroups": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16
+        },
+        "runRefs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "roleSeparationSatisfied": {
+          "type": "boolean"
+        },
+        "runSetDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "reasonCode": {
+      "enum": [
+        "insufficient_independence_groups",
+        "role_separation_unavailable",
+        "provider_unavailable",
+        "budget_insufficient"
+      ]
+    },
+    "decision": {
+      "enum": [
+        "continue_degraded",
+        "pause",
+        "cancel"
+      ]
+    },
+    "actorBindingId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "acceptanceArtifactRef": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "receiptDigest": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "decision": {
+            "const": "continue_degraded"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "actorBindingId",
+          "acceptanceArtifactRef"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

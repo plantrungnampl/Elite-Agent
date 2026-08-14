@@ -1,0 +1,199 @@
+{
+  "checks": [
+    {
+      "name": "sqlite.clean_install",
+      "passed": true,
+      "detail": "schema created and integrity_check=ok"
+    },
+    {
+      "name": "sqlite.events_update_forbidden",
+      "passed": true,
+      "detail": "events are append-only"
+    },
+    {
+      "name": "sqlite.events_delete_forbidden",
+      "passed": true,
+      "detail": "events are append-only"
+    },
+    {
+      "name": "sqlite.fencing_epoch_cannot_decrease",
+      "passed": true,
+      "detail": "task fencing epoch cannot decrease"
+    },
+    {
+      "name": "sqlite.task_update_requires_row_version_increment",
+      "passed": true,
+      "detail": "task row version must increase exactly by one for every update"
+    },
+    {
+      "name": "sqlite.lease_holder_cannot_change",
+      "passed": true,
+      "detail": "lease identity is immutable; transfer creates a new row"
+    },
+    {
+      "name": "sqlite.external_agent_cannot_enable_without_attestation",
+      "passed": true,
+      "detail": "external agent requires a current exact-tuple containment attestation"
+    },
+    {
+      "name": "sqlite.agent_run_cross_task_context_rejected",
+      "passed": true,
+      "detail": "agent run scope is incoherent"
+    },
+    {
+      "name": "sqlite.agent_run_role_is_immutable",
+      "passed": true,
+      "detail": "agent run identity is immutable"
+    },
+    {
+      "name": "sqlite.run_terminal_irreversible",
+      "passed": true,
+      "detail": "terminal agent run status is irreversible"
+    },
+    {
+      "name": "sqlite.attempt_evidence_set_once",
+      "passed": true,
+      "detail": "operation attempt evidence is set-once"
+    },
+    {
+      "name": "sqlite.attempt_evidence_cannot_be_cleared",
+      "passed": true,
+      "detail": "successful operation attempt requires a persisted receipt"
+    },
+    {
+      "name": "sqlite.intent_terminal_irreversible",
+      "passed": true,
+      "detail": "terminal operation intent status is irreversible"
+    },
+    {
+      "name": "sqlite.cross_task_authority_splicing_rejected",
+      "passed": true,
+      "detail": "tool execution does not match its exact active attempt authority"
+    },
+    {
+      "name": "sqlite.one_terminal_message_per_run",
+      "passed": true,
+      "detail": "UNIQUE constraint failed: messages.run_id"
+    },
+    {
+      "name": "sqlite.message_cross_task_run_and_artifact_rejected",
+      "passed": true,
+      "detail": "message scope is incoherent"
+    },
+    {
+      "name": "sqlite.message_identity_is_immutable",
+      "passed": true,
+      "detail": "message identity is immutable"
+    },
+    {
+      "name": "sqlite.operation_attempt_delete_forbidden",
+      "passed": true,
+      "detail": "operation attempts are retained for execution history"
+    },
+    {
+      "name": "sqlite.approval_receipt_wrong_actor_rejected",
+      "passed": true,
+      "detail": "decision receipt does not match pending approval request"
+    },
+    {
+      "name": "sqlite.approval_receipt_immutable",
+      "passed": true,
+      "detail": "approval decision receipts are immutable"
+    },
+    {
+      "name": "sqlite.protocol_request_cross_task_run_rejected",
+      "passed": true,
+      "detail": "protocol request scope is incoherent"
+    },
+    {
+      "name": "sqlite.protocol_response_cross_task_artifact_rejected",
+      "passed": true,
+      "detail": "protocol response artifact scope is incoherent"
+    },
+    {
+      "name": "sqlite.protocol_terminal_irreversible",
+      "passed": true,
+      "detail": "pending protocol request cannot have a completion time"
+    },
+    {
+      "name": "sqlite.protocol_response_evidence_cannot_be_cleared",
+      "passed": true,
+      "detail": "completed protocol request requires persisted response and completion time"
+    },
+    {
+      "name": "sqlite.protocol_request_delete_reset_forbidden",
+      "passed": true,
+      "detail": "protocol requests are retained for replay protection"
+    },
+    {
+      "name": "sqlite.protocol_stream_gap_rejected",
+      "passed": true,
+      "detail": "stream sequence must increase exactly by one"
+    },
+    {
+      "name": "sqlite.protocol_stream_delete_reset_forbidden",
+      "passed": true,
+      "detail": "protocol stream heads are retained for sequence history"
+    },
+    {
+      "name": "sqlite.foreign_keys_runtime",
+      "passed": true,
+      "detail": "runtime connection reports foreign_keys=ON"
+    },
+    {
+      "name": "schema.protocol.compiles",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.approval.compiles",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.receipt.compiles",
+      "passed": true,
+      "detail": "Draft 2020-12 schema valid"
+    },
+    {
+      "name": "schema.initialize_request_valid",
+      "passed": true,
+      "detail": "accepted"
+    },
+    {
+      "name": "schema.initialize_response_valid",
+      "passed": true,
+      "detail": "accepted"
+    },
+    {
+      "name": "schema.tool_response_valid",
+      "passed": true,
+      "detail": "accepted"
+    },
+    {
+      "name": "schema.method_specific_wrong_result_rejected",
+      "passed": true,
+      "detail": "Additional properties are not allowed ('totallyWrong' was unexpected)"
+    },
+    {
+      "name": "schema.unknown_core_field_rejected",
+      "passed": true,
+      "detail": "Additional properties are not allowed ('futureField' was unexpected)"
+    },
+    {
+      "name": "schema.namespaced_extension_accepted",
+      "passed": true,
+      "detail": "accepted"
+    },
+    {
+      "name": "schema.final_commit_requires_candidate_oid",
+      "passed": true,
+      "detail": "'candidateCommitOid' is a required property"
+    },
+    {
+      "name": "schema.final_commit_example_valid",
+      "passed": true,
+      "detail": "accepted"
+    }
+  ]
+}

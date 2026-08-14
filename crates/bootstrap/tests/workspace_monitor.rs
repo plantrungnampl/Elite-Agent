@@ -172,7 +172,7 @@ fn out_of_band_change_enters_workspace_dirty_once_with_atomic_evidence() {
         local_agent_terminal_domain::Phase::WorkspaceDirty
     );
     assert_eq!(mutation.task_state.workspace_version().get(), 1);
-    assert_eq!(mutation.task_state.fencing_token().get(), 2);
+    assert_eq!(mutation.task_state.fencing_epoch(), 2);
     assert_eq!(
         mutation.resume_target,
         Some(local_agent_terminal_domain::Phase::Implementation)

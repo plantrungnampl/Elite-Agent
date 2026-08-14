@@ -1,0 +1,49 @@
+PASS schema_migration_update_forbidden - schema migration records are immutable
+PASS schema_migration_delete_forbidden - schema migration records are retained
+PASS artifact_task_project_mismatch_rejected - artifact task/project scope is incoherent
+PASS artifact_identity_immutable - artifact identity is immutable
+PASS available_artifact_direct_delete_rejected - artifact must be quarantined before deletion
+PASS artifact_cross_scope_supersession_rejected - artifact supersession scope is incoherent
+PASS operation_intent_cross_task_scope_rejected - operation intent artifact scope is incoherent
+PASS operation_intent_delete_forbidden - operation intents are retained
+PASS attempt_counter_requires_existing_attempt - operation attempt counter requires a persisted matching attempt
+PASS policy_decision_update_forbidden - policy decisions are immutable
+PASS policy_decision_delete_forbidden - policy decisions are retained
+PASS context_policy_cross_task_rejected - context package policy scope is incoherent
+PASS required_approval_cannot_be_omitted - policy requires a granted approval
+PASS expired_policy_cannot_authorize_attempt - policy decision is expired for this attempt
+PASS attempt_cross_task_evidence_rejected - attempt receipt evidence scope is incoherent
+PASS tool_cross_task_arguments_rejected - tool argument artifact scope is incoherent
+PASS tool_must_use_attempt_policy - tool execution does not match its exact active attempt authority
+PASS tool_terminal_status_irreversible - terminal tool execution status is irreversible
+PASS tool_output_evidence_set_once - tool execution evidence is set-once
+PASS tool_execution_delete_forbidden - tool executions are retained
+PASS protocol_completed_insert_requires_response - completed protocol request requires persisted response and completion time
+PASS approval_request_artifact_scope_rejected - approval request artifact scope is incoherent
+PASS approval_credential_artifact_scope_rejected - approval credential evidence scope is incoherent
+PASS expired_approval_cannot_receive_grant - expired approval cannot receive a grant receipt
+PASS final_commit_consumption_exact_tuple_enforced - final commit approval consumption must match the exact candidate tuple
+PASS artifact_operation_identity_immutable - artifact operation identity is immutable
+PASS artifact_operation_delete_forbidden - artifact operations are retained for recovery history
+FAIL project_repository_identity_immutable - UNIQUE constraint failed: projects.repository_identity
+FAIL approval_must_start_pending - unsafe operation succeeded
+FAIL granted_approval_requires_resolution_time - unsafe operation succeeded
+FAIL successful_attempt_requires_receipt - unsafe operation succeeded
+FAIL agent_run_terminal_requires_completion_time - unsafe operation succeeded
+FAIL interrupted_agent_run_is_terminal - unsafe operation succeeded
+FAIL message_delete_forbidden - unsafe operation succeeded
+FAIL message_terminal_status_irreversible - unsafe operation succeeded
+FAIL disabled_external_agent_cannot_start_run - unsafe operation succeeded
+FAIL revoked_external_agent_cannot_start_run - unsafe operation succeeded
+FAIL protocol_response_update_scope_rejected - unsafe operation succeeded
+FAIL protocol_stream_identity_immutable - unsafe operation succeeded
+FAIL lease_expiry_identity_immutable - unsafe operation succeeded
+FAIL operation_digest_matches_canonical_artifact - unsafe operation succeeded
+FAIL policy_approval_scope_rejected - unsafe operation succeeded
+FAIL terminal_tool_requires_completion_time - unsafe operation succeeded
+FAIL source_document_task_project_scope_rejected - unsafe operation succeeded
+FAIL memory_artifact_project_scope_rejected - unsafe operation succeeded
+FAIL graph_edge_project_scope_rejected - unsafe operation succeeded
+FAIL update_journal_delete_forbidden - unsafe operation succeeded
+
+27/47 v3.2 hardening checks passed

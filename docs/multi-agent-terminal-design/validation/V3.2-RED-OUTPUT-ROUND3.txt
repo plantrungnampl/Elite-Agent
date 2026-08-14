@@ -1,0 +1,60 @@
+PASS schema_migration_update_forbidden - schema migration records are immutable
+PASS schema_migration_delete_forbidden - schema migration records are retained
+PASS artifact_task_project_mismatch_rejected - artifact task/project scope is incoherent
+PASS artifact_identity_immutable - artifact identity is immutable
+PASS available_artifact_direct_delete_rejected - artifact must be quarantined before deletion
+PASS artifact_cross_scope_supersession_rejected - artifact supersession scope is incoherent
+PASS operation_intent_cross_task_scope_rejected - operation intent artifact scope is incoherent
+PASS operation_intent_delete_forbidden - operation intents are retained
+PASS attempt_counter_requires_existing_attempt - operation attempt counter requires a persisted matching attempt
+PASS policy_decision_update_forbidden - policy decisions are immutable
+PASS policy_decision_delete_forbidden - policy decisions are retained
+PASS context_policy_cross_task_rejected - context package policy scope is incoherent
+PASS required_approval_cannot_be_omitted - policy requires a granted approval
+PASS expired_policy_cannot_authorize_attempt - policy decision is expired for this attempt
+PASS attempt_cross_task_evidence_rejected - attempt receipt evidence scope is incoherent
+PASS tool_cross_task_arguments_rejected - tool argument artifact scope is incoherent
+PASS tool_must_use_attempt_policy - tool execution does not match its exact active attempt authority
+PASS tool_terminal_status_irreversible - terminal tool execution status is irreversible
+PASS tool_output_evidence_set_once - tool execution evidence is set-once
+PASS tool_execution_delete_forbidden - tool executions are retained
+PASS protocol_completed_insert_requires_response - completed protocol request requires persisted response and completion time
+PASS approval_request_artifact_scope_rejected - approval request artifact scope is incoherent
+PASS approval_credential_artifact_scope_rejected - approval credential evidence scope is incoherent
+PASS expired_approval_cannot_receive_grant - expired approval cannot receive a grant receipt
+PASS final_commit_consumption_exact_tuple_enforced - final commit approval consumption must match the exact candidate tuple
+PASS artifact_operation_identity_immutable - artifact operation identity is immutable
+PASS artifact_operation_delete_forbidden - artifact operations are retained for recovery history
+PASS project_repository_identity_immutable - project repository identity is immutable
+PASS approval_must_start_pending - approval requests must start pending and unresolved
+PASS granted_approval_requires_resolution_time - resolved approval requires a resolution time
+PASS successful_attempt_requires_receipt - successful operation attempt requires a persisted receipt
+PASS agent_run_terminal_requires_completion_time - terminal agent run requires a completion time
+PASS interrupted_agent_run_is_terminal - terminal agent run status is irreversible
+PASS message_delete_forbidden - messages are retained
+PASS message_terminal_status_irreversible - terminal message status is irreversible
+PASS disabled_external_agent_cannot_start_run - agent descriptor is disabled
+PASS revoked_external_agent_cannot_start_run - agent descriptor is disabled
+PASS protocol_response_update_scope_rejected - protocol response artifact scope is incoherent
+PASS protocol_stream_identity_immutable - protocol stream identity is immutable
+PASS lease_expiry_identity_immutable - lease expiry is immutable; renewal creates a new fenced lease
+PASS operation_digest_matches_canonical_artifact - operation digest must match the canonical request artifact
+PASS policy_approval_scope_rejected - policy approval scope is incoherent
+PASS terminal_tool_requires_completion_time - terminal tool execution requires a completion time
+PASS source_document_task_project_scope_rejected - source document task/project scope is incoherent
+PASS memory_artifact_project_scope_rejected - memory content artifact scope is incoherent
+PASS graph_edge_project_scope_rejected - repository graph edge project scope is incoherent
+PASS update_journal_delete_forbidden - update journal records are retained
+FAIL interrupted_operation_intent_is_terminal - unsafe operation succeeded
+FAIL terminal_intent_requires_matching_attempt - unsafe operation succeeded
+FAIL completed_artifact_operation_requires_receipt_time - unsafe operation succeeded
+FAIL terminal_lease_requires_release_time - unsafe operation succeeded
+FAIL failed_protocol_requires_completion_time - unsafe operation succeeded
+FAIL pending_protocol_cannot_have_completion_time - unsafe operation succeeded
+FAIL superseded_message_requires_replacement - unsafe operation succeeded
+FAIL attempt_uses_policy_named_approval - unsafe operation succeeded
+FAIL final_commit_requires_final_commit_approval_type - unsafe operation succeeded
+FAIL approval_resolution_time_matches_receipt - unsafe operation succeeded
+FAIL project_repository_identity_requires_digest - unsafe operation succeeded
+
+47/58 v3.2 hardening checks passed

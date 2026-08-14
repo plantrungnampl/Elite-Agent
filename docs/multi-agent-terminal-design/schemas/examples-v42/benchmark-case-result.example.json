@@ -1,0 +1,16 @@
+{
+  "runId": "run-benchmark-1",
+  "logicalCaseId": "case-architecture-1",
+  "caseVersion": 1,
+  "scores": {
+    "verifierAcceptance": 1,
+    "unsupportedClaimRate": 0
+  },
+  "verifierDecision": "pass",
+  "regressions": [],
+  "evidenceArtifactIds": [
+    "artifact-result-1"
+  ],
+  "resultDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "createdAt": "2026-08-06T08:10:00Z"
+}

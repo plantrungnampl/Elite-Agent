@@ -1,0 +1,9 @@
+{
+  "bindingId": "benchmark-arm-binding-1",
+  "runId": "benchmark-candidate-1",
+  "experimentArm": "evidence_plus_experience",
+  "modelConfigurationDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "budgetProfileDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "policyConfigurationDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "createdAt": "2026-08-06T02:15:00Z"
+}

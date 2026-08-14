@@ -3,16 +3,17 @@ use std::path::{Path, PathBuf};
 
 use git2::{IndexAddOption, Repository, Signature};
 use local_agent_terminal_application::{
-    ArtifactRootMode, ArtifactWriteReservation, CanonicalEvidenceRef, Clock, CreateWorktree,
-    ExpectedPresence, IdempotencyClass, InspectRepository, IntentTransition, ManagedWorktreePath,
-    NewProject, NewTask, OperationIntent, OperationIntentStatus, PortError, ProjectSettings,
-    RecoveryAction, RecoveryOperationIntent, RepositoryGateway, RepositoryInspectionRecord,
-    ReservedArtifact, RiskLevel, TaskQuery, WorkspaceStateStore, WorktreeIntent,
+    select_initial_workflow, ArtifactRootMode, ArtifactWriteReservation, CanonicalEvidenceRef,
+    Clock, CreateWorktree, ExpectedPresence, IdempotencyClass, InspectRepository, IntentTransition,
+    ManagedWorktreePath, NewProject, NewTask, OperationIntent, OperationIntentStatus, PortError,
+    ProjectSettings, RecoveryAction, RecoveryOperationIntent, RepositoryGateway,
+    RepositoryInspectionRecord, ReservedArtifact, RiskLevel, TaskQuery, WorkspaceStateStore,
+    WorktreeIntent,
 };
 use local_agent_terminal_bootstrap::{Bootstrap, StartupConfig};
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, FencingToken, LeaseClaim, ProjectId, RunId, TaskBranch, TaskId,
-    WorkspaceVersion, WorktreeId,
+    TaskOutcomeMode, WorkspaceVersion, WorktreeId,
 };
 use local_agent_terminal_repository_git::GitRepositoryGateway;
 use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
@@ -100,6 +101,12 @@ impl WorkspaceFixture {
                 risk_level: RiskLevel::High,
                 base_branch: repository.default_branch.clone().expect("default branch"),
                 base_commit: repository.base_commit.clone().expect("base commit"),
+                initial_workflow: select_initial_workflow(
+                    RiskLevel::High,
+                    TaskOutcomeMode::WorkspaceChange,
+                    "default",
+                )
+                .expect("initial workflow"),
                 created_at: "2026-07-26T00:00:02Z".to_owned(),
             })
             .expect("task");

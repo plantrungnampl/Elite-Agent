@@ -1,0 +1,23 @@
+{
+  "sessionId": "rs-v42-1",
+  "requestId": "rq-v42-1",
+  "engineId": "local-hybrid",
+  "engineVersion": "4.2.0",
+  "pipelineVersion": "4.2.0",
+  "status": "indeterminate",
+  "branches": [
+    {
+      "method": "bm25",
+      "status": "unavailable",
+      "detail": "Process exited after the last durable trace boundary."
+    }
+  ],
+  "candidates": [],
+  "traceDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "recoveryEvidence": {
+    "recoveryReceiptArtifactId": "artifact-retrieval-recovery-1",
+    "lastDurableTraceArtifactId": "artifact-retrieval-trace-1",
+    "uncertaintyReason": "The retriever may have emitted candidates after the last durable trace flush.",
+    "reconcilerVersion": "4.2.0"
+  }
+}

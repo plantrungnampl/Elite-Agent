@@ -1,243 +1,78 @@
-# Workflow Transition Specification
+# Workflow Transition Specification v4.3
 
-## 1. Normative model
-
-Workflow state is:
+## 1. Normative state
 
 ```text
-WorkflowState {
-  phase: Phase,
+WorkflowStateV3 {
+  phase: PhaseV3,
   condition: Active | Paused | Blocked | BudgetExhausted,
   operation: None | AwaitingApproval | Running | Cancelling | Indeterminate,
+  workflowProfile: Quick | Standard | HighAssurance | ReadOnlyResearch,
+  outcomeMode: ReadOnlyDeliverable | WorkspaceChange | LocalCommit,
   streamVersion: u64,
+  profileRevision: u64,
   workspaceVersion: u64,
-  fencingEpoch: u64
+  fencingEpoch: u64,
+  lastTransitionEventId: Option<TransitionEventId>,
+  lastProfileRevisionId: Option<ProfileRevisionId>
 }
 ```
 
-`phase` describes business progress. `condition` explains why phase work can or
-cannot dispatch. `operation` tracks one privileged or external operation without
-inventing a new business phase.
+The current machine projection is [`schemas/workflow-transitions.v3.json`](schemas/workflow-transitions.v3.json) plus [`schemas/sqlite-v7.sql`](schemas/sqlite-v7.sql). The reducer command wire contract is [`schemas/workflow-transition-command.v1.schema.json`](schemas/workflow-transition-command.v1.schema.json).
 
-Terminal phases are `Completed`, `Cancelled`, and `Failed`. Terminal phases
-always have `condition = Active` and `operation = None`.
+## 2. Authority split
 
-The machine-readable projection is
-[`schemas/workflow-transitions.v1.json`](schemas/workflow-transitions.v1.json).
-Implementation tests load that file and assert that every emitted phase change
-is declared here.
+The trusted application reducer decides whether a command satisfies full domain policy. SQLite is the invariant boundary and rejects a projection update unless it points to the matching accepted event or profile-revision receipt.
 
-## 2. Phases
+A phase transition transaction must:
 
-```text
-Intake
-ContextBuild
-ParallelAnalysis
-CrossReview
-PrePlanVerification
-Synthesis
-FinalObjection
-AwaitingPlanApproval
-Implementation
-Verification
-Repair
-FinalReview
-AwaitingCommitApproval
-LocalCommit
-WorkspaceDirty
-Completed
-Cancelled
-Failed
-```
+1. read the current phase/profile/outcome and `streamVersion`;
+2. resolve one declared rule;
+3. insert the exact command artifact and a `prepared` event;
+4. bind all required guard evidence and effects;
+5. change the event to `accepted`;
+6. update phase, accepted-event pointer, and stream version by exactly one;
+7. commit atomically.
 
-## 3. Primary phase transitions
+A rejected event remains immutable. A corrected command may retry the same stream version using a new command/event ID. An accepted event cannot be replayed.
 
-| From | Event | Guard | To | Required effects |
-|---|---|---|---|---|
-| `Intake` | `task.validated` | repository, policy, budgets valid | `ContextBuild` | persist risk and base identity |
-| `ContextBuild` | `context.initial.ready` | required packages valid | `ParallelAnalysis` | freeze independent inputs |
-| `ParallelAnalysis` | `analysis.quorum.reached` | minimum independent results | `CrossReview` | reveal selected proposals and review edges |
-| `CrossReview` | `review.complete` | review outputs or bounded stop | `PrePlanVerification` | freeze material claims |
-| `PrePlanVerification` | `claims.checked` | every material claim classified | `Synthesis` | persist verified/rejected/inconclusive set |
-| `Synthesis` | `decision.draft.created` | schema and evidence valid | `FinalObjection` | publish immutable draft |
-| `FinalObjection` | `objection.severe.accepted` | reopen criteria satisfied | `CrossReview` | create bounded new round |
-| `FinalObjection` | `objection.round.closed` | no accepted severe objection | `AwaitingPlanApproval` | create plan approval request |
-| `AwaitingPlanApproval` | `plan.revision.requested` | user supplied feedback | `Synthesis` | supersede draft, preserve history |
-| `AwaitingPlanApproval` | `plan.approved` | exact digest valid | `Implementation` | create approved plan version |
-| `Implementation` | `implementation.submitted` | no in-flight writes | `Verification` | revoke executor lease, reconcile workspace, create candidate tree |
-| `Verification` | `verification.failed` | repair budget available | `Repair` | discard candidate, provide bounded failure evidence |
-| `Verification` | `verification.passed` | required suite complete | `FinalReview` | freeze verified candidate evidence |
-| `Repair` | `repair.submitted` | current fenced executor, scoped writes | `Verification` | persist workspace version, revoke lease, create new candidate |
-| `FinalReview` | `review.changes.required` | finding accepted | `Repair` | discard candidate tree and reacquire lease |
-| `FinalReview` | `review.accepted` | review cites candidate tree | `AwaitingCommitApproval` | create final approval request |
-| `AwaitingCommitApproval` | `commit.repair.requested` | user feedback | `Repair` | invalidate candidate and approval |
-| `AwaitingCommitApproval` | `commit.approved` | canonical inputs unchanged | `LocalCommit` | persist approval before side effect |
-| `LocalCommit` | `commit.verified` | commit tree equals candidate | `Completed` | persist commit and completion package |
-| `WorkspaceDirty` | `workspace.repair.authorized` | evidence preserved | `Repair` | allocate new fencing token |
-| `WorkspaceDirty` | `workspace.reconciled` | no change needed, candidate rebuilt and verified | `FinalReview` | create new candidate and evidence |
+## 3. Profile paths
 
-No other phase transition is legal without a schema version change.
+- **Quick:** `Intake -> ContextBuild -> PrePlanVerification -> Synthesis -> FinalObjection`.
+- **Standard:** includes `ParallelAnalysis -> CrossReview` before verification/synthesis.
+- **HighAssurance:** uses the Standard structural path plus policy-required quorum, independent groups, and hard executor/reviewer separation.
+- **ReadOnlyResearch:** uses evidence-oriented analysis/review and can finish only as `ReadOnlyDeliverable`.
 
-## 4. Global transitions
+A severe accepted objection returns Quick to `PrePlanVerification`; Standard, HighAssurance, and ReadOnlyResearch return to `CrossReview`. The profile-specific rule relation makes the routes mutually exclusive.
 
-### Cancellation
+## 4. Profile escalation
 
-The user may request cancellation from every nonterminal phase.
+The only in-task profile changes are:
 
-```text
-task.cancel.requested
-→ stop new dispatch
-→ condition remains visible
-→ operation = Cancelling while in-flight work is resolved
-→ task.cancelled
-→ phase = Cancelled
-```
+- `Quick -> Standard`;
+- `Quick -> HighAssurance`;
+- `Standard -> HighAssurance`.
 
-If an external operation is indeterminate, the task may remain blocked rather
-than falsely becoming safely cancelled. The user can preserve the task and
-inspect recovery evidence.
+Escalation is a separate atomic command, requires a scoped reason artifact and immutable revision receipt, increments `streamVersion` and `profileRevision`, and does not change phase. Downgrade is forbidden. ReadOnlyResearch cannot acquire a write outcome in place; the user creates an approved child task.
 
-### Pause
+## 5. Outcome paths
 
-`task.paused` changes only `condition` to `Paused`. It does not cancel an
-already started non-idempotent operation. `task.resumed` restores `Active` after
-policy, budget, approval, workspace, and lease revalidation.
+| Outcome | Required terminal path | Exact terminal evidence |
+|---|---|---|
+| `ReadOnlyDeliverable` | `AwaitingDeliverableApproval -> Completed` | deliverable acceptance receipt and completion package |
+| `WorkspaceChange` | plan, implementation, verification, final review, `AwaitingWorkspaceApproval -> Completed` | exact workspace acceptance and verified candidate tuple; no ref change |
+| `LocalCommit` | plan, implementation, verification, final review, `AwaitingCommitApproval -> RefPromotion -> Completed` | exact granted commit approval, one-time consumption, and successful ref CAS |
 
-### Budget exhaustion
+`AwaitingPlanApproval -> Implementation` requires the exact granted plan approval receipt plus effects `persist_approved_plan_version` and `allocate_executor_lease`.
 
-`budget.exhausted` sets `condition = BudgetExhausted`, preserving phase.
-`budget.extended` may restore `Active`. Declining extension leads to preserve or
-cancel; it is not a forced `Failed` transition.
+## 6. Candidate and repair invariant
 
-### Policy or dependency block
+`candidate.prepared` creates the complete commit object before verification. Verification and final review cite both tree and commit OIDs. Repair invalidates candidate tree, candidate commit, dependent verification, and dependent approvals together. `RefPromotion` performs only expected-old-value CAS and never constructs or rewrites the commit.
 
-`workflow.blocked` sets `condition = Blocked` with a typed reason and required
-resolution. `workflow.unblocked` restores `Active` only after the guard is
-re-evaluated.
+## 7. Workspace mutation
 
-### Fatal failure
+Any mutation detected in a write-capable phase uses the global workspace-dirty rule. It revokes the executor, increments fencing, invalidates affected approvals/candidates, stops write tools, captures evidence, and moves to `WorkspaceDirty`. Recovery requires a declared reconciliation or repair command.
 
-`task.failed` is permitted from a nonterminal phase only when:
+## 8. Terminal and condition rules
 
-- no external operation remains running or indeterminate;
-- recovery cannot preserve a resumable state;
-- failure evidence is persisted;
-- no uncommitted work is deleted.
-
-## 5. Workspace mutation transition
-
-From `Implementation`, `Verification`, `Repair`, `FinalReview`, or
-`AwaitingCommitApproval`, an unexpected `workspace.mutated` event moves phase to
-`WorkspaceDirty`.
-
-Required effects:
-
-1. revoke the executor lease;
-2. increment fencing epoch;
-3. invalidate affected approvals and candidate tree;
-4. stop write-capable tools;
-5. capture Git and filesystem evidence;
-6. preserve `resumeTarget` for UI guidance.
-
-Fast filesystem notifications may trigger the transition, but the guard uses an
-authoritative Git/filesystem rescan.
-
-## 6. Operation substates
-
-| Current | Event | Next | Rule |
-|---|---|---|---|
-| `None` | `operation.approval.required` | `AwaitingApproval` | persist canonical request |
-| `AwaitingApproval` | `approval.granted` | `Running` | recompute digest before dispatch |
-| `AwaitingApproval` | `approval.denied` | `None` | phase remains unchanged |
-| `Running` | `operation.succeeded` | `None` | persist evidence first |
-| `Running` | `operation.failed` | `None` | persist typed failure |
-| `Running` | `operation.cancel.requested` | `Cancelling` | stop new effects |
-| `Cancelling` | `operation.terminated` | `None` | record clean/forced result |
-| `Running` or `Cancelling` | `operation.outcome.unknown` | `Indeterminate` | no automatic retry |
-| `Indeterminate` | `operation.outcome.verified` | `None` | trusted reconciler only |
-
-An operation result may cause a later phase event, but operation state itself
-never advances the phase.
-
-## 7. Completion guards
-
-### Independent analysis
-
-- at least two eligible independent results when two are available;
-- “independent” means proposals were hidden, not merely different role labels;
-- same provider/model family is recorded and cannot be used as evidence of
-  independent factual verification;
-- early consensus can stop additional rounds only after minimum quorum.
-
-### Pre-plan verification
-
-Every material claim is:
-
-- `verified`;
-- `rejected`;
-- `inconclusive`;
-- `not_applicable`.
-
-Agent confidence does not change verification state.
-
-### Plan approval
-
-The plan digest, base commit, policy snapshot, scope, tools, verification
-profile, actor, and expiry must match.
-
-### Verification
-
-All required checks have terminal records tied to the current candidate
-workspace version. Optional or flaky checks are visibly classified.
-
-### Final review
-
-Review cites the immutable candidate Git tree and covers every changed path,
-binary/mode/submodule change, verification result, plan deviation, and policy
-exception.
-
-### Commit
-
-Final approval is unexpired, all canonical inputs still match, branch ref has
-the approved old value, no writer lease exists, and the resulting commit tree
-equals the candidate tree.
-
-## 8. Deterministic command processing
-
-For every command:
-
-1. load stream and expected version;
-2. reject terminal phase mutations;
-3. validate global condition and operation state;
-4. validate phase-specific guard;
-5. calculate deterministic events;
-6. append events and operation intents transactionally;
-7. dispatch effects after commit.
-
-Model output can propose a command but cannot call the reducer or emit a trusted
-event.
-
-## 9. Replay and versioning
-
-Replaying the same ordered event stream must produce the same state tuple.
-Readers upcast old event payloads without rewriting history. Adding or removing
-a legal transition requires:
-
-- workflow schema version increment;
-- updated machine-readable transition file;
-- migration/upcaster impact review;
-- property and replay tests;
-- documentation and UI compatibility update.
-
-## 10. Core invariants
-
-- terminal phases never transition;
-- phase and operation transitions are separately validated;
-- conditions preserve phase;
-- budget counters never decrease;
-- workspace version never decreases;
-- fencing epoch never decreases or repeats;
-- only one active executor lease exists per task;
-- no write occurs without the current fencing token;
-- no approval survives a change to its canonical inputs;
-- no model output directly changes workflow state.
+Conditions do not advance phase. Privileged effects use the operation substate. `Completed`, `Cancelled`, and `Failed` are irreversible and require a completion timestamp. Historical authority is retained; correction creates a new event or receipt.

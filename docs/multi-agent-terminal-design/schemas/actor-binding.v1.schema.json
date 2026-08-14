@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://multi-agent-terminal.local/schemas/actor-binding.v1.schema.json",
+  "title": "Actor Binding v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "bindingId",
+    "actorKind",
+    "actorId",
+    "sessionId",
+    "proofType",
+    "bindingDigest",
+    "issuedAt",
+    "expiresAt",
+    "sessionEpoch",
+    "status"
+  ],
+  "properties": {
+    "bindingId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "actorKind": {
+      "enum": [
+        "user",
+        "system"
+      ]
+    },
+    "actorId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sessionId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "proofType": {
+      "enum": [
+        "local_authenticated_session",
+        "windows_hello",
+        "os_biometric"
+      ]
+    },
+    "bindingDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "issuedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expiresAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sessionEpoch": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "status": {
+      "enum": [
+        "active",
+        "revoked",
+        "expired"
+      ]
+    }
+  }
+}

@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://multi-agent-terminal.local/schemas/orchestration-benchmark-comparison-report.v1.schema.json",
+  "title": "Orchestration Benchmark Comparison Report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "comparisonId",
+    "suiteId",
+    "suiteVersion",
+    "baselineArm",
+    "candidateArms",
+    "includedRunReceiptDigests",
+    "budgetCompliance",
+    "pairedResults",
+    "perCategoryResults",
+    "decision",
+    "limitations",
+    "createdAt",
+    "reportDigest"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "1.0"
+    },
+    "comparisonId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "suiteId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "suiteVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "baselineArm": {
+      "enum": [
+        "single_direct",
+        "single_with_retrieval_and_verification"
+      ]
+    },
+    "candidateArms": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "single_direct",
+          "single_with_retrieval_and_verification",
+          "same_model_multi_sample",
+          "quick_profile",
+          "standard_cross_review",
+          "high_assurance",
+          "heterogeneous_models"
+        ]
+      }
+    },
+    "includedRunReceiptDigests": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/digest"
+      }
+    },
+    "budgetCompliance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "validRunCount",
+        "invalidOverflowCount",
+        "maximumObservedVariancePercent"
+      ],
+      "properties": {
+        "validRunCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "invalidOverflowCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maximumObservedVariancePercent": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "pairedResults": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "candidateArm",
+          "metric",
+          "pairedSampleCount",
+          "estimate",
+          "confidenceInterval95",
+          "direction"
+        ],
+        "properties": {
+          "candidateArm": {
+            "enum": [
+              "single_direct",
+              "single_with_retrieval_and_verification",
+              "same_model_multi_sample",
+              "quick_profile",
+              "standard_cross_review",
+              "high_assurance",
+              "heterogeneous_models"
+            ]
+          },
+          "metric": {
+            "enum": [
+              "accepted_outcome",
+              "defect_escape_count",
+              "first_pass_test_success",
+              "unsupported_claim_count",
+              "requirement_omission_count",
+              "human_correction_minutes",
+              "time_to_accepted_ms",
+              "input_tokens",
+              "output_tokens",
+              "tool_calls",
+              "cost_microunits",
+              "approval_interruptions",
+              "task_abandoned",
+              "reviewer_unique_findings"
+            ]
+          },
+          "pairedSampleCount": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "estimate": {
+            "type": "number"
+          },
+          "confidenceInterval95": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+              "type": "number"
+            }
+          },
+          "direction": {
+            "enum": [
+              "candidate_better",
+              "baseline_better",
+              "inconclusive"
+            ]
+          }
+        }
+      }
+    },
+    "perCategoryResults": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "category",
+          "candidateArm",
+          "acceptedRateDelta",
+          "sampleCount",
+          "decision"
+        ],
+        "properties": {
+          "category": {
+            "enum": [
+              "bug_fix",
+              "feature_change",
+              "refactor",
+              "security_review",
+              "research",
+              "migration"
+            ]
+          },
+          "candidateArm": {
+            "enum": [
+              "single_direct",
+              "single_with_retrieval_and_verification",
+              "same_model_multi_sample",
+              "quick_profile",
+              "standard_cross_review",
+              "high_assurance",
+              "heterogeneous_models"
+            ]
+          },
+          "acceptedRateDelta": {
+            "type": "number",
+            "minimum": -1,
+            "maximum": 1
+          },
+          "sampleCount": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "decision": {
+            "enum": [
+              "candidate_better",
+              "baseline_better",
+              "inconclusive"
+            ]
+          }
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "qualityClaimAllowed",
+        "rationale"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "pass",
+            "fail",
+            "inconclusive"
+          ]
+        },
+        "qualityClaimAllowed": {
+          "type": "boolean"
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "reportDigest": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

@@ -1,56 +1,38 @@
-# Review Resolution Matrix
+# Review Resolution Matrix v3.2
 
-## 1. Purpose
+## 1. Status model
 
-This matrix records how v2 addresses the implementation blockers found in the
-original design. “Resolved in design” means the normative behavior is now
-specified; implementation and acceptance tests are still required before the
-corresponding guarantee can be claimed by a release.
+Every finding is tracked on three independent axes:
 
-## 2. Resolution status
+- **Specified:** the intended rule exists in normative prose.
+- **Machine-enforced:** schema, transition primitive, broker, or OS boundary rejects the unsafe state.
+- **Acceptance-proven:** executable negative/race/crash/installed-product evidence exists for the supported tuple.
 
-| Original issue | Severity | v2 resolution | Status |
-|---|---:|---|---|
-| Job Objects/ConPTY presented as process isolation | P0 | Explicit trust tiers, no ambient repository access, Windows control matrix, containment suite | Resolved in design |
-| Logical single writer could be bypassed by stale process | P0 | Durable lease plus monotonic fencing token checked by every write tool | Resolved in design |
-| User/agent terminal could mutate after review | P0 | Out-of-band mutation enters `WorkspaceDirty`, revokes lease, and invalidates approvals | Resolved in design |
-| Final commit could differ from reviewed worktree | P0 | Immutable candidate Git tree, clean-tree verification, canonical final approval, conditional ref update | Resolved in design |
-| SQLite/filesystem transaction assumed atomic | P0 | Intent journal, content-addressed objects, explicit crash matrix, startup reconciliation | Resolved in design |
-| JSON-RPC agent-to-core requests omitted IDs | P1 | Bidirectional request ownership, IDs, terminal request, framing, limits, schema | Resolved in design |
-| Run lifecycle and streaming completion ambiguous | P1 | Immediate start acknowledgement and exactly one `agent.run.complete` request | Resolved in design |
-| `Failed`/`Blocked`/`BudgetExhausted` inconsistent | P1 | State tuple separates phase, condition, and operation; normative transition table | Resolved in design |
-| Agent consensus could verify project memory | P1 | Consensus only nominates a candidate; authoritative evidence or human approval required | Resolved in design |
-| “Response reproducibility” overstated | P1 | Exact input is reconstructible; probabilistic output is not promised reproducible | Resolved in design |
-| Security and tool mediation scheduled too late | P1 | Policy, sandbox boundary, journal, and tool broker moved before live agent deliberation | Resolved in design |
-| Forward-only migration conflicted with binary rollback | P1 | Expand/contract rollback window or complete database/artifact/config restore | Resolved in design |
-| Data model lacked enforceable DDL/indexes/leases/outbox | P1 | Added SQLite v1 DDL with constraints, indexes, intent journal, leases, and update journal | Resolved in design |
-| Clean Architecture lacked composition root and dependency DAG | P2 | Added application-owned ports, `bootstrap` composition root, dependency graph and CI rule | Resolved in design |
-| Graph retrieval had no declared persistence boundary | P2 | Added optional `RepositoryGraph` port and SQLite metadata schema; degraded branch is explicit | Resolved in design |
-| WebView/terminal output were absent from threat model | P2 | Added Tauri IPC, CSP, remote-navigation, ANSI/OSC, clipboard, and link controls | Resolved in design |
+`Specified` alone never authorizes a capability.
 
-## 3. Decisions intentionally left to implementation milestones
+## 2. Current resolution matrix
 
-The design does not pretend that every implementation choice is already made.
-These decisions have an explicit deadline:
+| Finding | Specified | Machine-enforced in package | Acceptance-proven in package | Capability effect |
+|---|---|---|---|---|
+| Immutable/retained audit authority | Yes | Append-only, immutable, delete, quarantine, and set-once SQLite guards | Core + v3.2 adversarial DB suites | Runtime storage-path bypass tests pending |
+| Task optimistic concurrency bypass | Yes | Every `tasks` update increments `row_version` exactly once | Direct-update bypass test | Reducer/storage conformance pending |
+| Monotonic fencing and lease history | Yes | Monotonic epoch, immutable holder/token/expiry, terminal release evidence | Targeted DB tests | Broker race gate pending |
+| Artifact identity and supersession scope | Yes | Task/project coherence, immutable identity, same-scope supersession, retained metadata, quarantine-before-byte-GC, and lifecycle transition guards | Mutation/scope/delete/replacement/lifecycle tests | Real artifact-store crash matrix pending |
+| Cross-task run/context/config/message splicing | Yes | Run/message scope, immutable identity, retained history | Cross-task and mutation tests | Captured-wire/restart suite pending |
+| Cross-task operation authority splicing | Yes | Intent/attempt/policy/approval/execution scope and exact-attempt binding | Generated targeted DB counterexamples | Broader property suite pending |
+| Canonical request and policy approval binding | Yes | Operation digest equals request artifact hash; policy-selected approval exact, granted, and unexpired | Digest, omission, mismatch, expiry tests | Storage API canonicalization proof pending |
+| Attempt/tool/run evidence preservation | Yes | Retained rows, terminal consistency, task-scoped evidence, NULL-safe set-once guards | Overwrite, clear, delete, reversal tests | Effect crash matrices pending |
+| Actor-bound approval lifecycle | Yes | Pending-only creation, request/credential scope, immutable receipt/time, set-once resolution | Pre-grant, wrong actor/artifact/time/expiry tests | Credential integration pending |
+| Exact final commit object/effect | Yes | Final-commit approval type, immutable candidate, exact consumption tuple | Schema and DB tuple tests | Git object/ref integration pending |
+| External containment fail-closed | Yes | Enable-time and run-time exact-tuple attestation; revocation disables descriptor | Missing/disabled/revoked tests | Installed hostile suite pending |
+| Method-specific protocol responses | Yes | Protocol v2 schemas and durable request correlation | Schema and DB tests | Captured-wire restart suite pending |
+| Protocol replay/sequence reset | Yes | Request/stream retention, immutable stream key, contiguous sequence | Insert/update/delete/key-reset/gap tests | Multi-connection restart/fuzz pending |
+| Protocol terminal/response evidence | Yes | Pending/completed/failed consistency, task scope, set-once evidence | Missing time/response, cross-task, clear tests | Transport integration pending |
+| Context and retrieval privacy scope | Yes | Immutable context packages; source/memory/graph project guards | Structural and cross-project DB tests | Route-complete canary pending |
+| Update journal recovery evidence | Yes | Immutable identity, retained rows, terminal irreversibility | Delete/terminal tests | Installed update/restore pending |
+| Windows file/Git durability | Yes | Adapter/broker contract only | No | Write release blocker |
+| Accessibility/performance | Yes | Criteria only | No | Public release blocker |
 
-| Decision | Must be selected by | Constraint |
-|---|---|---|
-| Concrete Windows restricted-worker mechanism | Before Milestone 2 exits | Must pass the containment suite; otherwise external processes stay disabled |
-| First and second provider adapters | Before Milestones 3 and 4 exit | Must be built-in `core_adapter` or pass brokered-process containment |
-| Embedded vector implementation and local embedding model | Before Milestone 6 starts | Must support rebuild, local default, policy filtering, and Windows packaging |
-| Git library versus process adapter details | Before Milestone 1 exits | Must support exact object IDs, conditional ref update, worktrees, LFS/submodule evidence |
-| OS-protected audit signing key | Before claiming tamper evidence against local store modification | Plain hashes alone may only claim corruption detection |
-| Project-local artifact mode | Before enabling it | Must enforce Git exclusion, ACLs, and no placement inside task worktree |
+## 3. Release claim rule
 
-## 4. Release claim rule
-
-A release may claim a control only when:
-
-1. the corresponding normative document is implemented;
-2. the machine-readable schema and contract tests pass;
-3. negative acceptance tests demonstrate denied behavior;
-4. degraded or unavailable controls fail closed;
-5. the UI describes the effective guarantee without stronger wording.
-
-Until then, the package is an implementation-ready design baseline, not proof
-that a built binary is secure or production-ready.
+A capability may be enabled only when every invariant it depends on is both machine-enforced and acceptance-proven for the exact binary/schema/OS/toolchain profile. Evidence is attached to the release manifest. Missing evidence means disabled capability, not best-effort fallback.

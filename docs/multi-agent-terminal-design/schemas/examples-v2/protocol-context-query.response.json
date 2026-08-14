@@ -1,0 +1,21 @@
+{
+  "jsonrpc": "2.0",
+  "id": "agent:12",
+  "result": {
+    "queryId": "cq-12",
+    "items": [
+      {
+        "itemId": "ctx-item-44",
+        "contentRef": "artifact:ctx-supp-44:item-1",
+        "contentDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sourceRefs": [
+          "decision:auth-persistence-v3"
+        ],
+        "observationClass": "core_observed"
+      }
+    ],
+    "truncated": false,
+    "effectivePayloadDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "redactionReportDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  }
+}

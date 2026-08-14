@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://multi-agent-terminal.local/schemas/orchestration-benchmark-run-receipt.v1.schema.json",
+  "title": "Orchestration Benchmark Run Receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "runId",
+    "suiteId",
+    "suiteVersion",
+    "caseId",
+    "arm",
+    "repeatIndex",
+    "runConfigurationRefs",
+    "independenceGroups",
+    "controlledInputDigests",
+    "reservedBudget",
+    "actualUsage",
+    "status",
+    "startedAt",
+    "endedAt",
+    "outputArtifactRef",
+    "evidenceArtifactRefs",
+    "receiptDigest"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "1.0"
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "suiteId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "suiteVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "caseId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "arm": {
+      "enum": [
+        "single_direct",
+        "single_with_retrieval_and_verification",
+        "same_model_multi_sample",
+        "quick_profile",
+        "standard_cross_review",
+        "high_assurance",
+        "heterogeneous_models"
+      ]
+    },
+    "repeatIndex": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "runConfigurationRefs": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "independenceGroups": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "controlledInputDigests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repositoryRevision",
+        "objective",
+        "acceptanceRules",
+        "toolPolicy",
+        "evaluatorConfiguration"
+      ],
+      "properties": {
+        "repositoryRevision": {
+          "$ref": "#/$defs/digest"
+        },
+        "objective": {
+          "$ref": "#/$defs/digest"
+        },
+        "acceptanceRules": {
+          "$ref": "#/$defs/digest"
+        },
+        "toolPolicy": {
+          "$ref": "#/$defs/digest"
+        },
+        "evaluatorConfiguration": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "reservedBudget": {
+      "$ref": "#/$defs/budget"
+    },
+    "actualUsage": {
+      "$ref": "#/$defs/budget"
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "failed",
+        "invalid_budget_overflow",
+        "abandoned"
+      ]
+    },
+    "startedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "endedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "outputArtifactRef": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidenceArtifactRefs": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "receiptDigest": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inputTokens",
+        "outputTokens",
+        "toolCalls",
+        "wallTimeMs",
+        "costMicrounits",
+        "currency"
+      ],
+      "properties": {
+        "inputTokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "outputTokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "toolCalls": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "wallTimeMs": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "costMicrounits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        }
+      }
+    }
+  }
+}

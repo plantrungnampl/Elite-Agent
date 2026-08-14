@@ -949,7 +949,7 @@ fn wf_p015_accepts_exact_approval_receipt_and_required_effects() {
         .unwrap_or_else(|error| panic!("persist WF-P015 failed: {error:?}"));
     assert_eq!(next.phase(), Phase::Implementation);
     assert_eq!(next.stream_version(), 9);
-    assert_eq!(next.fencing_token().get(), 2);
+    assert_eq!(next.fencing_epoch(), 2);
     assert_eq!(
         fixture
             .store

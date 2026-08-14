@@ -5,10 +5,10 @@ use local_agent_terminal_application::{
     Retryability, SafeErrorClassification,
 };
 use local_agent_terminal_domain::{
-    ActorId, AgentDescriptor, AgentFamilyKey, AgentRunLimits, AgentRunSnapshot, AgentRunStatus,
-    AgentRunTerminal, AgentUsage, ArtifactId, BoundAgentConnection, BoundAgentRunRequest,
-    BoundEffectiveContext, BoundGenerationParameters, BoundRunConfig, Phase, RunId, Sha256Digest,
-    TaskId, Timestamp, TrustTier,
+    ActorId, AdapterProtocol, AgentDescriptor, AgentFamilyKey, AgentRole, AgentRunLimits,
+    AgentRunSnapshot, AgentRunStatus, AgentRunTerminal, AgentUsage, ArtifactId,
+    BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext, BoundGenerationParameters,
+    BoundRunConfig, Phase, RunConfiguration, RunId, Sha256Digest, TaskId, Timestamp, TrustTier,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
@@ -66,6 +66,7 @@ const RUN_CONFIG_ARTIFACT_KIND: &str = "run-config";
 const MESSAGE_ARTIFACT_KIND: &str = "agent-message";
 const RUN_CONFIG_SCHEMA_V1: &str = "agent-run-config.v1";
 const RUN_CONFIG_SCHEMA_V2: &str = "agent-run-config.v2";
+const RUNTIME_RUN_BINDING_SCHEMA_V1: &str = "runtime-run-binding.v1";
 const RUN_CONFIG_ARTIFACT_FIELDS: &[&str] = &["connection", "runConfig", "schema"];
 const RUN_CONFIG_CONNECTION_FIELDS: &[&str] = &[
     "adapterVersion",
@@ -111,12 +112,23 @@ const RUN_CONFIG_LIMIT_FIELDS_V2: &[&str] = &[
 pub fn canonical_agent_run_config_artifact(
     request: &BoundAgentRunRequest,
 ) -> Result<Vec<u8>, PortError> {
+    canonical_runtime_binding(request, RUN_CONFIG_SCHEMA_V2)
+}
+
+fn canonical_runtime_run_binding(request: &BoundAgentRunRequest) -> Result<Vec<u8>, PortError> {
+    canonical_runtime_binding(request, RUNTIME_RUN_BINDING_SCHEMA_V1)
+}
+
+fn canonical_runtime_binding(
+    request: &BoundAgentRunRequest,
+    schema: &str,
+) -> Result<Vec<u8>, PortError> {
     request.validate().map_err(|_| invalid_input())?;
     let generation_parameters: Value =
         serde_json::from_slice(&request.run_config.generation_parameters.canonical_json)
             .map_err(|_| invalid_input())?;
     let value = json!({
-        "schema": RUN_CONFIG_SCHEMA_V2,
+        "schema": schema,
         "connection": {
             "adapterVersion": request.connection.adapter_version,
             "agentId": request.connection.agent_id,
@@ -356,12 +368,17 @@ impl AgentRunStore for SqliteStore {
             &request.run_config.run_config_artifact_id,
             &request.task_id,
             Some(RUN_CONFIG_ARTIFACT_KIND),
-            Some(digest_bytes(&expected_run_config).as_str()),
+            None,
             None,
         )?;
-        if run_config_artifact.bytes != expected_run_config {
-            return Err(integrity_failure());
-        }
+        let normative_configuration = if run_config_artifact.bytes == expected_run_config {
+            None
+        } else {
+            let configuration = RunConfiguration::from_canonical_bytes(&run_config_artifact.bytes)
+                .map_err(|_| integrity_failure())?;
+            validate_normative_run_configuration(request, &configuration)?;
+            Some(configuration)
+        };
         verify_supersession(&transaction, request)?;
         insert_or_verify_context(&transaction, &request.context)?;
 
@@ -388,6 +405,20 @@ impl AgentRunStore for SqliteStore {
                 ],
             )
             .map_err(sqlite_error_to_port)?;
+        if inserted == 1 {
+            if let Some(configuration) = &normative_configuration {
+                let payload: Value =
+                    serde_json::from_slice(&canonical_runtime_run_binding(request)?)
+                        .map_err(|_| integrity_failure())?;
+                append_run_event(
+                    &transaction,
+                    &request.run_id,
+                    "agent.run.prepared",
+                    configuration.created_at_rfc3339(),
+                    payload,
+                )?;
+            }
+        }
         let snapshot = if inserted == 1 {
             AgentRunSnapshot::created(request.clone()).map_err(|_| invalid_input())?
         } else {
@@ -402,12 +433,17 @@ impl AgentRunStore for SqliteStore {
             if bound_run_id.as_deref() != Some(request.run_id.as_str()) {
                 return Err(conflict());
             }
-            let snapshot = load_run_on_connection(&transaction, artifact_reader, &request.run_id)?
-                .ok_or_else(integrity_failure)?;
-            if snapshot.request != *request {
-                return Err(conflict());
+            if normative_configuration.is_some() && created_run_matches(&transaction, request)? {
+                AgentRunSnapshot::created(request.clone()).map_err(|_| invalid_input())?
+            } else {
+                let snapshot =
+                    load_run_on_connection(&transaction, artifact_reader, &request.run_id)?
+                        .ok_or_else(integrity_failure)?;
+                if snapshot.request != *request {
+                    return Err(conflict());
+                }
+                snapshot
             }
-            snapshot
         };
         transaction.commit().map_err(sqlite_error_to_port)?;
         Ok(snapshot)
@@ -609,6 +645,108 @@ impl AgentRunStore for SqliteStore {
         let connection = self.connection().map_err(open_error_to_port)?;
         load_run_on_connection(&connection, artifact_reader, run_id)
     }
+}
+
+fn validate_normative_run_configuration(
+    request: &BoundAgentRunRequest,
+    configuration: &RunConfiguration,
+) -> Result<(), PortError> {
+    let unsigned = configuration.unsigned();
+    let expected_role = normative_agent_role(&request.role).ok_or_else(invalid_input)?;
+    let expected_tool_calls = request
+        .run_config
+        .limits
+        .max_tool_requests
+        .checked_add(request.run_config.limits.max_context_queries)
+        .and_then(|value| value.checked_add(request.run_config.limits.max_specialist_requests))
+        .ok_or_else(invalid_input)?;
+    let wall_time_ms = unsigned.budget_reservation.wall_time_ms;
+    let deadline_matches = wall_time_ms % 1_000 == 0
+        && i64::try_from(wall_time_ms / 1_000)
+            .ok()
+            .and_then(|seconds| unsigned.created_at.unix_seconds().checked_add(seconds))
+            == Some(request.run_config.limits.deadline.unix_seconds());
+    let expected_group = format!(
+        "{}-{}",
+        request.run_config.provider_id, request.run_config.model_id
+    );
+    if configuration.task_id() != &request.task_id
+        || configuration.run_configuration_id()
+            != request.run_config.run_config_artifact_id.as_str()
+        || configuration.provider_connection_ref() != request.connection.connection_id
+        || unsigned.adapter.adapter_id != request.run_config.provider_id
+        || unsigned.adapter.adapter_version != request.run_config.adapter_version
+        || unsigned.adapter.protocol != AdapterProtocol::MatAgentControlV2
+        || unsigned.adapter.implementation_digest != request.run_config.executable_digest
+        || unsigned.model_endpoint.provider_id != request.run_config.provider_id
+        || unsigned.model_endpoint.resolved_model_id != request.run_config.model_id
+        || unsigned.model_endpoint.max_output_tokens != request.run_config.limits.max_output_tokens
+        || unsigned.agent_profile.profile_id != request.agent_id
+        || unsigned.agent_profile.role != expected_role
+        || unsigned.agent_profile.prompt_template_version
+            != request.run_config.prompt_template_version
+        || unsigned.agent_profile.response_schema_ref != request.run_config.response_schema_version
+        || unsigned.generation_parameters.max_output_tokens
+            != request.run_config.limits.max_output_tokens
+        || unsigned.data_policy_snapshot.policy_digest != request.context.policy_snapshot_digest
+        || unsigned.budget_reservation.output_tokens != request.run_config.limits.max_output_tokens
+        || unsigned.budget_reservation.tool_calls != expected_tool_calls
+        || !deadline_matches
+        || unsigned.independence.group_id != expected_group
+        || unsigned.independence.dimensions.provider != request.run_config.provider_id
+        || unsigned.independence.dimensions.context_corpus != request.context.context_package_id
+        || unsigned.independence.dimensions.retrieval_pipeline
+            != request.context.retrieval_pipeline_version
+        || unsigned.independence.dimensions.adapter_implementation
+            != request.run_config.adapter_version
+    {
+        return Err(integrity_failure());
+    }
+    Ok(())
+}
+
+fn normative_agent_role(role: &str) -> Option<AgentRole> {
+    match role {
+        "lead" => Some(AgentRole::Lead),
+        "analyst" | "proposer" => Some(AgentRole::Analyst),
+        "reviewer" | "critic" => Some(AgentRole::Reviewer),
+        "implementer" => Some(AgentRole::Implementer),
+        "verifier" => Some(AgentRole::Verifier),
+        "specialist" => Some(AgentRole::Specialist),
+        "researcher" => Some(AgentRole::Researcher),
+        _ => None,
+    }
+}
+
+fn created_run_matches(
+    connection: &Connection,
+    request: &BoundAgentRunRequest,
+) -> Result<bool, PortError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM agent_runs
+                WHERE id = ?1 AND task_id = ?2 AND agent_id = ?3 AND role = ?4
+                  AND phase = ?5 AND status = 'created' AND context_package_id = ?6
+                  AND idempotency_key = ?7 AND connection_binding_digest = ?8
+                  AND run_config_artifact_id = ?9 AND supersedes_run_id IS ?10
+                  AND started_at IS NULL AND completed_at IS NULL
+            )",
+            params![
+                request.run_id.as_str(),
+                request.task_id.as_str(),
+                request.agent_id,
+                request.role,
+                request.phase,
+                request.context.context_package_id,
+                request.idempotency_key,
+                request.connection.binding_digest.as_str(),
+                request.run_config.run_config_artifact_id.as_str(),
+                request.supersedes_run_id.as_ref().map(RunId::as_str),
+            ],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error_to_port)
 }
 
 enum ActiveRunScope<'a> {
@@ -823,7 +961,13 @@ fn snapshot_from_raw(
         None,
         None,
     )?;
-    let (run_config, connection_binding) = parse_run_config_artifact(&artifact.bytes)?;
+    let normative_configuration = RunConfiguration::from_canonical_bytes(&artifact.bytes).ok();
+    let (run_config, connection_binding) = if normative_configuration.is_some() {
+        let runtime_binding = load_runtime_run_binding(connection, &run_id)?;
+        parse_run_config_artifact(&runtime_binding)?
+    } else {
+        parse_run_config_artifact(&artifact.bytes)?
+    };
     if connection_binding.binding_digest.as_str() != raw.connection_binding_digest {
         return Err(integrity_failure());
     }
@@ -860,6 +1004,15 @@ fn snapshot_from_raw(
             .transpose()
             .map_err(|_| integrity_failure())?,
     };
+    if let Some(configuration) = &normative_configuration {
+        validate_normative_run_configuration(&request, configuration)?;
+        require_run_configuration_binding(
+            connection,
+            &run_id,
+            &run_config_artifact_id,
+            configuration,
+        )?;
+    }
     let manifest_artifact = load_available_artifact(
         connection,
         artifact_reader,
@@ -908,6 +1061,47 @@ fn snapshot_from_raw(
         return Err(integrity_failure());
     }
     Ok(snapshot)
+}
+
+fn load_runtime_run_binding(connection: &Connection, run_id: &RunId) -> Result<Vec<u8>, PortError> {
+    let payload: String = connection
+        .query_row(
+            "SELECT payload_json FROM events
+             WHERE stream_id = ?1 AND event_type = 'agent.run.prepared'
+             ORDER BY sequence LIMIT 1",
+            [format!("agent-run:{}", run_id.as_str())],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error_to_port)?;
+    let value: Value = serde_json::from_str(&payload).map_err(|_| integrity_failure())?;
+    serde_json_canonicalizer::to_vec(&value).map_err(|_| integrity_failure())
+}
+
+fn require_run_configuration_binding(
+    connection: &Connection,
+    run_id: &RunId,
+    artifact_id: &ArtifactId,
+    configuration: &RunConfiguration,
+) -> Result<(), PortError> {
+    let exact: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM run_configuration_bindings
+                WHERE run_id = ?1 AND config_artifact_id = ?2 AND config_digest = ?3
+            )",
+            params![
+                run_id.as_str(),
+                artifact_id.as_str(),
+                configuration.config_digest().as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error_to_port)?;
+    if exact {
+        Ok(())
+    } else {
+        Err(integrity_failure())
+    }
 }
 
 fn verify_task(connection: &Connection, task_id: &TaskId) -> Result<(), PortError> {
@@ -1254,26 +1448,64 @@ pub(crate) fn load_deliberation_run_assignments(
                     None,
                     None,
                 )?;
-                let (config, binding) = parse_run_config_artifact(&artifact.bytes)?;
-                if config.run_config_artifact_id != artifact_id
-                    || config.task_id != *task_id
-                    || config.agent_id != agent_id
-                    || config.role != role
-                    || config.context_package_id != context_package_id
-                    || binding.agent_id != agent_id
-                    || binding.binding_digest.as_str() != binding_digest
-                    || config.trust_tier != binding.trust_tier
-                    || config.manifest_digest != binding.manifest_digest
-                    || config.executable_digest != binding.executable_digest
-                    || config.contract_version != binding.contract_version
-                    || config.adapter_version != binding.adapter_version
+                let run_id = RunId::new(run_id).map_err(|_| integrity_failure())?;
+                let (provider_id, model_id) = if let Ok(configuration) =
+                    RunConfiguration::from_canonical_bytes(&artifact.bytes)
                 {
-                    return Err(integrity_failure());
-                }
+                    let runtime_binding = load_runtime_run_binding(connection, &run_id)?;
+                    let (config, binding) = parse_run_config_artifact(&runtime_binding)?;
+                    require_run_configuration_binding(
+                        connection,
+                        &run_id,
+                        &artifact_id,
+                        &configuration,
+                    )?;
+                    if configuration.task_id() != task_id
+                        || configuration.run_configuration_id() != artifact_id.as_str()
+                        || configuration.unsigned().agent_profile.profile_id != agent_id
+                        || configuration.unsigned().agent_profile.role
+                            != normative_agent_role(&role).ok_or_else(integrity_failure)?
+                        || config.run_config_artifact_id != artifact_id
+                        || config.task_id != *task_id
+                        || config.agent_id != agent_id
+                        || config.role != role
+                        || config.context_package_id != context_package_id
+                        || binding.agent_id != agent_id
+                        || binding.binding_digest.as_str() != binding_digest
+                    {
+                        return Err(integrity_failure());
+                    }
+                    (
+                        configuration.unsigned().model_endpoint.provider_id.clone(),
+                        configuration
+                            .unsigned()
+                            .model_endpoint
+                            .resolved_model_id
+                            .clone(),
+                    )
+                } else {
+                    let (config, binding) = parse_run_config_artifact(&artifact.bytes)?;
+                    if config.run_config_artifact_id != artifact_id
+                        || config.task_id != *task_id
+                        || config.agent_id != agent_id
+                        || config.role != role
+                        || config.context_package_id != context_package_id
+                        || binding.agent_id != agent_id
+                        || binding.binding_digest.as_str() != binding_digest
+                        || config.trust_tier != binding.trust_tier
+                        || config.manifest_digest != binding.manifest_digest
+                        || config.executable_digest != binding.executable_digest
+                        || config.contract_version != binding.contract_version
+                        || config.adapter_version != binding.adapter_version
+                    {
+                        return Err(integrity_failure());
+                    }
+                    (config.provider_id, config.model_id)
+                };
                 DeliberationRunAssignment::new(
-                    RunId::new(run_id).map_err(|_| integrity_failure())?,
+                    run_id,
                     agent_id.clone(),
-                    AgentFamilyKey::from_provider_model(&config.provider_id, &config.model_id)
+                    AgentFamilyKey::from_provider_model(&provider_id, &model_id)
                         .map_err(|_| integrity_failure())?,
                     ActorId::new(agent_id).map_err(|_| integrity_failure())?,
                 )
@@ -1401,7 +1633,7 @@ fn parse_run_config_artifact(
             require_exact_fields(limits, RUN_CONFIG_LIMIT_FIELDS_V1)?;
             (0, 0)
         }
-        RUN_CONFIG_SCHEMA_V2 => {
+        RUN_CONFIG_SCHEMA_V2 | RUNTIME_RUN_BINDING_SCHEMA_V1 => {
             require_exact_fields(limits, RUN_CONFIG_LIMIT_FIELDS_V2)?;
             (
                 required_u64(limits, "maxContextQueries")?,

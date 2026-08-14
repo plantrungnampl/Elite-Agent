@@ -3,18 +3,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use local_agent_terminal_application::{
-    AcquireLease, ActorId, ArtifactId, ArtifactRootMode, CanonicalJsonRequest, Clock,
-    ConfirmDiscardWorkspaceRequestDto, CreateTaskWorkspaceRequestDto, CreateWorktree,
-    DiscardWorktree, ExecutorLeaseStore, ExpectedPresence, IdempotencyClass, InspectRepository,
-    InspectWorktree, IntentTransition, LeaseClaim, LeaseSnapshot, ManagedWorktreePath, NewTask,
-    OnboardRepository, OnboardRepositoryRequestDto, OperationIntent, OperationIntentStatus,
-    PortError, ProjectSettings, ProjectSnapshot, RecoveryAction, RecoveryCandidate,
-    RecoveryCandidateRequestDto, RecoveryOperationIntent, RecoveryProject, RecoveryReason,
-    RepositoryGateway, RepositoryHealth, RepositoryInspectionRecord, RepositoryLocator,
-    RevokeLease, RiskLevel, RunId, SafeErrorClassification, TaskBranch, TaskQuery, TaskSnapshot,
-    TimelineEntryDto, WorkspaceDashboardDto, WorkspaceDashboardRequestDto, WorkspaceEvidenceStore,
-    WorkspaceRecoveryStore, WorkspaceStateStore, WorkspaceWriteCoordinator, WorktreeId,
-    WorktreeIntent, WorktreeObservation, WorktreeSnapshot, WorktreeState,
+    select_initial_workflow, AcquireLease, ActorId, ArtifactId, ArtifactRootMode,
+    CanonicalJsonRequest, Clock, ConfirmDiscardWorkspaceRequestDto, CreateTaskWorkspaceRequestDto,
+    CreateWorktree, DiscardWorktree, ExecutorLeaseStore, ExpectedPresence, IdempotencyClass,
+    InspectRepository, InspectWorktree, IntentTransition, LeaseClaim, LeaseSnapshot,
+    ManagedWorktreePath, NewTask, OnboardRepository, OnboardRepositoryRequestDto, OperationIntent,
+    OperationIntentStatus, PortError, ProjectSettings, ProjectSnapshot, RecoveryAction,
+    RecoveryCandidate, RecoveryCandidateRequestDto, RecoveryOperationIntent, RecoveryProject,
+    RecoveryReason, RepositoryGateway, RepositoryHealth, RepositoryInspectionRecord,
+    RepositoryLocator, RevokeLease, RiskLevel, RunId, SafeErrorClassification, TaskBranch,
+    TaskOutcomeMode, TaskQuery, TaskSnapshot, TimelineEntryDto, WorkspaceDashboardDto,
+    WorkspaceDashboardRequestDto, WorkspaceEvidenceStore, WorkspaceRecoveryStore,
+    WorkspaceStateStore, WorkspaceWriteCoordinator, WorktreeId, WorktreeIntent,
+    WorktreeObservation, WorktreeSnapshot, WorktreeState,
 };
 use local_agent_terminal_application::{ProjectId, TaskId};
 use local_agent_terminal_repository_git::GitRepositoryGateway;
@@ -314,6 +315,11 @@ impl WorkspaceRuntime {
                     risk_level,
                     base_branch,
                     base_commit: base_commit.clone(),
+                    initial_workflow: select_initial_workflow(
+                        risk_level,
+                        TaskOutcomeMode::WorkspaceChange,
+                        "default",
+                    )?,
                     created_at: observed_at.clone(),
                 })?
             }

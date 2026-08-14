@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": "core:8",
+  "method": "agent.run.start",
+  "params": {
+    "runId": "run-238",
+    "taskId": "task-1",
+    "contextPackageRef": "ctx-501",
+    "idempotencyKey": "task-1:analysis:qwen:1",
+    "role": "critic"
+  }
+}

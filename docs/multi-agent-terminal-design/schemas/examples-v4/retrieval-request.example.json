@@ -1,0 +1,31 @@
+{
+  "requestId": "ret-req-1",
+  "projectId": "p1",
+  "taskId": "t1",
+  "runId": "r1",
+  "objective": "Find the cause of a warning-close regression",
+  "role": "debugger",
+  "taskClass": "bug-diagnosis",
+  "scopes": [
+    "repository",
+    "negative-memory",
+    "episodes"
+  ],
+  "methods": [
+    "exact",
+    "keyword",
+    "vector",
+    "graph",
+    "negative",
+    "episodic"
+  ],
+  "openQuestions": [
+    "Which model property is used by the SQL filter?"
+  ],
+  "contradictionTargets": [
+    "The close operation updates the same field that SQL filters"
+  ],
+  "maxItems": 24,
+  "maxTokens": 8000,
+  "policySnapshotDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

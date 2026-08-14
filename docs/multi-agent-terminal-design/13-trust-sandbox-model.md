@@ -80,6 +80,25 @@ It is disabled in MVP. If later offered for compatibility, the UI must state
 that the application cannot enforce repository, secret, network, or write
 isolation. It must not reuse the word “sandboxed”.
 
+### 3.5 Retrieval sidecar classification
+
+The embedded retrieval adapter ships as a reviewed `core_adapter`. The optional
+external retrieval sidecar **MUST run as `brokered_process`** by default. It is
+not part of the trusted core merely because it implements `RetrievalEngine`.
+
+The sidecar receives canonical request bytes or opaque source references over
+bounded protocol pipes. It runs under a dedicated low-privilege identity with a
+private runtime directory, no inherited secrets, **no repository or
+user-profile ACL**, no direct SQLite or Artifact Store handle, a kill-on-close
+Job Object, and only explicitly allowed network endpoints. Returned candidates
+remain untrusted references; the Context Compiler re-reads and re-authorizes all
+authoritative bytes.
+
+Enablement is fail-closed and binds the exact executable, manifest, policy, and network tuple to a current containment and cognitive-conformance attestation. A sidecar that requires a mounted task volume, repository path, or
+local tool execution is no longer eligible for this profile; it must be
+separately declared and attested as `isolated_worker`. The application must not
+silently upgrade privileges or fall back to `full_access_legacy`.
+
 ## 4. Windows control matrix
 
 | Control | Provides | Does not provide |
@@ -254,3 +273,36 @@ When an isolation feature is unavailable:
 - external local agents and repository-controlled process tools are disabled;
 - the UI identifies the unavailable guarantee;
 - the system never silently falls back to the user's full token.
+
+## 13. v3 exact-tuple attestation lifecycle
+
+An attestation key is the tuple:
+
+`(agentDescriptorId, executableDigest, manifestDigest, launcherDigest, isolationProfileDigest, osBuild, architecture, suiteVersion)`.
+
+The attestation and evidence are immutable. Revocation is a separate append-only record. An external descriptor may be enabled only when its active attestation matches the descriptor's executable and manifest, is unrevoked, and is valid at the descriptor update time. Any binary, manifest, launcher, profile, OS, architecture, or suite change requires a new attestation. Failure to verify disables the external capability while allowing the built-in read-only core to degrade honestly.
+
+## v4.2 actor binding and credential challenge
+
+The MVP security claim is deliberately limited to an authenticated local
+application session unless an OS-backed proof is configured. `ActorBinding`
+records actor identity, local session identity, proof type, session epoch,
+issuance, expiration, revocation, and an immutable binding digest.
+
+A privileged acceptance uses a one-time `CredentialChallenge` bound to:
+
+- actor binding;
+- exact purpose;
+- exact operation digest;
+- unpredictable nonce;
+- issue and expiry times.
+
+A challenge receipt is immutable and unique per challenge, so replay is
+rejected. Approval resolution requires a matching current actor binding and
+challenge receipt. User switching, session expiry, revocation, operation digest
+change, purpose change, or nonce reuse invalidates the proof. Windows Hello or
+OS biometric proof may strengthen the receipt, but the package does not claim
+that optional proof unless its exact challenge protocol and platform tests pass.
+
+Normative contracts: `schemas/actor-binding.v1.schema.json`,
+`schemas/credential-challenge.v1.schema.json`, and the v6 actor/challenge tables.

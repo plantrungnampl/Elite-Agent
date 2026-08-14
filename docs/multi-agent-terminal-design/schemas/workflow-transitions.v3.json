@@ -1,0 +1,1142 @@
+{
+  "schemaVersion": 3,
+  "authorityModel": {
+    "semanticAuthority": "trusted_application_reducer",
+    "persistenceBoundary": "sqlite_invariant_boundary",
+    "commandSchema": "workflow-transition-command.v1",
+    "atomicOrder": [
+      "prepare_transition_event",
+      "bind_guard_evidence",
+      "bind_effects",
+      "accept_transition_event",
+      "update_projection"
+    ],
+    "rawProjectionUpdateForbidden": true
+  },
+  "stateShape": {
+    "phase": "PhaseV2",
+    "condition": "Condition",
+    "operation": "OperationState",
+    "workflowProfile": "WorkflowProfile",
+    "outcomeMode": "TaskOutcomeMode",
+    "streamVersion": "u64",
+    "workspaceVersion": "u64",
+    "fencingEpoch": "u64",
+    "profileRevision": "u64",
+    "lastTransitionEventId": "TransitionEventId"
+  },
+  "workflowProfiles": [
+    "Quick",
+    "Standard",
+    "HighAssurance",
+    "ReadOnlyResearch"
+  ],
+  "profileRank": {
+    "Quick": 1,
+    "Standard": 2,
+    "HighAssurance": 3
+  },
+  "profileEscalations": [
+    {
+      "from": "Quick",
+      "to": "Standard",
+      "requiredEvidenceKinds": [
+        "risk_reassessment_receipt"
+      ],
+      "requiredEffectKinds": [
+        "persist_profile_revision",
+        "recompute_assurance_requirements"
+      ]
+    },
+    {
+      "from": "Quick",
+      "to": "HighAssurance",
+      "requiredEvidenceKinds": [
+        "risk_reassessment_receipt"
+      ],
+      "requiredEffectKinds": [
+        "persist_profile_revision",
+        "recompute_assurance_requirements"
+      ]
+    },
+    {
+      "from": "Standard",
+      "to": "HighAssurance",
+      "requiredEvidenceKinds": [
+        "risk_reassessment_receipt"
+      ],
+      "requiredEffectKinds": [
+        "persist_profile_revision",
+        "recompute_assurance_requirements"
+      ]
+    }
+  ],
+  "profileDowngradeWithinTaskForbidden": true,
+  "readOnlyResearchWriteConversion": "new_child_task_with_explicit_approval_boundary",
+  "taskOutcomeModes": [
+    "ReadOnlyDeliverable",
+    "WorkspaceChange",
+    "LocalCommit"
+  ],
+  "trustedProfileSelection": {
+    "selectedBy": "trusted_core",
+    "inputs": [
+      "risk",
+      "scope",
+      "policy",
+      "user_override"
+    ],
+    "agentSelectionForbidden": true
+  },
+  "phases": [
+    "Intake",
+    "ContextBuild",
+    "ParallelAnalysis",
+    "CrossReview",
+    "PrePlanVerification",
+    "Synthesis",
+    "FinalObjection",
+    "AwaitingPlanApproval",
+    "Implementation",
+    "Verification",
+    "Repair",
+    "FinalReview",
+    "AwaitingDeliverableApproval",
+    "AwaitingWorkspaceApproval",
+    "AwaitingCommitApproval",
+    "RefPromotion",
+    "WorkspaceDirty",
+    "Completed",
+    "Cancelled",
+    "Failed"
+  ],
+  "terminalPhases": [
+    "Completed",
+    "Cancelled",
+    "Failed"
+  ],
+  "conditions": [
+    "Active",
+    "Paused",
+    "Blocked",
+    "BudgetExhausted"
+  ],
+  "operationStates": [
+    "None",
+    "AwaitingApproval",
+    "Running",
+    "Cancelling",
+    "Indeterminate"
+  ],
+  "phaseTransitions": [
+    {
+      "ruleId": "WF-P001",
+      "from": "Intake",
+      "event": "task.validated",
+      "to": "ContextBuild",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance",
+        "ReadOnlyResearch"
+      ],
+      "allowedOutcomes": [
+        "ReadOnlyDeliverable",
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "trusted_core_selected_profile_outcome_policy_budgets_valid",
+      "requiredEvidenceKinds": [
+        "profile_outcome_policy_budget_receipt"
+      ],
+      "effects": [
+        "persist_risk",
+        "persist_base_identity",
+        "persist_workflow_profile",
+        "persist_outcome_mode"
+      ],
+      "requiredEffectKinds": [
+        "persist_risk",
+        "persist_base_identity",
+        "persist_workflow_profile",
+        "persist_outcome_mode"
+      ]
+    },
+    {
+      "ruleId": "WF-P002",
+      "from": "ContextBuild",
+      "event": "context.initial.ready",
+      "to": "ParallelAnalysis",
+      "allowedProfiles": [
+        "Standard",
+        "HighAssurance",
+        "ReadOnlyResearch"
+      ],
+      "allowedOutcomes": [
+        "ReadOnlyDeliverable",
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "workflow_profile_in(Standard,HighAssurance,ReadOnlyResearch) AND required_context_packages_valid",
+      "requiredEvidenceKinds": [
+        "context_package_set"
+      ],
+      "effects": [
+        "freeze_independent_inputs"
+      ],
+      "requiredEffectKinds": [
+        "freeze_independent_inputs"
+      ]
+    },
+    {
+      "ruleId": "WF-P003",
+      "from": "ContextBuild",
+      "event": "context.initial.ready",
+      "to": "PrePlanVerification",
+      "allowedProfiles": [
+        "Quick"
+      ],
+      "allowedOutcomes": [
+        "ReadOnlyDeliverable",
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "workflow_profile=Quick AND required_context_packages_valid",
+      "requiredEvidenceKinds": [
+        "context_package_set"
+      ],
+      "effects": [
+        "freeze_quick_path_input"
+      ],
+      "requiredEffectKinds": [
+        "freeze_quick_path_input"
+      ]
+    },
+    {
+      "ruleId": "WF-P004",
+      "from": "ParallelAnalysis",
+      "event": "analysis.quorum.reached",
+      "to": "CrossReview",
+      "allowedProfiles": [
+        "Standard",
+        "HighAssurance",
+        "ReadOnlyResearch"
+      ],
+      "allowedOutcomes": [
+        "ReadOnlyDeliverable",
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "profile_specific_independent_result_requirement_met",
+      "requiredEvidenceKinds": [
+        "analysis_quorum_receipt"
+      ],
+      "effects": [
+        "publish_selected_proposals",
+        "assign_review_edges"
+      ],
+      "requiredEffectKinds": [
+        "publish_selected_proposals",
+        "assign_review_edges"
+      ]
+    },
+    {
+      "ruleId": "WF-P005",
+      "from": "CrossReview",
+      "event": "review.complete",
+      "to": "PrePlanVerification",
+      "allowedProfiles": [
+        "Standard",
+        "HighAssurance",
+        "ReadOnlyResearch"
+      ],
+      "allowedOutcomes": [
+        "ReadOnlyDeliverable",
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "review_outputs_or_bounded_stop",
+      "requiredEvidenceKinds": [
+        "review_completion_receipt"
+      ],
+      "effects": [
+        "freeze_material_claims"
+      ],
+      "requiredEffectKinds": [
+        "freeze_material_claims"
+      ]
+    },
+    {
+      "ruleId": "WF-P006",
+      "from": "PrePlanVerification",
+      "event": "claims.checked",
+      "to": "Synthesis",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance",
+        "ReadOnlyResearch"
+      ],
+      "allowedOutcomes": [
+        "ReadOnlyDeliverable",
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "all_material_claims_classified",
+      "requiredEvidenceKinds": [
+        "claim_verification_set"
+      ],
+      "effects": [
+        "persist_claim_verification_set"
+      ],
+      "requiredEffectKinds": [
+        "persist_claim_verification_set"
+      ]
+    },
+    {
+      "ruleId": "WF-P007",
+      "from": "Synthesis",
+      "event": "decision.draft.created",
+      "to": "FinalObjection",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance",
+        "ReadOnlyResearch"
+      ],
+      "allowedOutcomes": [
+        "ReadOnlyDeliverable",
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "decision_schema_and_evidence_valid",
+      "requiredEvidenceKinds": [
+        "decision_draft_artifact"
+      ],
+      "effects": [
+        "publish_immutable_decision_draft"
+      ],
+      "requiredEffectKinds": [
+        "publish_immutable_decision_draft"
+      ]
+    },
+    {
+      "ruleId": "WF-P008",
+      "from": "FinalObjection",
+      "event": "objection.severe.accepted",
+      "to": "CrossReview",
+      "allowedProfiles": [
+        "Standard",
+        "HighAssurance",
+        "ReadOnlyResearch"
+      ],
+      "allowedOutcomes": [
+        "ReadOnlyDeliverable",
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "reopen_criteria_satisfied AND workflow_profile<>Quick",
+      "requiredEvidenceKinds": [
+        "accepted_severe_objection"
+      ],
+      "effects": [
+        "increment_review_round"
+      ],
+      "requiredEffectKinds": [
+        "increment_review_round"
+      ]
+    },
+    {
+      "ruleId": "WF-P009",
+      "from": "FinalObjection",
+      "event": "objection.severe.accepted",
+      "to": "PrePlanVerification",
+      "allowedProfiles": [
+        "Quick"
+      ],
+      "allowedOutcomes": [
+        "ReadOnlyDeliverable",
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "reopen_criteria_satisfied AND workflow_profile=Quick",
+      "requiredEvidenceKinds": [
+        "accepted_severe_objection"
+      ],
+      "effects": [
+        "increment_review_round"
+      ],
+      "requiredEffectKinds": [
+        "increment_review_round"
+      ]
+    },
+    {
+      "ruleId": "WF-P010",
+      "from": "FinalObjection",
+      "event": "deliverable.review.ready",
+      "to": "AwaitingDeliverableApproval",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance",
+        "ReadOnlyResearch"
+      ],
+      "allowedOutcomes": [
+        "ReadOnlyDeliverable"
+      ],
+      "guard": "outcome_mode=ReadOnlyDeliverable AND no_accepted_severe_objection",
+      "requiredEvidenceKinds": [
+        "final_objection_clearance"
+      ],
+      "effects": [
+        "freeze_deliverable_artifact",
+        "freeze_evidence_set",
+        "create_deliverable_approval_request"
+      ],
+      "requiredEffectKinds": [
+        "freeze_deliverable_artifact",
+        "freeze_evidence_set",
+        "create_deliverable_approval_request"
+      ]
+    },
+    {
+      "ruleId": "WF-P011",
+      "from": "AwaitingDeliverableApproval",
+      "event": "deliverable.revision.requested",
+      "to": "Synthesis",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance",
+        "ReadOnlyResearch"
+      ],
+      "allowedOutcomes": [
+        "ReadOnlyDeliverable"
+      ],
+      "guard": "user_feedback_present",
+      "requiredEvidenceKinds": [
+        "user_feedback"
+      ],
+      "effects": [
+        "supersede_deliverable",
+        "invalidate_deliverable_approval"
+      ],
+      "requiredEffectKinds": [
+        "supersede_deliverable",
+        "invalidate_deliverable_approval"
+      ]
+    },
+    {
+      "ruleId": "WF-P012",
+      "from": "AwaitingDeliverableApproval",
+      "event": "deliverable.approved",
+      "to": "Completed",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance",
+        "ReadOnlyResearch"
+      ],
+      "allowedOutcomes": [
+        "ReadOnlyDeliverable"
+      ],
+      "guard": "outcome_mode=ReadOnlyDeliverable AND exact_deliverable_evidence_objections_evaluator_and_user_receipt_bound",
+      "requiredEvidenceKinds": [
+        "deliverable_acceptance_receipt"
+      ],
+      "effects": [
+        "create_read_only_completion_package"
+      ],
+      "requiredEffectKinds": [
+        "create_read_only_completion_package"
+      ]
+    },
+    {
+      "ruleId": "WF-P013",
+      "from": "FinalObjection",
+      "event": "objection.round.closed",
+      "to": "AwaitingPlanApproval",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "outcome_mode IN (WorkspaceChange,LocalCommit) AND no_accepted_severe_objection",
+      "requiredEvidenceKinds": [
+        "final_objection_clearance"
+      ],
+      "effects": [
+        "create_plan_approval_request"
+      ],
+      "requiredEffectKinds": [
+        "create_plan_approval_request"
+      ]
+    },
+    {
+      "ruleId": "WF-P014",
+      "from": "AwaitingPlanApproval",
+      "event": "plan.revision.requested",
+      "to": "Synthesis",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "user_feedback_present",
+      "requiredEvidenceKinds": [
+        "user_feedback"
+      ],
+      "effects": [
+        "supersede_decision_draft"
+      ],
+      "requiredEffectKinds": [
+        "supersede_decision_draft"
+      ]
+    },
+    {
+      "ruleId": "WF-P015",
+      "from": "AwaitingPlanApproval",
+      "event": "plan.approved",
+      "to": "Implementation",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "plan_approval_digest_valid",
+      "requiredEvidenceKinds": [
+        "plan_approval_receipt"
+      ],
+      "effects": [
+        "persist_approved_plan_version",
+        "allocate_executor_lease"
+      ],
+      "requiredEffectKinds": [
+        "persist_approved_plan_version",
+        "allocate_executor_lease"
+      ]
+    },
+    {
+      "ruleId": "WF-P016",
+      "from": "Implementation",
+      "event": "candidate.prepared",
+      "to": "Verification",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "no_in_flight_writes AND outcome_mode IN (WorkspaceChange,LocalCommit)",
+      "requiredEvidenceKinds": [
+        "candidate_commit_receipt"
+      ],
+      "effects": [
+        "revoke_executor_lease",
+        "reconcile_workspace",
+        "create_candidate_tree",
+        "create_complete_candidate_commit",
+        "persist_candidate_tree_oid",
+        "persist_candidate_commit_oid"
+      ],
+      "requiredEffectKinds": [
+        "revoke_executor_lease",
+        "reconcile_workspace",
+        "create_candidate_tree",
+        "create_complete_candidate_commit",
+        "persist_candidate_tree_oid",
+        "persist_candidate_commit_oid"
+      ]
+    },
+    {
+      "ruleId": "WF-P017",
+      "from": "Verification",
+      "event": "verification.failed",
+      "to": "Repair",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "repair_budget_available",
+      "requiredEvidenceKinds": [
+        "verification_failure_receipt"
+      ],
+      "effects": [
+        "discard_candidate_tree",
+        "discard_candidate_commit",
+        "persist_failure_evidence",
+        "allocate_new_executor_token"
+      ],
+      "requiredEffectKinds": [
+        "discard_candidate_tree",
+        "discard_candidate_commit",
+        "persist_failure_evidence",
+        "allocate_new_executor_token"
+      ]
+    },
+    {
+      "ruleId": "WF-P018",
+      "from": "Verification",
+      "event": "verification.passed",
+      "to": "FinalReview",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "required_suite_complete AND verification_cites_candidate_tree_oid_and_candidate_commit_oid",
+      "requiredEvidenceKinds": [
+        "final_commit_verification_receipt"
+      ],
+      "effects": [
+        "freeze_verified_candidate_evidence",
+        "persist_final_commit_verification_receipt"
+      ],
+      "requiredEffectKinds": [
+        "freeze_verified_candidate_evidence",
+        "persist_final_commit_verification_receipt"
+      ]
+    },
+    {
+      "ruleId": "WF-P019",
+      "from": "Repair",
+      "event": "candidate.prepared",
+      "to": "Verification",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "current_fenced_executor_and_scoped_writes",
+      "requiredEvidenceKinds": [
+        "candidate_commit_receipt"
+      ],
+      "effects": [
+        "increment_workspace_version",
+        "revoke_executor_lease",
+        "create_candidate_tree",
+        "create_complete_candidate_commit",
+        "persist_candidate_tree_oid",
+        "persist_candidate_commit_oid"
+      ],
+      "requiredEffectKinds": [
+        "increment_workspace_version",
+        "revoke_executor_lease",
+        "create_candidate_tree",
+        "create_complete_candidate_commit",
+        "persist_candidate_tree_oid",
+        "persist_candidate_commit_oid"
+      ]
+    },
+    {
+      "ruleId": "WF-P020",
+      "from": "FinalReview",
+      "event": "review.changes.required",
+      "to": "Repair",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "review_finding_accepted",
+      "requiredEvidenceKinds": [
+        "accepted_review_finding"
+      ],
+      "effects": [
+        "discard_candidate_tree",
+        "discard_candidate_commit",
+        "invalidate_candidate_verification_receipt",
+        "allocate_new_executor_token"
+      ],
+      "requiredEffectKinds": [
+        "discard_candidate_tree",
+        "discard_candidate_commit",
+        "invalidate_candidate_verification_receipt",
+        "allocate_new_executor_token"
+      ]
+    },
+    {
+      "ruleId": "WF-P021",
+      "from": "FinalReview",
+      "event": "review.accepted",
+      "to": "AwaitingWorkspaceApproval",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "WorkspaceChange"
+      ],
+      "guard": "outcome_mode=WorkspaceChange AND review_cites_candidate_tree_oid_and_candidate_commit_oid",
+      "requiredEvidenceKinds": [
+        "final_review_receipt"
+      ],
+      "effects": [
+        "create_workspace_approval_request"
+      ],
+      "requiredEffectKinds": [
+        "create_workspace_approval_request"
+      ]
+    },
+    {
+      "ruleId": "WF-P022",
+      "from": "AwaitingWorkspaceApproval",
+      "event": "workspace.repair.requested",
+      "to": "Repair",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "WorkspaceChange"
+      ],
+      "guard": "user_feedback_present",
+      "requiredEvidenceKinds": [
+        "user_feedback"
+      ],
+      "effects": [
+        "discard_candidate_tree",
+        "discard_candidate_commit",
+        "invalidate_workspace_approval",
+        "allocate_new_executor_token"
+      ],
+      "requiredEffectKinds": [
+        "discard_candidate_tree",
+        "discard_candidate_commit",
+        "invalidate_workspace_approval",
+        "allocate_new_executor_token"
+      ]
+    },
+    {
+      "ruleId": "WF-P023",
+      "from": "AwaitingWorkspaceApproval",
+      "event": "workspace.approved",
+      "to": "Completed",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "WorkspaceChange"
+      ],
+      "guard": "outcome_mode=WorkspaceChange AND approval_binds_verified_workspace_candidate",
+      "requiredEvidenceKinds": [
+        "workspace_acceptance_receipt"
+      ],
+      "effects": [
+        "create_workspace_completion_package"
+      ],
+      "requiredEffectKinds": [
+        "create_workspace_completion_package"
+      ]
+    },
+    {
+      "ruleId": "WF-P024",
+      "from": "FinalReview",
+      "event": "review.accepted",
+      "to": "AwaitingCommitApproval",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "LocalCommit"
+      ],
+      "guard": "outcome_mode=LocalCommit AND review_cites_candidate_tree_oid_and_candidate_commit_oid",
+      "requiredEvidenceKinds": [
+        "final_review_receipt"
+      ],
+      "effects": [
+        "create_final_commit_approval_request"
+      ],
+      "requiredEffectKinds": [
+        "create_final_commit_approval_request"
+      ]
+    },
+    {
+      "ruleId": "WF-P025",
+      "from": "AwaitingCommitApproval",
+      "event": "commit.repair.requested",
+      "to": "Repair",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "LocalCommit"
+      ],
+      "guard": "user_feedback_present",
+      "requiredEvidenceKinds": [
+        "user_feedback"
+      ],
+      "effects": [
+        "discard_candidate_tree",
+        "discard_candidate_commit",
+        "invalidate_candidate_and_approval",
+        "allocate_new_executor_token"
+      ],
+      "requiredEffectKinds": [
+        "discard_candidate_tree",
+        "discard_candidate_commit",
+        "invalidate_candidate_and_approval",
+        "allocate_new_executor_token"
+      ]
+    },
+    {
+      "ruleId": "WF-P026",
+      "from": "AwaitingCommitApproval",
+      "event": "commit.approved",
+      "to": "RefPromotion",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "LocalCommit"
+      ],
+      "guard": "outcome_mode=LocalCommit AND approval_binds_candidate_commit_oid_and_expected_old_oid",
+      "requiredEvidenceKinds": [
+        "final_commit_approval_receipt"
+      ],
+      "effects": [
+        "persist_final_commit_approval"
+      ],
+      "requiredEffectKinds": [
+        "persist_final_commit_approval"
+      ]
+    },
+    {
+      "ruleId": "WF-P027",
+      "from": "RefPromotion",
+      "event": "ref.cas.succeeded",
+      "to": "Completed",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "LocalCommit"
+      ],
+      "guard": "ref_now_equals_candidate_commit_oid AND expected_old_value_cas_succeeded",
+      "requiredEvidenceKinds": [
+        "ref_promotion_receipt"
+      ],
+      "effects": [
+        "persist_ref_promotion_receipt",
+        "create_local_commit_completion_package"
+      ],
+      "requiredEffectKinds": [
+        "persist_ref_promotion_receipt",
+        "create_local_commit_completion_package"
+      ]
+    },
+    {
+      "ruleId": "WF-P028",
+      "from": "RefPromotion",
+      "event": "ref.cas.failed",
+      "to": "WorkspaceDirty",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "LocalCommit"
+      ],
+      "guard": "ref_or_workspace_diverged",
+      "requiredEvidenceKinds": [
+        "ref_promotion_failure_receipt"
+      ],
+      "effects": [
+        "preserve_candidate_commit",
+        "invalidate_final_commit_approval",
+        "capture_workspace_evidence"
+      ],
+      "requiredEffectKinds": [
+        "preserve_candidate_commit",
+        "invalidate_final_commit_approval",
+        "capture_workspace_evidence"
+      ]
+    },
+    {
+      "ruleId": "WF-P029",
+      "from": "WorkspaceDirty",
+      "event": "workspace.repair.authorized",
+      "to": "Repair",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "mutation_evidence_preserved",
+      "requiredEvidenceKinds": [
+        "workspace_mutation_evidence"
+      ],
+      "effects": [
+        "discard_candidate_tree",
+        "discard_candidate_commit",
+        "allocate_new_executor_token"
+      ],
+      "requiredEffectKinds": [
+        "discard_candidate_tree",
+        "discard_candidate_commit",
+        "allocate_new_executor_token"
+      ]
+    },
+    {
+      "ruleId": "WF-P030",
+      "from": "WorkspaceDirty",
+      "event": "workspace.reconciled",
+      "to": "FinalReview",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance"
+      ],
+      "allowedOutcomes": [
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "candidate_commit_rebuilt_and_verified",
+      "requiredEvidenceKinds": [
+        "workspace_reconciliation_receipt"
+      ],
+      "effects": [
+        "create_candidate_tree",
+        "create_complete_candidate_commit",
+        "persist_final_commit_verification_receipt"
+      ],
+      "requiredEffectKinds": [
+        "create_candidate_tree",
+        "create_complete_candidate_commit",
+        "persist_final_commit_verification_receipt"
+      ]
+    }
+  ],
+  "workspaceDirtyTransition": {
+    "ruleId": "WF-W001",
+    "fromPhases": [
+      "Implementation",
+      "Verification",
+      "Repair",
+      "FinalReview",
+      "AwaitingWorkspaceApproval",
+      "AwaitingCommitApproval",
+      "RefPromotion"
+    ],
+    "event": "workspace.mutated",
+    "to": "WorkspaceDirty",
+    "allowedProfiles": [
+      "Quick",
+      "Standard",
+      "HighAssurance"
+    ],
+    "allowedOutcomes": [
+      "WorkspaceChange",
+      "LocalCommit"
+    ],
+    "guard": "workspace_mutation_detected_and_evidence_preserved",
+    "requiredEvidenceKinds": [
+      "workspace_mutation_evidence"
+    ],
+    "effects": [
+      "revoke_executor_lease",
+      "increment_fencing_epoch",
+      "invalidate_affected_approvals",
+      "discard_candidate_tree",
+      "discard_candidate_commit",
+      "stop_write_capable_tools",
+      "capture_workspace_evidence"
+    ],
+    "requiredEffectKinds": [
+      "revoke_executor_lease",
+      "increment_fencing_epoch",
+      "invalidate_affected_approvals",
+      "discard_candidate_tree",
+      "discard_candidate_commit",
+      "stop_write_capable_tools",
+      "capture_workspace_evidence"
+    ]
+  },
+  "globalPhaseTransitions": [
+    {
+      "ruleId": "WF-G001",
+      "fromPhases": [
+        "Intake",
+        "ContextBuild",
+        "ParallelAnalysis",
+        "CrossReview",
+        "PrePlanVerification",
+        "Synthesis",
+        "FinalObjection",
+        "AwaitingPlanApproval",
+        "Implementation",
+        "Verification",
+        "Repair",
+        "FinalReview",
+        "AwaitingDeliverableApproval",
+        "AwaitingWorkspaceApproval",
+        "AwaitingCommitApproval",
+        "RefPromotion",
+        "WorkspaceDirty"
+      ],
+      "event": "task.cancelled",
+      "to": "Cancelled",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance",
+        "ReadOnlyResearch"
+      ],
+      "allowedOutcomes": [
+        "ReadOnlyDeliverable",
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "cancellation_authority_and_terminal_cleanup_valid",
+      "requiredEvidenceKinds": [
+        "cancellation_receipt"
+      ],
+      "effects": [
+        "revoke_executor_lease",
+        "stop_active_runs",
+        "persist_terminal_reason"
+      ],
+      "requiredEffectKinds": [
+        "revoke_executor_lease",
+        "stop_active_runs",
+        "persist_terminal_reason"
+      ]
+    },
+    {
+      "ruleId": "WF-G002",
+      "fromPhases": [
+        "Intake",
+        "ContextBuild",
+        "ParallelAnalysis",
+        "CrossReview",
+        "PrePlanVerification",
+        "Synthesis",
+        "FinalObjection",
+        "AwaitingPlanApproval",
+        "Implementation",
+        "Verification",
+        "Repair",
+        "FinalReview",
+        "AwaitingDeliverableApproval",
+        "AwaitingWorkspaceApproval",
+        "AwaitingCommitApproval",
+        "RefPromotion",
+        "WorkspaceDirty"
+      ],
+      "event": "task.failed",
+      "to": "Failed",
+      "allowedProfiles": [
+        "Quick",
+        "Standard",
+        "HighAssurance",
+        "ReadOnlyResearch"
+      ],
+      "allowedOutcomes": [
+        "ReadOnlyDeliverable",
+        "WorkspaceChange",
+        "LocalCommit"
+      ],
+      "guard": "failure_classification_and_terminal_cleanup_valid",
+      "requiredEvidenceKinds": [
+        "failure_receipt"
+      ],
+      "effects": [
+        "revoke_executor_lease",
+        "stop_active_runs",
+        "persist_terminal_reason"
+      ],
+      "requiredEffectKinds": [
+        "revoke_executor_lease",
+        "stop_active_runs",
+        "persist_terminal_reason"
+      ]
+    }
+  ],
+  "conditionTransitions": [
+    {
+      "from": "Active",
+      "event": "task.paused",
+      "to": "Paused",
+      "guard": "phase_nonterminal"
+    },
+    {
+      "from": "Paused",
+      "event": "task.resumed",
+      "to": "Active",
+      "guard": "policy_budget_workspace_and_lease_valid"
+    },
+    {
+      "from": "Active",
+      "event": "task.blocked",
+      "to": "Blocked",
+      "guard": "blocking_reason_persisted"
+    },
+    {
+      "from": "Blocked",
+      "event": "task.unblocked",
+      "to": "Active",
+      "guard": "blocking_condition_cleared"
+    },
+    {
+      "from": "Active",
+      "event": "budget.exhausted",
+      "to": "BudgetExhausted",
+      "guard": "budget_authority_confirmed"
+    },
+    {
+      "from": "BudgetExhausted",
+      "event": "budget.extended",
+      "to": "Active",
+      "guard": "trusted_budget_extension_receipt"
+    }
+  ]
+}

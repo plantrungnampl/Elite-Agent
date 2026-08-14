@@ -1,0 +1,41 @@
+{
+  "proposalId": "mp1",
+  "projectId": "p1",
+  "originTaskId": "t1",
+  "originRunId": "r1",
+  "memoryType": "negative",
+  "contentArtifactId": "a-memory-1",
+  "applicability": {
+    "summary": "QRQC warning-close mappings that filter by NUM",
+    "scope": {
+      "kind": "project",
+      "id": "p1"
+    },
+    "systems": [
+      "qrqc"
+    ],
+    "taskClasses": [
+      "bug-fix"
+    ],
+    "repositoryRevisionConstraints": [
+      "applies while warning identity remains NUM"
+    ]
+  },
+  "evidence": [
+    {
+      "sourceId": "a-tool-1",
+      "sourceRevision": "receipt-1",
+      "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sourceKind": "tool-receipt",
+      "locator": {
+        "test": "close-warning"
+      }
+    }
+  ],
+  "confidenceMillionths": 950000,
+  "invalidationConditions": [
+    "The QRQC data model no longer uses NUM for warning identity"
+  ],
+  "expiresAt": null,
+  "sensitivity": "internal-code"
+}

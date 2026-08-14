@@ -333,7 +333,10 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
     let coordinator = PreApprovalCoordinator::new(
         &authority,
         &boundaries,
-        &database,
+        bootstrap
+            .deliberation_runtime()
+            .and_then(local_agent_terminal_bootstrap::DeliberationRuntime::workflow_authority)
+            .expect("production workflow authority"),
         &tools,
         &dispatches,
         agents.as_ref(),
@@ -425,7 +428,11 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
     assert_eq!(message_count(&fixture.database(), None), 0);
     let openai_output = private_run_output(&fixture.database(), &openai_request.run_id);
     let anthropic_output = private_run_output(&fixture.database(), &anthropic_request.run_id);
-    let commands = DeliberationCommands::new(&database);
+    let workflow_authority = bootstrap
+        .deliberation_runtime()
+        .and_then(local_agent_terminal_bootstrap::DeliberationRuntime::workflow_authority)
+        .expect("production workflow authority");
+    let commands = DeliberationCommands::with_workflow_authority(&database, workflow_authority);
     let first_snapshot = database.load(&task_id).expect("parallel snapshot");
     commands
         .record_private_proposal(
@@ -904,9 +911,9 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
         agent_id: LEAD_CONTEXT.agent_id.to_owned(),
         agent_manifest_digest: OPENAI_MANIFEST_DIGEST.to_owned(),
         actor_id: "approver-1".to_owned(),
-        task_version: approval_snapshot.task_version + 1,
+        task_version: approval_snapshot.task_state.sequence().get() + 1,
         workspace_version: approval_snapshot.task_state.workspace_version().get(),
-        fencing_epoch: approval_snapshot.task_state.fencing_token().get() + 1,
+        fencing_epoch: approval_snapshot.task_state.fencing_epoch() + 1,
         requested_at: "2026-01-01T00:00:00Z".to_owned(),
         expires_at: "2099-01-01T00:00:00Z".to_owned(),
     };
@@ -926,7 +933,7 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
         "objection-round-close-1",
         br#"{"round":2,"schema":"m4-objection-round-close.v1"}"#,
     );
-    DeliberationCommands::with_plan_approval_authority(&database, &approval_authority)
+    DeliberationCommands::with_authorities(&database, workflow_authority, &approval_authority)
         .close_objection_round(
             command_context(
                 &approval_snapshot,
@@ -955,7 +962,7 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
     let stale_resolution = ResolvePlanApprovalInput {
         approval_id: approval.approval_id().clone(),
         displayed_digest: digest_bytes(b"stale displayed digest"),
-        expected_task_version: awaiting.task_version,
+        expected_task_version: awaiting.task_state.sequence().get(),
         actor_id: ActorId::new("approver-1").expect("approver actor"),
         action: PlanApprovalAction::Approve,
         feedback: None,
@@ -974,7 +981,7 @@ fn heterogeneous_loopback_proposals_remain_private_until_quorum_publication() {
     let exact_resolution = ResolvePlanApprovalRequestDto {
         approval_id: approval.approval_id().as_str().to_owned(),
         displayed_digest: approval.operation_digest().as_str().to_owned(),
-        expected_task_version: awaiting.task_version,
+        expected_task_version: awaiting.task_state.sequence().get(),
         actor_id: "approver-1".to_owned(),
         action: PlanApprovalAction::Approve,
         feedback: None,
@@ -1452,7 +1459,7 @@ fn proposal_run_request(
             executable_digest: Some(
                 Sha256Digest::new(CORE_RELEASE_DIGEST).expect("release digest"),
             ),
-            contract_version: "1.0".to_owned(),
+            contract_version: "2.0".to_owned(),
             adapter_version: provider.adapter_version.to_owned(),
             provider_id: provider.provider_id.to_owned(),
             model_id: provider.model_id.to_owned(),
@@ -1485,7 +1492,7 @@ fn bound_connection(provider: &ProviderRunBinding) -> BoundAgentConnection {
         trust_tier: TrustTier::CoreAdapter,
         manifest_digest: Sha256Digest::new(provider.manifest_digest).expect("manifest digest"),
         executable_digest: Some(Sha256Digest::new(CORE_RELEASE_DIGEST).expect("release digest")),
-        contract_version: "1.0".to_owned(),
+        contract_version: "2.0".to_owned(),
         adapter_version: provider.adapter_version.to_owned(),
         binding_digest: Sha256Digest::new(
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

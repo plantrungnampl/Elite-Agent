@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": "core:30",
+  "method": "agent.run.cancel",
+  "params": {
+    "runId": "run-238",
+    "reason": "user_cancelled"
+  }
+}

@@ -6,13 +6,14 @@ use std::path::{Path, PathBuf};
 
 use git2::{IndexAddOption, Repository, RepositoryInitOptions, Signature};
 use local_agent_terminal_application::{
-    canonical_approval_payload, AcquireLease, ApprovalDigestPayload, ApprovalId, ApprovalStore,
-    ArtifactRootMode, ArtifactWriteReservation, CanonicalEvidenceRef, CanonicalJsonRequest, Clock,
-    ConfirmDiscardWorkspaceRequestDto, CreateWorktree, DiscardWorktree, ExecutorLeaseStore,
-    ExpectedPresence, IdempotencyClass, InspectRepository, IntentTransition, ManagedWorktreePath,
-    NewApproval, NewProject, NewTask, OnboardRepositoryRequestDto, OperationIntent,
-    OperationIntentStatus, PolicyExceptionApprovalOperationV1, PolicyExceptionApprovalPayloadV1,
-    PortError, ProjectSettings, RecoveryAction, RecoveryCandidateRequestDto, RecoveryReason,
+    canonical_approval_payload, select_initial_workflow, AcquireLease, ApprovalDigestPayload,
+    ApprovalId, ApprovalStore, ArtifactRootMode, ArtifactWriteReservation, CanonicalEvidenceRef,
+    CanonicalJsonRequest, Clock, ConfirmDiscardWorkspaceRequestDto, CreateWorktree,
+    DiscardWorktree, ExecutorLeaseStore, ExpectedPresence, IdempotencyClass, InspectRepository,
+    IntentTransition, ManagedWorktreePath, NewApproval, NewProject, NewTask,
+    OnboardRepositoryRequestDto, OperationIntent, OperationIntentStatus,
+    PolicyExceptionApprovalOperationV1, PolicyExceptionApprovalPayloadV1, PortError,
+    ProjectSettings, RecoveryAction, RecoveryCandidateRequestDto, RecoveryReason,
     RepositoryGateway, RepositoryInspectionRecord, ReservedArtifact, RiskLevel,
     SafeErrorClassification, StartupStateDto, TaskQuery, WorkspaceDashboardRequestDto,
     WorkspaceRecoveryStore, WorkspaceStateStore, WorktreeIntent, WorktreeState,
@@ -20,7 +21,7 @@ use local_agent_terminal_application::{
 use local_agent_terminal_bootstrap::{Bootstrap, StartupConfig, ToolRuntimeAvailability};
 use local_agent_terminal_domain::{
     ActorId, ArtifactId, FencingToken, LeaseClaim, ProjectId, RunId, Sha256Digest, TaskBranch,
-    TaskId, WorkspaceVersion, WorktreeId,
+    TaskId, TaskOutcomeMode, WorkspaceVersion, WorktreeId,
 };
 use local_agent_terminal_repository_git::GitRepositoryGateway;
 use local_agent_terminal_storage_files::{ContentAddressedArtifactStore, JournaledArtifactWriter};
@@ -1068,6 +1069,12 @@ impl WorkspaceFixture {
                 risk_level: RiskLevel::High,
                 base_branch: repository.default_branch.clone().expect("default branch"),
                 base_commit: repository.base_commit.clone().expect("base commit"),
+                initial_workflow: select_initial_workflow(
+                    RiskLevel::High,
+                    TaskOutcomeMode::WorkspaceChange,
+                    "default",
+                )
+                .expect("initial workflow"),
                 created_at: "2026-07-26T00:00:02Z".to_owned(),
             })
             .expect("task");

@@ -1,0 +1,36 @@
+{
+  "schema": "approval-digest.v2",
+  "approvalType": "final_commit",
+  "taskId": "task-1",
+  "operationIntentId": "intent-commit-1",
+  "actorBindingDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "operation": {
+    "repositoryIdentityDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "baseCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "expectedRef": "refs/heads/task/task-1",
+    "expectedOldRefValue": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "candidateTree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "candidateCommitOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "plan": {
+      "id": "plan-1",
+      "version": 1,
+      "contentDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "verificationSetDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "reviewArtifactDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "commit": {
+      "messageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "authorIdentityRef": "user-1",
+      "authorTimestamp": "2026-08-04T08:00:00Z",
+      "committerIdentityRef": "core-1",
+      "committerTimestamp": "2026-08-04T08:00:00Z",
+      "hookPolicy": "disabled_exact_object"
+    },
+    "executorFencingEpoch": 1
+  },
+  "policySnapshotDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "workspaceVersion": 1,
+  "requestedAt": "2026-08-04T08:00:00Z",
+  "expiresAt": "2026-08-04T08:15:00Z",
+  "nonce": "abcdefghijklmnopqrstuvwxyzABCDEF"
+}

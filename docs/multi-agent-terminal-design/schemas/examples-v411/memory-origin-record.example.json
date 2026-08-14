@@ -1,0 +1,16 @@
+{
+  "originRecordId": "memory-origin-1",
+  "memoryId": "memory-negative-1",
+  "projectId": "p1",
+  "originKind": "model_generated",
+  "originActorKind": "agent",
+  "originActorId": "agent-specialist-1",
+  "originActorBindingDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "evidence": {
+    "sourceId": "artifact-memory-origin-1",
+    "sourceRevision": "artifact:v1",
+    "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sourceKind": "artifact"
+  },
+  "createdAt": "2026-08-06T02:10:00Z"
+}

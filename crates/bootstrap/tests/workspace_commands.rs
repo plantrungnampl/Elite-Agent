@@ -2,9 +2,9 @@ use std::fs;
 
 use git2::{IndexAddOption, Repository, Signature};
 use local_agent_terminal_application::{
-    CreateTaskWorkspaceRequestDto, NewTask, OnboardRepositoryRequestDto, ProjectId, RecoveryReason,
-    RiskLevel, TaskId, TaskLeaseState, WorkspaceDashboardRequestDto, WorkspaceStateStore,
-    WorktreeState,
+    select_initial_workflow, CreateTaskWorkspaceRequestDto, NewTask, OnboardRepositoryRequestDto,
+    ProjectId, RecoveryReason, RiskLevel, TaskId, TaskLeaseState, TaskOutcomeMode,
+    WorkspaceDashboardRequestDto, WorkspaceStateStore, WorktreeState,
 };
 use local_agent_terminal_bootstrap::{Bootstrap, StartupConfig};
 use local_agent_terminal_storage_sqlite::SqliteStore;
@@ -151,6 +151,12 @@ fn exact_retry_resumes_after_the_task_record_but_before_the_worktree_intent() {
             risk_level: RiskLevel::High,
             base_branch: project.repository.default_branch.unwrap(),
             base_commit: project.repository.base_commit.unwrap(),
+            initial_workflow: select_initial_workflow(
+                RiskLevel::High,
+                TaskOutcomeMode::WorkspaceChange,
+                "default",
+            )
+            .unwrap(),
             created_at: "2026-07-26T00:00:00Z".to_owned(),
         })
         .unwrap();

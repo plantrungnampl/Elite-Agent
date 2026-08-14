@@ -1054,8 +1054,7 @@ fn validate_current_binding(current: &PlanApprovalCurrentState) -> Result<(), Po
     if current.phase != current.task_state.phase()
         || current.task_state.sequence().get() != current.binding.task_version
         || current.task_state.workspace_version().get() != current.binding.workspace_version
-        || current.task_state.fencing_token().get().checked_add(1)
-            != Some(current.binding.fencing_epoch)
+        || current.task_state.fencing_epoch().checked_add(1) != Some(current.binding.fencing_epoch)
         || current.task_state.phase() != Phase::AwaitingPlanApproval
         || current.binding.task_id.trim().is_empty()
     {

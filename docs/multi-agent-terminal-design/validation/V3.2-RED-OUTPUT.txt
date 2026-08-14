@@ -1,0 +1,29 @@
+FAIL schema_migration_update_forbidden - unsafe operation succeeded
+FAIL schema_migration_delete_forbidden - unsafe operation succeeded
+FAIL artifact_task_project_mismatch_rejected - unsafe operation succeeded
+FAIL artifact_identity_immutable - unsafe operation succeeded
+FAIL available_artifact_direct_delete_rejected - unsafe operation succeeded
+FAIL artifact_cross_scope_supersession_rejected - unsafe operation succeeded
+FAIL operation_intent_cross_task_scope_rejected - unsafe operation succeeded
+FAIL operation_intent_delete_forbidden - unsafe operation succeeded
+FAIL attempt_counter_requires_existing_attempt - unsafe operation succeeded
+FAIL policy_decision_update_forbidden - unsafe operation succeeded
+FAIL policy_decision_delete_forbidden - unsafe operation succeeded
+FAIL context_policy_cross_task_rejected - unsafe operation succeeded
+FAIL required_approval_cannot_be_omitted - unsafe operation succeeded
+FAIL expired_policy_cannot_authorize_attempt - unsafe operation succeeded
+FAIL attempt_cross_task_evidence_rejected - unsafe operation succeeded
+FAIL tool_cross_task_arguments_rejected - unsafe operation succeeded
+FAIL tool_must_use_attempt_policy - unsafe operation succeeded
+FAIL tool_terminal_status_irreversible - unsafe operation succeeded
+FAIL tool_output_evidence_set_once - unsafe operation succeeded
+FAIL tool_execution_delete_forbidden - unsafe operation succeeded
+FAIL protocol_completed_insert_requires_response - unsafe operation succeeded
+FAIL approval_request_artifact_scope_rejected - unsafe operation succeeded
+FAIL approval_credential_artifact_scope_rejected - unsafe operation succeeded
+FAIL expired_approval_cannot_receive_grant - unsafe operation succeeded
+FAIL final_commit_consumption_exact_tuple_enforced - unsafe operation succeeded
+FAIL artifact_operation_identity_immutable - unsafe operation succeeded
+FAIL artifact_operation_delete_forbidden - unsafe operation succeeded
+
+0/27 v3.2 hardening checks passed

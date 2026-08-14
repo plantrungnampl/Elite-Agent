@@ -105,9 +105,12 @@ must verify before reuse.
 | `intent` | Valid final object | Complete metadata |
 | `intent` | Invalid bytes | Quarantine and fail |
 | `completed` | Valid object | Healthy |
-| `completed` | Missing/invalid object | Mark artifact unavailable; block consumers; restore or fail |
+| `completed` | Missing/invalid object | Mark artifact `missing`; block consumers; restore and reverify or fail |
 
-Artifact consumers verify expected hash and availability before reading.
+Artifact consumers verify expected hash and availability before reading. A
+`missing` artifact may return to `available` only after byte identity is
+reverified. `quarantined` is terminal in place; recovered content is recorded as
+a new artifact identity rather than reviving quarantined bytes.
 
 ## 6. Child-process protocol
 
@@ -191,15 +194,21 @@ Startup proceeds in this order:
 3. inspect update/migration journal;
 4. validate artifact roots and free disk reserve;
 5. reconcile artifact operations;
-6. rebuild or validate critical projections;
-7. fence stale executor leases;
-8. inspect Job Objects/process records and terminate unauthorized survivors;
-9. reconcile Git repositories and worktrees;
-10. reconcile external operation intents;
-11. validate open approvals against current canonical inputs;
-12. mark vector/graph indexes degraded until freshness checks complete;
-13. expose task state to the UI;
-14. release dispatch only after recovery completes.
+6. inspect open `retrieval_sessions` and sidecar/process traces;
+7. rebuild or validate critical projections;
+8. fence stale executor leases;
+9. inspect Job Objects/process records and terminate unauthorized survivors;
+10. reconcile Git repositories and worktrees;
+11. reconcile external operation intents;
+12. validate open approvals against current canonical inputs;
+13. mark vector/graph indexes degraded until freshness checks complete;
+14. expose task state to the UI;
+15. release dispatch only after recovery completes.
+
+For each retrieval row still `running`, the reconciler may record a proved
+terminal outcome. If the outcome cannot be proved, it writes a task-scoped exact
+trace artifact and sets `status = 'indeterminate'`; it never guesses success or
+safe retry. An `indeterminate` row is retained and terminal; retry creates a new retrieval session linked through application trace metadata rather than rewriting the uncertain receipt.
 
 Recovery actions are themselves events and operation records.
 
@@ -274,3 +283,11 @@ Test environments inject:
 - unexpected Git refs or worktrees are preserved, not overwritten;
 - update rollback restores a compatible whole state;
 - recovery never reports success without authoritative evidence.
+
+## 14. v3 intent/attempt evidence model
+
+A logical operation intent answers *what effect is authorized*. An operation attempt answers *which dispatch crossed or may have crossed the external boundary*. Attempt number starts at one and increases exactly by one. At most one attempt is active.
+
+Attempt identity fields are immutable. Boundary time, terminal time, result artifact, receipt artifact, and error artifact are set-once. A late completion may terminalize only its exact attempt and may update the aggregate only if that attempt remains current under compare-and-set.
+
+For `non_repeatable`, a durable `started` attempt without proof of external absence becomes `indeterminate` and receives zero automatic retry. Cancellation after the effect commit point does not erase or relabel the receipt. Reconciliation preserves all conflicting observations and never chooses the latest row by convenience.

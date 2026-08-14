@@ -1,0 +1,28 @@
+{
+  "reflectionId": "rf1",
+  "projectId": "p1",
+  "taskId": "t1",
+  "runId": "r1",
+  "observedOutcome": "succeeded",
+  "failedAssumptions": [
+    "The Vue page owned the close operation"
+  ],
+  "usefulEvidence": [
+    {
+      "sourceId": "a-test-1",
+      "sourceRevision": "receipt-1",
+      "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sourceKind": "tool-receipt",
+      "locator": {
+        "test": "warning-close"
+      }
+    }
+  ],
+  "wastedActions": [
+    "Inspected unrelated Vue state before locating the Web Forms handler"
+  ],
+  "proposedLessons": [
+    "Check SQL predicate fields against form-to-model assignments"
+  ],
+  "remainingUncertainty": []
+}

@@ -1,47 +1,38 @@
-# Machine-Readable Contracts
+# Machine-Readable Contracts v4.3
 
-## Contents
+## Current authority
 
-- `agent-protocol.v1.schema.json`: JSON-RPC frame and payload contract;
-- `approval-digest.v1.schema.json`: canonical authorization payload contract;
-- `workflow-transitions.v1.json`: allowed phase, condition, and operation
-  transitions;
-- `sqlite-v1.sql`: normative SQLite schema, constraints, indexes, and triggers;
-- `examples/`: schema-valid request and approval fixtures.
+- `sqlite-v7.sql` — authoritative clean install.
+- `migrate-v6-to-v7.sql` — exact additive v4.2-to-v4.3 migration plus workflow-trigger replacement.
+- `workflow-transitions.v3.json` — versioned event/profile/outcome/guard/effect rules.
+- `workflow-transition-command.v1.schema.json` — immutable reducer-command artifact.
+- `agent-protocol.v2.schema.json` — MAT Agent Control Protocol v2 closed core and bounded extensions.
+- `run-configuration.v1.schema.json` — reconstructible provider/model/adapter/policy/budget/fallback/independence snapshot with credentials excluded.
+- `assurance-degradation-receipt.v1.schema.json` — explicit degraded-assurance decision.
+- `cognitive-memory.v4.schema.json` — current cognitive payload authority.
+- `orchestration-benchmark-suite.v1.schema.json`, `orchestration-benchmark-run-receipt.v1.schema.json`, `orchestration-benchmark-case-result.v1.schema.json`, and `orchestration-benchmark-comparison-report.v1.schema.json` — equal-budget product proof.
+- `benchmark-suite.v3.schema.json` and related v4.2 receipts — context/memory treatment benchmark.
+- `product-traceability.v1.schema.json` and `product-traceability.v43.json` — all current FR/NFR mappings and proof boundaries.
+- approval, actor-binding, and credential-challenge v2/v1 schemas remain current where not superseded.
 
-## Authority
+## Canonical examples
 
-When prose and a machine-readable contract disagree:
+- `examples-v2/` contains protocol/approval v2 fixtures. Every complete JSON-RPC frame in `03-agent-protocol.md` is annotated and structurally identical to its fixture.
+- `examples-v43/` contains workflow command, run configuration, assurance, orchestration benchmark, and traceability examples.
 
-1. security invariants fail closed;
-2. the versioned machine contract governs serialization or persistence;
-3. the discrepancy is a design defect and must be corrected before release.
+## Historical contracts
 
-Schemas do not grant permission. A schema-valid request still requires identity
-binding, workflow guards, current policy, approval, budget, and fencing checks.
+- `sqlite-v3.sql` — authoritative v4.0 clean-install contract.
+- `sqlite-v4.sql` — authoritative v4.1 clean-install contract.
+- `sqlite-v5.sql` — authoritative v4.1.1 clean-install contract.
+- `sqlite-v6.sql` — authoritative v4.2 clean-install contract.
 
-## Versioning
+SQLite v1-v6, workflow v1-v2, cognitive v1-v3, and earlier benchmark schemas remain immutable migration and regression inputs. They must not be silently selected for new v4.3 records.
 
-- incompatible changes create a new major schema file;
-- additive optional fields may create a minor protocol/schema version;
-- event payloads use independent versions and upcasters;
-- SQLite migrations are forward-only expand/contract steps;
-- old files remain in the compatibility suite for the declared support window.
+## Validation
 
-## Validation expectations
+```bash
+python validation/validate_package.py
+```
 
-CI shall:
-
-- compile both JSON Schemas with a Draft 2020-12 validator and format support;
-- validate every file in `examples/`;
-- parse and apply `sqlite-v1.sql` to a new database;
-- run `PRAGMA integrity_check` and `PRAGMA foreign_key_check`;
-- exercise contiguous event sequence and fencing-token triggers;
-- verify every transition references a declared state and has a unique
-  `(from, event)` key;
-- compare implementation transition coverage with
-  `workflow-transitions.v1.json`.
-
-The migration runner records the real migration checksum and authoritative
-application time after the schema transaction succeeds. Those values are not
-hard-coded into `sqlite-v1.sql`.
+The package runner executes historical regressions, v4.3 authority tests, JSON/schema/example checks, protocol fixture identity, v7 clean/migration parity, Markdown links, traceability, and placeholder hygiene.

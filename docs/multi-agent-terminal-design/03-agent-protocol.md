@@ -1,6 +1,8 @@
-# Open Agent Protocol v1
+# MAT Agent Control Protocol v2
 
 ## 1. Purpose and trust model
+
+The internal protocol was previously called “Open Agent Protocol.” v4.3 uses the collision-free name **MAT Agent Control Protocol (MACP)**; method names and wire compatibility remain unchanged.
 
 The protocol lets a provider adapter or external agent participate without
 linking provider-specific behavior into application use cases. The protocol is
@@ -13,8 +15,8 @@ capabilities. An agent-supplied ID, timestamp, cost, tool result, or claim is
 untrusted until the core records or verifies it.
 
 The machine-readable payload contract is
-[`schemas/agent-protocol.v1.schema.json`](schemas/agent-protocol.v1.schema.json).
-Schema-valid fixtures are in [`schemas/examples`](schemas/examples).
+[`schemas/agent-protocol.v2.schema.json`](schemas/agent-protocol.v2.schema.json).
+Schema-valid fixtures are in [`schemas/examples-v2`](schemas/examples-v2).
 
 ## 2. Transport profile
 
@@ -63,59 +65,48 @@ confirms the corresponding request; it is not a workflow transition.
 
 ### 4.1 Core request
 
+<!-- protocol-schema:initializeRequest fixture=schemas/examples-v2/protocol-initialize.request.json -->
 ```json
 {
   "jsonrpc": "2.0",
   "id": "core:1",
   "method": "initialize",
   "params": {
-    "protocolVersions": ["1.0"],
-    "client": {
-      "name": "local-agent-terminal",
-      "version": "0.2.0"
-    },
-    "transport": {
-      "type": "stdio-ndjson",
-      "maxFrameBytes": 8388608
-    },
-    "features": [
-      "streaming",
-      "context-query",
-      "tool-request",
-      "specialist-request"
+    "protocolVersions": [
+      "2.0"
     ],
-    "launchBinding": {
-      "connectionId": "conn-71",
-      "manifestDigest": "sha256:...",
-      "executableDigest": "sha256:...",
-      "trustTier": "brokered_process"
-    }
+    "capabilities": [
+      "agent.stream.delta",
+      "context.query",
+      "tool.request",
+      "specialist.request"
+    ],
+    "connectionBindingDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   }
 }
 ```
 
 ### 4.2 Agent response
 
+<!-- protocol-schema:initializeResponse fixture=schemas/examples-v2/protocol-initialize.response.json -->
 ```json
 {
   "jsonrpc": "2.0",
   "id": "core:1",
   "result": {
-    "protocolVersion": "1.0",
-    "agent": {
-      "id": "qwen-coder-local",
-      "displayName": "Qwen Coder Local",
-      "implementationVersion": "0.4.0"
-    },
-    "capabilities": {
-      "roles": ["analyst", "critic", "executor", "reviewer"],
-      "skills": ["code-analysis", "implementation", "testing"],
-      "streaming": true,
-      "contextQuery": true,
-      "toolRequests": true,
-      "specialistRequests": true,
-      "maxConcurrentRuns": 1,
-      "maxContextTokens": 32768
+    "protocolVersion": "2.0",
+    "capabilities": [
+      "agent.stream.delta",
+      "context.query",
+      "tool.request",
+      "specialist.request"
+    ],
+    "connectionId": "conn-71",
+    "limits": {
+      "maxFrameBytes": 8388608,
+      "maxPendingRequests": 128,
+      "streamHighWatermark": 512,
+      "streamLowWatermark": 256
     }
   }
 }
@@ -127,13 +118,13 @@ by policy but never expanded by handshake.
 
 After validation the core emits:
 
+<!-- protocol-schema:initializedNotification fixture=schemas/examples-v2/protocol-initialized.notification.json -->
 ```json
 {
   "jsonrpc": "2.0",
   "method": "initialized",
   "params": {
-    "connectionId": "conn-71",
-    "effectiveCapabilitiesDigest": "sha256:..."
+    "connectionId": "conn-71"
   }
 }
 ```
@@ -187,6 +178,7 @@ sequenceDiagram
 `agent.run.start` returns promptly. It does not keep one JSON-RPC request open
 for the duration of the model run.
 
+<!-- protocol-schema:runStartRequest fixture=schemas/examples-v2/protocol-run-start.request.json -->
 ```json
 {
   "jsonrpc": "2.0",
@@ -194,40 +186,26 @@ for the duration of the model run.
   "method": "agent.run.start",
   "params": {
     "runId": "run-238",
-    "idempotencyKey": "task-1:analysis:qwen:1",
     "taskId": "task-1",
-    "role": "critic",
-    "objective": "Review the authentication proposal for security and codebase fit.",
-    "contextPackage": {
-      "packageId": "ctx-501",
-      "contentDigest": "sha256:...",
-      "manifestRef": "artifact:ctx-501",
-      "inlineSummary": "..."
-    },
-    "permissions": {
-      "contextQuery": true,
-      "toolRequest": true,
-      "writeFiles": false
-    },
-    "responseSchema": "agent-message.v1",
-    "limits": {
-      "deadline": "2026-07-23T13:30:00Z",
-      "maxOutputTokens": 8000,
-      "maxToolRequests": 8
-    }
+    "contextPackageRef": "ctx-501",
+    "idempotencyKey": "task-1:analysis:qwen:1",
+    "role": "critic"
   }
 }
 ```
 
+The immutable `contextPackageRef` and `RunConfiguration v1` binding carry the objective, effective permissions, provider/model snapshot, response schema, deadline, and budgets; those fields are not duplicated in the closed v2 frame.
+
 Acceptance:
 
+<!-- protocol-schema:runStartResponse fixture=schemas/examples-v2/protocol-run-start.response.json -->
 ```json
 {
   "jsonrpc": "2.0",
   "id": "core:8",
   "result": {
-    "accepted": true,
-    "runId": "run-238"
+    "runId": "run-238",
+    "accepted": true
   }
 }
 ```
@@ -239,6 +217,7 @@ unrecoverable model generation.
 
 ## 7. Streaming
 
+<!-- protocol-schema:streamDeltaNotification fixture=schemas/examples-v2/protocol-stream-delta.notification.json -->
 ```json
 {
   "jsonrpc": "2.0",
@@ -266,6 +245,7 @@ potentially malformed final result.
 Because the agent expects a result, `context.query` is a JSON-RPC request and
 must include `id`.
 
+<!-- protocol-schema:contextQueryRequest fixture=schemas/examples-v2/protocol-context-query.request.json -->
 ```json
 {
   "jsonrpc": "2.0",
@@ -275,7 +255,11 @@ must include `id`.
     "runId": "run-238",
     "queryId": "cq-12",
     "query": "Previous verified decisions about authentication persistence",
-    "scopes": ["project-memory", "decisions", "repository"],
+    "scopes": [
+      "project-memory",
+      "decisions",
+      "repository"
+    ],
     "maxItems": 12,
     "maxTokens": 8000
   }
@@ -284,17 +268,27 @@ must include `id`.
 
 The response returns an immutable supplement:
 
+<!-- protocol-schema:contextQueryResponse fixture=schemas/examples-v2/protocol-context-query.response.json -->
 ```json
 {
   "jsonrpc": "2.0",
   "id": "agent:12",
   "result": {
-    "supplementId": "ctx-supp-44",
-    "contentDigest": "sha256:...",
-    "items": [],
-    "provenance": [],
-    "redactions": [],
-    "policyDecisionIds": ["pol-41", "pol-42"]
+    "queryId": "cq-12",
+    "items": [
+      {
+        "itemId": "ctx-item-44",
+        "contentRef": "artifact:ctx-supp-44:item-1",
+        "contentDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sourceRefs": [
+          "decision:auth-persistence-v3"
+        ],
+        "observationClass": "core_observed"
+      }
+    ],
+    "truncated": false,
+    "effectivePayloadDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "redactionReportDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
   }
 }
 ```
@@ -304,6 +298,7 @@ content remain mediated and scoped to the run.
 
 ## 9. Tool requests
 
+<!-- protocol-schema:toolRequest fixture=schemas/examples-v2/protocol-tool.request.json -->
 ```json
 {
   "jsonrpc": "2.0",
@@ -318,6 +313,7 @@ content remain mediated and scoped to the run.
     "arguments": {
       "path": "src/auth"
     },
+    "argumentsDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "reason": "Verify whether the proposed change matches the approved scope"
   }
 }
@@ -356,6 +352,7 @@ Process execution uses structured arguments:
 
 ## 10. Specialist requests
 
+<!-- protocol-schema:specialistRequest fixture=schemas/examples-v2/protocol-specialist.request.json -->
 ```json
 {
   "jsonrpc": "2.0",
@@ -363,9 +360,13 @@ Process execution uses structured arguments:
   "method": "specialist.request",
   "params": {
     "runId": "run-238",
+    "requestId": "specialist-91",
     "capability": "database-migration-review",
     "reason": "The proposal introduces a new token-family table.",
-    "requiredContext": ["artifact:proposal-3", "source:schema.sql"]
+    "requiredContext": [
+      "artifact:proposal-3",
+      "source:schema.sql"
+    ]
   }
 }
 ```
@@ -378,6 +379,7 @@ Specialist depth, count, cost, and context are bounded by the parent task.
 
 The agent submits the terminal result in `agent.run.complete`:
 
+<!-- protocol-schema:runCompleteRequest fixture=schemas/examples-v2/protocol-run-complete.request.json -->
 ```json
 {
   "jsonrpc": "2.0",
@@ -394,26 +396,18 @@ The agent submits the terminal result in `agent.run.complete`:
       "content": "The proposal does not revoke the token family after reuse detection.",
       "claims": [
         {
-          "claimId": "claim-44",
-          "text": "Current code has no token-family invalidation path.",
+          "statement": "Current code has no token-family invalidation path.",
+          "observationClass": "agent_claimed",
           "evidenceRefs": [
-            {
-              "sourceType": "repository",
-              "sourceId": "src/auth/token_service.rs",
-              "revision": "worktree:task-1:abc123",
-              "contentDigest": "sha256:...",
-              "startLine": 88,
-              "endLine": 140
-            }
-          ],
-          "confidence": 0.88
+            "source:src/auth/token_service.rs@worktree-task-1-abc123:88-140"
+          ]
         }
       ]
     },
     "usage": {
       "inputTokens": 12000,
       "outputTokens": 1800,
-      "providerReportedCost": 0.08
+      "providerReportedCostMicrounits": 80000
     }
   }
 }
@@ -434,6 +428,7 @@ absent from the payload.
 
 Cancellation is a request:
 
+<!-- protocol-schema:runCancelRequest fixture=schemas/examples-v2/protocol-run-cancel.request.json -->
 ```json
 {
   "jsonrpc": "2.0",
@@ -441,14 +436,13 @@ Cancellation is a request:
   "method": "agent.run.cancel",
   "params": {
     "runId": "run-238",
-    "reason": "user_cancelled",
-    "deadlineMs": 5000
+    "reason": "user_cancelled"
   }
 }
 ```
 
-The agent acknowledges whether cancellation was accepted. If it does not stop
-by the deadline, the core terminates the process tree and records the run as
+The agent acknowledges whether cancellation was accepted. The cancellation deadline is core-owned connection state rather than peer-controlled frame data. If the process does not stop
+by that deadline, the core terminates the process tree and records the run as
 `terminated`, not `cancelled_cleanly`.
 
 For normal process shutdown the core sends `shutdown`, waits for its response,
@@ -457,6 +451,7 @@ active run on that connection.
 
 ## 13. Errors
 
+<!-- protocol-schema:errorResponse fixture=schemas/examples-v2/protocol-error.response.json -->
 ```json
 {
   "jsonrpc": "2.0",
@@ -510,3 +505,92 @@ The run record captures protocol version, manifest and executable digests,
 adapter version, provider/model identifier, generation parameters, prompt
 template version, response schema version, policy snapshot, and exact context
 package digest.
+
+
+## 15. v2 method-specific response and durable trace contract
+
+Protocol validation has three independent layers:
+
+1. **Frame schema:** encoding, size, method parameters, and method-specific result/error shape.
+2. **Authenticated connection state:** direction ownership, negotiated version/capabilities, pending `(connectionId, requestId, method)`, queue limits, and backpressure.
+3. **Durable trace state:** request digest replay, one terminal response, stream sequence continuity, and restart behavior.
+
+The receiver looks up the pending method from `protocol_requests` and validates the response against that method's `$defs/*Response` schema. It MUST NOT trust a peer-supplied method discriminator. The v2 schema defines distinct results for `initialize`, `agent.run.start`, `agent.run.cancel`, `agent.run.complete`, `context.query`, `tool.request`, `specialist.request`, and `shutdown`.
+
+Core and authority objects remain closed. Forward-compatible optional data may appear only inside the bounded namespaced `extensions` object after capability negotiation. The same `(connectionId, requestId)` with the same canonical request digest returns the persisted/current result; the same identifier with a different digest is a protocol conflict. A completed or failed request is terminal across restart.
+
+Backpressure is quantitative. Each connection negotiates maximum frame bytes, maximum pending requests, stream high/low watermarks, and overflow behavior. Authoritative requests, responses, audit records, and terminal messages are never dropped. Telemetry may be sampled or dropped only under an explicit negotiated policy.
+
+## 16. Cognitive extension v1
+
+The cognitive extension capability is negotiated under `cognitive-memory.v1`. Its current payload authority is `schemas/cognitive-memory.v4.schema.json`; extension capability version and payload schema version evolve independently. It does not change the authority model of MAT Agent Control Protocol v2.
+
+### 16.1 Capability negotiation
+
+An agent manifest may declare:
+
+```json
+{
+  "extensions": {
+    "cognitive-memory.v1": {
+      "progressiveContext": true,
+      "workingMemoryEvents": true,
+      "contextFeedback": true,
+      "structuredReflection": true
+    }
+  }
+}
+```
+
+The core may decline any extension. Absence of the extension does not prevent the core from compiling an initial cognitive context package.
+
+### 16.2 Progressive context methods
+
+Supported requests:
+
+- `context.request_more`;
+- `context.request_source`;
+- `context.request_related_symbols`;
+- `context.request_previous_failures`;
+- `context.request_decision_history`.
+
+Every request includes `runId`, `requestId`, reason, requested scope, maximum items, and maximum tokens. The response returns an immutable supplement ID, exact digest, provenance, redactions, policy decisions, and remaining budget.
+
+### 16.3 Working-memory events
+
+The agent may emit:
+
+- `agent.fact.record`;
+- `agent.inference.record`;
+- `agent.unknown.record`;
+- `agent.hypothesis.open`;
+- `agent.hypothesis.resolve`;
+- `agent.next_action.set`;
+- `agent.check.record`.
+
+A fact requires evidence references. An inference identifies supporting facts and confidence. An unknown or hypothesis cannot be submitted as evidence in `agent.run.complete` without later resolution.
+
+### 16.4 Context feedback
+
+`context.feedback` is a request with one entry per referenced package or supplement item. Allowed labels are `critical`, `useful`, `redundant`, `irrelevant`, `stale`, `contradictory`, and `misleading`.
+
+Feedback is retained for evaluation and offline tuning. It does not mutate authority data or current retrieval ranking in place.
+
+### 16.5 Reflection
+
+`agent.run.reflect` may be sent only after `agent.run.complete` and before the core closes the reflection window. It contains observed outcome, failed assumptions, useful evidence, wasted actions, proposed lessons, and remaining uncertainty.
+
+Reflection is untrusted input. The core binds it to the run and sends it to the Learning Engine only after outcome verification and quality evaluation.
+
+### 16.6 Error codes
+
+- `COGNITIVE_EXTENSION_NOT_NEGOTIATED`;
+- `CONTEXT_BUDGET_EXHAUSTED`;
+- `CONTEXT_SCOPE_DENIED`;
+- `CONTEXT_SOURCE_STALE`;
+- `WORKING_MEMORY_SEQUENCE_CONFLICT`;
+- `FACT_EVIDENCE_REQUIRED`;
+- `REFLECTION_WINDOW_CLOSED`;
+- `RETRIEVAL_DEGRADED`.
+
+The current machine-readable payloads are defined in [`schemas/cognitive-memory.v4.schema.json`](schemas/cognitive-memory.v4.schema.json). Historical v1-v3 payload schemas remain migration and regression inputs only.

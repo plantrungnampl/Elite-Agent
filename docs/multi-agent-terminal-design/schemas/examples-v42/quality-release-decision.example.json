@@ -1,0 +1,16 @@
+{
+  "decisionId": "quality-decision-1",
+  "comparisonId": "comparison-1",
+  "comparisonDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "requiredGateIds": [
+    "G11",
+    "G12"
+  ],
+  "decision": "allow_internal_experiment",
+  "residualRisks": [
+    "Runtime benefit is limited to the measured corpus."
+  ],
+  "decidedByActorBindingDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "decidedAt": "2026-08-06T08:10:00Z",
+  "decisionDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

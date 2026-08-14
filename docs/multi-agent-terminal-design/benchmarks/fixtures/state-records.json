@@ -1,0 +1,46 @@
+{
+  "records": [
+    {
+      "stateId": "state-current-output-language",
+      "projectId": "p1",
+      "taskId": "t1",
+      "key": "user.output.language",
+      "value": {"language": "vi"},
+      "scope": {"kind": "task", "id": "t1"},
+      "authorityKind": "current_instruction",
+      "precedenceRank": 600,
+      "status": "active"
+    },
+    {
+      "stateId": "state-old-output-language",
+      "projectId": "p1",
+      "key": "user.output.language",
+      "value": {"language": "en"},
+      "scope": {"kind": "project", "id": "p1"},
+      "authorityKind": "explicit_user_preference",
+      "precedenceRank": 200,
+      "status": "active"
+    },
+    {
+      "stateId": "state-task-db-read-only",
+      "projectId": "p1",
+      "taskId": "t2",
+      "key": "database.write_policy",
+      "value": {"mode": "read_only"},
+      "scope": {"kind": "task", "id": "t2"},
+      "authorityKind": "task_override",
+      "precedenceRank": 500,
+      "status": "active"
+    },
+    {
+      "stateId": "state-project-db-write",
+      "projectId": "p1",
+      "key": "database.write_policy",
+      "value": {"mode": "mediated_write"},
+      "scope": {"kind": "project", "id": "p1"},
+      "authorityKind": "project_setting",
+      "precedenceRank": 300,
+      "status": "active"
+    }
+  ]
+}

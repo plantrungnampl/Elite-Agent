@@ -1,0 +1,28 @@
+{
+  "evaluationId": "ev1",
+  "projectId": "p1",
+  "taskId": "t1",
+  "runId": "r1",
+  "evaluatorVersion": "quality.v1",
+  "configurationDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "scores": {
+    "correctness": 950000,
+    "evidenceGrounding": 900000,
+    "requirementCoverage": 1000000
+  },
+  "gateDecision": "pass",
+  "missedRequirements": [],
+  "unsupportedClaims": [],
+  "evidence": [
+    {
+      "sourceId": "a-test-1",
+      "sourceRevision": "receipt-1",
+      "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sourceKind": "tool-receipt",
+      "locator": {
+        "suite": "qrqc"
+      }
+    }
+  ],
+  "evaluatorKind": "ensemble"
+}

@@ -1,0 +1,245 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://multi-agent-terminal.local/schemas/workflow-transition-command.v1.schema.json",
+  "title": "Workflow Transition Command v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "commandId",
+    "taskId",
+    "ruleId",
+    "expectedStreamVersion",
+    "event",
+    "fromState",
+    "toState",
+    "guardEvidence",
+    "effects",
+    "actor",
+    "reducerVersion",
+    "preparedAt",
+    "commandDigest"
+  ],
+  "properties": {
+    "commandId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "ruleId": {
+      "type": "string",
+      "pattern": "^WF-[PWG][0-9]{3}$"
+    },
+    "expectedStreamVersion": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "event": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "fromState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "workflowProfile",
+        "outcomeMode"
+      ],
+      "properties": {
+        "phase": {
+          "enum": [
+            "Intake",
+            "ContextBuild",
+            "ParallelAnalysis",
+            "CrossReview",
+            "PrePlanVerification",
+            "Synthesis",
+            "FinalObjection",
+            "AwaitingPlanApproval",
+            "Implementation",
+            "Verification",
+            "Repair",
+            "FinalReview",
+            "AwaitingDeliverableApproval",
+            "AwaitingWorkspaceApproval",
+            "AwaitingCommitApproval",
+            "RefPromotion",
+            "WorkspaceDirty",
+            "Completed",
+            "Cancelled",
+            "Failed"
+          ]
+        },
+        "workflowProfile": {
+          "enum": [
+            "Quick",
+            "Standard",
+            "HighAssurance",
+            "ReadOnlyResearch"
+          ]
+        },
+        "outcomeMode": {
+          "enum": [
+            "ReadOnlyDeliverable",
+            "WorkspaceChange",
+            "LocalCommit"
+          ]
+        }
+      }
+    },
+    "toState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "workflowProfile",
+        "outcomeMode"
+      ],
+      "properties": {
+        "phase": {
+          "enum": [
+            "Intake",
+            "ContextBuild",
+            "ParallelAnalysis",
+            "CrossReview",
+            "PrePlanVerification",
+            "Synthesis",
+            "FinalObjection",
+            "AwaitingPlanApproval",
+            "Implementation",
+            "Verification",
+            "Repair",
+            "FinalReview",
+            "AwaitingDeliverableApproval",
+            "AwaitingWorkspaceApproval",
+            "AwaitingCommitApproval",
+            "RefPromotion",
+            "WorkspaceDirty",
+            "Completed",
+            "Cancelled",
+            "Failed"
+          ]
+        },
+        "workflowProfile": {
+          "enum": [
+            "Quick",
+            "Standard",
+            "HighAssurance",
+            "ReadOnlyResearch"
+          ]
+        },
+        "outcomeMode": {
+          "enum": [
+            "ReadOnlyDeliverable",
+            "WorkspaceChange",
+            "LocalCommit"
+          ]
+        }
+      }
+    },
+    "guardEvidence": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "reference",
+          "evidenceDigest"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "reference": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "subjectDigest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "evidenceDigest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    "effects": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "reference",
+          "effectDigest"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "reference": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "effectDigest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "bindingDigest"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "trusted_core",
+            "system",
+            "user"
+          ]
+        },
+        "bindingDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "reducerVersion": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "preparedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "commandDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "suiteId": "quality-core",
+  "version": 3,
+  "name": "Context and memory controlled benchmark",
+  "createdAt": "2026-08-06T08:00:00Z",
+  "controlledDimensions": [
+    "repositoryRevision",
+    "fixtureManifest",
+    "objective",
+    "budgetProfile",
+    "policy",
+    "toolPermissions",
+    "model",
+    "prompt",
+    "evaluator",
+    "acceptanceRules"
+  ],
+  "treatmentDimensions": [
+    "retrievalPipeline",
+    "contextCompiler",
+    "memoryPolicy"
+  ],
+  "experimentArms": [
+    "control_no_memory",
+    "evidence_plus_experience"
+  ],
+  "cases": [
+    {
+      "logicalCaseId": "case-architecture-1",
+      "caseVersion": 1,
+      "objective": "Review an architecture contract.",
+      "repositoryRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "fixtureManifestDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "objectiveDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "budgetProfileDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "policyDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "toolPermissionsDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "acceptanceRulesDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ]
+}

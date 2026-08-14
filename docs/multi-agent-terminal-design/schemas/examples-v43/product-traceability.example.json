@@ -1,0 +1,1395 @@
+{
+  "schemaVersion": "1.0",
+  "baselineVersion": "v4.3",
+  "requirements": [
+    {
+      "requirementId": "FR-001",
+      "title": "Repository onboarding",
+      "designAnchors": [
+        "01-product-requirements.md",
+        "05-workflow-orchestration.md",
+        "16-workflow-transition-specification.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G3"
+      ],
+      "milestones": [
+        "M0",
+        "MW0"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-002",
+      "title": "Task creation",
+      "designAnchors": [
+        "01-product-requirements.md",
+        "05-workflow-orchestration.md",
+        "16-workflow-transition-specification.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G3"
+      ],
+      "milestones": [
+        "M0",
+        "MW0"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-003",
+      "title": "Isolated workspace",
+      "designAnchors": [
+        "01-product-requirements.md",
+        "05-workflow-orchestration.md",
+        "16-workflow-transition-specification.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G3"
+      ],
+      "milestones": [
+        "M0",
+        "MW0"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-004",
+      "title": "Agent discovery",
+      "designAnchors": [
+        "02-system-architecture.md",
+        "03-agent-protocol.md",
+        "05-workflow-orchestration.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/agent-protocol.v2.schema.json",
+        "schemas/run-configuration.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G1",
+        "G5"
+      ],
+      "milestones": [
+        "M0",
+        "Standard",
+        "profile"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "FR-005",
+      "title": "Capability-based assignment",
+      "designAnchors": [
+        "02-system-architecture.md",
+        "03-agent-protocol.md",
+        "05-workflow-orchestration.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/agent-protocol.v2.schema.json",
+        "schemas/run-configuration.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G1",
+        "G5"
+      ],
+      "milestones": [
+        "M0",
+        "Standard",
+        "profile"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "FR-006",
+      "title": "Independent analysis",
+      "designAnchors": [
+        "02-system-architecture.md",
+        "03-agent-protocol.md",
+        "05-workflow-orchestration.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/assurance-degradation-receipt.v1.schema.json",
+        "schemas/run-configuration.v1.schema.json",
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G1",
+        "G5"
+      ],
+      "milestones": [
+        "M0",
+        "Standard",
+        "profile"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "FR-007",
+      "title": "Cross-review",
+      "designAnchors": [
+        "02-system-architecture.md",
+        "03-agent-protocol.md",
+        "05-workflow-orchestration.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/assurance-degradation-receipt.v1.schema.json",
+        "schemas/run-configuration.v1.schema.json",
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G1",
+        "G5"
+      ],
+      "milestones": [
+        "M0",
+        "Standard",
+        "profile"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "FR-008",
+      "title": "Direct collaboration",
+      "designAnchors": [
+        "02-system-architecture.md",
+        "03-agent-protocol.md",
+        "05-workflow-orchestration.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G1",
+        "G5"
+      ],
+      "milestones": [
+        "M0",
+        "Standard",
+        "profile"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "FR-009",
+      "title": "Structured messages",
+      "designAnchors": [
+        "02-system-architecture.md",
+        "03-agent-protocol.md",
+        "05-workflow-orchestration.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/agent-protocol.v2.schema.json",
+        "schemas/run-configuration.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G1",
+        "G5"
+      ],
+      "milestones": [
+        "M0",
+        "Standard",
+        "profile"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-010",
+      "title": "Context retrieval",
+      "designAnchors": [
+        "04-context-memory.md",
+        "24-cognitive-memory-agent-quality.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G6",
+        "G11",
+        "G13",
+        "G15"
+      ],
+      "milestones": [
+        "MQ1–MQ3"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-011",
+      "title": "Context query",
+      "designAnchors": [
+        "04-context-memory.md",
+        "24-cognitive-memory-agent-quality.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/agent-protocol.v2.schema.json",
+        "schemas/run-configuration.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G6",
+        "G11",
+        "G13",
+        "G15"
+      ],
+      "milestones": [
+        "MQ1–MQ3"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-012",
+      "title": "Lead synthesis",
+      "designAnchors": [
+        "04-context-memory.md",
+        "24-cognitive-memory-agent-quality.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G6",
+        "G11",
+        "G13",
+        "G15"
+      ],
+      "milestones": [
+        "MQ1–MQ3"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-013",
+      "title": "Plan approval",
+      "designAnchors": [
+        "14-finalization-approval-integrity.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G4"
+      ],
+      "milestones": [
+        "MW0",
+        "write",
+        "slice"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-014",
+      "title": "Tool mediation",
+      "designAnchors": [
+        "03-agent-protocol.md",
+        "06-security-threat-model.md",
+        "13-trust-sandbox-model.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G1",
+        "G3",
+        "G6"
+      ],
+      "milestones": [
+        "write",
+        "slice"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-015",
+      "title": "Single executor",
+      "designAnchors": [
+        "03-agent-protocol.md",
+        "06-security-threat-model.md",
+        "13-trust-sandbox-model.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/assurance-degradation-receipt.v1.schema.json",
+        "schemas/run-configuration.v1.schema.json",
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G1",
+        "G3",
+        "G6"
+      ],
+      "milestones": [
+        "write",
+        "slice"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "FR-016",
+      "title": "Verification",
+      "designAnchors": [
+        "05-workflow-orchestration.md",
+        "09-testing-reliability.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G1",
+        "G4"
+      ],
+      "milestones": [
+        "MW0",
+        "write",
+        "slice"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "FR-017",
+      "title": "Repair loop",
+      "designAnchors": [
+        "05-workflow-orchestration.md",
+        "09-testing-reliability.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G1",
+        "G4"
+      ],
+      "milestones": [
+        "MW0",
+        "write",
+        "slice"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-018",
+      "title": "Final review",
+      "designAnchors": [
+        "05-workflow-orchestration.md",
+        "09-testing-reliability.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/assurance-degradation-receipt.v1.schema.json",
+        "schemas/run-configuration.v1.schema.json",
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G1",
+        "G4"
+      ],
+      "milestones": [
+        "MW0",
+        "write",
+        "slice"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "FR-019",
+      "title": "Final approval and commit",
+      "designAnchors": [
+        "14-finalization-approval-integrity.md",
+        "16-workflow-transition-specification.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G4"
+      ],
+      "milestones": [
+        "local",
+        "commit",
+        "slice"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "FR-020",
+      "title": "Event-sourced audit",
+      "designAnchors": [
+        "07-storage-data-model.md",
+        "15-crash-consistency-recovery.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G1",
+        "G3"
+      ],
+      "milestones": [
+        "M0-B"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-021",
+      "title": "Recovery",
+      "designAnchors": [
+        "07-storage-data-model.md",
+        "15-crash-consistency-recovery.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G1",
+        "G3"
+      ],
+      "milestones": [
+        "M0-B"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "FR-022",
+      "title": "Project memory",
+      "designAnchors": [
+        "04-context-memory.md",
+        "24-cognitive-memory-agent-quality.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/cognitive-memory.v4.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G11",
+        "G13",
+        "G15"
+      ],
+      "milestones": [
+        "MQ1–MQ4"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-023",
+      "title": "Local-first operation",
+      "designAnchors": [
+        "02-system-architecture.md",
+        "06-security-threat-model.md",
+        "08-desktop-ux.md",
+        "09-testing-reliability.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G6",
+        "G9"
+      ],
+      "milestones": [
+        "M0",
+        "MQ0"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "FR-024",
+      "title": "Policy enforcement",
+      "designAnchors": [
+        "02-system-architecture.md",
+        "06-security-threat-model.md",
+        "08-desktop-ux.md",
+        "09-testing-reliability.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G6",
+        "G9"
+      ],
+      "milestones": [
+        "M0",
+        "MQ0"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-025",
+      "title": "Cost and token visibility",
+      "designAnchors": [
+        "02-system-architecture.md",
+        "06-security-threat-model.md",
+        "08-desktop-ux.md",
+        "09-testing-reliability.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G6",
+        "G9"
+      ],
+      "milestones": [
+        "M0",
+        "MQ0"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-026",
+      "title": "Agent trust tiers",
+      "designAnchors": [
+        "03-agent-protocol.md",
+        "05-workflow-orchestration.md",
+        "07-storage-data-model.md",
+        "13-trust-sandbox-model.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/assurance-degradation-receipt.v1.schema.json",
+        "schemas/run-configuration.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G1",
+        "G7"
+      ],
+      "milestones": [
+        "write",
+        "external",
+        "slices"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-027",
+      "title": "Workspace mutation detection",
+      "designAnchors": [
+        "03-agent-protocol.md",
+        "05-workflow-orchestration.md",
+        "07-storage-data-model.md",
+        "13-trust-sandbox-model.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G1",
+        "G7"
+      ],
+      "milestones": [
+        "write",
+        "external",
+        "slices"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-028",
+      "title": "Exact outbound and execution records",
+      "designAnchors": [
+        "03-agent-protocol.md",
+        "05-workflow-orchestration.md",
+        "07-storage-data-model.md",
+        "13-trust-sandbox-model.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G1",
+        "G7"
+      ],
+      "milestones": [
+        "write",
+        "external",
+        "slices"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "NFR-001",
+      "title": "Reliability",
+      "designAnchors": [
+        "05-workflow-orchestration.md",
+        "09-testing-reliability.md",
+        "15-crash-consistency-recovery.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G3",
+        "G9"
+      ],
+      "milestones": [
+        "all",
+        "milestones"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "NFR-002",
+      "title": "Performance",
+      "designAnchors": [
+        "05-workflow-orchestration.md",
+        "09-testing-reliability.md",
+        "15-crash-consistency-recovery.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G3",
+        "G9"
+      ],
+      "milestones": [
+        "all",
+        "milestones"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "NFR-003",
+      "title": "Security",
+      "designAnchors": [
+        "06-security-threat-model.md",
+        "13-trust-sandbox-model.md",
+        "14-finalization-approval-integrity.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/assurance-degradation-receipt.v1.schema.json",
+        "schemas/run-configuration.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G4",
+        "G6",
+        "G7"
+      ],
+      "milestones": [
+        "security",
+        "gates"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "NFR-004",
+      "title": "Portability",
+      "designAnchors": [
+        "02-system-architecture.md",
+        "03-agent-protocol.md",
+        "08-desktop-ux.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/agent-protocol.v2.schema.json",
+        "schemas/run-configuration.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G5",
+        "G9"
+      ],
+      "milestones": [
+        "M0",
+        "adapter",
+        "slice"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "NFR-005",
+      "title": "Observability",
+      "designAnchors": [
+        "02-system-architecture.md",
+        "03-agent-protocol.md",
+        "08-desktop-ux.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/agent-protocol.v2.schema.json",
+        "schemas/run-configuration.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G5",
+        "G9"
+      ],
+      "milestones": [
+        "M0",
+        "adapter",
+        "slice"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "NFR-006",
+      "title": "Extensibility",
+      "designAnchors": [
+        "02-system-architecture.md",
+        "03-agent-protocol.md",
+        "08-desktop-ux.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/agent-protocol.v2.schema.json",
+        "schemas/run-configuration.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G5",
+        "G9"
+      ],
+      "milestones": [
+        "M0",
+        "adapter",
+        "slice"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "NFR-007",
+      "title": "Deterministic control",
+      "designAnchors": [
+        "07-storage-data-model.md",
+        "09-testing-reliability.md",
+        "14-finalization-approval-integrity.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G4",
+        "G12"
+      ],
+      "milestones": [
+        "M0",
+        "MQ0"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "NFR-008",
+      "title": "Data integrity",
+      "designAnchors": [
+        "07-storage-data-model.md",
+        "09-testing-reliability.md",
+        "14-finalization-approval-integrity.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G4",
+        "G12"
+      ],
+      "milestones": [
+        "M0",
+        "MQ0"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "NFR-009",
+      "title": "Approval integrity",
+      "designAnchors": [
+        "07-storage-data-model.md",
+        "09-testing-reliability.md",
+        "14-finalization-approval-integrity.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/sqlite-v7.sql",
+        "schemas/workflow-transitions.v3.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G4",
+        "G12"
+      ],
+      "milestones": [
+        "M0",
+        "MQ0"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "NFR-010",
+      "title": "Measurability",
+      "designAnchors": [
+        "07-storage-data-model.md",
+        "09-testing-reliability.md",
+        "14-finalization-approval-integrity.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/orchestration-benchmark-case-result.v1.schema.json",
+        "schemas/orchestration-benchmark-comparison-report.v1.schema.json",
+        "schemas/orchestration-benchmark-run-receipt.v1.schema.json",
+        "schemas/orchestration-benchmark-suite.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G0",
+        "G4",
+        "G12"
+      ],
+      "milestones": [
+        "M0",
+        "MQ0"
+      ],
+      "proofStatus": "product_unproven",
+      "proofBoundary": "The equal-budget benchmark contract is defined, but no live paired provider corpus is included; no orchestration quality claim is allowed."
+    },
+    {
+      "requirementId": "FR-029",
+      "title": "Typed memory lifecycle",
+      "designAnchors": [
+        "04-context-memory.md",
+        "24-cognitive-memory-agent-quality.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/cognitive-memory.v4.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G11",
+        "G13",
+        "G15"
+      ],
+      "milestones": [
+        "MQ1–MQ4"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-030",
+      "title": "Role-aware hybrid retrieval",
+      "designAnchors": [
+        "04-context-memory.md",
+        "24-cognitive-memory-agent-quality.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/cognitive-memory.v4.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G11",
+        "G13",
+        "G15"
+      ],
+      "milestones": [
+        "MQ1–MQ4"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-031",
+      "title": "Cognitive context compilation",
+      "designAnchors": [
+        "04-context-memory.md",
+        "24-cognitive-memory-agent-quality.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/cognitive-memory.v4.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G11",
+        "G13",
+        "G15"
+      ],
+      "milestones": [
+        "MQ1–MQ4"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-032",
+      "title": "Progressive context",
+      "designAnchors": [
+        "04-context-memory.md",
+        "24-cognitive-memory-agent-quality.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/cognitive-memory.v4.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G11",
+        "G13",
+        "G15"
+      ],
+      "milestones": [
+        "MQ1–MQ4"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-033",
+      "title": "Verified learning loop",
+      "designAnchors": [
+        "04-context-memory.md",
+        "24-cognitive-memory-agent-quality.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/cognitive-memory.v4.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G11",
+        "G13",
+        "G15"
+      ],
+      "milestones": [
+        "MQ1–MQ4"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-034",
+      "title": "Agent quality evaluation",
+      "designAnchors": [
+        "08-desktop-ux.md",
+        "09-testing-reliability.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/cognitive-memory.v4.schema.json",
+        "schemas/orchestration-benchmark-case-result.v1.schema.json",
+        "schemas/orchestration-benchmark-comparison-report.v1.schema.json",
+        "schemas/orchestration-benchmark-run-receipt.v1.schema.json",
+        "schemas/orchestration-benchmark-suite.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G11",
+        "G15"
+      ],
+      "milestones": [
+        "MQ0–MQ5"
+      ],
+      "proofStatus": "product_unproven",
+      "proofBoundary": "The equal-budget benchmark contract is defined, but no live paired provider corpus is included; no orchestration quality claim is allowed."
+    },
+    {
+      "requirementId": "FR-035",
+      "title": "Memory and context inspection",
+      "designAnchors": [
+        "08-desktop-ux.md",
+        "09-testing-reliability.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/cognitive-memory.v4.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G11",
+        "G15"
+      ],
+      "milestones": [
+        "MQ0–MQ5"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "FR-036",
+      "title": "Benchmark and comparison",
+      "designAnchors": [
+        "08-desktop-ux.md",
+        "09-testing-reliability.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/cognitive-memory.v4.schema.json",
+        "schemas/orchestration-benchmark-case-result.v1.schema.json",
+        "schemas/orchestration-benchmark-comparison-report.v1.schema.json",
+        "schemas/orchestration-benchmark-run-receipt.v1.schema.json",
+        "schemas/orchestration-benchmark-suite.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G11",
+        "G15"
+      ],
+      "milestones": [
+        "MQ0–MQ5"
+      ],
+      "proofStatus": "product_unproven",
+      "proofBoundary": "The equal-budget benchmark contract is defined, but no live paired provider corpus is included; no orchestration quality claim is allowed."
+    },
+    {
+      "requirementId": "FR-037",
+      "title": "Degraded cognitive operation",
+      "designAnchors": [
+        "08-desktop-ux.md",
+        "09-testing-reliability.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/assurance-degradation-receipt.v1.schema.json",
+        "schemas/cognitive-memory.v4.schema.json",
+        "schemas/run-configuration.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G11",
+        "G15"
+      ],
+      "milestones": [
+        "MQ0–MQ5"
+      ],
+      "proofStatus": "runtime_unproven",
+      "proofBoundary": "The contract and authority boundary are specified; external adapters, sandbox containment, latency, or model behavior require runtime evidence."
+    },
+    {
+      "requirementId": "NFR-011",
+      "title": "Memory integrity",
+      "designAnchors": [
+        "04-context-memory.md",
+        "09-testing-reliability.md",
+        "24-cognitive-memory-agent-quality.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/cognitive-memory.v4.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G11",
+        "G15"
+      ],
+      "milestones": [
+        "MQ1–MQ5"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "NFR-012",
+      "title": "Explainability",
+      "designAnchors": [
+        "04-context-memory.md",
+        "09-testing-reliability.md",
+        "24-cognitive-memory-agent-quality.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/assurance-degradation-receipt.v1.schema.json",
+        "schemas/cognitive-memory.v4.schema.json",
+        "schemas/run-configuration.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G11",
+        "G15"
+      ],
+      "milestones": [
+        "MQ1–MQ5"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    },
+    {
+      "requirementId": "NFR-013",
+      "title": "Quality measurability",
+      "designAnchors": [
+        "04-context-memory.md",
+        "09-testing-reliability.md",
+        "24-cognitive-memory-agent-quality.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/cognitive-memory.v4.schema.json",
+        "schemas/orchestration-benchmark-case-result.v1.schema.json",
+        "schemas/orchestration-benchmark-comparison-report.v1.schema.json",
+        "schemas/orchestration-benchmark-run-receipt.v1.schema.json",
+        "schemas/orchestration-benchmark-suite.v1.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G11",
+        "G15"
+      ],
+      "milestones": [
+        "MQ1–MQ5"
+      ],
+      "proofStatus": "product_unproven",
+      "proofBoundary": "The equal-budget benchmark contract is defined, but no live paired provider corpus is included; no orchestration quality claim is allowed."
+    },
+    {
+      "requirementId": "NFR-014",
+      "title": "Replaceable retrieval",
+      "designAnchors": [
+        "04-context-memory.md",
+        "09-testing-reliability.md",
+        "24-cognitive-memory-agent-quality.md",
+        "38-v4.3-implementation-product-proof.md"
+      ],
+      "machineContracts": [
+        "schemas/cognitive-memory.v4.schema.json"
+      ],
+      "validationAnchors": [
+        "validation/validate_v43_implementation_product_proof.py"
+      ],
+      "releaseGates": [
+        "G11",
+        "G15"
+      ],
+      "milestones": [
+        "MQ1–MQ5"
+      ],
+      "proofStatus": "contract_proven",
+      "proofBoundary": "Machine contracts and encoded negative/positive tests prove structural coherence; live runtime behavior remains outside this package."
+    }
+  ],
+  "generatedAt": "2026-08-07T09:00:00Z",
+  "traceabilityDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+}

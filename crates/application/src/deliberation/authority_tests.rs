@@ -1,6 +1,7 @@
 
 #[cfg(test)]
 mod authority_tests {
+    use crate::ProjectionChange;
     use local_agent_terminal_domain::{
         Condition, DeliberationTaskBudget, FencingToken, OperationState, Sequence, Timestamp,
         WorkspaceVersion,

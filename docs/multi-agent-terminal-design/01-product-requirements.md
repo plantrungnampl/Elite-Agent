@@ -284,7 +284,7 @@ performance requirements.
 - task recovery after restart;
 - a structured non-shell tool broker;
 - executor leases with fencing tokens;
-- exact-tree approval and commit;
+- exact-object approval and commit;
 - intent journal and startup reconciliation;
 
 ### Excluded
@@ -321,3 +321,85 @@ The MVP is considered successful when:
    approval.
 10. Crash injection at every artifact-journal boundary reaches a deterministic,
     auditable state after restart.
+
+## 9. v3 safety outcomes and measurable acceptance
+
+The following outcomes are part of product correctness, not optional hardening:
+
+- zero successful stale authoritative writes after a newer fencing grant commits;
+- zero cross-task or cross-digest authority chains accepted by storage or dispatch;
+- zero source audit records updated or deleted through production write paths;
+- zero automatic retry of a `non_repeatable` attempt after durable `started` when absence of the external effect is not proved;
+- every final ref update targets the exact pre-created `candidateCommitOid` approved by the bound actor;
+- every enabled external executable has a current attestation for the exact executable, manifest, launcher, isolation profile, OS build, architecture, and suite version;
+- every protocol response is validated against the durable pending request method;
+- every release claim maps to a machine gate and evidence artifact in the invariant registry.
+
+A metric passes only when the negative-case success count is zero. Aggregate test pass rate cannot override a failed P0 gate.
+
+## 10. v4 cognitive memory and agent-quality requirements
+
+### FR-029 Typed memory lifecycle
+
+The system shall support working, episodic, semantic, procedural, negative, and scoped preference memory with explicit lifecycle, provenance, versioning, expiry where applicable, and supersession.
+
+### FR-030 Role-aware hybrid retrieval
+
+The system shall create a typed retrieval plan from objective, role, phase, risk, open questions, and policy; retrieve through exact, keyword, vector, graph, temporal, and memory-type channels as available; and record every channel used or omitted.
+
+### FR-031 Cognitive context compilation
+
+The system shall compile immutable role-specific context packages containing facts, inferences, unknowns, contradictions, evidence, relevant memories, required checks, policy receipts, and exact content digests.
+
+### FR-032 Progressive context
+
+An eligible agent may request bounded context supplements without gaining permissions. Each supplement shall repeat scope, freshness, redaction, budget, and receipt enforcement.
+
+### FR-033 Verified learning loop
+
+The system shall evaluate terminal outcomes, extract reviewable memory proposals, and prevent activation until configured human or deterministic verification succeeds.
+
+### FR-034 Agent quality evaluation
+
+The system shall evaluate material runs against role-specific correctness, evidence, coverage, constraint, uncertainty, efficiency, and regression criteria and retain immutable evaluation evidence.
+
+### FR-035 Memory and context inspection
+
+The user shall be able to inspect why an item was retrieved, its authority source, memory status, evidence, applicability, contradictions, redactions, and contribution to an agent conclusion.
+
+### FR-036 Benchmark and comparison
+
+The system shall run a locked benchmark corpus against named system configurations and produce comparable reports with per-task regressions, not only aggregate scores.
+
+### FR-037 Degraded cognitive operation
+
+Loss of vector, graph, reranking, or sidecar services shall not lose authority data. The system shall expose degraded status and shall block operations whose required evidence coverage cannot be satisfied.
+
+### NFR-011 Memory integrity
+
+No retrieval engine, model response, summary, reflection, or agreement among agents may directly create active memory. Cross-project memory references are rejected at the authority boundary.
+
+### NFR-012 Explainability
+
+Every included context item shall identify source, revision, hash, retrieval reason, policy decision, and memory lifecycle state where applicable.
+
+### NFR-013 Quality measurability
+
+Claims of improved memory or agent quality require benchmark evidence against a locked baseline with equal task inputs, revisions, budgets, and acceptance rules.
+
+### NFR-014 Replaceable retrieval
+
+The embedded, sidecar, and remote retrieval implementations shall conform to one application-owned contract. Authority and workflow behavior shall not depend on engine-specific identifiers or scores.
+
+### v4 success metrics
+
+- repeated known-error rate;
+- first-pass verifier acceptance;
+- unsupported-claim rate;
+- requirement omission rate;
+- contradiction recall;
+- useful-context ratio;
+- stale-memory use rate;
+- memory retraction rate;
+- context compilation p50/p95 latency;
+- accepted outcome cost and tool-call count.

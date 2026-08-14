@@ -17,6 +17,10 @@ fn agent_ports_are_object_safe_and_keep_only_bound_values_at_the_boundary() {
             Ok(vec![])
         }
 
+        fn prepare_run(&self, _: &BoundAgentRunRequest) -> Result<(), PortError> {
+            Ok(())
+        }
+
         fn start_run(&self, request: BoundAgentRunRequest) -> Result<AgentRunReceipt, PortError> {
             Ok(AgentRunReceipt {
                 run_id: request.run_id,

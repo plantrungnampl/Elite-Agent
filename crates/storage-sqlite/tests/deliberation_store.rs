@@ -505,7 +505,7 @@ fn deliberation_load_rehydrates_exact_v7_workflow_authority() {
     assert_eq!(state.stream_version(), 3);
     assert_eq!(state.profile_revision(), 2);
     assert_eq!(state.workspace_version().get(), 3);
-    assert_eq!(state.fencing_token().get(), 4);
+    assert_eq!(state.fencing_epoch(), 4);
     assert_eq!(
         state.last_transition_event_id(),
         Some("workflow-transition-p2")
@@ -668,7 +668,7 @@ fn repository_boundary_is_idempotent_and_invalidates_task_context_packages() {
 }
 
 #[test]
-fn dispatch_reservations_are_atomic_idempotent_and_task_bounded() {
+fn dispatch_requires_context_and_normative_run_configuration_binding() {
     let database = TestDatabase::new();
     let store = database.store();
     let budget =
@@ -681,7 +681,7 @@ fn dispatch_reservations_are_atomic_idempotent_and_task_bounded() {
         .unwrap_err();
     assert_eq!(
         error.safe_classification(),
-        SafeErrorClassification::IntegrityFailure
+        SafeErrorClassification::Conflict
     );
     assert_eq!(
         count(&database.connection(), "deliberation_dispatch_reservations"),
@@ -1686,7 +1686,7 @@ fn plan_approval_binding(
         actor_id: "core".to_owned(),
         task_version: snapshot.task_version + 1,
         workspace_version: snapshot.task_state.workspace_version().get(),
-        fencing_epoch: snapshot.task_state.fencing_token().get() + 1,
+        fencing_epoch: snapshot.task_state.fencing_epoch() + 1,
         requested_at: "2026-08-09T00:00:00Z".to_owned(),
         expires_at: "2026-08-09T00:15:00Z".to_owned(),
     }

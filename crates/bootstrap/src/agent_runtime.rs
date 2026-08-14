@@ -15,11 +15,11 @@ use local_agent_terminal_application::{
     AgentRequestKind, AgentRunReceipt, AgentRunStatus, AgentRunStore, AgentRuntime,
     AgentSpecialistCommit, AgentSpecialistDispatchCommand, AgentSpecialistDispatchStore,
     AgentSpecialistRequest, AgentSpecialistResponse, ArtifactId, ArtifactRef, ArtifactStore,
-    ArtifactWriteReservation, BoundAgentConnection, BoundAgentRunRequest, BoundEffectiveContext,
-    CancelAgentRun, CanonicalJsonRequest, Clock, ContextBudget, ContextBuildPolicy,
-    ContextPackageContract, ContextPackageDescriptor, ContextPackageDraft, ContextPackageIdentity,
-    ContextQuery, ContextRunReconstructibility, ContextVersionSet, DeliberationArtifactRef,
-    DeliberationBudget, DeliberationCommandContext, DeliberationCommands,
+    ArtifactWriteReservation, BindRunConfiguration, BoundAgentConnection, BoundAgentRunRequest,
+    BoundEffectiveContext, CancelAgentRun, CanonicalJsonRequest, Clock, ContextBudget,
+    ContextBuildPolicy, ContextPackageContract, ContextPackageDescriptor, ContextPackageDraft,
+    ContextPackageIdentity, ContextQuery, ContextRunReconstructibility, ContextVersionSet,
+    DeliberationArtifactRef, DeliberationBudget, DeliberationCommandContext, DeliberationCommands,
     DeliberationRunAssignment, DeliberationStore, EventId, PolicyActor, PortError,
     ProtocolRequestStore, ProtocolResponseArtifactPublisher, ReservedArtifact, ResourceClass,
     RiskLevel, RunId, Sha256Digest, SpecialistBudget, SpecialistRequest, TaskId, TaskQuery,
@@ -35,7 +35,9 @@ use local_agent_terminal_provider_openai::{OpenAiProviderConfig, OpenAiResponses
 use local_agent_terminal_storage_files::{
     ContentAddressedArtifactReader, ContentAddressedArtifactStore, JournaledArtifactWriter,
 };
-use local_agent_terminal_storage_sqlite::{canonical_agent_run_config_artifact, SqliteStore};
+#[cfg(test)]
+use local_agent_terminal_storage_sqlite::canonical_agent_run_config_artifact;
+use local_agent_terminal_storage_sqlite::SqliteStore;
 use serde_json::{json, Value};
 use url::Url;
 
@@ -390,7 +392,7 @@ impl ComposedAgentRuntime {
         self.lifecycle.shutdown(|| self.runtime.shutdown())
     }
 
-    fn prepare_run(&self, request: &BoundAgentRunRequest) -> Result<(), PortError> {
+    fn prepare_bound_run(&self, request: &BoundAgentRunRequest) -> Result<(), PortError> {
         request.validate().map_err(|_| invalid_input())?;
         let descriptor = self
             .descriptors
@@ -413,10 +415,30 @@ impl ComposedAgentRuntime {
             return Err(invalid_input());
         }
 
-        self.publish_manifest(request, descriptor)?;
+        self.publish_manifest(request, descriptor)
+            .map_err(|error| {
+                eprintln!("agent manifest preparation failed: {error:?}");
+                error
+            })?;
         self.durable_artifacts
-            .load_effective_context(&request.context)?;
-        self.publish_run_config(request)
+            .load_effective_context(&request.context)
+            .map_err(|error| {
+                eprintln!("effective context preparation failed: {error:?}");
+                error
+            })?;
+        let created_at = request.context.created_at;
+        let (artifact, configuration) = crate::agent_run_configuration::publish_for_run(
+            &self.database,
+            &self.durable_artifacts.artifacts,
+            request,
+            created_at,
+        )?;
+        self.runtime.prepare_run(request)?;
+        BindRunConfiguration::new(&self.database).execute(
+            &request.run_id,
+            &artifact,
+            &configuration,
+        )
     }
 
     fn publish_manifest(
@@ -452,33 +474,6 @@ impl ComposedAgentRuntime {
         }
         Ok(())
     }
-
-    fn publish_run_config(&self, request: &BoundAgentRunRequest) -> Result<(), PortError> {
-        let bytes = canonical_agent_run_config_artifact(request)?;
-        let value: Value = serde_json::from_slice(&bytes).map_err(|_| integrity_failure())?;
-        let published = publish_canonical_json(
-            &self.database,
-            self.durable_artifacts.artifacts.as_ref(),
-            CanonicalJsonRequest::new(
-                request.run_config.run_config_artifact_id.clone(),
-                project_id(&self.database, &request.task_id)?,
-                Some(request.task_id.clone()),
-                "run-config",
-                format!(
-                    "agent-runs/{}.json",
-                    stable_digest(request.run_config.run_config_artifact_id.as_str())
-                ),
-                "core",
-                "bootstrap",
-                &value,
-                format!("agent-run-config:{}", request.run_id.as_str()),
-            )?,
-        )?;
-        if published.content_hash != digest_bytes(&bytes).as_str() {
-            return Err(integrity_failure());
-        }
-        Ok(())
-    }
 }
 
 impl AgentRuntime for ComposedAgentRuntime {
@@ -486,12 +481,22 @@ impl AgentRuntime for ComposedAgentRuntime {
         self.runtime.list_agents()
     }
 
+    fn prepare_run(&self, request: &BoundAgentRunRequest) -> Result<(), PortError> {
+        let lifecycle = self.lifecycle.lock()?;
+        if !matches!(*lifecycle, ComposedRuntimeLifecycle::Open) {
+            return Err(conflict());
+        }
+        let prepared = self.prepare_bound_run(request);
+        drop(lifecycle);
+        prepared
+    }
+
     fn start_run(&self, request: BoundAgentRunRequest) -> Result<AgentRunReceipt, PortError> {
         let lifecycle = self.lifecycle.lock()?;
         if !matches!(*lifecycle, ComposedRuntimeLifecycle::Open) {
             return Err(conflict());
         }
-        self.prepare_run(&request)?;
+        self.prepare_bound_run(&request)?;
         let receipt = self.runtime.start_run(request);
         drop(lifecycle);
         receipt

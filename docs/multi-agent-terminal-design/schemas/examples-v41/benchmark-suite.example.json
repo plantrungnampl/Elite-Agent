@@ -1,0 +1,46 @@
+{
+  "suiteId": "context-memory-bootstrap-v1",
+  "version": 2,
+  "name": "Context and Memory Controlled Bootstrap",
+  "createdAt": "2026-08-06T01:00:00Z",
+  "description": "Controlled contract-level benchmark; not a production quality claim.",
+  "experimentArms": [
+    "control_no_memory",
+    "compaction_only",
+    "evidence_retrieval",
+    "evidence_plus_experience"
+  ],
+  "comparisonRules": {
+    "equalModelConfiguration": true,
+    "equalEvaluatorConfiguration": true,
+    "equalRepositoryRevision": true,
+    "equalBudgetProfile": true,
+    "reportPerCaseRegressions": true
+  },
+  "primaryMetrics": [
+    "first_pass_verifier_acceptance",
+    "repeated_known_error_rate",
+    "unsupported_claim_rate",
+    "stale_memory_use_rate",
+    "cross_scope_leakage",
+    "token_cost",
+    "latency_ms",
+    "memory_contribution"
+  ],
+  "cases": [
+    {
+      "caseId": "precedence-current-instruction",
+      "taskClass": "architecture-design",
+      "objective": "Resolve the output language when a current instruction conflicts with an older preference.",
+      "repositoryRevision": "design-v4.1",
+      "fixturePaths": ["benchmarks/fixtures/state-records.json"],
+      "applicableMemoryFixtureIds": ["memory-old-output-language"],
+      "budgetProfile": {"maxTokens": 8000, "maxToolCalls": 10, "maxDurationMs": 60000},
+      "expectedInformationNeeds": ["Current instruction", "Older preference", "State precedence rule"],
+      "requiredFacts": ["Current explicit instruction has precedence rank 600"],
+      "requiredEvidence": ["state-current-output-language"],
+      "forbiddenMistakes": ["Apply the older preference over the current instruction"],
+      "acceptanceRules": ["Select Vietnamese and cite the winning state record"]
+    }
+  ]
+}

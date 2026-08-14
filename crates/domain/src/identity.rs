@@ -159,13 +159,6 @@ impl FencingToken {
     pub fn get(self) -> u64 {
         self.0.get()
     }
-
-    pub(crate) fn checked_increment(self) -> Option<Self> {
-        self.get()
-            .checked_add(1)
-            .and_then(NonZeroU64::new)
-            .map(Self)
-    }
 }
 
 impl TryFrom<i64> for FencingToken {

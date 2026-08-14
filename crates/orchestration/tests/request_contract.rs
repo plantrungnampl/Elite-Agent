@@ -5,10 +5,11 @@ use local_agent_terminal_application::{
     recover_deliberation, CanonicalDeliberationFact, DeliberationArtifactRef,
     DeliberationBoundaryCheck, DeliberationBoundaryRecord, DeliberationBoundaryStore,
     DeliberationClaimCandidate, DeliberationClaimSource, DeliberationCommandContext,
-    DeliberationPersistenceCommand, DeliberationPlanDto, DeliberationRecord,
-    DeliberationRecoveryInput, DeliberationRejectedAlternativeDto, DeliberationRepositoryAuthority,
-    DeliberationRunAssignment, DeliberationSnapshot, DeliberationStore,
-    DeliberationSynthesisCommand, DeliberationSynthesisStore, PortError,
+    DeliberationPersistenceCommand, DeliberationPhaseTransition, DeliberationPlanDto,
+    DeliberationRecord, DeliberationRecoveryInput, DeliberationRejectedAlternativeDto,
+    DeliberationRepositoryAuthority, DeliberationRunAssignment, DeliberationSnapshot,
+    DeliberationStore, DeliberationSynthesisCommand, DeliberationSynthesisStore,
+    DeliberationWorkflowAuthority, PortError,
 };
 use local_agent_terminal_domain::{
     ActorId, AgentFamilyKey, ArtifactId, ClaimVerification, Condition, DecisionApproach,
@@ -197,7 +198,8 @@ fn synthesis_validates_complete_plan_and_persists_through_application_commands()
 
     let repository = FixedRepositoryAuthority;
     let boundaries = SynthesisBoundaryStore::default();
-    DeliberationCoordinator::new(&repository, &boundaries, &store)
+    let workflow = SynthesisWorkflowAuthority::default();
+    DeliberationCoordinator::with_workflow_authority(&repository, &boundaries, &store, &workflow)
         .synthesize(SynthesisRequest {
             context: synthesis_context(),
             decision: decision.clone(),
@@ -208,6 +210,7 @@ fn synthesis_validates_complete_plan_and_persists_through_application_commands()
         .unwrap();
 
     assert!(store.ordinary_writes.lock().unwrap().is_empty());
+    assert_eq!(workflow.transitions.lock().unwrap().len(), 1);
     let writes = store.synthesis_writes.lock().unwrap();
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].plan(), &plan_dto());
@@ -236,18 +239,22 @@ fn synthesis_post_commit_fault_never_exposes_a_partial_decision_or_plan() {
     };
     let repository = FixedRepositoryAuthority;
     let boundaries = SynthesisBoundaryStore::default();
+    let workflow = SynthesisWorkflowAuthority::default();
 
-    assert!(
-        DeliberationCoordinator::new(&repository, &boundaries, &store)
-            .synthesize(SynthesisRequest {
-                context: synthesis_context(),
-                decision: decision(claims),
-                plan: plan_dto(),
-                plan_artifact: deliberation_artifact("plan-1", '4'),
-                plan_version: 1,
-            })
-            .is_err()
-    );
+    assert!(DeliberationCoordinator::with_workflow_authority(
+        &repository,
+        &boundaries,
+        &store,
+        &workflow,
+    )
+    .synthesize(SynthesisRequest {
+        context: synthesis_context(),
+        decision: decision(claims),
+        plan: plan_dto(),
+        plan_artifact: deliberation_artifact("plan-1", '4'),
+        plan_version: 1,
+    })
+    .is_err());
 
     assert!(store.ordinary_writes.lock().unwrap().is_empty());
     let durable = store.synthesis_writes.lock().unwrap();
@@ -391,6 +398,18 @@ impl DeliberationClaimSource for ClaimAuthorityStore {
 }
 
 struct FixedRepositoryAuthority;
+
+#[derive(Default)]
+struct SynthesisWorkflowAuthority {
+    transitions: Mutex<Vec<DeliberationPhaseTransition>>,
+}
+
+impl DeliberationWorkflowAuthority for SynthesisWorkflowAuthority {
+    fn transition(&self, request: DeliberationPhaseTransition) -> Result<(), PortError> {
+        self.transitions.lock().unwrap().push(request);
+        Ok(())
+    }
+}
 
 impl DeliberationRepositoryAuthority for FixedRepositoryAuthority {
     fn current_fingerprint(&self, _: &TaskId) -> Result<WorkspaceFingerprint, PortError> {

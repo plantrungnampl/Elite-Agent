@@ -1,0 +1,30 @@
+{
+  "schemaVersion": "1.0",
+  "resultId": "result-standard-001-r1",
+  "runId": "bench-run-standard-001-r1",
+  "caseId": "bugfix-null-guard-001",
+  "arm": "standard_cross_review",
+  "repeatIndex": 1,
+  "metrics": {
+    "accepted_outcome": true,
+    "defect_escape_count": 0,
+    "first_pass_test_success": true,
+    "unsupported_claim_count": 0,
+    "requirement_omission_count": 0,
+    "human_correction_minutes": 3.0,
+    "time_to_accepted_ms": 950000,
+    "input_tokens": 93000,
+    "output_tokens": 18000,
+    "tool_calls": 52,
+    "cost_microunits": 3700000,
+    "approval_interruptions": 1,
+    "task_abandoned": false,
+    "reviewer_unique_findings": 2
+  },
+  "evaluatorVerdict": "accepted",
+  "evidenceRefs": [
+    "artifacts/bench-run-standard-001-tests",
+    "artifacts/evaluator-standard-001"
+  ],
+  "resultDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+}
